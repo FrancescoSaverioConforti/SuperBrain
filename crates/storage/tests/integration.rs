@@ -644,6 +644,40 @@ fn secret_only_in_the_body_is_rejected_by_the_gate_and_the_record_file_is_never_
     assert!(files_in(&root).is_empty(), "nothing may be written");
 }
 
+// --- A1 third whole-branch review, Finding I-C: symlink at the real record path ---
+
+#[test]
+fn propose_and_commit_rejects_a_record_path_symlinked_outside_the_vault_root() {
+    // `root/note-a.record` (the exact path every I/O call uses) is a symlink
+    // to a well-formed record at version 7 outside the root. Before the fix,
+    // committing note-a at Version(7) succeeded because the version check
+    // read the outside file through the link.
+    let root = unique_test_dir();
+    let outside_dir = unique_test_dir();
+    let outside_file = outside_dir.join("victim.record");
+    let outside_bytes = "7\n---\nOUTSIDE CONTENT".as_bytes();
+    std::fs::write(&outside_file, outside_bytes).unwrap();
+    let link = root.join("note-a.record");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_file, &link).unwrap();
+    let vault = Vault::new(root.clone());
+
+    for expected in [Version(7), Version(0)] {
+        let err = commit(&vault, &valid_yaml("note-a"), expected).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProposeError::Storage(StorageError::PathEscapesVaultRoot { note_id }) if note_id == "note-a"
+            ),
+            "expected Version {expected:?}: got {err:?}"
+        );
+    }
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "link left untouched");
+    assert_eq!(std::fs::read(&outside_file).unwrap(), outside_bytes, "outside file untouched");
+}
+
 #[test]
 fn frontmatter_only_note_without_delimiters_still_commits_unchanged() {
     // Backward compatibility: bare YAML (no `---` delimiters, no body) is

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -213,66 +213,74 @@ impl Vault {
         Ok(new_version)
     }
 
-    /// Resolves the on-disk record path for `note_id` and verifies, via
-    /// filesystem canonicalization, that it still resolves inside the vault
-    /// root. `NoteId::parse` only ever sees the id string, so it cannot
-    /// detect a symlink planted inside the vault root that resolves
-    /// elsewhere on disk — this check catches exactly that case.
+    /// Resolves the on-disk record path for `note_id` — `root/<id>.record`,
+    /// the exact path that `read_note` and `write_record_unchecked` open —
+    /// and verifies, via filesystem canonicalization, that this same path
+    /// resolves inside the vault root. `NoteId::parse` only ever sees the id
+    /// string, so it cannot detect a symlink planted inside the vault root
+    /// that resolves elsewhere on disk; this check is what catches that. See
+    /// [`ensure_resolves_inside_root`] for the exact rule.
     ///
-    /// Two things are canonicalized and checked against the canonicalized
-    /// root:
-    /// - the candidate record file's parent directory (always `root`
-    ///   itself, since `NoteId` guarantees no path separators — but
-    ///   canonicalizing it still catches the case where `root` itself is
-    ///   not a real, fully-resolved directory);
-    /// - the note id's own bare path (`root.join(note_id)`, with no
-    ///   `.record` suffix), if an entry with that exact name already
-    ///   exists. This is the check that matters: an attacker who plants a
-    ///   symlink inside the vault root *named exactly like a note id* can
-    ///   make that name resolve outside the root even though the actual
-    ///   record file (`<note_id>.record`) is a different, sibling path
-    ///   string that never traverses the symlink. Canonicalizing the bare
-    ///   note-id path catches that case before any write touches disk.
+    /// (A1 third review, Finding I-C: until then this function canonicalized
+    /// the bare `root/<id>` path, without the `.record` suffix, which no I/O
+    /// ever touches, and returned the `.record` path unchecked. A symlink at
+    /// `root/<id>.record` was therefore followed by every read and by the
+    /// version check.)
     ///
-    /// KNOWN LIMITATION (accepted for A1, Continuity [c12ah]): this is a
-    /// check-then-use — a residual TOCTOU window exists between this
-    /// canonicalization and the later `atomic_write` create/rename, in which
-    /// a concurrent process could swap a path component for a symlink. Not
-    /// closed in A1 because A1's threat model is explicitly single-process
-    /// and non-adversarial (see `eval/results/A1/evidence.md`, "Known
-    /// limitations").
+    /// KNOWN LIMITATION (accepted for A1, Continuity [c12ah]): this is still
+    /// a check-then-use. The I-C fix changes *which* path is checked, not
+    /// *when*: nothing here is atomic with the later `std::fs::read` or
+    /// `atomic_write` create/rename, so a concurrent process could still swap
+    /// the record path, or a component of it, for a symlink between this
+    /// check and the I/O. Closing that window needs handle-relative
+    /// (`openat`/`O_NOFOLLOW`-style) I/O and is not done in A1, whose threat
+    /// model is explicitly single-process and non-adversarial (see
+    /// `eval/results/A1/evidence.md`, "Known limitations").
     fn record_path_checked(&self, note_id: &NoteId) -> Result<PathBuf, StorageError> {
         let candidate = self.root.join(format!("{}.record", note_id.as_str()));
-        let parent = candidate.parent().unwrap_or(&self.root);
-
         let canonical_root = std::fs::canonicalize(&self.root).map_err(StorageError::Io)?;
-
-        let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
-            StorageError::PathEscapesVaultRoot {
-                note_id: note_id.as_str().to_string(),
-            }
-        })?;
-        if canonical_parent != canonical_root {
-            return Err(StorageError::PathEscapesVaultRoot {
-                note_id: note_id.as_str().to_string(),
-            });
-        }
-
-        let bare_note_path = self.root.join(note_id.as_str());
-        if bare_note_path.symlink_metadata().is_ok() {
-            let canonical_bare = std::fs::canonicalize(&bare_note_path).map_err(|_| {
-                StorageError::PathEscapesVaultRoot {
-                    note_id: note_id.as_str().to_string(),
-                }
-            })?;
-            if canonical_bare.parent() != Some(canonical_root.as_path()) {
-                return Err(StorageError::PathEscapesVaultRoot {
-                    note_id: note_id.as_str().to_string(),
-                });
-            }
-        }
-
+        ensure_resolves_inside_root(&canonical_root, &candidate, note_id)?;
         Ok(candidate)
+    }
+}
+
+/// Fails with [`StorageError::PathEscapesVaultRoot`] unless `candidate`
+/// resolves to a location inside `canonical_root` (which must already be
+/// canonical).
+///
+/// - If an entry exists at `candidate` — `symlink_metadata` succeeds, which
+///   it does for a symlink whether or not the link's target exists — the
+///   **full** `candidate` path is canonicalized. That resolves a symlink at
+///   the final component *and* any symlinked directory component above it,
+///   so both are caught by the same comparison. If canonicalization fails
+///   (a dangling link, a self-referential link or loop, ...), the entry's
+///   real location cannot be established and the check fails closed with
+///   `PathEscapesVaultRoot`; it is never treated as "no note here yet".
+/// - If nothing exists at `candidate` (first write), the parent directory is
+///   canonicalized instead, which again resolves every symlinked directory
+///   component on the way.
+///
+/// "Inside" means the canonical path starts with `canonical_root`. A link
+/// whose target is elsewhere inside the root is accepted; that is aliasing,
+/// not escape, and it is out of this check's scope.
+fn ensure_resolves_inside_root(
+    canonical_root: &Path,
+    candidate: &Path,
+    note_id: &NoteId,
+) -> Result<(), StorageError> {
+    let escapes = || StorageError::PathEscapesVaultRoot {
+        note_id: note_id.as_str().to_string(),
+    };
+    let to_resolve = if candidate.symlink_metadata().is_ok() {
+        candidate
+    } else {
+        candidate.parent().ok_or_else(escapes)?
+    };
+    let resolved = std::fs::canonicalize(to_resolve).map_err(|_| escapes())?;
+    if resolved.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(escapes())
     }
 }
 
@@ -324,22 +332,209 @@ mod tests {
         assert_eq!(entries, vec!["note-a.record".to_string()], "no write may be attempted");
     }
 
-    #[test]
-    fn write_target_resolving_outside_vault_root_via_symlink_is_rejected() {
-        let root = unique_test_dir();
-        let outside = unique_test_dir(); // a sibling dir, not under root
+    fn symlink_dir(target: &std::path::Path, link: &std::path::Path) {
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(target, link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&outside, root.join("escape")).unwrap();
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    #[test]
+    fn symlink_at_the_bare_note_id_path_is_never_touched_by_io() {
+        // Replaces the Task 6 test `write_target_resolving_outside_vault_root_via_symlink_is_rejected`,
+        // which planted a directory symlink at `root/escape` (no `.record`
+        // suffix) and expected a rejection. No I/O ever opens that path: the
+        // record lives at `root/escape.record`, a sibling entry that does not
+        // traverse the link. So the old test proved nothing about escapes
+        // (Finding I-C). This test pins the actual behavior: the bare-path
+        // entry is irrelevant, the write lands inside the root, and nothing
+        // is written through the link.
+        let root = unique_test_dir();
+        let outside = unique_test_dir();
+        symlink_dir(&outside, &root.join("escape"));
         let vault = Vault::new(root.clone());
-        // "escape" itself is a syntactically valid NoteId; the vault must still refuse
-        // to resolve a record path through it once canonicalization shows it leaves root.
-        let note_id = NoteId::parse("escape").unwrap();
-        let err = vault
-            .write_record_unchecked(&note_id, "x", Version(0), Uuid::new_v4())
+        let id = NoteId::parse("escape").unwrap();
+        let v = vault
+            .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
+            .unwrap();
+        assert_eq!(v, Version(1));
+        assert!(root.join("escape.record").symlink_metadata().unwrap().is_file());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside");
+    }
+
+    // Finding I-C, part (c): a symlinked *directory* component. With today's
+    // layout the only directory above `<id>.record` is the root itself
+    // (`NoteId` has no separators), so this cannot be reached through
+    // `Vault`; it is tested on `ensure_resolves_inside_root` directly to
+    // show that canonicalizing the full path covers it.
+
+    #[test]
+    fn existing_file_under_a_symlinked_directory_component_escapes() {
+        let (root, outside_file) = root_and_outside_record();
+        symlink_dir(outside_file.parent().unwrap(), &root.join("sub"));
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let id = NoteId::parse("victim").unwrap();
+        let err = ensure_resolves_inside_root(&canonical_root, &root.join("sub").join("victim.record"), &id)
             .unwrap_err();
-        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }));
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn new_file_under_a_symlinked_directory_component_escapes() {
+        let root = unique_test_dir();
+        let outside = unique_test_dir();
+        symlink_dir(&outside, &root.join("sub"));
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let id = NoteId::parse("fresh").unwrap();
+        let err = ensure_resolves_inside_root(&canonical_root, &root.join("sub").join("fresh.record"), &id)
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn real_subdirectory_component_inside_the_root_is_accepted() {
+        let root = unique_test_dir();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let id = NoteId::parse("fresh").unwrap();
+        ensure_resolves_inside_root(&canonical_root, &root.join("sub").join("fresh.record"), &id).unwrap();
+    }
+
+    #[test]
+    fn vault_root_reached_through_a_symlinked_ancestor_still_works() {
+        // The root itself is the trust anchor: if the configured root path
+        // goes through a symlink, both sides of the comparison are
+        // canonicalized, so ordinary reads and writes are not rejected.
+        let base = unique_test_dir();
+        let real = unique_test_dir();
+        symlink_dir(&real, &base.join("via"));
+        let vault = Vault::new(base.join("via"));
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "ok", Version(0), Uuid::new_v4()).unwrap();
+        assert_eq!(vault.read_note(&id).unwrap().content, "ok");
+        assert!(real.join("note-a.record").is_file());
+    }
+
+    // --- A1 third whole-branch review, Finding I-C ---
+    //
+    // Every test below plants the symlink at the REAL record path,
+    // `root/<id>.record` (with the suffix), which is the exact path
+    // `read_note` and `write_record_unchecked` open. The pre-I-C test planted
+    // it at the bare `root/<id>` path, which no I/O ever touches, so it could
+    // not detect an escape whether or not the check was correct.
+
+    fn symlink_file(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
+    /// A vault root plus a sibling directory (outside the root) holding a
+    /// well-formed record at version 7, so a read or version check that
+    /// follows an escaping symlink *succeeds* and is observable.
+    fn root_and_outside_record() -> (PathBuf, PathBuf) {
+        let root = unique_test_dir();
+        let outside_dir = unique_test_dir();
+        let outside_file = outside_dir.join("victim.record");
+        std::fs::write(&outside_file, serialize_record("OUTSIDE CONTENT", Version(7))).unwrap();
+        (root, outside_file)
+    }
+
+    #[test]
+    fn read_note_rejects_record_path_symlinked_to_a_file_outside_the_vault_root() {
+        let (root, outside_file) = root_and_outside_record();
+        symlink_file(&outside_file, &root.join("note-a.record"));
+        let vault = Vault::new(root);
+        let result = vault.read_note(&NoteId::parse("note-a").unwrap());
+        assert!(
+            matches!(result, Err(StorageError::PathEscapesVaultRoot { ref note_id }) if note_id == "note-a"),
+            "read_note must refuse an escaping .record symlink, got {result:?}"
+        );
+        assert!(matches!(
+            vault.current_version(&NoteId::parse("note-a").unwrap()),
+            Err(StorageError::PathEscapesVaultRoot { .. })
+        ));
+    }
+
+    #[test]
+    fn write_rejects_record_path_symlinked_outside_and_never_reads_the_outside_version() {
+        let (root, outside_file) = root_and_outside_record();
+        let link = root.join("note-a.record");
+        symlink_file(&outside_file, &link);
+        let vault = Vault::new(root.clone());
+        let id = NoteId::parse("note-a").unwrap();
+        // Version(7) is the OUTSIDE file's version: before the fix the version
+        // check read it through the link and accepted this write.
+        let err = vault
+            .write_record_unchecked(&id, "x", Version(7), Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+        // Version(0) must not surface as a Conflict carrying the outside version.
+        let err = vault
+            .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "link left untouched");
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap(),
+            serialize_record("OUTSIDE CONTENT", Version(7)),
+            "outside file untouched"
+        );
+    }
+
+    #[test]
+    fn dangling_record_symlink_is_rejected_not_treated_as_a_missing_note() {
+        // The link exists but its target does not. Before the fix, read_note
+        // said NotFound and a Version(0) write went through (replacing the
+        // link). The target's location cannot be verified, so it must fail
+        // closed on both paths.
+        let root = unique_test_dir();
+        let outside_dir = unique_test_dir();
+        let link = root.join("note-a.record");
+        symlink_file(&outside_dir.join("does-not-exist.record"), &link);
+        let vault = Vault::new(root.clone());
+        let id = NoteId::parse("note-a").unwrap();
+        let read = vault.read_note(&id);
+        assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
+        let err = vault
+            .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "no write through the link");
+        assert!(!outside_dir.join("does-not-exist.record").exists());
+    }
+
+    #[test]
+    fn self_referential_record_symlink_is_rejected_cleanly() {
+        // A link to itself never resolves (ELOOP on unix, a resolution
+        // failure on Windows). It must be an explicit rejection, not a panic.
+        let root = unique_test_dir();
+        let link = root.join("note-a.record");
+        symlink_file(&link, &link);
+        let vault = Vault::new(root.clone());
+        let id = NoteId::parse("note-a").unwrap();
+        let read = vault.read_note(&id);
+        assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
+        let err = vault
+            .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathEscapesVaultRoot { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn record_symlink_resolving_inside_the_vault_root_is_not_an_escape() {
+        // The check is about leaving the root, not about symlinks as such: a
+        // link whose target is inside the root is read normally.
+        let root = unique_test_dir();
+        std::fs::create_dir(root.join("store")).unwrap();
+        let target = root.join("store").join("real.record");
+        std::fs::write(&target, serialize_record("inside", Version(3))).unwrap();
+        symlink_file(&target, &root.join("note-a.record"));
+        let vault = Vault::new(root);
+        let record = vault.read_note(&NoteId::parse("note-a").unwrap()).unwrap();
+        assert_eq!(record.content, "inside");
+        assert_eq!(record.version, Version(3));
     }
 
     #[test]
