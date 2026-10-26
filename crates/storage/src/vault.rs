@@ -83,8 +83,10 @@ pub enum StorageError {
     InvalidNoteId(NoteIdError),
     #[error("resolved path for note {note_id} escapes the vault root")]
     PathEscapesVaultRoot { note_id: String },
-    #[error("atomic write failed: {0}")]
-    Atomic(AtomicWriteError),
+    /// Any filesystem I/O failure, including a failure inside the
+    /// crate-private atomic-write step (temp-file create/write/fsync/rename).
+    /// The crate-private `AtomicWriteError` is folded into this variant at
+    /// the crate boundary so it never becomes public API.
     #[error("io error: {0}")]
     Io(std::io::Error),
 }
@@ -139,15 +141,15 @@ impl Vault {
     /// wire it to journal-backed idempotency without changing this
     /// signature.
     ///
-    /// Private: this is the single primitive through which every write to
-    /// the vault must flow, and it performs **no policy validation**. It is
-    /// kept private (not `pub`, not `pub(crate)`) so that no code outside
-    /// this crate — and, before Task 9 adds a gated public entry point, no
-    /// code at all — can write to the vault while bypassing policy. Task 9
-    /// adds `propose_and_commit`, which runs `policy::Gate::evaluate`
-    /// before calling this method, from elsewhere in this same crate.
+    /// Crate-private (`pub(crate)`, never `pub`): this is the single
+    /// primitive through which every note write to the vault flows, and it
+    /// performs **no policy validation**, so no code outside this crate may
+    /// call it. The other raw primitive it builds on, `atomic::atomic_write`,
+    /// is likewise `pub(crate)` and not re-exported (A1 final review, Finding
+    /// C1). Both are pinned unreachable from other crates by the
+    /// `compile_fail` doctests in `lib.rs`.
     ///
-    /// As of Task 9, `propose::propose_and_commit` (same crate) is this
+    /// `propose::propose_and_commit` (same crate) is this
     /// method's first and only production caller, reaching it only after
     /// `policy::Gate::evaluate` returns `GateDecision::Pass`. `pub(crate)`
     /// (not `pub`) is the minimum visibility that lets a sibling module in
@@ -201,7 +203,7 @@ impl Vault {
 
         let new_version = Version(actual_version.0 + 1);
         let buffer = serialize_record(content, new_version);
-        atomic_write(&record_path, &buffer).map_err(StorageError::Atomic)?;
+        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
 
         Ok(new_version)
     }

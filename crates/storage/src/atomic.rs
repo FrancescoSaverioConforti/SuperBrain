@@ -2,8 +2,12 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+/// Crate-private: never crosses the `storage` crate boundary. `Vault`
+/// converts it into `StorageError::Io` (an atomic-write failure is an I/O
+/// failure), so callers of `propose_and_commit` still see the underlying
+/// `std::io::Error` without this type becoming public API.
 #[derive(Debug, thiserror::Error)]
-pub enum AtomicWriteError {
+pub(crate) enum AtomicWriteError {
     #[error("io error during atomic write: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -15,7 +19,13 @@ pub enum AtomicWriteError {
 ///
 /// No note schema, policy, or versioning lives here — this is pure
 /// filesystem mechanics (that layering is Task 6's job).
-pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
+///
+/// `pub(crate)`, never `pub`, and not re-exported from `lib.rs`: calling
+/// this directly would write arbitrary bytes to an arbitrary path with no
+/// `NoteId` validation, no policy gate, and no version check. The only
+/// production caller is `Vault::write_record_unchecked`, itself reachable
+/// from outside the crate only through `propose_and_commit`.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
 
     let tmp_name = format!(

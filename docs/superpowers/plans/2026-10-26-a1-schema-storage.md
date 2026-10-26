@@ -64,10 +64,10 @@ SuperBrain/
 │       ├── Cargo.toml                   # depends on domain AND policy (amended from the spec's original table)
 │       └── src/
 │           ├── lib.rs
-│           ├── vault.rs                 # Vault, write_record_unchecked (private), read_note, current_version
-│           ├── note_id.rs               # NoteId newtype: path-traversal/symlink-safe id validation
-│           ├── atomic.rs                # temp-file+fsync+rename+fsync-dir helpers
-│           └── propose.rs               # propose_and_commit: the ONLY pub write function in the whole workspace
+│           ├── vault.rs                 # Vault, write_record_unchecked (pub(crate), never pub), read_note, current_version
+│           ├── note_id.rs               # NoteId newtype: path-traversal/symlink-safe, lowercase-ASCII-only id validation
+│           ├── atomic.rs                # temp-file+fsync+rename+fsync-dir helpers — atomic_write is pub(crate) and NOT re-exported (final-review fix C1)
+│           └── propose.rs               # propose_and_commit: the ONLY pub write function in the whole workspace (atomic_write and write_record_unchecked are both pub(crate); pinned by compile_fail doctests in storage/src/lib.rs)
 ├── eval/
 │   └── results/
 │       └── A1/                          # evidence artifacts, one file per checkpoint
@@ -428,8 +428,8 @@ git commit -m "feat(domain): WriteState enum mirroring C1 state names (interface
 
 **Interfaces:**
 - Produces:
-  - `pub enum AtomicWriteError { Io(std::io::Error) }` (derive `thiserror::Error`, `#[from] std::io::Error`)
-  - `pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError>` — writes to `<path>.tmp-<random>`, calls `File::sync_all()`, renames to `path`, then opens and syncs the parent directory.
+  - `pub(crate) enum AtomicWriteError { Io(std::io::Error) }` (derive `thiserror::Error`, `#[from] std::io::Error`)
+  - `pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError>` — **crate-private, never re-exported** (corrected by the A1 final-review fix C1: it was originally written as `pub` and re-exported from `lib.rs`, which let any external crate write raw bytes to any path, bypassing `NoteId` validation, the gate, and the version check; `Vault` folds `AtomicWriteError` into `StorageError::Io` at the crate boundary). Writes to `<path>.tmp-<random>`, calls `File::sync_all()`, renames to `path`, then opens and syncs the parent directory.
 - Consumes: nothing (pure filesystem helper).
 
 - [ ] **Step 1: Write failing tests for atomic write correctness**
@@ -503,7 +503,7 @@ git commit -m "feat(storage): atomic file write via temp+rename+fsync"
   - `pub enum NoteIdError { Empty, ContainsPathSeparator, ContainsParentRef, NotRelative }` — `parse` rejects empty strings, any `/` or `\`, any `..` component, and any absolute path; only `[a-zA-Z0-9_-]+` (plus `.` for date-ish ids, but never `..`) is accepted. This is the only constructor for `NoteId`; every `storage` function that currently would take `&str` for a note id instead takes `&NoteId`, so a path-traversal or symlink-escape attempt is rejected before any `Path` is built.
   - `pub struct Version(pub u64)` (newtype, `Copy, Clone, PartialEq, Eq`)
   - `pub struct VaultRecord { pub content: String, pub version: Version }` — the single unit serialized to disk. On-disk representation is one file per note (`<root>/<note_id>.record`) containing a small fixed header (`version` as a decimal line) followed by a `\n---\n` separator and the raw content; this whole buffer is built in memory as one `Vec<u8>` and handed to `atomic_write` as one call, so content and version are replaced by a single rename — there is no second file and no window where one can be read without the other.
-  - `pub enum StorageError { Conflict { note_id: String, expected: Version, actual: Version }, NotFound { note_id: String }, InvalidNoteId(NoteIdError), PathEscapesVaultRoot { note_id: String }, Atomic(AtomicWriteError), Io(std::io::Error) }`
+  - `pub enum StorageError { Conflict { note_id: String, expected: Version, actual: Version }, NotFound { note_id: String }, InvalidNoteId(NoteIdError), PathEscapesVaultRoot { note_id: String }, Io(std::io::Error) }` (final-review fix C1 removed the original `Atomic(AtomicWriteError)` variant: `AtomicWriteError` is crate-private and is folded into `Io` at the crate boundary)
   - `impl Vault { pub fn new(root: PathBuf) -> Self; pub fn current_version(&self, note_id: &NoteId) -> Result<Version, StorageError>; pub fn read_note(&self, note_id: &NoteId) -> Result<VaultRecord, StorageError>; fn write_record_unchecked(&self, note_id: &NoteId, content: &str, expected_version: Version, operation_id: Uuid) -> Result<Version, StorageError>; }`
   - **`write_record_unchecked` is a `pub(crate)` method, never plain `pub`** — it is only ever called from within `storage`: by this task's own unit tests (same module) and, starting in Task 9, by `propose_and_commit` in a sibling file, `crates/storage/src/propose.rs`. `pub(crate)` is required rather than a bare private `fn` precisely because of that sibling-module call: Rust's bare (module-private) visibility does not extend to sibling modules within the same crate, only to the defining module and its descendants, so Task 9's `propose_and_commit` could not otherwise compile against it. `pub(crate)` still makes the primitive fully unreachable from any other crate, including `policy` — this is what makes the "no bypass" guarantee a compiler fact rather than a convention; it is a statement about crate boundaries, not intra-crate module boundaries. `Vault` as built in this task exposes no public write function at all — `pub fn write_note`/`propose_and_commit` is added in Task 9, once `storage` can call `policy::Gate::evaluate` to gate it. Until Task 9 lands, this task's own tests reach the primitive directly because they live inside the same crate.
   - `Vault`'s internal state: `root: PathBuf`, `locks: Mutex<HashMap<String, Arc<Mutex<()>>>>` — document on the struct itself, in a doc comment, that this mutex scope is **per-process, per-`Vault`-instance only**: it serializes concurrent callers that share this `Vault` object (e.g., multiple threads in the same running process), and makes no claim about two separate processes, two separate `Vault::new` calls on the same root, or a crash mid-write — those guarantees require the A2 journal and are explicitly not provided here.

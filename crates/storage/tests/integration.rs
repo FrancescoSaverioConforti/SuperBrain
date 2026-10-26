@@ -92,13 +92,46 @@ relations:
 
 #[test]
 fn storage_exposes_exactly_one_public_write_function() {
-    // The "no bypass" guarantee for A1 is: write_record_unchecked is a private
-    // method, unreachable from outside this crate, and propose_and_commit is the
-    // only public function whose body can reach it. This test pins that shape so
-    // a future change adding a second public write path fails here and forces a
-    // conscious review, rather than landing silently.
+    // The "no bypass" guarantee for A1 is: both raw write primitives —
+    // Vault::write_record_unchecked and atomic::atomic_write — are pub(crate),
+    // unreachable from outside this crate, neither is re-exported from lib.rs,
+    // and propose_and_commit is the only public function whose body can reach
+    // them. The compiler-level proof is the set of compile_fail doctests in
+    // lib.rs; this textual test is a belt-and-braces regression guard over the
+    // same shape, so a future change adding a second public write path (in any
+    // of vault.rs, propose.rs, atomic.rs, or lib.rs's re-exports) fails here
+    // and forces a conscious review, rather than landing silently.
+    let lib_source = include_str!("../src/lib.rs");
+    let atomic_source = include_str!("../src/atomic.rs");
     let vault_source = include_str!("../src/vault.rs");
     let propose_source = include_str!("../src/propose.rs");
+
+    let forbidden_reexports: Vec<&str> = lib_source
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pub use"))
+        .filter(|l| {
+            l.contains("atomic")
+                || l.contains("AtomicWriteError")
+                || l.contains("write_record_unchecked")
+        })
+        .collect();
+    assert!(
+        forbidden_reexports.is_empty(),
+        "lib.rs must not re-export any raw write primitive, found: {forbidden_reexports:?}"
+    );
+
+    let bare_pub_items_in_atomic: Vec<&str> = atomic_source
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("pub ") && !t.starts_with("pub(crate)")
+        })
+        .collect();
+    assert!(
+        bare_pub_items_in_atomic.is_empty(),
+        "atomic.rs must expose no bare-pub item, found: {bare_pub_items_in_atomic:?}"
+    );
+
     let pub_write_fns_in_vault: Vec<&str> = vault_source
         .lines()
         .filter(|l| l.trim_start().starts_with("pub fn") && l.contains("write"))
