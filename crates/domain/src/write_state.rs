@@ -19,7 +19,11 @@ pub fn valid_transition(from: WriteState, to: WriteState) -> bool {
             | (GitCommitted, IndexCurrent)
             | (IntentRecorded, Failed)
             | (IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent, Recovering)
-            | (Recovering, IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent)
+            // KNOWN LIMITATION (accepted for A1, Continuity [c10b3]): Recovering's outgoing set is
+            // broader than contract C1's crash-recovery table (e.g. it allows Recovering ->
+            // IntentRecorded, which C1 never describes). WriteState is an interface-only placeholder
+            // in A1; A2 owns real recovery semantics and must tighten this against C1's table.
+            | (Recovering,IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent)
     )
 }
 

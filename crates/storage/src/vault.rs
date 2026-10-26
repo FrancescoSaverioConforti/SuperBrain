@@ -233,6 +233,14 @@ impl Vault {
     ///   record file (`<note_id>.record`) is a different, sibling path
     ///   string that never traverses the symlink. Canonicalizing the bare
     ///   note-id path catches that case before any write touches disk.
+    ///
+    /// KNOWN LIMITATION (accepted for A1, Continuity [c12ah]): this is a
+    /// check-then-use — a residual TOCTOU window exists between this
+    /// canonicalization and the later `atomic_write` create/rename, in which
+    /// a concurrent process could swap a path component for a symlink. Not
+    /// closed in A1 because A1's threat model is explicitly single-process
+    /// and non-adversarial (see `eval/results/A1/evidence.md`, "Known
+    /// limitations").
     fn record_path_checked(&self, note_id: &NoteId) -> Result<PathBuf, StorageError> {
         let candidate = self.root.join(format!("{}.record", note_id.as_str()));
         let parent = candidate.parent().unwrap_or(&self.root);
@@ -303,6 +311,17 @@ mod tests {
             matches!(err, StorageError::Io(_)),
             "expected StorageError::Io, got {err:?}"
         );
+        // Since fix C1 folds atomic-write failures into StorageError::Io too,
+        // the error variant alone no longer distinguishes "stopped at the
+        // read" from "treated it as Version(0) and attempted the write" (the
+        // latter leaves an orphaned `note-a.record.tmp-*` file when the
+        // rename onto the directory fails). Assert the write was never
+        // attempted: the directory must contain only what we created.
+        let entries: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["note-a.record".to_string()], "no write may be attempted");
     }
 
     #[test]
