@@ -248,6 +248,62 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
     assert!(matches!(err, ProposeError::Storage(StorageError::Conflict { .. })));
 }
 
+// --- A1 final review, Finding I1: typo'd relation key must not commit ---
+
+#[test]
+fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_created() {
+    // Reviewer's reproduction: `supprots: ["missing-id"]` used to parse and
+    // COMMIT, the broken link silently vanishing with the ignored key.
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let yaml = valid_yaml("note-typo").replace("supports: []", "supprots: [\"missing-id\"]");
+    let err = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &gate,
+    )
+    .unwrap_err();
+    match err {
+        ProposeError::Rejected(policy::GateRejection::Schema(domain::ValidationError::UnknownField(f))) => {
+            assert_eq!(f, "relations.supprots")
+        }
+        other => panic!("expected Rejected(Schema(UnknownField)), got {other:?}"),
+    }
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let yaml = format!("{}totally_unknown: 1\n", valid_yaml("note-extra"));
+    let err = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &gate,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ProposeError::Rejected(policy::GateRejection::Schema(domain::ValidationError::UnknownField(f)))
+                if f == "totally_unknown"
+        ),
+        "got {err:?}"
+    );
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
+
 // --- A1 final review, Finding C2: case-insensitive filesystem collision ---
 
 fn files_in(dir: &std::path::Path) -> Vec<String> {

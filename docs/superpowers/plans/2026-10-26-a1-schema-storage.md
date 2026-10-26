@@ -173,7 +173,7 @@ git commit -m "chore: scaffold domain/storage/policy workspace and CI"
   - `pub enum NoteStatus { Draft, TestPassed, Reviewed, Verified, Superseded, Contradicted }`
   - `pub enum TrustLevel { Web, Internal, Official }` (ordered: `Web < Internal < Official` — implement `Ord`)
   - `pub enum Classification { Public, Internal, Sensitive }` — **note: no `Secret` variant.** `secret` from YAML parses to a dedicated `ValidationError::SecretClassificationForbidden` at parse time, not as an enum value, because the spec says a `secret`-classified note is *always* rejected — it must never become a valid in-memory `Classification`.
-  - `pub enum ValidationError { MissingField(String), InvalidFieldType { field: String, expected: String }, InvalidEnumValue { field: String, value: String }, SecretClassificationForbidden }` (derive `thiserror::Error`)
+  - `pub enum ValidationError { MissingField(String), InvalidFieldType { field: String, expected: String }, InvalidEnumValue { field: String, value: String }, SecretClassificationForbidden, UnknownField(String) }` (derive `thiserror::Error`). `UnknownField` was added by A1 final-review fix I1: any top-level frontmatter key outside the fixed field set, and any key inside `relations` other than the five relation names, is rejected by name (`"totally_unknown"`, `"relations.supprots"`) instead of being silently ignored; `Relations` also carries `#[serde(deny_unknown_fields)]`.
   - `pub fn parse_frontmatter(yaml: &str) -> Result<NoteMetadata, ValidationError>`
 - Consumes: nothing (first domain task after scaffolding).
 

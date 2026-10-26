@@ -54,4 +54,10 @@ pub enum ValidationError {
     InvalidEnumValue { field: String, value: String },
     #[error("classification 'secret' is always forbidden")]
     SecretClassificationForbidden,
+    /// A frontmatter key that is not part of the schema. Top-level keys are
+    /// reported by name (`"totally_unknown"`); keys inside `relations` are
+    /// reported with a `relations.` prefix (`"relations.supprots"`), so a
+    /// typo'd relation is a loud error instead of a silently dropped link.
+    #[error("unknown field: {0}")]
+    UnknownField(String),
 }
