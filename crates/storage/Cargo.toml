@@ -10,3 +10,4 @@ description = "SuperBrain storage layer (placeholder)."
 [dependencies]
 domain = { path = "../domain" }
 policy = { path = "../policy" }
+thiserror = "1"
