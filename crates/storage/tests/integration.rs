@@ -424,3 +424,134 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
     .unwrap();
     assert_eq!(v, Version(1));
 }
+
+// --- A1 second whole-branch review, Finding I-A: pending references are opaque ---
+//
+// Spec C6 / Fase A: a "pending" reference (external source, not-yet-imported
+// note, unresolved code symbol) is accepted and flagged. Such references are
+// not note ids and must not be forced through NoteId syntax.
+
+fn pending(refs: &[&str]) -> HashSet<String> {
+    refs.iter().map(|r| r.to_string()).collect()
+}
+
+fn assert_pending_ref_commits(relation: &str, target: &str) {
+    let vault = Vault::new(unique_test_dir());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let yaml = valid_yaml("note-p").replace(&format!("{relation}: []"), &format!("{relation}: [\"{target}\"]"));
+    assert!(yaml.contains(target), "fixture must actually contain the target");
+    let v = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &pending(&[target]),
+        &gate,
+    )
+    .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
+    assert_eq!(v, Version(1));
+    let id = NoteId::parse("note-p").unwrap();
+    assert_eq!(vault.read_note(&id).unwrap().content, yaml);
+}
+
+#[test]
+fn pending_url_reference_in_derived_from_is_accepted() {
+    assert_pending_ref_commits("derived_from", "https://example.com/some-paper");
+}
+
+#[test]
+fn pending_doi_reference_in_supports_is_accepted() {
+    assert_pending_ref_commits("supports", "doi:10.1000/xyz");
+}
+
+#[test]
+fn pending_unresolved_code_symbol_in_applies_to_is_accepted() {
+    assert_pending_ref_commits("applies_to", "src/main.rs::CorsMiddleware");
+}
+
+#[test]
+fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
+    let vault = Vault::new(unique_test_dir());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let mut known = HashSet::new();
+    known.insert(NoteId::parse("note-b").unwrap());
+    let pending_refs = pending(&["https://fastapi.tiangolo.com/tutorial/cors/"]);
+    let yaml = valid_yaml("note-mixed")
+        .replace("supports: []", "supports: [\"note-b\"]")
+        .replace(
+            "derived_from: []",
+            "derived_from: [\"https://fastapi.tiangolo.com/tutorial/cors/\"]",
+        );
+    let v = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &known,
+        &pending_refs,
+        &gate,
+    )
+    .unwrap();
+    assert_eq!(v, Version(1));
+    // propose_and_commit returns only the new Version, so the link state is
+    // observed by classifying the same note against the same sets.
+    let note = domain::parse_frontmatter(&yaml).unwrap();
+    let known_strings: HashSet<String> = known.iter().map(|id| id.as_str().to_string()).collect();
+    assert_eq!(
+        domain::classify_links(&note, &known_strings, &pending_refs).unwrap(),
+        domain::LinkState::Pending
+    );
+}
+
+#[test]
+fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id() {
+    // Only a caller-declared pending reference may bypass NoteId syntax. A
+    // URL that is NOT in pending_ids is malformed input, reported precisely
+    // as InvalidNoteId (not confused with a BrokenLink to a missing note).
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let yaml = valid_yaml("note-q").replace("derived_from: []", "derived_from: [\"https://example.com/x\"]");
+    let err = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &pending(&["https://example.com/other"]),
+        &gate,
+    )
+    .unwrap_err();
+    match err {
+        ProposeError::InvalidNoteId { field, value, .. } => {
+            assert_eq!(field, "relations.derived_from");
+            assert_eq!(value, "https://example.com/x");
+        }
+        other => panic!("expected ProposeError::InvalidNoteId, got {other:?}"),
+    }
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let yaml = valid_yaml("note-r").replace("supports: []", "supports: [\"missing-id\"]");
+    let err = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &pending(&["https://example.com/unrelated"]),
+        &gate,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, ProposeError::Link(domain::LinkError::BrokenLink { target_id, .. }) if target_id == "missing-id"),
+        "got {err:?}"
+    );
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
