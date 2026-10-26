@@ -147,16 +147,16 @@ impl Vault {
     /// adds `propose_and_commit`, which runs `policy::Gate::evaluate`
     /// before calling this method, from elsewhere in this same crate.
     ///
-    /// `#[allow(dead_code)]`: this task's own tests exercise this method
-    /// directly (same crate, so privacy is not a barrier to them), but
-    /// until Task 9 adds `propose_and_commit` as its first production
-    /// caller, nothing in a non-test build calls it — so the compiler sees
-    /// it, and the private helpers it alone uses, as unreachable outside
-    /// `#[cfg(test)]`. That is the deliberate, temporary state this task
-    /// leaves behind on purpose (see the Interfaces note above); it is not
-    /// a sign of an actual bug.
-    #[allow(dead_code)]
-    fn write_record_unchecked(
+    /// As of Task 9, `propose::propose_and_commit` (same crate) is this
+    /// method's first and only production caller, reaching it only after
+    /// `policy::Gate::evaluate` returns `GateDecision::Pass`. `pub(crate)`
+    /// (not `pub`) is the minimum visibility that lets a sibling module in
+    /// this same crate call it while keeping it completely unreachable from
+    /// outside the crate — Rust's module-privacy model scopes a bare,
+    /// non-`pub` item to its *defining module only*, not the whole crate, so
+    /// `propose.rs` (a sibling of `vault.rs`, not a descendant) could not
+    /// call a plain-private method here even though both live in `storage`.
+    pub(crate) fn write_record_unchecked(
         &self,
         note_id: &NoteId,
         content: &str,
@@ -276,6 +276,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn non_not_found_io_error_on_read_propagates_as_io_error_not_version_zero() {
+        // If the record path happens to be a directory (not a plain missing
+        // file), std::fs::read fails with PermissionDenied (on this
+        // platform), not NotFound. write_record_unchecked must propagate
+        // that as StorageError::Io, not silently treat it as "note doesn't
+        // exist yet" (Version(0)) and proceed to write over/through it.
+        let root = unique_test_dir();
+        let vault = Vault::new(root.clone());
+        let id = NoteId::parse("note-a").unwrap();
+        std::fs::create_dir_all(root.join("note-a.record")).unwrap();
+        let err = vault
+            .write_record_unchecked(&id, "content", Version(0), Uuid::new_v4())
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Io(_)),
+            "expected StorageError::Io, got {err:?}"
+        );
     }
 
     #[test]
