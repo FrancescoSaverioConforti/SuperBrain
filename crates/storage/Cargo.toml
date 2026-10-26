@@ -11,3 +11,4 @@ description = "SuperBrain storage layer (placeholder)."
 domain = { path = "../domain" }
 policy = { path = "../policy" }
 thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
