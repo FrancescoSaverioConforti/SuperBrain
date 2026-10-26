@@ -3,6 +3,8 @@ name = "storage"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
 description = "SuperBrain storage layer (placeholder)."
 
 [dependencies]

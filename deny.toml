@@ -1,2 +1,11 @@
+[advisories]
+# Exception RUSTSEC-2024-0449 (unsafe-libyaml unmaintained): transitive dependency
+# of serde_yaml 0.9, which is pinned by the plan. No fixed upstream release is
+# available as of 2026-10-26. Granted 2026-10-26; must be re-reviewed by
+# 2027-04-26 for an available fix. See eval/results/A1/dependency-exceptions.md.
+ignore = [
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is a transitive dependency of serde_yaml 0.9 (pinned by plan); no upstream fix. Granted 2026-10-26, re-review by 2027-04-26." },
+]
+
 [licenses]
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0"]
