@@ -555,3 +555,102 @@ fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
     );
     assert!(files_in(&root).is_empty(), "nothing may be written");
 }
+
+// --- A1 second whole-branch review, Finding I-B: full notes (frontmatter + body) ---
+
+/// A full note: `---`-delimited YAML frontmatter followed by an opaque body.
+fn full_note(id: &str, body: &str) -> String {
+    format!("---\n{}---\n{body}", valid_yaml(id).trim_start())
+}
+
+fn commit(vault: &Vault, text: &str, expected: Version) -> Result<Version, ProposeError> {
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    storage::propose_and_commit(
+        vault,
+        text,
+        expected,
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &gate,
+    )
+}
+
+#[test]
+fn note_with_frontmatter_and_body_round_trips_byte_for_byte() {
+    let vault = Vault::new(unique_test_dir());
+    let text = full_note(
+        "note-body",
+        "# CORS bug\n\nSome prose.\n\n---\n\nA thematic break above, and a fake key below:\nid: not-the-real-id\n",
+    );
+    assert_eq!(commit(&vault, &text, Version(0)).unwrap(), Version(1));
+    let record = vault.read_note(&NoteId::parse("note-body").unwrap()).unwrap();
+    assert_eq!(record.content, text, "stored content must equal the input exactly");
+    assert_eq!(record.version, Version(1));
+}
+
+#[test]
+fn updating_a_note_replaces_its_body_atomically() {
+    let vault = Vault::new(unique_test_dir());
+    let id = NoteId::parse("note-upd").unwrap();
+    let v1 = full_note("note-upd", "old body: first draft\n");
+    let v2 = full_note("note-upd", "new body: rewritten\n");
+    commit(&vault, &v1, Version(0)).unwrap();
+    assert_eq!(commit(&vault, &v2, Version(1)).unwrap(), Version(2));
+    let record = vault.read_note(&id).unwrap();
+    assert_eq!(record.content, v2);
+    assert!(!record.content.contains("first draft"), "old body must be gone");
+    assert_eq!(record.version, Version(2));
+}
+
+#[test]
+fn version_conflict_on_a_note_with_a_body_is_the_ordinary_storage_conflict() {
+    let vault = Vault::new(unique_test_dir());
+    let id = NoteId::parse("note-conf").unwrap();
+    let original = full_note("note-conf", "body A\n");
+    commit(&vault, &original, Version(0)).unwrap();
+    let err = commit(&vault, &full_note("note-conf", "body B\n"), Version(0)).unwrap_err();
+    match err {
+        ProposeError::Storage(StorageError::Conflict { note_id, expected, actual }) => {
+            assert_eq!(note_id, "note-conf");
+            assert_eq!(expected, Version(0));
+            assert_eq!(actual, Version(1));
+        }
+        other => panic!("expected Storage(Conflict), got {other:?}"),
+    }
+    assert_eq!(vault.read_note(&id).unwrap().content, original, "loser must not modify the note");
+}
+
+#[test]
+fn secret_only_in_the_body_is_rejected_by_the_gate_and_the_record_file_is_never_created() {
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let text = full_note("note-leak", "Debug notes.\naws_key = AKIAABCDEFGHIJKLMNOP\n");
+    let frontmatter_end = text.find("---\nDebug").unwrap();
+    assert!(!text[..frontmatter_end].contains("AKIA"), "secret must be in the body only");
+    let err = commit(&vault, &text, Version(0)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ProposeError::Rejected(policy::GateRejection::SecretContentDetected { note_id, pattern_id })
+                if note_id == "note-leak" && pattern_id == "aws-access-key"
+        ),
+        "got {err:?}"
+    );
+    assert!(matches!(
+        vault.read_note(&NoteId::parse("note-leak").unwrap()).unwrap_err(),
+        StorageError::NotFound { .. }
+    ));
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn frontmatter_only_note_without_delimiters_still_commits_unchanged() {
+    // Backward compatibility: bare YAML (no `---` delimiters, no body) is
+    // still accepted and stored exactly as given.
+    let vault = Vault::new(unique_test_dir());
+    let yaml = valid_yaml("note-legacy");
+    assert!(!yaml.contains("---"));
+    assert_eq!(commit(&vault, &yaml, Version(0)).unwrap(), Version(1));
+    assert_eq!(vault.read_note(&NoteId::parse("note-legacy").unwrap()).unwrap().content, yaml);
+}

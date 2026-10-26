@@ -32,15 +32,33 @@ pub enum ProposeError {
 
 /// The single public write path out of `storage`, and therefore out of the
 /// whole workspace (the raw primitives `atomic_write` and
-/// `Vault::write_record_unchecked` are both `pub(crate)`): parses `yaml` as
-/// frontmatter, validates the note's id and every non-pending relation
-/// target as a canonical [`NoteId`], classifies its relations against
-/// `known_ids`/`pending_ids`, runs `gate.evaluate` (or
-/// `gate.evaluate_schema_error` if parsing already failed), and — only on
-/// `policy::GateDecision::Pass` — calls the crate-private
-/// `Vault::write_record_unchecked`. No `ProposeError` variant is returned
-/// after a write has happened; every rejection path returns before the vault
-/// is ever touched, so a rejected note's record file is never created.
+/// `Vault::write_record_unchecked` are both `pub(crate)`): parses the
+/// frontmatter of `note_text`, validates the note's id and every non-pending
+/// relation target as a canonical [`NoteId`], classifies its relations
+/// against `known_ids`/`pending_ids`, runs `gate.evaluate` over the **whole**
+/// `note_text` (or `gate.evaluate_schema_error` if parsing already failed),
+/// and — only on `policy::GateDecision::Pass` — calls the crate-private
+/// `Vault::write_record_unchecked` with the whole `note_text`. No
+/// `ProposeError` variant is returned after a write has happened; every
+/// rejection path returns before the vault is ever touched, so a rejected
+/// note's record file is never created.
+///
+/// `note_text` is a complete note, in one of two forms (the private helper
+/// `frontmatter_of` documents the exact splitting rule):
+///
+/// - **Full note**: a first line that is exactly `---`, the YAML
+///   frontmatter, a closing line that is exactly `---`, then an optional
+///   body. The body is opaque: it is never parsed as YAML or Markdown and
+///   never validated, but it *is* scanned by the gate's secret scanner.
+/// - **Frontmatter only** (the original form): bare YAML with no opening
+///   `---` line and no body.
+///
+/// Either way, the stored record content is `note_text` byte-for-byte —
+/// delimiters, frontmatter and body exactly as given — so
+/// `Vault::read_note` returns exactly what the caller passed in. Frontmatter
+/// and body are one record with one [`Version`]: an update replaces both
+/// together, and a stale `expected_version` is the same
+/// `StorageError::Conflict` whether or not a body is present.
 ///
 /// Identity — deliberately asymmetric:
 ///
@@ -59,14 +77,14 @@ pub enum ProposeError {
 ///   the caller declares exactly which references are pending.
 pub fn propose_and_commit(
     vault: &Vault,
-    yaml: &str,
+    note_text: &str,
     expected_version: Version,
     operation_id: Uuid,
     known_ids: &HashSet<NoteId>,
     pending_ids: &HashSet<String>,
     gate: &policy::Gate,
 ) -> Result<Version, ProposeError> {
-    let note = match domain::parse_frontmatter(yaml) {
+    let note = match domain::parse_frontmatter(frontmatter_of(note_text)) {
         Ok(note) => note,
         Err(err) => {
             return match gate.evaluate_schema_error(err) {
@@ -114,12 +132,55 @@ pub fn propose_and_commit(
         Err(link_err) => return Err(ProposeError::Link(link_err)),
     };
 
-    match gate.evaluate(&note, yaml, Ok(link_state)) {
+    // The gate scans the WHOLE note text, body included, so a secret that
+    // appears only in the body is still caught before the vault is touched.
+    match gate.evaluate(&note, note_text, Ok(link_state)) {
         policy::GateDecision::Reject(rejection) => Err(ProposeError::Rejected(rejection)),
         policy::GateDecision::Pass => vault
-            .write_record_unchecked(&note_id, yaml, expected_version, operation_id)
+            .write_record_unchecked(&note_id, note_text, expected_version, operation_id)
             .map_err(ProposeError::Storage),
     }
+}
+
+/// Returns the YAML frontmatter portion of `note_text`, which is what gets
+/// handed (unchanged) to `domain::parse_frontmatter`.
+///
+/// - If the first line of `note_text` is exactly `---` (LF or CRLF line
+///   ending), the frontmatter is everything after that line up to (not
+///   including) the next line that is exactly `---`; everything after that
+///   closing line is the body and is ignored here.
+/// - Otherwise — no opening `---` line, or an opening line with no closing
+///   line — the whole of `note_text` is the frontmatter (the original,
+///   bare-YAML input form; a lone leading `---` is just a YAML
+///   document-start marker), and there is no body.
+///
+/// This is unambiguous: inside YAML frontmatter a line consisting of exactly
+/// `---` at column 0 can only be a YAML document separator, never part of a
+/// field value (a `---` inside a block scalar is indented, so it is not
+/// exactly `---`). Hence the first such line always closes the frontmatter,
+/// and any later `---` line (e.g. a Markdown thematic break) is body.
+fn frontmatter_of(note_text: &str) -> &str {
+    let Some(after_open) = strip_delimiter_line(note_text) else {
+        return note_text;
+    };
+    let mut offset = 0;
+    for line in after_open.split_inclusive('\n') {
+        if strip_delimiter_line(line).is_some() {
+            return &after_open[..offset];
+        }
+        offset += line.len();
+    }
+    note_text
+}
+
+/// If `text` starts with a line that is exactly `---` (terminated by `\n`,
+/// `\r\n`, or end of text), returns the text after that line.
+fn strip_delimiter_line(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("---")?;
+    if rest.is_empty() {
+        return Some(rest);
+    }
+    rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))
 }
 
 fn parse_note_id(field: &str, raw: &str) -> Result<NoteId, ProposeError> {
@@ -128,4 +189,58 @@ fn parse_note_id(field: &str, raw: &str) -> Result<NoteId, ProposeError> {
         value: raw.to_string(),
         error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontmatter_of;
+
+    #[test]
+    fn bare_yaml_without_delimiters_is_entirely_frontmatter() {
+        assert_eq!(frontmatter_of("\nid: x\nproject: p\n"), "\nid: x\nproject: p\n");
+    }
+
+    #[test]
+    fn delimited_frontmatter_excludes_delimiters_and_body() {
+        assert_eq!(frontmatter_of("---\nid: x\n---\n# Body\nprose\n"), "id: x\n");
+    }
+
+    #[test]
+    fn empty_frontmatter_between_delimiters_is_empty() {
+        assert_eq!(frontmatter_of("---\n---\nbody"), "");
+    }
+
+    #[test]
+    fn crlf_delimiters_are_recognized() {
+        assert_eq!(frontmatter_of("---\r\nid: x\r\n---\r\nbody\r\n"), "id: x\r\n");
+    }
+
+    #[test]
+    fn closing_delimiter_at_end_of_text_without_newline_closes() {
+        assert_eq!(frontmatter_of("---\nid: x\n---"), "id: x\n");
+    }
+
+    #[test]
+    fn only_the_first_closing_line_counts_later_ones_are_body() {
+        assert_eq!(frontmatter_of("---\na: 1\n---\nb\n---\nc: 2\n"), "a: 1\n");
+    }
+
+    #[test]
+    fn indented_dashes_inside_a_block_scalar_do_not_close_the_frontmatter() {
+        assert_eq!(frontmatter_of("---\na: |\n  ---\n---\nbody"), "a: |\n  ---\n");
+    }
+
+    #[test]
+    fn lines_that_merely_start_with_dashes_are_not_delimiters() {
+        // Not an opening line: whole text is (bare) frontmatter.
+        assert_eq!(frontmatter_of("---x\nid: x\n"), "---x\nid: x\n");
+        // Not a closing line: `--- ` (trailing space) and `----` are skipped.
+        assert_eq!(frontmatter_of("---\na: 1\n--- \n----\n---\nbody"), "a: 1\n--- \n----\n");
+    }
+
+    #[test]
+    fn opening_line_without_closing_line_falls_back_to_whole_text() {
+        // A lone leading `---` is a YAML document-start marker on bare YAML.
+        assert_eq!(frontmatter_of("---\nid: x\n"), "---\nid: x\n");
+    }
 }
