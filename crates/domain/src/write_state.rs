@@ -11,16 +11,16 @@ pub enum WriteState {
 
 pub fn valid_transition(from: WriteState, to: WriteState) -> bool {
     use WriteState::*;
-    match (from, to) {
-        (IntentRecorded, ContentPersisted) => true,
-        (ContentPersisted, JournalCommitted) => true,
-        (JournalCommitted, GitCommitted) => true,
-        (GitCommitted, IndexCurrent) => true,
-        (IntentRecorded, Failed) => true,
-        (IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent, Recovering) => true,
-        (Recovering, IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent) => true,
-        _ => false,
-    }
+    matches!(
+        (from, to),
+        (IntentRecorded, ContentPersisted)
+            | (ContentPersisted, JournalCommitted)
+            | (JournalCommitted, GitCommitted)
+            | (GitCommitted, IndexCurrent)
+            | (IntentRecorded, Failed)
+            | (IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent, Recovering)
+            | (Recovering, IntentRecorded | ContentPersisted | JournalCommitted | GitCommitted | IndexCurrent)
+    )
 }
 
 #[cfg(test)]
