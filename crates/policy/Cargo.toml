@@ -9,3 +9,5 @@ description = "SuperBrain policy gate (placeholder)."
 
 [dependencies]
 domain = { path = "../domain" }
+regex = "1"
+sha2 = "0.10"
