@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::atomic::{atomic_write, AtomicWriteError};
-use crate::note_id::{NoteId, NoteIdError};
+use crate::note_id::NoteId;
 
 /// The separator between the version header line and the raw note content
 /// in the on-disk record format.
@@ -79,8 +79,6 @@ pub enum StorageError {
     },
     #[error("note {note_id} not found")]
     NotFound { note_id: String },
-    #[error("invalid note id: {0}")]
-    InvalidNoteId(NoteIdError),
     #[error("resolved path for note {note_id} escapes the vault root")]
     PathEscapesVaultRoot { note_id: String },
     /// Any filesystem I/O failure, including a failure inside the
@@ -102,7 +100,14 @@ pub struct Vault {
     /// separate `Vault::new` calls on the same root, or a crash mid-write —
     /// those guarantees require the A2 journal and are explicitly not
     /// provided here.
-    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    ///
+    /// Keyed by the canonical [`NoteId`] itself (not a separately-derived
+    /// string), so the lock key, the record path (`<note_id>.record`, built
+    /// from `NoteId::as_str`) and the identity checked in
+    /// `propose_and_commit` are one and the same value. Because `NoteId` is
+    /// lowercase-only, two distinct keys can never name the same file on a
+    /// case-insensitive filesystem (A1 final review, Finding C2).
+    locks: Mutex<HashMap<NoteId, Arc<Mutex<()>>>>,
 }
 
 impl Vault {
@@ -181,7 +186,7 @@ impl Vault {
             let mut locks = self.locks.lock().unwrap();
             Arc::clone(
                 locks
-                    .entry(note_id.as_str().to_string())
+                    .entry(note_id.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(()))),
             )
         };

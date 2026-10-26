@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use storage::{NoteId, ProposeError, StorageError, Vault, Version};
+use storage::{NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
 
 fn unique_test_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -246,4 +246,125 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
     )
     .unwrap_err();
     assert!(matches!(err, ProposeError::Storage(StorageError::Conflict { .. })));
+}
+
+// --- A1 final review, Finding C2: case-insensitive filesystem collision ---
+
+fn files_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original_is_unchanged() {
+    // Reproduction of the reviewer's data-loss scenario: write note-a, then
+    // follow the documented "read current version, retry" flow with id
+    // NOTE-A at note-a's current version. On a case-insensitive filesystem
+    // NOTE-A.record IS note-a.record, so before the fix this silently
+    // overwrote note-a. It must now be a validation error naming the id
+    // field, raised before the vault is touched.
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let original_yaml = valid_yaml("note-a");
+    storage::propose_and_commit(
+        &vault,
+        &original_yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &gate,
+    )
+    .unwrap();
+    let id = NoteId::parse("note-a").unwrap();
+    let original = vault.read_note(&id).unwrap();
+    let files_before = files_in(&root);
+
+    for alias in ["NOTE-A", "Note-A", "note-A"] {
+        let current = vault.current_version(&id).unwrap();
+        let err = storage::propose_and_commit(
+            &vault,
+            &valid_yaml(alias).replace("project-x", "clobbered"),
+            current,
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &gate,
+        )
+        .unwrap_err();
+        match err {
+            ProposeError::InvalidNoteId { field, value, error } => {
+                assert_eq!(field, "id");
+                assert_eq!(value, alias);
+                assert!(
+                    matches!(error, NoteIdError::MustBeLowercase { .. }),
+                    "alias {alias:?}: expected MustBeLowercase, got {error:?}"
+                );
+            }
+            other => panic!("alias {alias:?}: expected ProposeError::InvalidNoteId, got {other:?}"),
+        }
+        assert_eq!(
+            vault.read_note(&id).unwrap(),
+            original,
+            "alias {alias:?} must not modify note-a's record"
+        );
+        assert_eq!(files_in(&root), files_before, "alias {alias:?} must not create or touch any file");
+    }
+}
+
+#[test]
+fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_id() {
+    // Link lookups must compare canonical NoteIds too: an uppercase relation
+    // target must not be silently treated as a different (broken or
+    // resolved) id than its lowercase form.
+    let root = unique_test_dir();
+    let vault = Vault::new(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let mut known = HashSet::new();
+    known.insert(NoteId::parse("note-b").unwrap());
+    let yaml = valid_yaml("note-c").replace("supports: []", "supports: [\"NOTE-B\"]");
+    let err = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &known,
+        &HashSet::new(),
+        &gate,
+    )
+    .unwrap_err();
+    match err {
+        ProposeError::InvalidNoteId { field, value, error } => {
+            assert_eq!(field, "relations.supports");
+            assert_eq!(value, "NOTE-B");
+            assert!(matches!(error, NoteIdError::MustBeLowercase { .. }));
+        }
+        other => panic!("expected ProposeError::InvalidNoteId, got {other:?}"),
+    }
+    assert!(files_in(&root).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn canonical_relation_target_resolves_against_known_note_ids() {
+    let vault = Vault::new(unique_test_dir());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let mut known = HashSet::new();
+    known.insert(NoteId::parse("note-b").unwrap());
+    let yaml = valid_yaml("note-c").replace("supports: []", "supports: [\"note-b\"]");
+    let v = storage::propose_and_commit(
+        &vault,
+        &yaml,
+        Version(0),
+        Uuid::new_v4(),
+        &known,
+        &HashSet::new(),
+        &gate,
+    )
+    .unwrap();
+    assert_eq!(v, Version(1));
 }

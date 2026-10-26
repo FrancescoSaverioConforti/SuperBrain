@@ -36,7 +36,7 @@
 //! let id = storage::NoteId::parse("note-a").unwrap();
 //! let _ = vault.read_note(&id);
 //! let gate = policy::Gate::new(policy::SecretPolicy::new(1));
-//! let none: HashSet<String> = HashSet::new();
+//! let none: HashSet<storage::NoteId> = HashSet::new();
 //! let result = storage::propose_and_commit(
 //!     &vault, "not: frontmatter", storage::Version(0), uuid::Uuid::new_v4(), &none, &none, &gate,
 //! );
