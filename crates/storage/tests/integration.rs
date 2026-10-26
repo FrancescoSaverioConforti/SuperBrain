@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use storage::{NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
+use storage::{CommitOutcome, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
 
 fn unique_test_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -167,7 +167,7 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
         &gate,
     )
     .unwrap();
-    assert_eq!(v, Version(1));
+    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Unlinked });
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
         &gate,
     )
     .unwrap();
-    assert_eq!(v, Version(1));
+    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Resolved });
 }
 
 // --- A1 second whole-branch review, Finding I-A: pending references are opaque ---
@@ -450,7 +450,7 @@ fn assert_pending_ref_commits(relation: &str, target: &str) {
         &gate,
     )
     .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
-    assert_eq!(v, Version(1));
+    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending });
     let id = NoteId::parse("note-p").unwrap();
     assert_eq!(vault.read_note(&id).unwrap().content, yaml);
 }
@@ -483,7 +483,7 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
             "derived_from: []",
             "derived_from: [\"https://fastapi.tiangolo.com/tutorial/cors/\"]",
         );
-    let v = storage::propose_and_commit(
+    let outcome = storage::propose_and_commit(
         &vault,
         &yaml,
         Version(0),
@@ -493,14 +493,11 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
         &gate,
     )
     .unwrap();
-    assert_eq!(v, Version(1));
-    // propose_and_commit returns only the new Version, so the link state is
-    // observed by classifying the same note against the same sets.
-    let note = domain::parse_frontmatter(&yaml).unwrap();
-    let known_strings: HashSet<String> = known.iter().map(|id| id.as_str().to_string()).collect();
+    // Spec C6: a pending reference is "accettato e segnalato". The commit
+    // result itself flags it; the caller does not have to re-classify.
     assert_eq!(
-        domain::classify_links(&note, &known_strings, &pending_refs).unwrap(),
-        domain::LinkState::Pending
+        outcome,
+        CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending }
     );
 }
 
@@ -563,7 +560,7 @@ fn full_note(id: &str, body: &str) -> String {
     format!("---\n{}---\n{body}", valid_yaml(id).trim_start())
 }
 
-fn commit(vault: &Vault, text: &str, expected: Version) -> Result<Version, ProposeError> {
+fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome, ProposeError> {
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     storage::propose_and_commit(
         vault,
@@ -583,7 +580,7 @@ fn note_with_frontmatter_and_body_round_trips_byte_for_byte() {
         "note-body",
         "# CORS bug\n\nSome prose.\n\n---\n\nA thematic break above, and a fake key below:\nid: not-the-real-id\n",
     );
-    assert_eq!(commit(&vault, &text, Version(0)).unwrap(), Version(1));
+    assert_eq!(commit(&vault, &text, Version(0)).unwrap().version, Version(1));
     let record = vault.read_note(&NoteId::parse("note-body").unwrap()).unwrap();
     assert_eq!(record.content, text, "stored content must equal the input exactly");
     assert_eq!(record.version, Version(1));
@@ -596,7 +593,7 @@ fn updating_a_note_replaces_its_body_atomically() {
     let v1 = full_note("note-upd", "old body: first draft\n");
     let v2 = full_note("note-upd", "new body: rewritten\n");
     commit(&vault, &v1, Version(0)).unwrap();
-    assert_eq!(commit(&vault, &v2, Version(1)).unwrap(), Version(2));
+    assert_eq!(commit(&vault, &v2, Version(1)).unwrap().version, Version(2));
     let record = vault.read_note(&id).unwrap();
     assert_eq!(record.content, v2);
     assert!(!record.content.contains("first draft"), "old body must be gone");
@@ -685,6 +682,6 @@ fn frontmatter_only_note_without_delimiters_still_commits_unchanged() {
     let vault = Vault::new(unique_test_dir());
     let yaml = valid_yaml("note-legacy");
     assert!(!yaml.contains("---"));
-    assert_eq!(commit(&vault, &yaml, Version(0)).unwrap(), Version(1));
+    assert_eq!(commit(&vault, &yaml, Version(0)).unwrap().version, Version(1));
     assert_eq!(vault.read_note(&NoteId::parse("note-legacy").unwrap()).unwrap().content, yaml);
 }

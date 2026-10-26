@@ -30,6 +30,24 @@ pub enum ProposeError {
     Storage(StorageError),
 }
 
+/// What a successful [`propose_and_commit`] reports back to the caller.
+///
+/// `link_state` is the `domain::classify_links` result for the committed
+/// note's relations: `Unlinked` (no relation targets), `Resolved` (every
+/// target is a known note) or `Pending` (at least one target was accepted
+/// because the caller declared it in `pending_ids`). Spec contract C6 says a
+/// pending reference is "accettato e segnalato" — accepted *and flagged* —
+/// and this field is the flag: a caller can tell a commit that still carries
+/// unresolved references from a fully resolved one without re-classifying
+/// the note itself. (`Broken` cannot appear here: a broken link is
+/// `ProposeError::Link` and nothing is committed.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// The note's new version, as returned by the vault.
+    pub version: Version,
+    pub link_state: domain::LinkState,
+}
+
 /// The single public write path out of `storage`, and therefore out of the
 /// whole workspace (the raw primitives `atomic_write` and
 /// `Vault::write_record_unchecked` are both `pub(crate)`): parses the
@@ -75,6 +93,10 @@ pub enum ProposeError {
 ///   through `NoteId::parse`. Pending targets never touch the filesystem, so
 ///   they cannot alias a record file. Matching is exact (byte-for-byte):
 ///   the caller declares exactly which references are pending.
+///
+/// On success the result is a [`CommitOutcome`]: the new [`Version`] plus
+/// the note's link state, so a note committed with pending references is
+/// reported as `LinkState::Pending` rather than accepted silently.
 pub fn propose_and_commit(
     vault: &Vault,
     note_text: &str,
@@ -83,7 +105,7 @@ pub fn propose_and_commit(
     known_ids: &HashSet<NoteId>,
     pending_ids: &HashSet<String>,
     gate: &policy::Gate,
-) -> Result<Version, ProposeError> {
+) -> Result<CommitOutcome, ProposeError> {
     let note = match domain::parse_frontmatter(frontmatter_of(note_text)) {
         Ok(note) => note,
         Err(err) => {
@@ -138,6 +160,7 @@ pub fn propose_and_commit(
         policy::GateDecision::Reject(rejection) => Err(ProposeError::Rejected(rejection)),
         policy::GateDecision::Pass => vault
             .write_record_unchecked(&note_id, note_text, expected_version, operation_id)
+            .map(|version| CommitOutcome { version, link_state })
             .map_err(ProposeError::Storage),
     }
 }
