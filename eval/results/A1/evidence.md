@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-26
 
-**Git commit hash (this commit, which adds this file):** `db3a7e3b7b7c74cbef9cc2a1b78b4bde92a1ee3e` — see the note at the end of this section on how this value was produced.
+**Git commit hash (Task 9's implementation commit, which this file was part of):** `8b63b35fe95ccbf973273ad962399570d8d4030d`
 
-> Note on the hash above: Git commit hashes are content-addressed and cannot be known before the commit is created, but this file is itself one of the files included in that commit (per Task 9's own commit step). The value above was filled in by reading `git rev-parse HEAD` immediately after creating the commit that includes this exact file content, and is the final, authoritative hash for this evidence. If you are reading this file from a checkout, you can verify it independently with `git log --oneline -1 -- eval/results/A1/evidence.md`.
+> Note on this hash: because a commit hash is content-addressed, it cannot be known while this file is still being written as part of that same commit. The value above is the real `git rev-parse HEAD` read immediately after that commit was created. Since this file's own content cannot retroactively change the already-made commit without amending it (which this project's workflow avoids except when explicitly requested), a second, small follow-up commit updates only this recorded hash from a placeholder to the verified value above — see `git log --oneline -- eval/results/A1/evidence.md` for both commits.
 
 **Plan:** `docs/superpowers/plans/2026-10-26-a1-schema-storage.md`
 **Task brief:** `.superpowers/sdd/2026-10-26-a1-schema-storage/task-9-brief.md`
