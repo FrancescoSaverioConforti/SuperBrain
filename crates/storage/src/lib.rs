@@ -20,7 +20,7 @@
 //! stable rustdoc does not enforce the `E0xxx` codes pinned on each block
 //! (only nightly does; they are kept as documentation of the intended
 //! failure). What keeps these blocks honest on stable is the positive control
-//! below: it uses exactly the same setup expressions (`Vault::new`,
+//! below: it uses exactly the same setup expressions (`Vault::open`,
 //! `NoteId::parse`, `Version`, `uuid::Uuid::new_v4`, `dir.join`, a byte
 //! slice) and must compile and run, so if the setup ever stops compiling the
 //! control fails too, and the `compile_fail` blocks can only be failing
@@ -31,8 +31,9 @@
 //!
 //! ```
 //! use std::collections::HashSet;
-//! let dir = std::env::temp_dir();
-//! let vault = storage::Vault::new(dir.clone());
+//! let dir = std::env::temp_dir().join(format!("superbrain-doctest-control-{}", uuid::Uuid::new_v4()));
+//! std::fs::create_dir_all(&dir).unwrap();
+//! let vault = storage::Vault::open(dir.clone(), &dir.join("journal.sqlite")).unwrap();
 //! let id = storage::NoteId::parse("note-a").unwrap();
 //! let _ = vault.read_note(&id);
 //! let gate = policy::Gate::new(policy::SecretPolicy::new(1));
@@ -69,18 +70,15 @@
 //! this crate:
 //!
 //! ```compile_fail,E0624
-//! let dir = std::env::temp_dir();
-//! let vault = storage::Vault::new(dir.clone());
+//! let dir = std::env::temp_dir().join(format!("superbrain-doctest-bypass-{}", uuid::Uuid::new_v4()));
+//! std::fs::create_dir_all(&dir).unwrap();
+//! let vault = storage::Vault::open(dir.clone(), &dir.join("journal.sqlite")).unwrap();
 //! let id = storage::NoteId::parse("note-a").unwrap();
 //! let _ = vault.write_record_unchecked(&id, "bypass", storage::Version(0), uuid::Uuid::new_v4());
 //! ```
 
 mod atomic;
-// The seam has no production caller until the write pipeline is instrumented in a later task.
-#[allow(dead_code)]
 mod fault;
-// The journal has no production caller until the write pipeline is wired to it in a later task.
-#[allow(dead_code)]
 mod journal;
 mod note_id;
 mod propose;

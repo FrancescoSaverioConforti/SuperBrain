@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use domain::WriteState;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::atomic::{atomic_write, AtomicWriteError};
+use crate::fault::{FaultInjector, FaultPoint};
+use crate::journal::{AdvanceFields, Journal};
 use crate::note_id::NoteId;
 
 /// The separator between the version header line and the raw note content
@@ -88,6 +91,31 @@ pub enum StorageError {
     /// the crate boundary so it never becomes public API.
     #[error("io error: {0}")]
     Io(std::io::Error),
+    /// A failure inside the SQLite-backed journal. The crate-private
+    /// `journal::JournalError` cannot be stored directly here (`StorageError`
+    /// is `pub`, and a `pub(crate)` type in a `pub` enum variant's field is a
+    /// visibility leak rustc/clippy reject under `-D warnings`), so its
+    /// rendered message is captured instead — this still folds it out of the
+    /// public API, matching the existing `AtomicWriteError` -> `Io` pattern.
+    #[error("journal error: {0}")]
+    Journal(String),
+    /// The on-disk bytes at the record path for `note_id` do not hash to the
+    /// `content_hash` recorded by the journal's resolved committed row (a
+    /// post-commit integrity failure), and an attempted rollback to the
+    /// before-image also failed verification (or none existed). There is no
+    /// read-time repair for this: the only way back to a readable vault is
+    /// through `Vault::open`'s recovery pass (`reconcile`, Task 7), which
+    /// performs the rollback as a journal state transition rather than a
+    /// read substituting a different operation's before-image.
+    #[error("note {note_id} is inconsistent: on-disk content does not match the journal's committed record")]
+    Inconsistent { note_id: String },
+}
+
+/// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
+/// by capturing its rendered message, since the error type itself cannot be
+/// stored in a `pub` enum's field (see `StorageError::Journal`'s doc comment).
+fn journal_err(e: crate::journal::JournalError) -> StorageError {
+    StorageError::Journal(e.to_string())
 }
 
 /// The core storage type: a single-record-per-note vault rooted at `root`,
@@ -108,23 +136,92 @@ pub struct Vault {
     /// `propose_and_commit` are one and the same value. Because `NoteId` is
     /// lowercase-only, two distinct keys can never name the same file on a
     /// case-insensitive filesystem (A1 final review, Finding C2).
+    ///
+    /// A2 widens this from a writer-vs-writer mutex to a full
+    /// reader-vs-writer exclusion: `read_note`/`current_version` now
+    /// acquire the SAME per-note lock for the duration of their read, so a
+    /// read can never observe the filesystem mid-write (see the Task 4
+    /// architectural-review correction on the race between the writer's
+    /// rename and its `JournalCommitted` journal advance). Still
+    /// process-local/in-memory only — this does not change the mutex's
+    /// documented cross-process limitations.
     locks: Mutex<HashMap<NoteId, Arc<Mutex<()>>>>,
+    /// The SQLite-backed write-operation journal (Task 2) that every write
+    /// now drives through, and that reads now resolve the current committed
+    /// row from, instead of trusting the raw filesystem.
+    ///
+    /// Wrapped in its own `Mutex` (independent of the per-note locks above)
+    /// because `rusqlite::Connection` is `!Sync`: two different notes can be
+    /// read/written concurrently on this one `Vault` instance (they take
+    /// different per-note locks), and both paths touch this same
+    /// connection, so the connection itself needs its own short-lived lock
+    /// around each individual journal call. This is unrelated to, and does
+    /// not substitute for, the per-note lock's reader-vs-writer exclusion.
+    journal: Mutex<Journal>,
 }
 
 impl Vault {
-    pub fn new(root: PathBuf) -> Self {
-        Vault {
+    /// Opens a vault rooted at `root`, backed by the write-operation journal
+    /// at `journal_path` (created if it does not yet exist). Replaces A1's
+    /// `Vault::new`: every caller now supplies a journal path, since A1 had
+    /// no production caller to break.
+    pub fn open(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
+        let journal = Journal::open(journal_path).map_err(journal_err)?;
+        Ok(Vault {
             root,
             locks: Mutex::new(HashMap::new()),
-        }
+            journal: Mutex::new(journal),
+        })
     }
 
     pub fn current_version(&self, note_id: &NoteId) -> Result<Version, StorageError> {
         self.read_note(note_id).map(|record| record.version)
     }
 
+    /// Reads the current record for `note_id` by resolving it through the
+    /// journal rather than trusting the raw filesystem: the committed row
+    /// (`Journal::last_committed_for_note`) says which on-disk bytes are
+    /// "current" and what hash they must have. A write in flight
+    /// (`IntentRecorded`/`ContentPersisted`, not yet `JournalCommitted`) is
+    /// invisible to readers, per C1.
+    ///
+    /// Shares the same per-note lock `write_record_unchecked` holds for its
+    /// whole critical section, so a read can never be interleaved with
+    /// another thread's in-progress rename on the same note within this
+    /// process (Task 4 architectural-review correction).
+    ///
+    /// On a hash mismatch against the resolved row there is NO before-image
+    /// fallback: this is unconditionally `StorageError::Inconsistent`. A
+    /// mismatch means the vault's officially linearized file is corrupted —
+    /// a genuine post-commit integrity failure that only `Vault::open`'s
+    /// recovery pass (`reconcile`, Task 7) has the authority to repair, by
+    /// demoting the affected operation to `Failed` as a journal state
+    /// transition (after which `last_committed_for_note` resolves to the
+    /// prior, still-correctly-paired, operation). Substituting a different
+    /// operation's before-image at read time would pair that operation's
+    /// overwritten content with THIS row's version number — exactly the
+    /// cross-operation mislabeling the second architectural review forbids.
     pub fn read_note(&self, note_id: &NoteId) -> Result<VaultRecord, StorageError> {
+        let note_lock = self.note_lock(note_id);
+        let _guard = note_lock.lock().unwrap();
+        self.read_note_locked(note_id)
+    }
+
+    /// The body of `read_note`, run while the caller already holds the
+    /// per-note lock. Split out so `write_record_unchecked` can re-read the
+    /// current committed record (for its own version check) without trying
+    /// to re-acquire a lock it already holds.
+    fn read_note_locked(&self, note_id: &NoteId) -> Result<VaultRecord, StorageError> {
+        // The containment check runs before the journal lookup (A1's own
+        // check order, unchanged): a symlink escape is a structural problem
+        // with the path itself and must be caught regardless of whether a
+        // committed journal row happens to exist yet for this note id.
         let path = self.record_path_checked(note_id)?;
+        let Some(row) = self.journal.lock().unwrap().last_committed_for_note(note_id.as_str()).map_err(journal_err)? else {
+            return Err(StorageError::NotFound {
+                note_id: note_id.as_str().to_string(),
+            });
+        };
         let bytes = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound {
@@ -134,7 +231,26 @@ impl Vault {
                 StorageError::Io(e)
             }
         })?;
+        let expected_hash = row.content_hash.as_deref();
+        if expected_hash != Some(content_hash(&bytes).as_str()) {
+            return Err(StorageError::Inconsistent {
+                note_id: note_id.as_str().to_string(),
+            });
+        }
         parse_record(&bytes, note_id)
+    }
+
+    /// Returns (creating if absent) the `Arc<Mutex<()>>` for `note_id`,
+    /// without locking it. Shared by `read_note` and
+    /// `write_record_unchecked` so both sides serialize on the exact same
+    /// lock object per note id.
+    fn note_lock(&self, note_id: &NoteId) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(note_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     /// Writes `content` as the new record for `note_id`, provided
@@ -164,6 +280,42 @@ impl Vault {
     /// non-`pub` item to its *defining module only*, not the whole crate, so
     /// `propose.rs` (a sibling of `vault.rs`, not a descendant) could not
     /// call a plain-private method here even though both live in `storage`.
+    ///
+    /// A2 restructures the body to drive the write through the journal
+    /// (Task 2) to `WriteState::JournalCommitted`, and to persist a
+    /// before-image (Task 3) of any content being overwritten. The exact
+    /// sequence, each step's journal/filesystem effect followed immediately
+    /// by a `FaultInjector::check` call (production callers always pass
+    /// `FaultInjector::none()`, so this never interrupts them — the seam
+    /// exists for Task 8's crash tests):
+    ///
+    /// 1. `journal.insert_intent` — this IS `IntentRecorded`, persisted
+    ///    before anything else happens. Safe to run before the per-note
+    ///    lock below because it touches only the journal, never the
+    ///    filesystem: nothing a concurrent reader could observe on disk
+    ///    changes as a result of this row existing.
+    /// 2. Acquire the per-note lock (now also shared with `read_note`) and
+    ///    read the actual current version exactly as A1 did. On a version
+    ///    mismatch, advance the journal row to `Failed` (a rejected
+    ///    attempt is terminal) and return `Conflict`.
+    /// 3. If a record already exists, persist its current bytes as the
+    ///    before-image for this `operation_id`.
+    /// 4. Write the new record via `atomic_write`, then advance the
+    ///    journal to `ContentPersisted`, attaching both the new content's
+    ///    hash and (if one exists) the before-image's hash on the SAME row.
+    /// 5. Re-read the just-written file and verify its hash. On mismatch,
+    ///    attempt rollback to the before-image and verify THAT hash; if
+    ///    rollback also fails verification (or no before-image exists),
+    ///    return `StorageError::Inconsistent` without advancing the journal
+    ///    past `ContentPersisted`, so the next `Vault::open` recovery pass
+    ///    finds it and also fails closed.
+    /// 6. On successful verification, advance the journal to
+    ///    `JournalCommitted` — the linearization point.
+    /// 7. Release the per-note lock (by scope exit).
+    /// 8. Return the new version.
+    ///
+    /// Git commit/index are NOT part of this task: this stops at
+    /// `JournalCommitted`. Task 5 (git) and Task 6 (index) extend the chain.
     pub(crate) fn write_record_unchecked(
         &self,
         note_id: &NoteId,
@@ -171,35 +323,37 @@ impl Vault {
         expected_version: Version,
         operation_id: Uuid,
     ) -> Result<Version, StorageError> {
-        let _ = operation_id;
+        let injector = FaultInjector::none();
 
         let record_path = self.record_path_checked(note_id)?;
 
-        // Acquire (creating if absent) the per-note-id lock, then hold it
-        // for the entire critical section below: reading the current
-        // version, comparing it to `expected_version`, and writing the new
-        // record are all done while this lock is held, so no other thread
-        // sharing this `Vault` instance can observe or act on a stale
-        // version between the check and the write. Releasing the lock
-        // between the check and the write would reintroduce exactly the
-        // race this method exists to close.
-        let note_lock = {
-            let mut locks = self.locks.lock().unwrap();
-            Arc::clone(
-                locks
-                    .entry(note_id.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
+        // Step 1: intent_recorded. Deliberately before the per-note lock —
+        // see the doc comment above for why that is safe.
+        self.journal.lock().unwrap().insert_intent(operation_id, note_id.as_str(), expected_version.0).map_err(journal_err)?;
+        let _ = injector.check(FaultPoint::AfterIntentRecorded);
+
+        // Step 2: acquire the per-note lock, now shared with read_note, and
+        // hold it for the rest of this critical section — reading the
+        // current version, comparing it to `expected_version`, persisting
+        // the before-image, writing the new record, and advancing the
+        // journal to JournalCommitted are all done while this lock is held,
+        // so no concurrent reader on this Vault instance can observe the
+        // filesystem mid-write (Task 4 architectural-review correction).
+        let note_lock = self.note_lock(note_id);
         let _guard = note_lock.lock().unwrap();
 
-        let actual_version = match std::fs::read(&record_path) {
-            Ok(bytes) => parse_record(&bytes, note_id)?.version,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Version(0),
+        let current_bytes = match std::fs::read(&record_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(StorageError::Io(e)),
+        };
+        let actual_version = match &current_bytes {
+            Some(bytes) => parse_record(bytes, note_id)?.version,
+            None => Version(0),
         };
 
         if actual_version != expected_version {
+            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
             return Err(StorageError::Conflict {
                 note_id: note_id.as_str().to_string(),
                 expected: expected_version,
@@ -207,11 +361,88 @@ impl Vault {
             });
         }
 
+        // Step 3: preserve what this write is about to overwrite, if
+        // anything, keyed by THIS operation's own operation_id.
+        let before_image_hash = match &current_bytes {
+            Some(bytes) => Some(persist_before_image(&self.root, note_id, operation_id, bytes)?),
+            None => None,
+        };
+
+        // Step 4: write the new record, then advance the journal to
+        // ContentPersisted carrying both hashes on the same row.
         let new_version = Version(actual_version.0 + 1);
         let buffer = serialize_record(content, new_version);
         atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+        let _ = injector.check(FaultPoint::AfterRenameBeforeJournalCommitted);
+        let new_hash = content_hash(&buffer);
+        let fields = match &before_image_hash {
+            Some(before_hash) => {
+                AdvanceFields::content_with_before_image(new_version.0, new_hash.clone(), before_hash.clone())
+            }
+            None => AdvanceFields::content(new_version.0, new_hash.clone()),
+        };
+        self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
 
+        // Step 5: verify the bytes actually on disk hash to what was just
+        // recorded. This closes the "hash della nuova versione verificato"
+        // fault-matrix row.
+        let written_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        if content_hash(&written_bytes) != new_hash {
+            if let Some(before_hash) = &before_image_hash {
+                if let Ok(before_bytes) = read_before_image(&self.root, note_id, operation_id) {
+                    if content_hash(&before_bytes) == *before_hash
+                        && atomic_write(&record_path, &before_bytes).is_ok()
+                    {
+                        let rolled_back = std::fs::read(&record_path).map_err(StorageError::Io)?;
+                        if content_hash(&rolled_back) == *before_hash {
+                            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+                            return Err(StorageError::Inconsistent {
+                                note_id: note_id.as_str().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            // Rollback was not possible, or did not itself verify: fail
+            // closed WITHOUT advancing the journal past ContentPersisted,
+            // per the spec's allowance that recovery itself may not be able
+            // to resolve this one fault-matrix row.
+            return Err(StorageError::Inconsistent {
+                note_id: note_id.as_str().to_string(),
+            });
+        }
+
+        // Step 6: the linearization point.
+        self.journal.lock().unwrap().advance(operation_id, WriteState::JournalCommitted, AdvanceFields::none()).map_err(journal_err)?;
+
+        // Step 7: the per-note lock is released when `_guard` drops at the
+        // end of this scope.
+        // Step 8:
         Ok(new_version)
+    }
+
+    /// Test-only introspection: the journal row for `operation_id`, or
+    /// `None` if no such row exists. Lets tests assert on journal state
+    /// (e.g. `WriteState`, `new_version`) without widening any production
+    /// visibility — `Journal`/`OperationRow` stay crate-private.
+    #[cfg(test)]
+    pub(crate) fn journal_row_for_test(&self, operation_id: Uuid) -> Option<crate::journal::OperationRow> {
+        self.journal.lock().unwrap().get(operation_id).unwrap()
+    }
+
+    /// Test-only introspection: inserts an intent row directly against this
+    /// vault's journal, so tests can simulate a crash frozen at
+    /// `IntentRecorded` without going through `write_record_unchecked` at
+    /// all.
+    #[cfg(test)]
+    pub(crate) fn insert_intent_for_test(&self, operation_id: Uuid, note_id: &str, expected_version: u64) {
+        self.journal.lock().unwrap().insert_intent(operation_id, note_id, expected_version).unwrap()
+    }
+
+    /// Test-only introspection: this vault's root directory.
+    #[cfg(test)]
+    pub(crate) fn root_for_test(&self) -> &Path {
+        &self.root
     }
 
     /// Resolves the on-disk record path for `note_id` — `root/<id>.record`,
@@ -291,7 +522,6 @@ fn ensure_resolves_inside_root(
 const BEFORE_IMAGE_DIR: &str = ".before-images";
 
 /// Hex-encoded SHA-256 of `bytes`.
-#[allow(dead_code)] // consumed by the Task 4 write path
 pub(crate) fn content_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -301,7 +531,6 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 
 /// `<root>/.before-images/<note_id>-<operation_id>.record`. Pure path
 /// construction; nothing is created or checked here.
-#[allow(dead_code)] // consumed by the Task 4 write path
 pub(crate) fn before_image_path(root: &Path, note_id: &NoteId, operation_id: Uuid) -> PathBuf {
     root.join(BEFORE_IMAGE_DIR)
         .join(format!("{}-{}.record", note_id.as_str(), operation_id))
@@ -331,7 +560,6 @@ fn before_image_path_checked(
 /// Writes `current_record_bytes` as the before-image for `operation_id` via
 /// the crate-private `atomic_write`, and returns the content hash of the
 /// bytes written.
-#[allow(dead_code)] // consumed by the Task 4 write path
 pub(crate) fn persist_before_image(
     root: &Path,
     note_id: &NoteId,
@@ -346,7 +574,7 @@ pub(crate) fn persist_before_image(
 
 /// Removes the before-image for `operation_id`. Idempotent: a missing file
 /// is not an error.
-#[allow(dead_code)] // consumed by the Task 4 write path
+#[allow(dead_code)] // consumed by Task 5's git-committed cleanup
 pub(crate) fn delete_before_image(
     root: &Path,
     note_id: &NoteId,
@@ -361,7 +589,6 @@ pub(crate) fn delete_before_image(
 }
 
 /// Reads back the before-image for `operation_id`.
-#[allow(dead_code)] // consumed by the Task 4 write path
 pub(crate) fn read_before_image(
     root: &Path,
     note_id: &NoteId,
@@ -396,6 +623,141 @@ mod tests {
         dir
     }
 
+    /// `Vault::open` with a fresh root and a fresh journal path, for tests
+    /// that don't care about sharing either across calls.
+    fn open_test_vault() -> Vault {
+        Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap()
+    }
+
+    // --- Task 4: journal- and before-image-wired write/read path ---
+
+    #[test]
+    fn write_record_unchecked_advances_journal_to_journal_committed_on_success() {
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "content v1", Version(0), op).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, domain::WriteState::JournalCommitted);
+        assert_eq!(row.new_version, Some(1));
+    }
+
+    #[test]
+    fn read_note_resolves_through_the_journal_not_the_raw_file() {
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "committed content", Version(0), Uuid::new_v4()).unwrap();
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!(record.content, "committed content");
+        assert_eq!(record.version, Version(1));
+    }
+
+    #[test]
+    fn before_image_is_persisted_and_old_content_recoverable_before_deletion() {
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let op2 = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        // the before-image for op2 (the v1->v2 transition) must still exist:
+        // A1/A2 delete it only after git_committed, which this task does not yet reach.
+        let before = read_before_image(vault.root_for_test(), &id, op2).unwrap();
+        assert!(String::from_utf8(before).unwrap().contains("v1"));
+    }
+
+    #[test]
+    fn reading_a_note_whose_only_write_never_reached_journal_committed_returns_not_found() {
+        // Simulates a crash frozen at IntentRecorded by inserting the intent row
+        // directly against the journal without ever calling write_record_unchecked's
+        // file-writing steps — exercising the "uncommitted write is invisible" rule
+        // without needing the full fault-injection harness (that lands in Task 6).
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.insert_intent_for_test(Uuid::new_v4(), id.as_str(), 0);
+        assert!(matches!(vault.read_note(&id), Err(StorageError::NotFound { .. })));
+    }
+
+    #[test]
+    fn concurrent_read_during_rename_never_observes_uncommitted_bytes_against_the_wrong_row() {
+        // Reproduces the exact race the architectural review identified: a writer
+        // has renamed new content onto disk (step 4) but not yet advanced the
+        // journal to JournalCommitted (step 6). Without the shared per-note lock,
+        // a concurrent read_note would open the ALREADY-RENAMED file and hash it
+        // against the PREVIOUS row's content_hash, producing a spurious mismatch.
+        // With the lock shared between read_note and write_record_unchecked, the
+        // reader cannot run until the writer's whole critical section — including
+        // the journal.advance to JournalCommitted — has completed.
+        let vault = Arc::new(open_test_vault());
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            writer_vault.write_record_unchecked(&writer_id, "v2", Version(1), Uuid::new_v4())
+        });
+
+        let reader_vault = Arc::clone(&vault);
+        let reader_id = id.clone();
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            reader_vault.read_note(&reader_id)
+        });
+
+        writer.join().unwrap().unwrap();
+        let read_result = reader.join().unwrap();
+        // Whichever order the lock actually serialized them in, the reader must
+        // see EITHER the fully-committed v1 OR the fully-committed v2 — never an
+        // Inconsistent error from comparing renamed-but-uncommitted bytes against
+        // a stale row, which is what the unlocked version of read_note could do.
+        let record = read_result.expect("read must never spuriously report Inconsistent due to the writer's in-flight rename");
+        assert!(record.content == "v1" || record.content == "v2");
+    }
+
+    #[test]
+    fn read_note_returns_inconsistent_on_hash_mismatch_never_a_before_image_substitution() {
+        // Pins the second user architectural review's correction to issue 1: a
+        // corrupted on-disk file for the committed row must surface as
+        // Inconsistent, never as a before-image's content silently relabeled with
+        // the committed row's version. This replaces the original (defective)
+        // test, which asserted read_note returned op2's before-image ("v1")
+        // paired with op2's own committed version (2) — a content/version
+        // mismatch across two different operations.
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let op2 = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        // op2's row is now committed as version 2, content "v2". Corrupt the
+        // on-disk file so its hash no longer matches op2's row.
+        std::fs::write(vault.root_for_test().join("note-a.record"), b"CORRUPTED-ON-DISK").unwrap();
+        let result = vault.read_note(&id);
+        assert!(matches!(result, Err(StorageError::Inconsistent { .. })), "a hash mismatch on the committed row must be reported, never silently repaired by a read with a different operation's before-image, got {result:?}");
+    }
+
+    #[test]
+    fn persist_before_image_is_keyed_by_the_writing_operations_own_operation_id_not_a_different_ones() {
+        // Retains the before-image/operation_id association coverage the first
+        // review flagged — now verified directly against the persistence
+        // primitive (Task 3) rather than through read_note, since read_note no
+        // longer consults before-images at all (see the correction above).
+        let vault = open_test_vault();
+        let id = NoteId::parse("note-a").unwrap();
+        let op1 = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "v1", Version(0), op1).unwrap();
+        let op2 = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        // op2's before-image (persisted under op2's own operation_id) must hold
+        // what op2 itself overwrote ("v1"); no before-image should exist under op1.
+        let op2_before = read_before_image(vault.root_for_test(), &id, op2).unwrap();
+        assert!(String::from_utf8(op2_before).unwrap().contains("v1"), "op2's before-image must hold what op2 overwrote");
+        assert!(read_before_image(vault.root_for_test(), &id, op1).is_err(), "op1 never had a prior version to preserve a before-image for");
+    }
+
     #[test]
     fn non_not_found_io_error_on_read_propagates_as_io_error_not_version_zero() {
         // If the record path happens to be a directory (not a plain missing
@@ -404,7 +766,7 @@ mod tests {
         // that as StorageError::Io, not silently treat it as "note doesn't
         // exist yet" (Version(0)) and proceed to write over/through it.
         let root = unique_test_dir();
-        let vault = Vault::new(root.clone());
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         std::fs::create_dir_all(root.join("note-a.record")).unwrap();
         let err = vault
@@ -447,7 +809,7 @@ mod tests {
         let root = unique_test_dir();
         let outside = unique_test_dir();
         symlink_dir(&outside, &root.join("escape"));
-        let vault = Vault::new(root.clone());
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("escape").unwrap();
         let v = vault
             .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
@@ -503,7 +865,7 @@ mod tests {
         let base = unique_test_dir();
         let real = unique_test_dir();
         symlink_dir(&real, &base.join("via"));
-        let vault = Vault::new(base.join("via"));
+        let vault = Vault::open(base.join("via"), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         vault.write_record_unchecked(&id, "ok", Version(0), Uuid::new_v4()).unwrap();
         assert_eq!(vault.read_note(&id).unwrap().content, "ok");
@@ -540,7 +902,7 @@ mod tests {
     fn read_note_rejects_record_path_symlinked_to_a_file_outside_the_vault_root() {
         let (root, outside_file) = root_and_outside_record();
         symlink_file(&outside_file, &root.join("note-a.record"));
-        let vault = Vault::new(root);
+        let vault = Vault::open(root, &unique_test_dir().join("journal.sqlite")).unwrap();
         let result = vault.read_note(&NoteId::parse("note-a").unwrap());
         assert!(
             matches!(result, Err(StorageError::PathEscapesVaultRoot { ref note_id }) if note_id == "note-a"),
@@ -557,7 +919,7 @@ mod tests {
         let (root, outside_file) = root_and_outside_record();
         let link = root.join("note-a.record");
         symlink_file(&outside_file, &link);
-        let vault = Vault::new(root.clone());
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         // Version(7) is the OUTSIDE file's version: before the fix the version
         // check read it through the link and accepted this write.
@@ -588,7 +950,7 @@ mod tests {
         let outside_dir = unique_test_dir();
         let link = root.join("note-a.record");
         symlink_file(&outside_dir.join("does-not-exist.record"), &link);
-        let vault = Vault::new(root.clone());
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let read = vault.read_note(&id);
         assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
@@ -607,7 +969,7 @@ mod tests {
         let root = unique_test_dir();
         let link = root.join("note-a.record");
         symlink_file(&link, &link);
-        let vault = Vault::new(root.clone());
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let read = vault.read_note(&id);
         assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
@@ -621,20 +983,32 @@ mod tests {
     fn record_symlink_resolving_inside_the_vault_root_is_not_an_escape() {
         // The check is about leaving the root, not about symlinks as such: a
         // link whose target is inside the root is read normally.
+        //
+        // A2 note: `read_note` now resolves through the journal, so the
+        // record must actually be written via `write_record_unchecked`
+        // first (establishing a committed row) rather than placed directly
+        // on disk as A1's version of this test did — a raw `fs::write` with
+        // no journal row is now correctly invisible to readers regardless
+        // of containment. The symlink is then swapped in afterward, still
+        // pointing at a copy of the exact bytes the committed row expects,
+        // so this test still isolates the containment check from the
+        // journal-resolution check.
         let root = unique_test_dir();
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "inside", Version(0), Uuid::new_v4()).unwrap();
         std::fs::create_dir(root.join("store")).unwrap();
         let target = root.join("store").join("real.record");
-        std::fs::write(&target, serialize_record("inside", Version(3))).unwrap();
+        std::fs::rename(root.join("note-a.record"), &target).unwrap();
         symlink_file(&target, &root.join("note-a.record"));
-        let vault = Vault::new(root);
-        let record = vault.read_note(&NoteId::parse("note-a").unwrap()).unwrap();
+        let record = vault.read_note(&id).unwrap();
         assert_eq!(record.content, "inside");
-        assert_eq!(record.version, Version(3));
+        assert_eq!(record.version, Version(1));
     }
 
     #[test]
     fn write_then_read_returns_same_content_and_version_one() {
-        let vault = Vault::new(unique_test_dir());
+        let vault = open_test_vault();
         let id = NoteId::parse("note-a").unwrap();
         let v = vault
             .write_record_unchecked(&id, "content v1", Version(0), Uuid::new_v4())
@@ -650,7 +1024,7 @@ mod tests {
         // After N writes, the on-disk record's embedded version always matches
         // the version current_version() reports — there is exactly one file,
         // so this is a structural guarantee, not a race to test for.
-        let vault = Vault::new(unique_test_dir());
+        let vault = open_test_vault();
         let id = NoteId::parse("note-a").unwrap();
         vault
             .write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4())
@@ -665,7 +1039,7 @@ mod tests {
 
     #[test]
     fn stale_expected_version_is_rejected_with_explicit_conflict() {
-        let vault = Vault::new(unique_test_dir());
+        let vault = open_test_vault();
         let id = NoteId::parse("note-a").unwrap();
         vault
             .write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4())
@@ -692,7 +1066,7 @@ mod tests {
 
     #[test]
     fn version_numbers_do_not_collide_across_different_notes() {
-        let vault = Vault::new(unique_test_dir());
+        let vault = open_test_vault();
         let a = NoteId::parse("note-a").unwrap();
         let b = NoteId::parse("note-b").unwrap();
         vault
@@ -708,7 +1082,7 @@ mod tests {
     fn concurrent_writers_sharing_one_vault_instance_on_same_version_only_one_succeeds() {
         // Scope of this guarantee: both writers share `vault` (one process, one Vault
         // instance, two threads) — this is exactly what the in-memory mutex can promise.
-        let vault = Arc::new(Vault::new(unique_test_dir()));
+        let vault = Arc::new(open_test_vault());
         let id = NoteId::parse("note-a").unwrap();
         vault
             .write_record_unchecked(&id, "initial", Version(0), Uuid::new_v4())
@@ -743,7 +1117,7 @@ mod tests {
 
     #[test]
     fn losing_writer_can_retry_with_fresh_version_and_succeed() {
-        let vault = Vault::new(unique_test_dir());
+        let vault = open_test_vault();
         let id = NoteId::parse("note-a").unwrap();
         vault
             .write_record_unchecked(&id, "initial", Version(0), Uuid::new_v4())

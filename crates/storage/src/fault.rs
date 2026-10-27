@@ -11,8 +11,14 @@
 pub(crate) enum FaultPoint {
     AfterIntentRecorded,
     AfterRenameBeforeJournalCommitted,
+    // The remaining three variants have no production call site until Task
+    // 5 (git) and Task 6 (index) extend write_record_unchecked's chain past
+    // JournalCommitted, and Task 7's before-image rollback during recovery.
+    #[allow(dead_code)]
     AfterJournalCommittedBeforeGit,
+    #[allow(dead_code)]
     AfterGitCommittedBeforeIndex,
+    #[allow(dead_code)]
     DuringBeforeImageRestore,
 }
 

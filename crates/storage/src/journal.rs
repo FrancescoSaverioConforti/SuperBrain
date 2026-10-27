@@ -212,6 +212,9 @@ impl Journal {
     }
 
     /// Every operation that is neither `IndexCurrent` nor `Failed`, oldest first.
+    // No production call site until Task 7's recovery pass (reconcile) scans
+    // in-flight operations on Vault::open.
+    #[allow(dead_code)]
     pub(crate) fn non_terminal_operations(&self) -> Result<Vec<OperationRow>, JournalError> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_ROWS} WHERE state NOT IN (?1, ?2) ORDER BY rowid ASC"
