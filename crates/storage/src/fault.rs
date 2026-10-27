@@ -3,8 +3,10 @@
 //! A [`FaultInjector`] is threaded through write steps. When it is armed for a
 //! point, [`FaultInjector::check`] returns `Err(Interrupted::At(point))` right
 //! after that point's effect has happened, so a test can simulate a crash at
-//! an exact step boundary without killing a process. Production code always
-//! uses [`FaultInjector::none`], which never interrupts.
+//! an exact step boundary without killing a process. A test can instead
+//! *pause* a pipeline at a point (`FaultInjector::pause_at`) and act while it
+//! is stopped there. Production code always uses [`FaultInjector::none`],
+//! which never interrupts or pauses.
 
 /// The crash-injectable boundaries in the write pipeline and in recovery.
 ///
@@ -15,16 +17,21 @@
 /// unnameable outside this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultPoint {
+    /// `write_record_unchecked`: the intent row exists; nothing on disk changed.
     AfterIntentRecorded,
+    /// `write_record_unchecked`: the record was renamed into place and the row
+    /// advanced to `ContentPersisted` with its hash, before verification and
+    /// before `JournalCommitted`.
     AfterRenameBeforeJournalCommitted,
-    // The remaining three variants have no production call site until Task
-    // 5 (git) and Task 6 (index) extend write_record_unchecked's chain past
-    // JournalCommitted, and Task 7's before-image rollback during recovery.
-    #[allow(dead_code)]
+    /// `write_record_unchecked`: the row is `JournalCommitted`; no git commit
+    /// has been attempted.
     AfterJournalCommittedBeforeGit,
-    #[allow(dead_code)]
+    /// `write_record_unchecked`: the row is `GitCommitted` (Oid recorded,
+    /// before-image deleted); the index step has not run.
     AfterGitCommittedBeforeIndex,
-    #[allow(dead_code)]
+    /// `recovery::reconcile` row 2: the before-image was written back over the
+    /// record and verified, but the before-image is not yet deleted and the
+    /// row is not yet `Failed`.
     DuringBeforeImageRestore,
     /// Checked inside `recovery::reconcile`, immediately after it marks a
     /// non-terminal row `Recovering` (recording `previous_state`) and before
@@ -41,25 +48,68 @@ pub(crate) enum Interrupted {
 }
 
 /// Decides whether a pipeline should stop at a given [`FaultPoint`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Clone`/`Copy`: the test-only pause variant owns channel endpoints.
+/// Callers pass it by reference.
+#[derive(Debug)]
 pub(crate) struct FaultInjector {
     trigger: Option<FaultPoint>,
+    #[cfg(test)]
+    pause: Option<Pause>,
+}
+
+/// Test-only: where to pause, and the two channel ends used to tell the test
+/// "paused" and to wait for "resume".
+#[cfg(test)]
+#[derive(Debug)]
+struct Pause {
+    point: FaultPoint,
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl FaultInjector {
     /// A no-op injector: no point ever interrupts.
     pub(crate) fn none() -> Self {
-        Self { trigger: None }
+        Self {
+            trigger: None,
+            #[cfg(test)]
+            pause: None,
+        }
     }
 
     /// An injector that interrupts when the pipeline reaches `point`.
     #[cfg(test)]
     pub(crate) fn trigger_at(point: FaultPoint) -> Self {
-        Self { trigger: Some(point) }
+        Self { trigger: Some(point), pause: None }
+    }
+
+    /// An injector that, when the pipeline reaches `point`, sends `()` on
+    /// `paused` and then blocks until `()` arrives on `resume` (or the
+    /// resume sender is dropped), and then lets the pipeline continue. It
+    /// never returns `Interrupted`. Lets a test act deterministically while
+    /// a pipeline is stopped at an exact step boundary, for example while a
+    /// writer still holds its per-note lock.
+    #[cfg(test)]
+    pub(crate) fn pause_at(
+        point: FaultPoint,
+        paused: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self { trigger: None, pause: Some(Pause { point, paused, resume }) }
     }
 
     /// Called by a pipeline immediately after `point`'s effect has happened.
     pub(crate) fn check(&self, point: FaultPoint) -> Result<(), Interrupted> {
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            if pause.point == point {
+                // A test that already went away is not an error here: the
+                // pipeline just continues.
+                let _ = pause.paused.send(());
+                let _ = pause.resume.recv();
+            }
+        }
         if self.trigger == Some(point) {
             Err(Interrupted::At(point))
         } else {
@@ -93,6 +143,42 @@ mod tests {
         assert_eq!(effects, vec!["intent_recorded"]);
         // ...but the pipeline stopped there, distinguishably, instead of continuing
         assert!(matches!(result, Err(Interrupted::At(FaultPoint::AfterIntentRecorded))));
+    }
+
+    #[test]
+    fn pause_at_blocks_right_after_the_named_point_until_resumed_then_continues() {
+        // Task 8: the pause variant stops the pipeline at the same boundary
+        // trigger_at would, but instead of returning Interrupted it signals
+        // the test and waits, then lets the pipeline run to completion.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterRenameBeforeJournalCommitted, paused_tx, resume_rx);
+        let effects = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipeline_effects = std::sync::Arc::clone(&effects);
+        let pipeline = std::thread::spawn(move || {
+            let mut local = Vec::new();
+            let step = |name: &'static str, local: &mut Vec<&'static str>| {
+                local.push(name);
+                pipeline_effects.lock().unwrap().push(name);
+            };
+            step("intent_recorded", &mut local);
+            injector.check(FaultPoint::AfterIntentRecorded)?;
+            step("content_persisted", &mut local);
+            injector.check(FaultPoint::AfterRenameBeforeJournalCommitted)?;
+            step("journal_committed", &mut local);
+            injector.check(FaultPoint::AfterJournalCommittedBeforeGit)?;
+            Ok::<_, Interrupted>(local)
+        });
+
+        paused_rx.recv().unwrap();
+        assert_eq!(*effects.lock().unwrap(), vec!["intent_recorded", "content_persisted"], "paused right after the named point's effect");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!pipeline.is_finished(), "the pipeline must stay paused until resumed");
+        assert_eq!(effects.lock().unwrap().len(), 2, "no further step ran while paused");
+
+        resume_tx.send(()).unwrap();
+        let result = pipeline.join().unwrap();
+        assert_eq!(result.unwrap(), vec!["intent_recorded", "content_persisted", "journal_committed"], "a paused point never interrupts: the pipeline completes");
     }
 
     #[test]

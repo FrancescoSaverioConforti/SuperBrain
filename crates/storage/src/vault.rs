@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use crate::atomic::{atomic_write, AtomicWriteError};
 use crate::fault::{FaultInjector, FaultPoint};
-use crate::git::{commit_operation, find_commit_for_operation, GitError, ScanDepth};
+use crate::git::{commit_operation, commit_operation_contents, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal};
 use crate::note_id::NoteId;
-use crate::recovery::{reconcile, ReconcileError};
+use crate::recovery::{own_content, reconcile, ReconcileError};
 
 /// The separator between the version header line and the raw note content
 /// in the on-disk record format.
@@ -138,6 +138,20 @@ pub enum StorageError {
     /// match this variant (`Interrupted(_)`) but cannot name the point.
     #[error("interrupted at {0:?}")]
     Interrupted(FaultPoint),
+    /// A retry of an `operation_id` whose journal row is already `Failed`.
+    /// Per C1 ("retry of the same operation_id: the outcome already reached,
+    /// no double application"), the write is not attempted again. The caller
+    /// must use a new `operation_id`.
+    #[error("operation {operation_id} already failed; retry with a new operation_id")]
+    OperationFailed { operation_id: Uuid },
+    /// A retry of an `operation_id` whose journal row exists but has not
+    /// reached a resolved state (`IntentRecorded`, `ContentPersisted` or
+    /// `Recovering`) in this process: it is either still being written by
+    /// another call, or was abandoned mid-flight. Nothing is applied. The
+    /// next `Vault::open` recovery pass resolves the row, after which a retry
+    /// reports that outcome.
+    #[error("operation {operation_id} is still in flight; nothing was applied")]
+    OperationInProgress { operation_id: Uuid },
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -159,6 +173,26 @@ fn git_err(note_id: &NoteId, e: GitError) -> StorageError {
         },
         other => StorageError::Git(other.to_string()),
     }
+}
+
+/// Folds a crate-private `recovery::ReconcileError`, from the shared
+/// `recovery::own_content` helper used by the retry path, into `StorageError`.
+fn reconcile_err(note_id: &NoteId, e: ReconcileError) -> StorageError {
+    match e {
+        ReconcileError::Io(e) => StorageError::Io(e),
+        ReconcileError::Journal(e) => journal_err(e),
+        ReconcileError::Interrupted(point) => StorageError::Interrupted(point),
+        ReconcileError::Inconsistent { .. } => StorageError::Inconsistent {
+            note_id: note_id.as_str().to_string(),
+        },
+    }
+}
+
+/// The version a journal row at `JournalCommitted` or later committed.
+fn committed_version(row: &crate::journal::OperationRow) -> Result<Version, StorageError> {
+    row.new_version.map(Version).ok_or_else(|| StorageError::Inconsistent {
+        note_id: row.note_id.clone(),
+    })
 }
 
 /// The index step of the write pipeline (Task 6). Pre-B1 the only
@@ -428,11 +462,10 @@ impl Vault {
     /// `expected_version` matches the version currently on disk (or
     /// `Version(0)` if the note does not yet exist).
     ///
-    /// `operation_id` is accepted and currently unused beyond being
-    /// threaded through the signature: A1 does not implement cross-restart
-    /// idempotency, so this parameter exists only so a later phase (A2) can
-    /// wire it to journal-backed idempotency without changing this
-    /// signature.
+    /// `operation_id` is the journal key and the idempotency key: a call
+    /// with an `operation_id` the journal already knows never writes again
+    /// and reports the outcome that operation already reached (step 0
+    /// below; see `resume_existing_operation`).
     ///
     /// Crate-private (`pub(crate)`, never `pub`): this is the single
     /// primitive through which every note write to the vault flows, and it
@@ -460,6 +493,11 @@ impl Vault {
     /// `FaultInjector::none()`, so this never interrupts them — the seam
     /// exists for Task 8's crash tests):
     ///
+    /// 0. If the journal already has a row for `operation_id`, return that
+    ///    operation's outcome via `resume_existing_operation` (`Failed` ->
+    ///    `OperationFailed`, finished -> its version, mid-flight ->
+    ///    `OperationInProgress`, `JournalCommitted`/`GitCommitted` -> finish
+    ///    the remaining git/index steps). Nothing is written twice.
     /// 1. `journal.insert_intent` — this IS `IntentRecorded`, persisted
     ///    before anything else happens. Safe to run before the per-note
     ///    lock below because it touches only the journal, never the
@@ -475,7 +513,9 @@ impl Vault {
     ///    journal to `ContentPersisted`, attaching both the new content's
     ///    hash and (if one exists) the before-image's hash on the SAME row.
     /// 5. Re-read the just-written file and verify its hash. On mismatch,
-    ///    attempt rollback to the before-image and verify THAT hash; if
+    ///    attempt rollback to the before-image and verify THAT hash (on
+    ///    success the before-image is deleted, the row advanced to `Failed`,
+    ///    and `Inconsistent` returned to report the write did not land); if
     ///    rollback also fails verification (or no before-image exists),
     ///    return `StorageError::Inconsistent` without advancing the journal
     ///    past `ContentPersisted`, so the next `Vault::open` recovery pass
@@ -521,8 +561,11 @@ impl Vault {
     /// callers go through `write_record_unchecked`, which passes
     /// `FaultInjector::none()`. An armed injector stops the write right after
     /// the named step boundary and returns `StorageError::Interrupted(point)`.
-    /// Today only `AfterIntentRecorded` and `AfterRenameBeforeJournalCommitted`
-    /// are wired; Task 8 threads the remaining points.
+    /// The four write-path points are checked, in order:
+    /// `AfterIntentRecorded` (after step 1), `AfterRenameBeforeJournalCommitted`
+    /// (after step 4's `ContentPersisted` advance), `AfterJournalCommittedBeforeGit`
+    /// (after step 6) and `AfterGitCommittedBeforeIndex` (after step 7). The
+    /// fifth, `DuringBeforeImageRestore`, lives in `recovery::reconcile`.
     pub(crate) fn write_record_unchecked_with_injector(
         &self,
         note_id: &NoteId,
@@ -532,6 +575,15 @@ impl Vault {
         injector: &FaultInjector,
     ) -> Result<Version, StorageError> {
         let interrupted = |crate::fault::Interrupted::At(point)| StorageError::Interrupted(point);
+
+        // Step 0: retry idempotency (C1, "Retry dello stesso operation_id").
+        // An operation_id the journal already knows is never applied a second
+        // time; the outcome it already reached is reported instead. Bound to
+        // a local first so the journal guard is released before resuming.
+        let existing = self.journal.lock().unwrap().get(operation_id).map_err(journal_err)?;
+        if let Some(row) = existing {
+            return self.resume_existing_operation(row);
+        }
 
         let record_path = self.record_path_checked(note_id)?;
 
@@ -612,6 +664,11 @@ impl Vault {
                     {
                         let rolled_back = std::fs::read(&record_path).map_err(StorageError::Io)?;
                         if content_hash(&rolled_back) == *before_hash {
+                            // Delete the before-image BEFORE advancing to the
+                            // terminal Failed state, matching recovery's row 2:
+                            // a Failed row is never revisited, so the opposite
+                            // order would orphan the file (Task 8).
+                            delete_before_image(&self.root, note_id, operation_id)?;
                             self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
                             return Err(StorageError::Inconsistent {
                                 note_id: note_id.as_str().to_string(),
@@ -631,50 +688,145 @@ impl Vault {
 
         // Step 6: the linearization point.
         self.journal.lock().unwrap().advance(operation_id, WriteState::JournalCommitted, AdvanceFields::none()).map_err(journal_err)?;
+        injector.check(FaultPoint::AfterJournalCommittedBeforeGit).map_err(interrupted)?;
 
-        // Step 7 (Task 5): extend the chain from JournalCommitted to
-        // GitCommitted. find_commit_for_operation is consulted FIRST (its
-        // own Tier 1 is the journal's own git_commit_oid column, O(1) and
-        // authoritative; Tier 2 is a bounded defensive history scan) so a
-        // re-entrant call for an operation that already has a commit never
-        // creates a second one.
-        //
-        // The whole find-then-commit-then-record sequence is serialized by
-        // `git_lock` across ALL notes (fix round, independent-review finding
-        // I1): two threads writing to two DIFFERENT notes hold DIFFERENT
-        // per-note locks and would otherwise both read the same HEAD and
-        // race to update the same branch ref, and the loser's otherwise-
-        // successful commit_operation call would fail outright. Acquired
-        // here, strictly after the per-note lock (already held since step
-        // 2), never before it — see `git_lock`'s own doc comment for the
-        // full lock-ordering argument.
+        // Step 7 (Task 5): JournalCommitted -> GitCommitted, committing the
+        // record this call just wrote and verified (still under the per-note
+        // lock). A brand-new operation cannot already have a commit far back
+        // in history, so the bounded scan suffices here.
+        self.commit_to_git(note_id, &record_path, operation_id, ScanDepth::Bounded(500), None)?;
+        injector.check(FaultPoint::AfterGitCommittedBeforeIndex).map_err(interrupted)?;
+
+        // Step 7b (Task 6): the index step, GitCommitted -> IndexCurrent.
+        self.mark_index_current(note_id, operation_id, new_version)?;
+
+        // Step 8: the per-note lock is released when `_guard` drops at the
+        // end of this scope.
+        // Step 9:
+        Ok(new_version)
+    }
+
+    /// Step 0 of `write_record_unchecked_with_injector`: `row` is the existing
+    /// journal row for the caller's `operation_id`. Reports the outcome that
+    /// operation already reached, finishing any remaining pipeline step that
+    /// can be finished safely, and never writes the record again (C1, "Retry
+    /// dello stesso operation_id in ciascuno stato").
+    ///
+    /// The operation_id alone identifies the operation: the retry's own
+    /// note id, content and expected version are not consulted, and all work
+    /// is done against the row's own note.
+    ///
+    /// - `Failed`: `OperationFailed`. The caller must use a new id.
+    /// - `IndexCurrent`: `Ok` with the version it committed.
+    /// - `IntentRecorded`, `ContentPersisted`, `Recovering`: `OperationInProgress`.
+    ///   In a live process such a row is either still being written by another
+    ///   call or was abandoned mid-flight, and the two cannot be told apart
+    ///   from here, so it is neither resumed nor failed. Recovery on the next
+    ///   `Vault::open` resolves it.
+    /// - `JournalCommitted` (for example after `git_pending`): resumes the git
+    ///   step and then the index step. The commit carries this operation's OWN
+    ///   bytes (the record if it still hashes to the row's `content_hash`,
+    ///   otherwise a successor's before-image), exactly as recovery's row 3
+    ///   does. If they cannot be found, or git is still unavailable, the
+    ///   result is `GitPending` and the row keeps resting.
+    /// - `GitCommitted`: resumes the index step.
+    ///
+    /// The last two run under the note's per-note lock, after re-reading the
+    /// row, so a concurrent call finishing the same operation is observed
+    /// rather than repeated, and `commit_to_git` looks for an existing commit
+    /// first (unbounded, as on the recovery path).
+    fn resume_existing_operation(&self, row: crate::journal::OperationRow) -> Result<Version, StorageError> {
+        let operation_id = row.operation_id;
+        match row.state {
+            WriteState::Failed => return Err(StorageError::OperationFailed { operation_id }),
+            WriteState::IndexCurrent => return committed_version(&row),
+            WriteState::IntentRecorded | WriteState::ContentPersisted | WriteState::Recovering => {
+                return Err(StorageError::OperationInProgress { operation_id });
+            }
+            WriteState::JournalCommitted | WriteState::GitCommitted => {}
+        }
+
+        let note_id = NoteId::parse(&row.note_id).map_err(|_| StorageError::Inconsistent {
+            note_id: row.note_id.clone(),
+        })?;
+        let record_path = self.record_path_checked(&note_id)?;
+        let note_lock = self.note_lock(&note_id);
+        let _guard = note_lock.lock().unwrap();
+
+        let row = self
+            .journal
+            .lock()
+            .unwrap()
+            .get(operation_id)
+            .map_err(journal_err)?
+            .ok_or_else(|| StorageError::Inconsistent { note_id: note_id.as_str().to_string() })?;
+        let version = committed_version(&row)?;
+        match row.state {
+            WriteState::IndexCurrent => return Ok(version),
+            WriteState::JournalCommitted => {
+                self.commit_to_git(&note_id, &record_path, operation_id, ScanDepth::Unbounded, Some(&row))?;
+            }
+            WriteState::GitCommitted => {}
+            // Nothing moves a JournalCommitted/GitCommitted row anywhere else
+            // on a live vault (Recovering is only written by `reconcile`,
+            // before any Vault exists).
+            WriteState::Failed | WriteState::IntentRecorded | WriteState::ContentPersisted | WriteState::Recovering => {
+                return Err(StorageError::OperationInProgress { operation_id });
+            }
+        }
+        self.mark_index_current(&note_id, operation_id, version)?;
+        Ok(version)
+    }
+
+    /// JournalCommitted -> GitCommitted for `operation_id`, then deletes its
+    /// before-image (per spec, only once git_committed is reached). The caller
+    /// must hold `note_id`'s per-note lock.
+    ///
+    /// `find_commit_for_operation` is consulted FIRST (Tier 1 is the
+    /// journal's own `git_commit_oid`, Tier 2 a history scan to `scan`'s
+    /// depth), so an operation that already has a commit never gets a second
+    /// one. Only on a miss is a commit made: of the record on disk when
+    /// `own_content_of` is `None` (the live write path, which has just written
+    /// and verified it), or of that row's own bytes as recovered by
+    /// `recovery::own_content` (the retry path, where a successor may have
+    /// overwritten the record since). If those bytes cannot be recovered,
+    /// returns `GitPending` without committing anything.
+    ///
+    /// The whole find-then-commit-then-record sequence is serialized by
+    /// `git_lock` across ALL notes (Task 5 fix round, finding I1): two threads
+    /// writing two DIFFERENT notes hold different per-note locks and would
+    /// otherwise race on the same branch ref. Acquired strictly after the
+    /// per-note lock, never before it; see `git_lock`'s doc comment. The Oid
+    /// is recorded on the SAME journal write that advances to GitCommitted,
+    /// also under `git_lock`, so there is no window where the state says
+    /// GitCommitted but `git_commit_oid` is unset, and no second thread can
+    /// re-run the lookup between the commit and that write.
+    fn commit_to_git(
+        &self,
+        note_id: &NoteId,
+        record_path: &Path,
+        operation_id: Uuid,
+        scan: ScanDepth,
+        own_content_of: Option<&crate::journal::OperationRow>,
+    ) -> Result<(), StorageError> {
         {
             let _git_guard = self.git_lock.lock().unwrap();
 
-            let existing_oid = find_commit_for_operation(
-                &self.journal.lock().unwrap(),
-                &self.root,
-                operation_id,
-                ScanDepth::Bounded(500),
-            )
-            .map_err(|e| git_err(note_id, e))?;
+            let existing_oid = find_commit_for_operation(&self.journal.lock().unwrap(), &self.root, operation_id, scan)
+                .map_err(|e| git_err(note_id, e))?;
 
-            let git_oid = match existing_oid {
-                Some(oid) => oid,
-                None => commit_operation(&self.root, operation_id, note_id.as_str(), &record_path)
+            let git_oid = match (existing_oid, own_content_of) {
+                (Some(oid), _) => oid,
+                (None, None) => commit_operation(&self.root, operation_id, note_id.as_str(), record_path)
                     .map_err(|e| git_err(note_id, e))?,
+                (None, Some(row)) => {
+                    let contents = own_content(&self.root, &self.journal.lock().unwrap(), row, note_id, record_path)
+                        .map_err(|e| reconcile_err(note_id, e))?
+                        .ok_or_else(|| StorageError::GitPending { note_id: note_id.as_str().to_string() })?;
+                    commit_operation_contents(&self.root, operation_id, note_id.as_str(), record_path, &contents)
+                        .map_err(|e| git_err(note_id, e))?
+                }
             };
-            // Recording the Oid and advancing to GitCommitted happen on the
-            // SAME journal write (AdvanceFields::git_oid), so there is no
-            // window where the state says GitCommitted but git_commit_oid
-            // is unset — this covers both the idempotent re-entry (Tier 2
-            // found it but the journal row didn't have it recorded yet) and
-            // the fresh-commit case. Also still under git_lock: otherwise a
-            // second thread could re-run find_commit_for_operation between
-            // this commit and this journal write, find nothing (Tier 1
-            // unset, Tier 2 racing the same HEAD this thread just moved past)
-            // and attempt its own commit_operation against a now-stale
-            // assumption.
             self.journal
                 .lock()
                 .unwrap()
@@ -682,25 +834,20 @@ impl Vault {
                 .map_err(journal_err)?;
             // _git_guard drops here, releasing git_lock.
         }
+        delete_before_image(&self.root, note_id, operation_id)
+    }
 
-        // Per spec: the before-image is deleted only after git_committed.
-        delete_before_image(&self.root, note_id, operation_id)?;
-
-        // Step 7b (Task 6): the index step, GitCommitted -> IndexCurrent.
-        // `mark_current` is the indexer's hook (a no-op for `NullIndexer`).
-        // The journal advance records only that this pipeline step completed.
-        // It is NOT an index-freshness claim; that is `index_state_for`'s job.
-        self.indexer.mark_current(note_id.as_str(), new_version.0);
+    /// The index step, GitCommitted -> IndexCurrent (Task 6). `mark_current`
+    /// is the indexer's hook (a no-op for `NullIndexer`). The journal advance
+    /// records only that this pipeline step completed. It is NOT an
+    /// index-freshness claim; that is `index_state_for`'s job.
+    fn mark_index_current(&self, note_id: &NoteId, operation_id: Uuid, version: Version) -> Result<(), StorageError> {
+        self.indexer.mark_current(note_id.as_str(), version.0);
         self.journal
             .lock()
             .unwrap()
             .advance(operation_id, WriteState::IndexCurrent, AdvanceFields::none())
-            .map_err(journal_err)?;
-
-        // Step 8: the per-note lock is released when `_guard` drops at the
-        // end of this scope.
-        // Step 9:
-        Ok(new_version)
+            .map_err(journal_err)
     }
 
     /// Test-only introspection: the journal row for `operation_id`, or
@@ -917,13 +1064,17 @@ mod tests {
     use super::*;
 
     fn unique_test_dir() -> PathBuf {
+        // A per-process counter on top of the timestamp: parallel tests can read
+        // the same clock value, which made two tests share one directory.
+        static UNIQUE_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "superbrain-vault-test-{}-{}",
+            "superbrain-vault-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            UNIQUE_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1699,5 +1850,695 @@ mod tests {
     fn content_hash_is_stable_and_detects_any_byte_change() {
         assert_eq!(content_hash(b"abc"), content_hash(b"abc"));
         assert_ne!(content_hash(b"abc"), content_hash(b"abd"));
+    }
+
+    // --- Task 8: crash injection against the C1 fault matrix, end to end ---
+    //
+    // Each test drives the REAL write path, interrupts it with
+    // `FaultInjector::trigger_at` (or stops it with `pause_at`), then
+    // simulates a restart by dropping the `Vault` and calling `Vault::open`
+    // again on the same root and journal path. Row 2's valid-hash
+    // roll-forward (first write and overwrite) is already pinned end to end
+    // by Task 7's fix-round tests in `recovery.rs`
+    // (`crash_at_after_rename_on_a_first_write_...` and
+    // `crash_at_after_rename_over_a_prior_version_...`), so it is not repeated
+    // here.
+
+    use crate::git::test_support::{commit_unrelated_change_for_test, init_git_repo_at};
+
+    /// A fresh vault root (NOT a git repository) and a journal path in a
+    /// separate fresh directory.
+    fn fresh_root_and_journal_path() -> (PathBuf, PathBuf) {
+        (unique_test_dir(), unique_test_dir().join("journal.sqlite"))
+    }
+
+    /// Git-initializes `root` in place and returns it as the repository path.
+    fn init_test_repo_at(root: &Path) -> PathBuf {
+        init_git_repo_at(root);
+        root.to_path_buf()
+    }
+
+    /// How many commits reachable from `HEAD` carry `op`'s marker. The
+    /// "exactly once" counter on the git side.
+    fn commits_for_operation(repo_dir: &Path, op: Uuid) -> usize {
+        let repo = git2::Repository::open(repo_dir).unwrap();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        let marker = op.to_string();
+        walk.filter(|oid| {
+            let commit = repo.find_commit(*oid.as_ref().unwrap()).unwrap();
+            commit.message().is_some_and(|m| m.contains(&marker))
+        })
+        .count()
+    }
+
+    /// The bytes of `<note>.record` in commit `oid`'s tree.
+    fn committed_record_bytes(repo_dir: &Path, oid: &str, note: &str) -> Vec<u8> {
+        let repo = git2::Repository::open(repo_dir).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(oid).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        let entry = tree.get_name(&format!("{note}.record")).unwrap();
+        let bytes = repo.find_blob(entry.id()).unwrap().content().to_vec();
+        bytes
+    }
+
+    /// Every `(note_id, version)` a `CountingIndexer` was told is current.
+    type IndexCalls = Arc<Mutex<Vec<(String, u64)>>>;
+
+    /// An indexer that records every `mark_current` call: the "exactly once"
+    /// counter on the index side.
+    struct CountingIndexer {
+        calls: IndexCalls,
+    }
+
+    impl Indexer for CountingIndexer {
+        fn mark_current(&self, note_id: &str, version: u64) {
+            self.calls.lock().unwrap().push((note_id.to_string(), version));
+        }
+
+        fn state_for(&self, _note_id: &str) -> IndexState {
+            IndexState::Stale
+        }
+    }
+
+    fn counting_indexer() -> (Box<dyn Indexer>, IndexCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (Box::new(CountingIndexer { calls: Arc::clone(&calls) }), calls)
+    }
+
+    // Matrix row 1: "Dopo intent_recorded, prima della scrittura".
+
+    #[test]
+    fn crash_after_intent_recorded_before_any_write_results_in_failed_no_file_touched() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        // Deviation from the brief: the root is a git repository, so the
+        // retry below can reach `Ok` (on a non-git root it is GitPending).
+        init_test_repo_at(&root);
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterIntentRecorded);
+        let result = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterIntentRecorded))));
+        assert!(!root.join("note-a.record").exists(), "no file touched");
+        drop(vault);
+        let vault2 = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault2.journal_row_for_test(op).unwrap().state, WriteState::Failed);
+        assert!(!root.join("note-a.record").exists(), "recovery did not touch a file either");
+        assert!(matches!(vault2.read_note(&id), Err(StorageError::NotFound { .. })));
+        // caller can retry only with a NEW operation_id, per C1:
+        let retry = vault2.write_record_unchecked(&id, "content", Version(0), Uuid::new_v4()).unwrap();
+        assert_eq!(retry, Version(1));
+    }
+
+    // Matrix row 2, invalid-hash branch: "Dopo il rename, prima di
+    // journal_committed ... altrimenti ripristino esatto della before-image".
+
+    #[test]
+    fn crash_after_rename_with_an_invalid_hash_restores_the_exact_before_image_on_reopen() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op1 = Uuid::new_v4();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), op1).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let result = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
+            assert_eq!(vault.journal_row_for_test(op2).unwrap().state, WriteState::ContentPersisted);
+        }
+        // The new version is damaged on disk before the restart.
+        std::fs::write(root.join("note-a.record"), b"TORN WRITE").unwrap();
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let row2 = vault.journal_row_for_test(op2).unwrap();
+        assert_eq!(row2.state, WriteState::Failed, "rolled back, not rolled forward");
+        assert_eq!(row2.previous_state, Some(WriteState::ContentPersisted));
+        assert_eq!(
+            std::fs::read(root.join("note-a.record")).unwrap(),
+            serialize_record("v1", Version(1)),
+            "exact restore: same bytes, so same hash and same version"
+        );
+        assert!(!before_image_path(&root, &id, op2).exists(), "the before-image is consumed by the restore");
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
+        assert_eq!(commits_for_operation(&root, op2), 0, "a rolled-back operation is never committed to git");
+    }
+
+    // Matrix row 3: "Nuova versione con hash non valido -> Ripristino della
+    // before-image", detected by the writer's own step-5 verification.
+
+    #[test]
+    fn new_version_with_an_invalid_hash_is_detected_by_the_writer_and_restored_from_the_before_image() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let vault = Arc::new(Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap());
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterRenameBeforeJournalCommitted, paused_tx, resume_rx);
+        let op2 = Uuid::new_v4();
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            writer_vault.write_record_unchecked_with_injector(&writer_id, "v2", Version(1), op2, &injector)
+        });
+        paused_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("writer must reach the rename boundary");
+        // The writer has renamed v2 into place and recorded its hash, and is
+        // stopped before verifying it. Damage the file now.
+        std::fs::write(root.join("note-a.record"), b"TORN WRITE").unwrap();
+        resume_tx.send(()).unwrap();
+
+        let result = writer.join().unwrap();
+        assert!(matches!(result, Err(StorageError::Inconsistent { .. })), "the writer reports that its write did not land, got {result:?}");
+        assert_eq!(vault.journal_row_for_test(op2).unwrap().state, WriteState::Failed);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), serialize_record("v1", Version(1)));
+        assert!(!before_image_path(&root, &id, op2).exists(), "a terminal Failed row must not leave its before-image behind");
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
+        assert_eq!(commits_for_operation(&root, op2), 0);
+    }
+
+    // Matrix row 4: "Durante il ripristino della before-image -> Il
+    // ripristino riparte in modo idempotente; se la before-image e'
+    // illeggibile, stato inconsistente".
+
+    #[test]
+    fn crash_during_before_image_restore_restarts_idempotently_on_the_next_open() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let _ = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+        }
+        std::fs::write(root.join("note-a.record"), b"TORN WRITE").unwrap();
+
+        // Second process: recovery restores the before-image and crashes
+        // before it can finish the operation.
+        let injector = FaultInjector::trigger_at(FaultPoint::DuringBeforeImageRestore);
+        let result = Vault::open_with_injector(root.clone(), &journal_path, &injector);
+        assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::DuringBeforeImageRestore))), "recovery must be interrupted mid-restore");
+        {
+            let journal = Journal::open(&journal_path).unwrap();
+            let row = journal.get(op2).unwrap().unwrap();
+            assert_eq!(row.state, WriteState::Recovering);
+            assert_eq!(row.previous_state, Some(WriteState::ContentPersisted));
+        }
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), serialize_record("v1", Version(1)), "the restore itself happened");
+        assert!(before_image_path(&root, &id, op2).exists(), "the crash came before the before-image was consumed");
+
+        // Third process: the restore restarts and completes, without a
+        // second (corrupting) application.
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op2).unwrap().state, WriteState::Failed);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), serialize_record("v1", Version(1)));
+        assert!(!before_image_path(&root, &id, op2).exists());
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
+    }
+
+    #[test]
+    fn unreadable_before_image_during_restore_is_inconsistent_and_open_refuses_to_start() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let _ = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+        }
+        std::fs::write(root.join("note-a.record"), b"TORN WRITE").unwrap();
+        std::fs::remove_file(before_image_path(&root, &id, op2)).unwrap();
+
+        let result = Vault::open_with_default_indexer(root.clone(), &journal_path);
+        assert!(matches!(result, Err(StorageError::Inconsistent { ref note_id }) if note_id == "note-a"), "got {:?}", result.err());
+        assert_eq!(Journal::open(&journal_path).unwrap().get(op2).unwrap().unwrap().state, WriteState::Recovering, "left unresolved, never reported as Failed or committed");
+    }
+
+    // Matrix row 5: "Dopo journal_committed, prima di git_committed ->
+    // Roll-forward del commit git".
+
+    #[test]
+    fn crash_after_journal_committed_before_git_rolls_the_git_commit_forward_on_reopen() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterJournalCommittedBeforeGit);
+            let result = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterJournalCommittedBeforeGit))));
+            let row = vault.journal_row_for_test(op2).unwrap();
+            assert_eq!(row.state, WriteState::JournalCommitted);
+            assert_eq!(row.git_commit_oid, None);
+            assert_eq!(commits_for_operation(&root, op2), 0, "the crash came before any git commit");
+            assert!(before_image_path(&root, &id, op2).exists(), "kept until git_committed");
+            // JournalCommitted is the linearization point: already readable.
+            assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v2".into(), version: Version(2) });
+        }
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let row = vault.journal_row_for_test(op2).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent);
+        assert_eq!(row.previous_state, Some(WriteState::JournalCommitted));
+        assert_eq!(commits_for_operation(&root, op2), 1);
+        assert_eq!(committed_record_bytes(&root, row.git_commit_oid.as_deref().unwrap(), "note-a"), serialize_record("v2", Version(2)));
+        assert!(!before_image_path(&root, &id, op2).exists(), "deleted once git_committed is reached");
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v2".into(), version: Version(2) });
+    }
+
+    #[test]
+    fn crash_after_journal_committed_without_git_rests_as_git_pending_then_commits_once_git_exists() {
+        let (root, journal_path) = fresh_root_and_journal_path(); // not a git repository yet
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterJournalCommittedBeforeGit);
+            let result = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterJournalCommittedBeforeGit))));
+        }
+        {
+            // git_pending is an allowed resting state: open succeeds and the
+            // committed content is served.
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted);
+            assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content".into(), version: Version(1) });
+        }
+        init_test_repo_at(&root);
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent);
+        assert_eq!(commits_for_operation(&root, op), 1);
+        assert_eq!(committed_record_bytes(&root, row.git_commit_oid.as_deref().unwrap(), "note-a"), serialize_record("content", Version(1)));
+    }
+
+    // Matrix row 6: "Dopo git_committed, prima di index_current ->
+    // Ricostruzione dell'indice, nel frattempo index_stale".
+
+    #[test]
+    fn crash_after_git_committed_before_index_current_reaches_index_current_on_reopen_and_is_stale_meanwhile() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let (indexer, calls) = counting_indexer();
+            let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterGitCommittedBeforeIndex);
+            let result = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterGitCommittedBeforeIndex))));
+            let row = vault.journal_row_for_test(op).unwrap();
+            assert_eq!(row.state, WriteState::GitCommitted);
+            assert!(row.git_commit_oid.is_some());
+            assert!(calls.lock().unwrap().is_empty(), "the index step never ran");
+            assert_eq!(vault.index_state_for(&id), IndexState::Stale, "index_stale in the meantime");
+            assert_eq!(vault.read_note(&id).unwrap().content, "content");
+        }
+        let (indexer, calls) = counting_indexer();
+        let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(*calls.lock().unwrap(), vec![("note-a".to_string(), 1)], "the index step ran exactly once, on recovery");
+        assert_eq!(commits_for_operation(&root, op), 1, "recovery did not commit a second time");
+    }
+
+    // Matrix row 7: "Lettura concorrente in ciascuno dei momenti sopra ->
+    // L'API restituisce sempre la versione committata, anche se il file
+    // definitivo e' gia' sostituito".
+
+    #[test]
+    fn read_blocks_behind_a_paused_writer_holding_the_same_note_lock_and_then_sees_the_fully_committed_result() {
+        // Deviation from the brief: the root is a git repository (via
+        // open_test_vault_with_git_repo) so the resumed writer can return Ok,
+        // which the brief's `writer.join().unwrap().unwrap()` requires.
+        let (vault, _root) = open_test_vault_with_git_repo();
+        let vault = Arc::new(vault);
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+
+        let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterRenameBeforeJournalCommitted, pause_tx, resume_rx);
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            writer_vault.write_record_unchecked_with_injector(&writer_id, "v2", Version(1), Uuid::new_v4(), &injector)
+        });
+
+        pause_rx.recv().unwrap(); // writer has renamed the file but is paused BEFORE releasing its per-note lock
+
+        // Start a reader now. It must not be able to acquire the lock while the
+        // writer holds it, so prove it hasn't completed yet by racing it against
+        // a short timeout BEFORE resuming the writer.
+        let reader_vault = Arc::clone(&vault);
+        let reader_id = id.clone();
+        let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = reader_vault.read_note(&reader_id);
+            reader_done_tx.send(result).unwrap();
+        });
+        assert!(
+            reader_done_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "reader must still be blocked on the per-note lock while the writer holds it"
+        );
+
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        let record = reader_done_rx.recv().unwrap().unwrap();
+        assert_eq!(record.content, "v2", "reader unblocks only after the writer's full critical section, including journal_committed, completes");
+    }
+
+    #[test]
+    fn a_read_concurrent_with_each_write_fault_point_returns_only_a_committed_version() {
+        // The test above covers one point. This walks every write-path point.
+        // At AfterIntentRecorded the writer has not taken the per-note lock
+        // yet, and its intent row is invisible, so the reader is NOT blocked
+        // and sees v1. At every later point the writer holds the lock, so the
+        // reader waits and then sees the fully committed v2. It never sees the
+        // replaced file paired with v1's row, nor an error.
+        // (DuringBeforeImageRestore fires inside recovery, before any Vault
+        // exists, so no concurrent reader is possible there.)
+        for point in [
+            FaultPoint::AfterIntentRecorded,
+            FaultPoint::AfterRenameBeforeJournalCommitted,
+            FaultPoint::AfterJournalCommittedBeforeGit,
+            FaultPoint::AfterGitCommittedBeforeIndex,
+        ] {
+            let (vault, _root) = open_test_vault_with_git_repo();
+            let vault = Arc::new(vault);
+            let id = NoteId::parse("note-a").unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+
+            let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let injector = FaultInjector::pause_at(point, pause_tx, resume_rx);
+            let writer_vault = Arc::clone(&vault);
+            let writer_id = id.clone();
+            let writer = std::thread::spawn(move || {
+                writer_vault.write_record_unchecked_with_injector(&writer_id, "v2", Version(1), Uuid::new_v4(), &injector)
+            });
+            pause_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("writer never paused at {point:?}"));
+
+            let reader_vault = Arc::clone(&vault);
+            let reader_id = id.clone();
+            let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = reader_done_tx.send(reader_vault.read_note(&reader_id));
+            });
+
+            if point == FaultPoint::AfterIntentRecorded {
+                let record = reader_done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("reader must not block at {point:?}"))
+                    .unwrap();
+                assert_eq!(record, VaultRecord { content: "v1".into(), version: Version(1) }, "at {point:?}");
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap().unwrap();
+            } else {
+                assert!(
+                    reader_done_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+                    "reader must be blocked behind the writer at {point:?}"
+                );
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap().unwrap();
+                let record = reader_done_rx.recv().unwrap().unwrap();
+                assert_eq!(record, VaultRecord { content: "v2".into(), version: Version(2) }, "at {point:?}");
+            }
+        }
+    }
+
+    // Matrix row 8: "Retry dello stesso operation_id in ciascuno stato ->
+    // Esito gia' raggiunto, nessuna doppia applicazione".
+
+    #[test]
+    fn retry_of_a_failed_operation_id_returns_failed_again_without_reapplying() {
+        // Deviation from the brief: the brief retried in the SAME process,
+        // claiming the row was already Failed. Nothing marks it Failed at that
+        // point: a crash at AfterIntentRecorded leaves the row at
+        // IntentRecorded (that is what row 1 of reconcile resolves). The
+        // Failed state is reached on restart, so the retry happens after one.
+        // The in-process case is covered by
+        // `retry_of_an_operation_still_in_flight_is_refused_without_reapplying`.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterIntentRecorded);
+            let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        }
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::Failed);
+        let retry_same_id = vault.write_record_unchecked(&id, "content", Version(0), op);
+        assert!(
+            matches!(retry_same_id, Err(StorageError::OperationFailed { operation_id }) if operation_id == op),
+            "same operation_id on a failed op must not retry the write, got {retry_same_id:?}"
+        );
+        assert!(!root.join("note-a.record").exists(), "nothing was applied");
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::Failed);
+    }
+
+    #[test]
+    fn retry_of_a_conflict_failed_operation_id_returns_operation_failed_not_a_second_attempt() {
+        let (vault, _root) = open_test_vault_with_git_repo();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let op = Uuid::new_v4();
+        assert!(matches!(vault.write_record_unchecked(&id, "stale", Version(0), op), Err(StorageError::Conflict { .. })));
+        // The same operation_id, now with an expected version that WOULD
+        // match: the outcome already reached (Failed) stands.
+        let retry = vault.write_record_unchecked(&id, "stale", Version(1), op);
+        assert!(matches!(retry, Err(StorageError::OperationFailed { operation_id }) if operation_id == op), "got {retry:?}");
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
+    }
+
+    #[test]
+    fn retry_of_an_operation_still_in_flight_is_refused_without_reapplying() {
+        // A row at IntentRecorded or ContentPersisted, in a process that has
+        // not restarted, is either still being written by another call or was
+        // abandoned mid-flight. Neither can be safely resumed or failed from
+        // here; recovery on the next open resolves it.
+        for point in [FaultPoint::AfterIntentRecorded, FaultPoint::AfterRenameBeforeJournalCommitted] {
+            let (vault, root) = open_test_vault_with_git_repo();
+            let id = NoteId::parse("note-a").unwrap();
+            let op = Uuid::new_v4();
+            let injector = FaultInjector::trigger_at(point);
+            let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+            let state_before = vault.journal_row_for_test(op).unwrap().state;
+            let bytes_before = std::fs::read(root.join("note-a.record")).ok();
+
+            let retry = vault.write_record_unchecked(&id, "content", Version(0), op);
+            assert!(matches!(retry, Err(StorageError::OperationInProgress { operation_id }) if operation_id == op), "at {point:?}, got {retry:?}");
+            assert_eq!(vault.journal_row_for_test(op).unwrap().state, state_before, "at {point:?}: the row is untouched");
+            assert_eq!(std::fs::read(root.join("note-a.record")).ok(), bytes_before, "at {point:?}: the file is untouched");
+            assert_eq!(commits_for_operation(&root, op), 0, "at {point:?}");
+        }
+    }
+
+    #[test]
+    fn retry_of_a_journal_committed_operation_commits_to_git_exactly_once() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let (indexer, calls) = counting_indexer();
+        let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterJournalCommittedBeforeGit);
+        let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted);
+
+        // The retry resumes the chain from where it stopped.
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        // A second retry finds the outcome already reached.
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(commits_for_operation(&root, op), 1, "two retries, one commit");
+        assert_eq!(*calls.lock().unwrap(), vec![("note-a".to_string(), 1)], "two retries, one index step");
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content".into(), version: Version(1) });
+    }
+
+    #[test]
+    fn retry_of_a_git_pending_operation_commits_its_own_content_once_git_exists() {
+        // CommitResult::GitPending documents that a retry of the SAME
+        // operation_id advances the operation once a repository exists.
+        let (root, journal_path) = fresh_root_and_journal_path(); // not a git repository yet
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        assert!(matches!(vault.write_record_unchecked(&id, "content", Version(0), op), Err(StorageError::GitPending { .. })));
+        // Still no repository: the retry reports the same outcome, nothing new applied.
+        assert!(matches!(vault.write_record_unchecked(&id, "content", Version(0), op), Err(StorageError::GitPending { .. })));
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted);
+
+        init_test_repo_at(&root);
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent);
+        assert_eq!(commits_for_operation(&root, op), 1);
+        assert_eq!(committed_record_bytes(&root, row.git_commit_oid.as_deref().unwrap(), "note-a"), serialize_record("content", Version(1)));
+    }
+
+    #[test]
+    fn retry_of_a_git_pending_operation_after_a_successor_overwrote_it_commits_its_own_content_not_the_successors() {
+        // The retry-path counterpart of Task 7's fix-round finding I-2: the
+        // record on disk now belongs to op_b, so the retry of op_a must take
+        // op_a's bytes from op_b's before-image.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(matches!(vault.write_record_unchecked(&id, "content A", Version(0), op_a), Err(StorageError::GitPending { .. })));
+        assert!(matches!(vault.write_record_unchecked(&id, "content B", Version(1), op_b), Err(StorageError::GitPending { .. })));
+        init_test_repo_at(&root);
+
+        assert_eq!(vault.write_record_unchecked(&id, "ignored", Version(0), op_a).unwrap(), Version(1));
+        let row_a = vault.journal_row_for_test(op_a).unwrap();
+        assert_eq!(committed_record_bytes(&root, row_a.git_commit_oid.as_deref().unwrap(), "note-a"), serialize_record("content A", Version(1)));
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content B".into(), version: Version(2) }, "the retry never touched the record");
+    }
+
+    #[test]
+    fn retry_of_a_git_committed_operation_completes_the_index_step_exactly_once() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let (indexer, calls) = counting_indexer();
+        let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterGitCommittedBeforeIndex);
+        let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::GitCommitted);
+
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(*calls.lock().unwrap(), vec![("note-a".to_string(), 1)]);
+        assert_eq!(commits_for_operation(&root, op), 1);
+    }
+
+    #[test]
+    fn retry_of_an_index_current_operation_returns_its_version_without_a_second_write_commit_or_index_step() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let (indexer, calls) = counting_indexer();
+        let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        let bytes = std::fs::read(root.join("note-a.record")).unwrap();
+
+        // Different content and expected version: the operation_id alone
+        // decides, and its outcome is already reached.
+        assert_eq!(vault.write_record_unchecked(&id, "other content", Version(1), op).unwrap(), Version(1));
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), bytes, "no second write");
+        assert_eq!(commits_for_operation(&root, op), 1, "no second commit");
+        assert_eq!(calls.lock().unwrap().len(), 1, "no second index step");
+        assert!(read_before_image(&root, &id, op).is_err(), "no before-image was taken for the retry");
+    }
+
+    #[test]
+    fn retry_after_a_restart_returns_the_outcome_recovery_reached() {
+        // ContentPersisted at crash time, rolled forward to IndexCurrent by
+        // recovery: the retry reports success without applying anything.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        }
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        assert_eq!(commits_for_operation(&root, op), 1);
+    }
+
+    // Review Focus item 2: a second crash during recovery of the same operation.
+
+    #[test]
+    fn second_crash_during_recovery_of_the_same_operation_still_converges() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        let repo_dir = init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterJournalCommittedBeforeGit);
+            let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        } // first "crash": process 1 ends, op is stuck at JournalCommitted
+        {
+            // Second restart: reconcile is given an injector that interrupts it
+            // right after it marks the row Recovering (Task 7's
+            // FaultPoint::AfterMarkedRecoveringBeforeFixup) but before row 3's
+            // git-commit fix-up completes — reproducing a genuine second crash
+            // mid-recovery, not just a second ordinary open.
+            let second_open_injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
+            let result = Vault::open_with_injector(root.clone(), &journal_path, &second_open_injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(_))), "the second open's own recovery must be genuinely interrupted, not merely re-run to completion");
+            // The row is now genuinely AT Recovering, with previous_state recording
+            // JournalCommitted — not re-labeled back to JournalCommitted itself.
+            let journal = Journal::open(&journal_path).unwrap();
+            let row = journal.get(op).unwrap().unwrap();
+            assert_eq!(row.state, WriteState::Recovering, "second crash left the row genuinely at Recovering, mid-fixup");
+            assert_eq!(row.previous_state, Some(WriteState::JournalCommitted), "previous_state preserves what row 3's dispatch was resuming from");
+            assert_eq!(commits_for_operation(&repo_dir, op), 0);
+        }
+        let vault3 = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault3.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        // and the git history has exactly one commit for this operation_id, not two,
+        // despite two separate reconcile passes touching this row — verified via
+        // Tier 1 (the journal's own recorded Oid), the actual idempotency source:
+        assert!(find_commit_for_operation(&vault3.journal_for_test(), &repo_dir, op, ScanDepth::Unbounded).unwrap().is_some());
+        assert_eq!(commits_for_operation(&repo_dir, op), 1, "exactly one commit, counted in history");
+        assert_eq!(vault3.read_note(&id).unwrap().content, "content");
+    }
+
+    // Review Focus item 5: a repository dirtied between journal_committed
+    // and recovery.
+
+    #[test]
+    fn a_manual_git_commit_between_journal_committed_and_recovery_does_not_break_idempotent_commit() {
+        // Deviation from the brief: the JournalCommitted row is produced by the
+        // real write path interrupted at AfterJournalCommittedBeforeGit
+        // (instead of hand-seeded journal rows), and the end state is
+        // IndexCurrent, not GitCommitted: a row recovered from JournalCommitted
+        // runs row 3 and then row 4 in the same pass (Task 7's cascade).
+        let (root, journal_path) = fresh_root_and_journal_path();
+        let repo_dir = init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterJournalCommittedBeforeGit);
+            let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        }
+        // A manual, unrelated commit lands in the repo before recovery runs.
+        commit_unrelated_change_for_test(&repo_dir);
+        let manual_head = git2::Repository::open(&repo_dir).unwrap().head().unwrap().peel_to_commit().unwrap().id();
+
+        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent);
+        let oid = find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op, ScanDepth::Unbounded).unwrap();
+        assert!(oid.is_some(), "recovery's own commit still exists alongside the manual one");
+        assert_eq!(commits_for_operation(&repo_dir, op), 1);
+        let repo = git2::Repository::open(&repo_dir).unwrap();
+        let recovery_commit = repo.find_commit(oid.unwrap()).unwrap();
+        assert_eq!(recovery_commit.parent_id(0).unwrap(), manual_head, "built on top of the manual commit, which is kept");
+        assert_eq!(committed_record_bytes(&repo_dir, &oid.unwrap().to_string(), "note-a"), serialize_record("content", Version(1)));
     }
 }

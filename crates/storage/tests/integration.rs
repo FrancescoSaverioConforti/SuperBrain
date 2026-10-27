@@ -6,13 +6,17 @@ use uuid::Uuid;
 use storage::{CommitOutcome, CommitResult, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
 
 fn unique_test_dir() -> PathBuf {
+    // A per-process counter on top of the timestamp: parallel tests can read
+    // the same clock value, which made two tests share one directory.
+    static UNIQUE_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "superbrain-propose-test-{}-{}",
+        "superbrain-propose-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        UNIQUE_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir

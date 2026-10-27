@@ -359,6 +359,19 @@ mod tests {
     }
 
     #[test]
+    fn insert_intent_with_a_duplicate_operation_id_is_rejected_cleanly_not_a_panic() {
+        // Task 8: the second, SQL-level guard behind write_record_unchecked's
+        // own "operation_id already exists" check.
+        let journal = Journal::open_in_memory().unwrap();
+        let op = Uuid::new_v4();
+        journal.insert_intent(op, "note-a", 0).unwrap();
+        journal.advance(op, WriteState::Failed, AdvanceFields::none()).unwrap();
+        let err = journal.insert_intent(op, "note-a", 0).unwrap_err();
+        assert!(matches!(err, JournalError::Sqlite(_)), "got {err:?}");
+        assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed, "the existing row is untouched");
+    }
+
+    #[test]
     fn advance_through_the_full_chain_updates_state_each_time() {
         let journal = Journal::open_in_memory().unwrap();
         let op = Uuid::new_v4();

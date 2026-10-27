@@ -34,7 +34,10 @@
 //!   `before_image_hash` (a first write, so there is nothing to restore), it
 //!   becomes `Failed`. If no operation has ever committed the note, the
 //!   unverified record is also removed. A recorded before-image that cannot be
-//!   restored or does not verify gives `Inconsistent`.
+//!   restored or does not verify gives `Inconsistent`. A pass interrupted
+//!   after the restore (`FaultPoint::DuringBeforeImageRestore`) is resumed
+//!   idempotently: the next pass finds the record already equal to the
+//!   before-image and only completes the deletion and the `Failed` advance.
 //! - `JournalCommitted`: `find_commit_for_operation` with
 //!   `ScanDepth::Unbounded`, always. A bounded miss would be ambiguous, and a
 //!   `commit_operation` call on that ambiguity could duplicate a commit. A
@@ -143,7 +146,7 @@ pub(crate) fn reconcile(
         injector
             .check(FaultPoint::AfterMarkedRecoveringBeforeFixup)
             .map_err(|Interrupted::At(point)| ReconcileError::Interrupted(point))?;
-        match resolve(root, journal, repo_path, indexer, &row, origin)? {
+        match resolve(root, journal, repo_path, indexer, &row, origin, injector)? {
             Outcome::Completed => report.recovered.push(op),
             Outcome::Failed => report.failed.push(op),
             Outcome::GitPending(reason) => {
@@ -185,6 +188,7 @@ fn resolve(
     indexer: &dyn Indexer,
     row: &OperationRow,
     origin: WriteState,
+    injector: &FaultInjector,
 ) -> Result<Outcome, ReconcileError> {
     let op = row.operation_id;
     let mut at = origin;
@@ -196,7 +200,7 @@ fn resolve(
                 return Ok(Outcome::Failed);
             }
             // Row 2: roll forward on a verified hash, else roll back to Failed.
-            WriteState::ContentPersisted => match fix_content_persisted(root, journal, row)? {
+            WriteState::ContentPersisted => match fix_content_persisted(root, journal, row, injector)? {
                 WriteState::Failed => return Ok(Outcome::Failed),
                 next => next,
             },
@@ -247,7 +251,12 @@ fn resolve(
 /// `before_image_path` column is not used, because the write path never fills
 /// it. The row's `operation_id` always identifies the before-image uniquely,
 /// so the derived path needs no second source of truth.
-fn fix_content_persisted(root: &Path, journal: &Journal, row: &OperationRow) -> Result<WriteState, ReconcileError> {
+fn fix_content_persisted(
+    root: &Path,
+    journal: &Journal,
+    row: &OperationRow,
+    injector: &FaultInjector,
+) -> Result<WriteState, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
     let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
@@ -305,6 +314,12 @@ fn fix_content_persisted(root: &Path, journal: &Journal, row: &OperationRow) -> 
         if content_hash(&restored) != before_hash {
             return Err(inconsistent(op, "before-image restore failed: restored record does not verify"));
         }
+        // "Durante il ripristino della before-image": the record is restored
+        // but the operation is not yet resolved and its before-image still
+        // exists. Checked only when this pass performed the restore itself.
+        injector
+            .check(FaultPoint::DuringBeforeImageRestore)
+            .map_err(|Interrupted::At(point)| ReconcileError::Interrupted(point))?;
     }
 
     // The restore is complete and verified. Delete the before-image BEFORE
@@ -392,7 +407,7 @@ enum GitStep {
 ///
 /// `None` if neither is available. The caller then leaves the row pending
 /// rather than guessing.
-fn own_content(
+pub(crate) fn own_content(
     root: &Path,
     journal: &Journal,
     row: &OperationRow,
