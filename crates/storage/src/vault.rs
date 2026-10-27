@@ -191,6 +191,37 @@ pub struct Vault {
     /// around each individual journal call. This is unrelated to, and does
     /// not substitute for, the per-note lock's reader-vs-writer exclusion.
     journal: Mutex<Journal>,
+    /// Serializes the git-commit sequence (`find_commit_for_operation` +
+    /// `commit_operation` + the journal advance that records the resulting
+    /// `Oid`) across ALL notes, not just within one note (Task 5 fix round,
+    /// independent-review finding I1).
+    ///
+    /// The per-note lock map above only serializes writers (and readers) of
+    /// the SAME note. Two threads writing to two DIFFERENT notes take
+    /// different per-note locks and can run their chain extensions
+    /// concurrently. Both would read the same `HEAD`, build their own tree
+    /// via `TreeBuilder`, and call `repo.commit(Some(branch), ..., &[&parent])`
+    /// — but a git branch ref update requires the ref's current tip to
+    /// still equal the commit's first parent, so the second commit to
+    /// actually update the ref fails (libgit2's "current tip is not the
+    /// first parent" / `GIT_EMODIFIED`). Without this lock that failure
+    /// surfaced as a hard `StorageError::Git` for the loser's otherwise-
+    /// successful write (its content was already durably `JournalCommitted`),
+    /// rather than the resumable `GitPending`-style outcome the rest of this
+    /// plan treats git-layer contention as.
+    ///
+    /// Lock ordering (deadlock-free, matching the per-note lock's existing
+    /// discipline): the per-note lock is always acquired FIRST, in
+    /// `write_record_unchecked`'s step 2, before this lock is ever touched.
+    /// This lock is acquired only within that per-note critical section,
+    /// held only for the duration of the git-commit sequence itself (step
+    /// 7), and is never held while attempting to acquire a per-note lock or
+    /// the journal mutex's own short-lived locks (which are taken and
+    /// released individually, not held across the git sequence). Since this
+    /// lock is always acquired after the per-note lock and never before it,
+    /// and no code path re-enters a per-note lock while already holding
+    /// one, two threads can never form a lock-ordering cycle through it.
+    git_lock: Mutex<()>,
 }
 
 impl Vault {
@@ -204,6 +235,7 @@ impl Vault {
             root,
             locks: Mutex::new(HashMap::new()),
             journal: Mutex::new(journal),
+            git_lock: Mutex::new(()),
         })
     }
 
@@ -472,29 +504,50 @@ impl Vault {
         // authoritative; Tier 2 is a bounded defensive history scan) so a
         // re-entrant call for an operation that already has a commit never
         // creates a second one.
-        let existing_oid = find_commit_for_operation(
-            &self.journal.lock().unwrap(),
-            &self.root,
-            operation_id,
-            ScanDepth::Bounded(500),
-        )
-        .map_err(|e| git_err(note_id, e))?;
+        //
+        // The whole find-then-commit-then-record sequence is serialized by
+        // `git_lock` across ALL notes (fix round, independent-review finding
+        // I1): two threads writing to two DIFFERENT notes hold DIFFERENT
+        // per-note locks and would otherwise both read the same HEAD and
+        // race to update the same branch ref, and the loser's otherwise-
+        // successful commit_operation call would fail outright. Acquired
+        // here, strictly after the per-note lock (already held since step
+        // 2), never before it — see `git_lock`'s own doc comment for the
+        // full lock-ordering argument.
+        {
+            let _git_guard = self.git_lock.lock().unwrap();
 
-        let git_oid = match existing_oid {
-            Some(oid) => oid,
-            None => commit_operation(&self.root, operation_id, note_id.as_str(), &record_path)
-                .map_err(|e| git_err(note_id, e))?,
-        };
-        // Recording the Oid and advancing to GitCommitted happen on the SAME
-        // journal write (AdvanceFields::git_oid), so there is no window
-        // where the state says GitCommitted but git_commit_oid is unset —
-        // this covers both the idempotent re-entry (Tier 2 found it but the
-        // journal row didn't have it recorded yet) and the fresh-commit case.
-        self.journal
-            .lock()
-            .unwrap()
-            .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
-            .map_err(journal_err)?;
+            let existing_oid = find_commit_for_operation(
+                &self.journal.lock().unwrap(),
+                &self.root,
+                operation_id,
+                ScanDepth::Bounded(500),
+            )
+            .map_err(|e| git_err(note_id, e))?;
+
+            let git_oid = match existing_oid {
+                Some(oid) => oid,
+                None => commit_operation(&self.root, operation_id, note_id.as_str(), &record_path)
+                    .map_err(|e| git_err(note_id, e))?,
+            };
+            // Recording the Oid and advancing to GitCommitted happen on the
+            // SAME journal write (AdvanceFields::git_oid), so there is no
+            // window where the state says GitCommitted but git_commit_oid
+            // is unset — this covers both the idempotent re-entry (Tier 2
+            // found it but the journal row didn't have it recorded yet) and
+            // the fresh-commit case. Also still under git_lock: otherwise a
+            // second thread could re-run find_commit_for_operation between
+            // this commit and this journal write, find nothing (Tier 1
+            // unset, Tier 2 racing the same HEAD this thread just moved past)
+            // and attempt its own commit_operation against a now-stale
+            // assumption.
+            self.journal
+                .lock()
+                .unwrap()
+                .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
+                .map_err(journal_err)?;
+            // _git_guard drops here, releasing git_lock.
+        }
 
         // Per spec: the before-image is deleted only after git_committed.
         delete_before_image(&self.root, note_id, operation_id)?;
@@ -754,6 +807,65 @@ mod tests {
         assert_eq!(row.state, WriteState::GitCommitted);
         assert!(row.git_commit_oid.is_some(), "the commit's Oid must be recorded on the row itself (Tier 1 idempotency source)");
         assert!(find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op, ScanDepth::Bounded(500)).unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_writes_to_different_notes_both_reach_git_committed_without_a_hard_git_error() {
+        // Fix round, independent-review finding I1: two threads writing to
+        // TWO DIFFERENT notes take DIFFERENT per-note locks and, before the
+        // git_lock fix, could run their git-commit sequences concurrently —
+        // both reading the same HEAD, both building a tree via TreeBuilder,
+        // both calling repo.commit against the same branch ref. Only one
+        // ref update can win; the loser's commit_operation call would fail
+        // outright (libgit2's "current tip is not the first parent" /
+        // GIT_EMODIFIED), surfacing as a hard StorageError::Git for a write
+        // whose content was already durably JournalCommitted. With git_lock
+        // serializing the find-then-commit-then-record sequence across all
+        // notes, both writers must succeed cleanly.
+        let (vault, repo_dir) = open_test_vault_with_git_repo();
+        let vault = Arc::new(vault);
+        let id_a = NoteId::parse("note-a").unwrap();
+        let id_b = NoteId::parse("note-b").unwrap();
+        let op_a = Uuid::new_v4();
+        let op_b = Uuid::new_v4();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let vault_a = Arc::clone(&vault);
+        let id_a2 = id_a.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let thread_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            vault_a.write_record_unchecked(&id_a2, "content-a", Version(0), op_a)
+        });
+
+        let vault_b = Arc::clone(&vault);
+        let id_b2 = id_b.clone();
+        let barrier_b = Arc::clone(&barrier);
+        let thread_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            vault_b.write_record_unchecked(&id_b2, "content-b", Version(0), op_b)
+        });
+
+        let result_a = thread_a.join().unwrap();
+        let result_b = thread_b.join().unwrap();
+
+        result_a.unwrap_or_else(|e| panic!("writer for note-a must succeed, got {e:?}"));
+        result_b.unwrap_or_else(|e| panic!("writer for note-b must succeed, got {e:?}"));
+
+        let row_a = vault.journal_row_for_test(op_a).unwrap();
+        let row_b = vault.journal_row_for_test(op_b).unwrap();
+        assert_eq!(row_a.state, WriteState::GitCommitted, "note-a's write must reach GitCommitted, not get stuck behind a lost ref race");
+        assert_eq!(row_b.state, WriteState::GitCommitted, "note-b's write must reach GitCommitted, not get stuck behind a lost ref race");
+        assert!(row_a.git_commit_oid.is_some());
+        assert!(row_b.git_commit_oid.is_some());
+        assert_ne!(row_a.git_commit_oid, row_b.git_commit_oid, "each note's write must have its own distinct commit");
+
+        // Both commits must actually be reachable from HEAD: the repository
+        // ends up with one commit per note, neither write's commit lost or
+        // silently dropped by the ref race.
+        assert!(find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op_a, ScanDepth::Unbounded).unwrap().is_some());
+        assert!(find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op_b, ScanDepth::Unbounded).unwrap().is_some());
     }
 
     #[test]
