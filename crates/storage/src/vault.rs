@@ -11,6 +11,7 @@ use crate::fault::{FaultInjector, FaultPoint};
 use crate::git::{commit_operation, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal};
 use crate::note_id::NoteId;
+use crate::recovery::{reconcile, ReconcileError};
 
 /// The separator between the version header line and the raw note content
 /// in the on-disk record format.
@@ -128,6 +129,15 @@ pub enum StorageError {
     /// as `StorageError::Journal` above).
     #[error("git error: {0}")]
     Git(String),
+    /// A pipeline was stopped at `FaultPoint` by a test's armed
+    /// `FaultInjector`. Production code passes `FaultInjector::none()`
+    /// everywhere and never produces this. Today the only source is
+    /// `Vault::open_with_injector` propagating an interrupted `reconcile`;
+    /// Task 8 adds the write-path source. `FaultPoint` is nominally `pub` but
+    /// lives in the private `fault` module, so code outside this crate can
+    /// match this variant (`Interrupted(_)`) but cannot name the point.
+    #[error("interrupted at {0:?}")]
+    Interrupted(FaultPoint),
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -258,8 +268,63 @@ impl Vault {
     /// at `journal_path` (created if it does not yet exist), using `indexer`
     /// for the index step. Crate-private because [`Indexer`] is: callers
     /// outside this crate use [`Vault::open_with_default_indexer`].
+    ///
+    /// Before returning, runs the startup reconciliation pass
+    /// (`recovery::reconcile`, Task 7) over every non-terminal journal row,
+    /// with the vault root as the git repository. A `Vault` value exists only
+    /// if that pass succeeded. If any operation cannot be brought to a safe
+    /// state, this returns `StorageError::Inconsistent` (fail closed at
+    /// startup), so no caller can use a vault with a known-bad operation left
+    /// unresolved. Rows left at `JournalCommitted` because git is unavailable
+    /// (`git_pending`) are an allowed resting state and do not block opening.
     pub(crate) fn open(root: PathBuf, journal_path: &Path, indexer: Box<dyn Indexer>) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, indexer, &FaultInjector::none())
+    }
+
+    /// Opens a vault rooted at `root` with the A2 default indexer
+    /// ([`NullIndexer`]), backed by the journal at `journal_path`. Replaces
+    /// A1's `Vault::new`: every caller supplies a journal path, since A1 had
+    /// no production caller to break. Runs the same startup reconciliation
+    /// as `Vault::open` and fails closed the same way.
+    pub fn open_with_default_indexer(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
+        Self::open(root, journal_path, Box::new(NullIndexer))
+    }
+
+    /// Test-only sibling of [`Vault::open_with_default_indexer`] (also uses
+    /// [`NullIndexer`]) that threads `injector` into the internal `reconcile`
+    /// call instead of `FaultInjector::none()`. This lets a test interrupt
+    /// recovery itself, for example at
+    /// `FaultPoint::AfterMarkedRecoveringBeforeFixup`. An interrupted pass
+    /// comes back as `StorageError::Interrupted`, never as a usable `Vault`.
+    #[cfg(test)]
+    pub(crate) fn open_with_injector(root: PathBuf, journal_path: &Path, injector: &FaultInjector) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, Box::new(NullIndexer), injector)
+    }
+
+    fn open_reconciled(
+        root: PathBuf,
+        journal_path: &Path,
+        indexer: Box<dyn Indexer>,
+        injector: &FaultInjector,
+    ) -> Result<Self, StorageError> {
         let journal = Journal::open(journal_path).map_err(journal_err)?;
+        // No Vault lock is taken here: this runs before the Vault exists, so
+        // nothing else can be writing or committing through it. See
+        // `recovery`'s module docs, "Concurrency".
+        match reconcile(&root, &journal, &root, indexer.as_ref(), injector) {
+            Ok(_report) => {}
+            Err(ReconcileError::Inconsistent { operation_id, reason: _ }) => {
+                let note_id = journal
+                    .get(operation_id)
+                    .map_err(journal_err)?
+                    .map(|row| row.note_id)
+                    .unwrap_or_else(|| format!("<unknown note for operation {operation_id}>"));
+                return Err(StorageError::Inconsistent { note_id });
+            }
+            Err(ReconcileError::Interrupted(point)) => return Err(StorageError::Interrupted(point)),
+            Err(ReconcileError::Journal(e)) => return Err(journal_err(e)),
+            Err(ReconcileError::Io(e)) => return Err(StorageError::Io(e)),
+        }
         Ok(Vault {
             root,
             locks: Mutex::new(HashMap::new()),
@@ -267,14 +332,6 @@ impl Vault {
             git_lock: Mutex::new(()),
             indexer,
         })
-    }
-
-    /// Opens a vault rooted at `root` with the A2 default indexer
-    /// ([`NullIndexer`]), backed by the journal at `journal_path`. Replaces
-    /// A1's `Vault::new`: every caller supplies a journal path, since A1 had
-    /// no production caller to break.
-    pub fn open_with_default_indexer(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
-        Self::open(root, journal_path, Box::new(NullIndexer))
     }
 
     /// The indexer's own verdict on whether the index reflects `note_id`'s
@@ -678,11 +735,26 @@ impl Vault {
     /// model is explicitly single-process and non-adversarial (see
     /// `eval/results/A1/evidence.md`, "Known limitations").
     fn record_path_checked(&self, note_id: &NoteId) -> Result<PathBuf, StorageError> {
-        let candidate = self.root.join(format!("{}.record", note_id.as_str()));
-        let canonical_root = std::fs::canonicalize(&self.root).map_err(StorageError::Io)?;
-        ensure_resolves_inside_root(&canonical_root, &candidate, note_id)?;
-        Ok(candidate)
+        record_path_checked(&self.root, note_id)
     }
+}
+
+/// The free-function body of [`Vault::record_path_checked`], shared with
+/// `recovery::reconcile`, which runs before any `Vault` value exists but
+/// must touch record files under exactly the same containment check.
+pub(crate) fn record_path_checked(root: &Path, note_id: &NoteId) -> Result<PathBuf, StorageError> {
+    let candidate = root.join(format!("{}.record", note_id.as_str()));
+    let canonical_root = std::fs::canonicalize(root).map_err(StorageError::Io)?;
+    ensure_resolves_inside_root(&canonical_root, &candidate, note_id)?;
+    Ok(candidate)
+}
+
+/// Test-only access to the private on-disk record serializer, so tests in
+/// other modules (`recovery`) can seed record files byte-identical to what
+/// `write_record_unchecked` would have written.
+#[cfg(test)]
+pub(crate) fn serialize_record_for_test(content: &str, version: Version) -> Vec<u8> {
+    serialize_record(content, version)
 }
 
 /// Fails with [`StorageError::PathEscapesVaultRoot`] unless `candidate`

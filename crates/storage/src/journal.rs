@@ -21,13 +21,14 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS operations (
     before_image_hash TEXT,
     before_image_path TEXT,
     git_commit_oid TEXT,
+    previous_state TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )";
 
 // Columns in the order `row_from_sql` reads them.
 const SELECT_ROWS: &str = "SELECT operation_id, note_id, state, expected_version, new_version, \
-    content_hash, before_image_hash, before_image_path, git_commit_oid FROM operations";
+    content_hash, before_image_hash, before_image_path, git_commit_oid, previous_state FROM operations";
 
 // SQLite-side UTC timestamp with millisecond precision; keeps the journal free of a clock dependency.
 const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -40,7 +41,7 @@ pub(crate) enum JournalError {
     InvalidState(String),
 }
 
-/// One journal row. `previous_state` arrives with the `Recovering` column in a later task.
+/// One journal row.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OperationRow {
     pub(crate) operation_id: Uuid,
@@ -52,6 +53,13 @@ pub(crate) struct OperationRow {
     pub(crate) before_image_hash: Option<String>,
     pub(crate) before_image_path: Option<String>,
     pub(crate) git_commit_oid: Option<String>,
+    /// The state this row was in when `recovery::reconcile` marked it
+    /// `Recovering`. Written on the SAME journal write that moves the row to
+    /// `Recovering`, so a row found at `Recovering` (a crash interrupted a
+    /// previous reconcile pass) always says which fault-matrix row to resume
+    /// from. Not cleared once the row resolves — it stays as an audit trail.
+    /// `None` for a row that was never marked `Recovering`.
+    pub(crate) previous_state: Option<WriteState>,
 }
 
 /// Optional columns that `Journal::advance` may set alongside a state change.
@@ -63,6 +71,7 @@ pub(crate) struct AdvanceFields {
     before_image_hash: Option<String>,
     before_image_path: Option<String>,
     git_commit_oid: Option<String>,
+    previous_state: Option<WriteState>,
 }
 
 impl AdvanceFields {
@@ -96,6 +105,17 @@ impl AdvanceFields {
     pub(crate) fn git_oid(oid: git2::Oid) -> Self {
         Self {
             git_commit_oid: Some(oid.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// Records the state a row is leaving when `recovery::reconcile` moves it
+    /// to `Recovering`, on the SAME journal write as that state change — so
+    /// there is no window where a row is at `Recovering` without knowing what
+    /// to resume from.
+    pub(crate) fn previous_state(state: WriteState) -> Self {
+        Self {
+            previous_state: Some(state),
             ..Self::default()
         }
     }
@@ -167,6 +187,7 @@ impl Journal {
                     before_image_hash = COALESCE(?5, before_image_hash), \
                     before_image_path = COALESCE(?6, before_image_path), \
                     git_commit_oid = COALESCE(?7, git_commit_oid), \
+                    previous_state = COALESCE(?9, previous_state), \
                     updated_at = {NOW_SQL} \
                  WHERE operation_id = ?1 AND state = ?8"
             ),
@@ -179,6 +200,7 @@ impl Journal {
                 fields.before_image_path,
                 fields.git_commit_oid,
                 state_to_sql(current.state),
+                fields.previous_state.map(state_to_sql),
             ],
         )?;
         if updated != 1 {
@@ -235,10 +257,8 @@ impl Journal {
         Ok(row)
     }
 
-    /// Every operation that is neither `IndexCurrent` nor `Failed`, oldest first.
-    // No production call site until Task 7's recovery pass (reconcile) scans
-    // in-flight operations on Vault::open.
-    #[allow(dead_code)]
+    /// Every operation that is neither `IndexCurrent` nor `Failed`, oldest
+    /// first. Consumed by `recovery::reconcile` on `Vault::open`.
     pub(crate) fn non_terminal_operations(&self) -> Result<Vec<OperationRow>, JournalError> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_ROWS} WHERE state NOT IN (?1, ?2) ORDER BY rowid ASC"
@@ -299,6 +319,10 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         before_image_hash: row.get(6)?,
         before_image_path: row.get(7)?,
         git_commit_oid: row.get(8)?,
+        previous_state: row
+            .get::<_, Option<String>>(9)?
+            .map(|s| state_from_sql(&s).map_err(|e| conversion_error(9, e)))
+            .transpose()?,
     })
 }
 

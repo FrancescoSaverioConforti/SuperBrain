@@ -83,6 +83,7 @@ mod git;
 mod journal;
 mod note_id;
 mod propose;
+mod recovery;
 mod vault;
 
 // `atomic` is deliberately NOT re-exported: `atomic_write` is a raw,

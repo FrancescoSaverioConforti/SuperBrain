@@ -6,9 +6,15 @@
 //! an exact step boundary without killing a process. Production code always
 //! uses [`FaultInjector::none`], which never interrupts.
 
-/// The crash-injectable boundaries in the write pipeline.
+/// The crash-injectable boundaries in the write pipeline and in recovery.
+///
+/// Nominally `pub` (not `pub(crate)`) only because the public
+/// `StorageError::Interrupted` variant carries it: a `pub(crate)` type in a
+/// `pub` enum's field trips the `private_interfaces` lint under `-D warnings`.
+/// This module is private and the type is not re-exported, so it stays
+/// unnameable outside this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FaultPoint {
+pub enum FaultPoint {
     AfterIntentRecorded,
     AfterRenameBeforeJournalCommitted,
     // The remaining three variants have no production call site until Task
@@ -20,6 +26,12 @@ pub(crate) enum FaultPoint {
     AfterGitCommittedBeforeIndex,
     #[allow(dead_code)]
     DuringBeforeImageRestore,
+    /// Checked inside `recovery::reconcile`, immediately after it marks a
+    /// non-terminal row `Recovering` (recording `previous_state`) and before
+    /// that row's fix-up runs. Lets a test leave a row genuinely AT
+    /// `Recovering`, as a crash mid-recovery would. Only ever armed by tests
+    /// (`trigger_at` is `#[cfg(test)]`).
+    AfterMarkedRecoveringBeforeFixup,
 }
 
 /// Returned when an armed injector interrupts a pipeline at `point`.
