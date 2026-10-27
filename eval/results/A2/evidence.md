@@ -94,8 +94,9 @@ sources ok`.** Full tail of the actual re-run:
 advisories ok, bans ok, licenses ok, sources ok
 ```
 
-(preceded only by the same two pre-existing, informational `duplicate`/`license-not-encountered`
-warnings described below — none of which fail the check.)
+(preceded only by 5 pre-existing, informational warnings — 2 `duplicate` + 3
+`license-not-encountered`, described below, current as of the `git2` 0.21 upgrade — none of
+which fail the check.)
 
 **This section originally reported `advisories FAILED` at this task's first pass** (2026-10-27,
 commit `9771c1e`), on three RustSec unsoundness advisories newly published against `git2`
@@ -115,8 +116,14 @@ failing. **The check is green as of commit `247df9e`** (a separate, later commit
   explicitly.
 - **`bans ok`, `sources ok`**: clean except for two pre-existing informational `duplicate`
   warnings (`hashbrown` 0.14.5/0.17.1 via `rusqlite`→`hashlink` vs. `domain`→`serde_yaml`→
-  `indexmap`; `syn` 2.0.119/3.0.9 via `thiserror` vs. `git2`'s own `url`→`idna`→`icu_*` chain)
-  and three `license-not-encountered` informational warnings carried over unchanged from A1.
+  `indexmap`; `syn` 2.0.119/3.0.9) and three `license-not-encountered` informational warnings
+  carried over unchanged from A1. **Fix-round correction:** this bullet originally attributed
+  the `syn` 3.0.9 duplicate to `git2`'s own `url`→`idna`→`icu_*` chain. That was accurate for
+  `git2` 0.19.0 but is now stale after the `git2` 0.21 upgrade (Section 2.2.1), which drops
+  that entire transitive chain. `cargo tree -p storage -i syn@3.0.9` now shows `syn` 3.0.9
+  coming from `serde_derive` → `serde` → `domain`/`storage` (and, separately, `serde_yaml` →
+  `domain`) instead — unrelated to `git2` entirely. `syn` 2.0.119 still comes from
+  `thiserror-impl` → `thiserror`, as before.
   None of these fail the check; they are the same class of informational noise A1's evidence
   file already recorded as non-blocking.
 - **`advisories FAILED`**: three new RustSec advisories were found against `git2` 0.19.0,
@@ -248,80 +255,132 @@ Every one of the 14 missed mutants is examined below against the actual source, 
 brief's acceptance threshold ("Ogni mutante sopravvissuto esaminato e giustificato o coperto da
 un nuovo test"). No new test was added — per this task's "no code changes" scope, every
 survivor below is **justified** as a documented test-coverage gap rather than closed, and
-recorded here so it is not silently absorbed. If this task's scope had permitted new tests, the
-IO-error-path cluster (items 1–13 below) is the concrete, actionable work a follow-up task
-should do.
+recorded here so it is not silently absorbed.
 
-**Cluster A — un-exercised non-`NotFound` I/O error branches (13 of 14 survivors).** Every
-item in this cluster shares one root cause: the test suite only ever induces a *missing file*
-(`NotFound`) at these call sites — never a different I/O failure (permission denied, a locked
-file, a directory where a file was expected, disk-full, etc.). Each of these call sites has a
-`match`/`if` arm that specifically distinguishes `NotFound` (treated as an expected, recoverable
-case) from any other `io::Error` (propagated as a hard failure). Mutating the guard
-(`==`→`!=`) or collapsing it to a constant (`true`/`false`) changes which branch handles
-`NotFound` versus "every other error," and no test fails, because no test ever produces the
-"every other error" input in the first place.
+**Fix-round correction (independent review):** this section originally claimed all 13
+I/O-error-path survivors shared one uniform "Windows-hard to close" root cause. On closer,
+per-mutant tracing against the actual source (re-done for this fix round), that claim does not
+hold uniformly. The 13 split into two groups with genuinely different closing cost, plus one
+mutant with its own distinct root cause — three groups below, not one.
 
-1. `crates/storage/src/git.rs:221` — `open_repo`: `e.code() == git2::ErrorCode::NotFound` → `true`.
-   Collapsing the guard to always-true would make *every* `git2::Repository::open` failure
-   (not just "no repository here") map to `GitError::NoRepository`/`git_pending`, silently
-   hiding a real git error (corrupt `.git`, permissions) behind the ordinary "git not
-   initialized yet" path. No test opens a git repository in a state that fails for a reason
-   other than "doesn't exist." **Justified as a real, if narrow, coverage gap**: a test that
-   corrupts `.git` (e.g. truncates `.git/HEAD`) and asserts `GitError::Git2` rather than
-   `NoRepository` would close it; not added here per this task's scope.
-2. `crates/storage/src/recovery.rs:272` (×2: the guard-to-`true` mutant and the `==`→`!=`
-   mutant) — `fix_content_persisted`'s on-disk-read: same pattern, deciding whether a missing
-   record (`None`, to be recreated from before-image) or a different I/O error
-   (`ReconcileError::Io`, hard-fails reconcile) is reported. No test makes this specific read
-   fail with anything but `NotFound`. **Justified**, same gap shape as item 1.
-3. `crates/storage/src/recovery.rs:290` — `on_disk_hash.is_some() && journal.last_committed_for_note(...)?.is_none()` →
-   `&&`→`||`. This guards whether reconcile deletes an unverified record with no
-   before-image when no committed row exists for the note. Flipping to `||` would delete the
-   record even when `on_disk_hash` is `None` (nothing to delete) or even when a committed row
-   *does* exist for the note (which the comment explicitly says must be preserved: "the record
-   is left alone rather than deleting content another row may describe"). No test constructs
-   the specific combination needed to observe the behavioral difference (a `ContentPersisted`
-   row with no before-image, no on-disk file, on a note that nonetheless already has a
-   different committed row). **Justified as a real gap worth a dedicated test**, not added
-   here.
-4. `crates/storage/src/recovery.rs:293` (×3: guard-to-`true`, guard-to-`false`, `==`→`!=`) —
-   the `remove_file` cleanup inside that same branch: distinguishes "file was already gone"
-   (fine) from "removal failed for another reason" (`ReconcileError::Io`). Same
-   un-exercised-non-`NotFound`-error pattern as items 1–2. **Justified**, same gap shape.
-5. `crates/storage/src/recovery.rs:423` (×3: guard-to-`true`, guard-to-`false`, `==`→`!=`) —
-   `own_content`'s on-disk read, deciding whether a missing file (fall through to checking
-   successor before-images) or another I/O error (hard-fails reconcile) is reported. Same
-   pattern again. **Justified**, same gap shape.
-6. `crates/storage/src/vault.rs:468` — `read_note_locked`'s read: `e.kind() ==
-   std::io::ErrorKind::NotFound`, `==`→`!=`. Same pattern on the live read path: distinguishes
-   `StorageError::NotFound` from `StorageError::Io`. No test makes this specific read fail with
-   a non-`NotFound` error. **Justified**, same gap shape.
-7. `crates/storage/src/vault.rs:1088` — `delete_before_image`: guard-to-`true` on the
-   `remove_file`'s `NotFound` arm. Same pattern; a mutant that always treats removal failure as
-   "already gone" would mask a genuine before-image deletion failure. **Justified**, same gap
-   shape.
-8. `crates/storage/src/vault.rs:1101` — `read_before_image`: `==`→`!=` on the same `NotFound`
-   distinction for reading a before-image back. **Justified**, same gap shape.
+**Group A — genuinely need a non-`NotFound` I/O error to kill (5 of 14 survivors).** These
+call sites only branch away from their current behavior if the underlying I/O call fails for a
+reason *other than* "file genuinely missing" (permission denied, a locked file, a directory
+substituted for a file, disk-full, or — for the `remove_file` case below — the file vanishing
+in the narrow window between an earlier read and this call, which is itself a race, not an
+ordinary condition a test can set up by just deleting a file beforehand). No test induces any
+of these specific conditions, and doing so on Windows has no `chmod`-style lever — the
+practical options are a locked file handle or a directory-for-file substitution, which is new
+test infrastructure, not a documentation fix.
 
-   **Why this cluster is accepted as justified rather than closed in this task:** closing it
-   properly means inducing a *real*, non-`NotFound` I/O failure at eight distinct call sites —
-   on Windows, the practical options are limited (no `chmod` semantics; a file locked by another
-   handle, or a directory substituted for a file, are the realistic levers) and doing this
-   properly for all eight would mean either new test infrastructure (an injectable I/O layer)
-   or OS-specific test code, which is new test-writing work, not evidence-gathering. It is
-   recorded here as the single concrete, actionable follow-up this mutation-testing pass
-   surfaced, per the spec's "justified or covered by a new test" standard — justified, not
-   covered, within this task's own scope.
+1. `crates/storage/src/git.rs:222` (line number shifted by one after the `git2` 0.21 upgrade,
+   commit `247df9e`; was `:221` when this section was first written) — `open_repo`:
+   `e.code() == git2::ErrorCode::NotFound` → `true`. Needs `git2::Repository::open` to fail for
+   a reason other than "no repository here" (a corrupted `.git`, for example) — a `git2`-level
+   failure, not a plain filesystem `NotFound`. **Justified as hard to close**: no test
+   corrupts `.git` in a way that produces a non-`NotFound` `git2::Error` from `open`.
+2. `crates/storage/src/recovery.rs:272` — `fix_content_persisted`'s on-disk read, the
+   guard-to-`true` mutant only (collapsing "is this NotFound" to always-true). Needs
+   `std::fs::read(&record_path)` to fail for a reason other than the file being missing.
+   **Justified as hard to close.** (The `==`→`!=` mutant at this same line is a *different*
+   case — see Group B, item 1 below — because it is reachable via an ordinary missing file,
+   not a non-`NotFound` error.)
+3. `crates/storage/src/recovery.rs:293` (all three mutants at this line: guard-to-`true`,
+   guard-to-`false`, `==`→`!=`) — the `remove_file` cleanup inside
+   `fix_content_persisted`'s "no before-image, no committed row" branch. Unlike the other
+   `NotFound`-guard sites in this file, **all three** of this line's mutants require the same
+   precondition: the record file must vanish in the narrow window *between* the earlier
+   `std::fs::read` (line 270, which must have returned `Ok` for this branch to even be
+   reached) and this `remove_file` call, a few lines later in the same single-threaded
+   function (`reconcile` runs before any `Vault` exists, so no concurrent writer can cause
+   this). That is a race against an external actor deleting the file mid-call, not an ordinary
+   "the file happens to already be missing" setup a test can arrange by simply deleting it
+   beforehand — by the time this line runs, the preceding `on_disk_hash.is_some()` check has
+   already confirmed the file was just read successfully. **Justified as hard to close** for
+   all three mutants at this line, not only the guard-to-`true` one.
+4. `crates/storage/src/recovery.rs:423` — `own_content`'s on-disk read, the guard-to-`true`
+   mutant only. Needs `std::fs::read(record_path)` to fail for a reason other than the file
+   being missing. **Justified as hard to close.** (The guard-to-`false` and `==`→`!=` mutants
+   at this same line are in Group B below — reachable via an ordinary missing file.)
+5. `crates/storage/src/vault.rs:1088` — `delete_before_image`'s `remove_file`, the
+   guard-to-`true` mutant. `delete_before_image`'s own doc comment states it is "idempotent: a
+   missing file is not an error" — collapsing the guard to always-true would make it swallow
+   every removal failure (not just NotFound) as success, masking a genuine deletion failure
+   that should propagate. Needs `remove_file` to fail for a reason other than the file being
+   already gone. **Justified as hard to close.**
 
-**Cluster B — a semantically equivalent mutant (1 of 14 survivors).**
+**Group B — ordinary, untested `NotFound` paths; cheap to close, not a platform-specific
+problem (7 of 14 survivors).** Each of these is reachable by an everyday "the file genuinely
+isn't there" scenario that no existing test happens to construct — closing any of them needs
+nothing more exotic than deleting a file and checking the resulting variant, which works
+identically on Windows, Linux, and macOS. These are acknowledged as real, currently-untested
+gaps, not closed in this pass (per this task's documentation-only scope), but they are
+**not** "hard to close" in the way Group A is, and the original version of this section was
+wrong to describe them that way.
 
-9. `crates/storage/src/journal.rs:79` — `AdvanceFields::none() -> Self` body:
-   `Self::default()` → `Default::default()`. `Self` and `AdvanceFields` are the same type at
-   this point, so `Self::default()` and `Default::default()` compile to the identical call —
-   this is a **mutant-equivalence false positive**, not a real coverage gap. No test can ever
-   distinguish these two expressions because they produce bit-for-bit identical values by
-   construction. **Justified as inherently unkillable**, not a defect in test coverage.
+1. `crates/storage/src/recovery.rs:272`'s `==`→`!=` mutant. Concrete untested scenario: a
+   `ContentPersisted` row is reconciled whose record file was genuinely deleted (not merely
+   corrupted) before `Vault::open` runs — every existing crash-matrix test that reaches this
+   function instead *damages* the file's content in place
+   (`crash_after_rename_with_an_invalid_hash_restores_the_exact_before_image_on_reopen` writes
+   `b"TORN WRITE"` over it; `content_persisted_first_write_with_a_mismatched_record_resolves_to_failed_not_inconsistent`
+   writes `b"CORRUPTED"` over it) — none ever actually removes the file, so the `NotFound`
+   arm (`Ok(None)`) is never exercised at all. A test that deletes the record outright before
+   reconciling would kill this mutant.
+2. `crates/storage/src/recovery.rs:423`'s guard-to-`false` and `==`→`!=` mutants (2 of the 14).
+   Concrete untested scenario: `own_content` falling through to check a successor's
+   before-image specifically because the record file is missing (as opposed to present but
+   hash-mismatched, which is what both existing `own_content`-exercising tests —
+   `superseded_journal_committed_operation_commits_its_own_content_not_its_successors` and
+   `journal_committed_row_whose_own_content_is_unrecoverable_stays_pending_and_never_commits_other_content`
+   — actually set up: both leave a present-but-wrong-content file on disk, never delete it).
+3. `crates/storage/src/vault.rs:468`'s `==`→`!=` mutant. Concrete untested scenario:
+   `read_note` on a note whose journal row **is** committed but whose on-disk file was deleted
+   out from under it afterward. The two existing tests that get `StorageError::NotFound` from
+   `read_note`
+   (`reading_a_note_whose_only_write_never_reached_journal_committed_returns_not_found`, and the
+   equivalent check after an `AfterIntentRecorded` crash) both hit the *earlier* "no committed
+   journal row at all" branch (`last_committed_for_note` returning `None`, a few lines above
+   this one) and never reach this function's own `std::fs::read` call at line 467 at all — so
+   this specific `NotFound` arm, for an already-committed note's vanished file, is never
+   exercised.
+4. `crates/storage/src/vault.rs:1101`'s `==`→`!=` mutant. Concrete untested scenario:
+   `read_before_image` on a genuinely missing file, checked for the *specific* `NotFound`
+   variant. Existing tests do call `read_before_image` on a missing before-image (e.g.
+   `before_image_is_deleted_only_after_git_committed`, and three others), but every one of
+   them asserts only `.is_err()` — a loose check that cannot distinguish `StorageError::NotFound`
+   from `StorageError::Io`, so it passes identically whether the guard is `==` or `!=`. A test
+   asserting `matches!(result, Err(StorageError::NotFound { .. }))` specifically, rather than
+   just `.is_err()`, would kill this mutant.
+
+**Group C — a distinct root cause, not an I/O-error-path gap at all (1 of 14 survivors).**
+
+`crates/storage/src/recovery.rs:290` — `on_disk_hash.is_some() && journal.last_committed_for_note(...)?.is_none()`
+→ `&&`→`||`. This is not about `NotFound` vs. any other I/O error at all — it is a missing
+*test combination* for a boolean guard with two independent conditions. Flipping `&&` to `||`
+would make reconcile delete an unverified record even when `on_disk_hash` is `None` (nothing
+on disk to delete) or even when a different operation already has a committed row for the
+same note (which the code's own comment says must be preserved: "the record is left alone
+rather than deleting content another row may describe"). The one existing test exercising this
+branch
+(`content_persisted_first_write_with_a_mismatched_record_resolves_to_failed_not_inconsistent`)
+only covers the case where both conditions are true (file present, no committed row) — it
+never constructs the case that would distinguish `&&` from `||` (e.g. a note with an existing
+committed row, plus a second, unrelated `ContentPersisted` operation on that same note with no
+before-image). **Justified as a real, cheap-to-close gap with its own distinct cause** — a
+missing test case, not a platform-specific I/O-error limitation.
+
+**Cluster (unchanged) — a semantically equivalent mutant (1 of 14 survivors).**
+
+`crates/storage/src/journal.rs:79` — `AdvanceFields::none() -> Self` body:
+`Self::default()` → `Default::default()`. `Self` and `AdvanceFields` are the same type at
+this point, so `Self::default()` and `Default::default()` compile to the identical call —
+this is a **mutant-equivalence false positive**, not a real coverage gap. No test can ever
+distinguish these two expressions because they produce bit-for-bit identical values by
+construction. **Justified as inherently unkillable**, not a defect in test coverage.
+
+**Tally check:** Group A (5) + Group B (7) + Group C (1) + the equivalent mutant (1) = 14,
+matching the full survivor count.
 
 **The 1 timeout**, `crates/storage/src/fault.rs:115` (`pause.point == point` → `!=`, inside
 `FaultInjector::check`'s `#[cfg(test)]`-only pause-handling branch): this line decides whether
@@ -337,12 +396,16 @@ in a production build. **Not a coverage gap**: the mutant is effectively caught 
 test failure under `cargo-mutants`' own accounting it just classifies separately from a clean
 `MISSED`/`CAUGHT` outcome), and no production guarantee is affected.
 
-**Summary disposition:** 0 of the 14 survivors represent a production correctness defect. 13
-are a single recurring, real test-coverage gap (non-`NotFound` I/O error branches, documented
-above as the one concrete follow-up this pass surfaced) and 1 is a mutant-equivalence false
-positive. The 1 timeout is scaffolding-only and not a production-code gap. Raw tool output
-(`missed.txt`, `timeout.txt`, `caught.txt`, `unviable.txt`) was produced by
-`cargo mutants --package domain --package storage --package policy` and is not committed to
+**Summary disposition:** 0 of the 14 survivors represent a production correctness defect. 5
+(Group A) genuinely need a non-`NotFound` I/O error and are fairly accepted as hard to close on
+this platform without new, injectable-I/O test infrastructure. 7 (Group B) are ordinary,
+untested `NotFound`-path gaps — real and currently uncovered, but cheap to close with a
+straightforward "delete the file, check the specific result variant" test, not a platform
+limitation. 1 (Group C, `recovery.rs:290`) has its own distinct root cause: a missing boolean
+test-combination, not an I/O-error-path issue at all. 1 (`journal.rs:79`) is a
+mutant-equivalence false positive. The 1 timeout is scaffolding-only and not a production-code
+gap. Raw tool output (`missed.txt`, `timeout.txt`, `caught.txt`, `unviable.txt`) was produced
+by `cargo mutants --package domain --package storage --package policy` and is not committed to
 the repository (it is a local, regenerable tool artifact, consistent with A1's own practice of
 not committing `mutants.out/` directories).
 
@@ -390,8 +453,8 @@ implements:
   as "in progress" or silently merged
   (`reusing_an_in_flight_operation_id_for_different_content_is_refused_as_reused_not_in_progress`),
   surfaced via `StorageError::OperationIdReused` and backed by validating a retry's request
-  against the originally recorded request, not just against the `operation_id` alone (Task 5's
-  fix, `d758d5e`).
+  against the originally recorded request, not just against the `operation_id` alone (Task 8's
+  fix round, finding I1, commit `d758d5e`).
 - **Before-image rollback.** A new version's content is durably persisted as a before-image
   before the rename that replaces it, and deleted only after `GitCommitted` — never before (C1
   "Before-image"), proven by the crash-matrix tests that interrupt mid-write and confirm the
@@ -404,7 +467,7 @@ implements:
   shared `.git/index` — so concurrent commits cannot interleave staged-but-uncommitted content
   from different operations. The journal's own `git_commit_oid` column is the primary O(1)
   idempotency source; a bounded history scan backs the live write path, while `reconcile` uses
-  an unbounded scan (Section 6 discusses its residual risk). Commits are serialized via a
+  an unbounded scan (Section 5, item 12 discusses its residual risk). Commits are serialized via a
   repo-wide lock, closing the git-commit-concurrency gap found during Task 5's review (subject
   to the residual `HEAD`-ordering limitation in Section 5, item 5).
 - **Reads resolve through the journal, verified by hash, and share the writer's lock.**
@@ -564,16 +627,53 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     re-verified by this task: `cargo deny check` now reports `advisories ok, bans ok, licenses
     ok, sources ok`; `cargo test --workspace` still 199/199; `cargo clippy --workspace -- -D
     warnings` still clean. No longer an open item.
-15. **(Task 10, new finding from this task's own mutation-testing pass, Section 2.4.1)** 13 of
-    `storage`'s 14 surviving mutants share one recurring, real test-coverage gap: no test
-    induces a non-`NotFound` I/O error (permission denied, locked file, etc.) at eight call
-    sites across `git.rs`, `recovery.rs`, and `vault.rs` that each explicitly branch on
-    `NotFound` vs. "any other I/O error." Each survivor is individually justified in Section
-    2.4.1, not closed — closing it would require new test infrastructure (an injectable I/O
-    layer, since Windows offers no `chmod`-style lever) or OS-specific test code, which is new
-    test-writing work this documentation task does not perform. The 14th survivor
-    (`journal.rs:79`) is a mutant-equivalence false positive (`Self::default()` vs.
-    `Default::default()` on the same type), not a coverage gap at all.
+15. **(Task 10, new finding from this task's own mutation-testing pass, Section 2.4.1;
+    corrected in this task's fix round — see below)** `storage`'s 14 surviving mutants split
+    into three groups, not one uniform cause:
+    - **Group A (5 survivors)** genuinely need a non-`NotFound` I/O error to kill
+      (`git.rs:222`'s guard-to-`true`; `recovery.rs:272`'s guard-to-`true`;
+      `recovery.rs:293`'s all three mutants, which require a file to vanish in a narrow
+      single-threaded window between an earlier read and this `remove_file` call;
+      `recovery.rs:423`'s guard-to-`true`; `vault.rs:1088`'s guard-to-`true`). Accepted as hard
+      to close on this platform without new, injectable-I/O test infrastructure.
+    - **Group B (7 survivors)** are ordinary, untested `NotFound`-path gaps — reachable by an
+      everyday "delete the file" scenario no existing test happens to construct
+      (`recovery.rs:272`'s `==`→`!=`; `recovery.rs:423`'s guard-to-`false` and `==`→`!=`;
+      `vault.rs:468`'s `==`→`!=`; `vault.rs:1101`'s `==`→`!=`). These are real, currently
+      acknowledged-but-uncovered gaps, cheap to close with a straightforward test, **not** a
+      platform limitation — this task's first pass incorrectly lumped them in with Group A.
+    - **Group C (1 survivor, `recovery.rs:290`'s `&&`→`||`)** has a distinct root cause: a
+      missing boolean test-combination (no test exercises a `ContentPersisted` row with no
+      before-image on a note that already has a *different* committed row), not an I/O-error
+      issue at all.
+    - Plus the mutant-equivalence false positive (`journal.rs:79`,
+      `Self::default()`/`Default::default()` on the same type) — not a coverage gap.
+    None were closed in this pass (documentation-only scope), but all are now described
+    accurately rather than with a uniform "Windows-hard" framing. Full per-mutant detail in
+    Section 2.4.1.
+16. **(Task 8, deferred Minor M1 — added in this task's fix round; the progress ledger
+    explicitly routes it here and it was missing from this file's first pass)** A race on the
+    journal's `UNIQUE` constraint when two first-time inserts for the same `operation_id`
+    arrive simultaneously returns a generic `StorageError::Journal(...)` error rather than the
+    more specific `OperationInProgress`. Nothing is applied twice either way — this is an
+    error-type consistency gap, not a correctness defect: the caller gets a less informative
+    error variant than the "normal" concurrent-retry case would produce.
+17. **(Task 8, deferred Minor M2 — added in this task's fix round)**
+    `StorageError::OperationInProgress`'s doc text ("operation {operation_id} is still in
+    flight; nothing was applied," `crates/storage/src/vault.rs`) is misleading for the case
+    where a production I/O error — not an actively running writer — left the row in a
+    non-terminal state. A retry against such a row also gets this variant, but "in flight"
+    isn't an accurate description of that row's state until the next `Vault::open` resolves
+    it.
+18. **(Task 8, deferred Minor M3 — added in this task's fix round)** One specific interaction
+    between the writer's own step-5 rollback and `reconcile`'s row 2 (a before-image already
+    deleted but the row still resting at `ContentPersisted`) converges correctly on reading the
+    code, but has no test exercising it directly.
+19. **(Task 8, deferred Minor M4, process note — included per the reviewer's explicit
+    allowance that it is optional)** Task 8's own dispatch brief named the wrong file
+    (`vault.rs` instead of `recovery.rs`) for where Task 7's fix-round tests actually live.
+    Not a product limitation; recorded here only because the ledger routed it to this file
+    alongside M1–M3.
 
 ---
 
@@ -582,7 +682,7 @@ Flagged here per Step 5's own requirement, not silently absorbed.
 | Acceptance criterion | Status | Evidence |
 |---|---|---|
 | Test suite green (workspace) | **PASS** | Section 2.1: 199/199 passed, 0 failed. |
-| Every C1 fault-matrix row covered by a dedicated crash test | **PASS** | Six `crash_*` tests plus the double-crash test, `crates/storage/src/vault.rs`. |
+| Every C1 fault-matrix row covered by a dedicated crash test | **PASS** | Six `crash_*` tests plus the double-crash test (`crates/storage/src/vault.rs`, exercising each row via the full write pipeline + fault injector), **plus** a parallel, more direct set of row-specific `reconcile`-calling tests in `crates/storage/src/recovery.rs` (e.g. `intent_recorded_with_no_further_progress_is_marked_failed_on_reconcile`, `content_persisted_with_valid_hash_rolls_forward_to_journal_committed`, `content_persisted_with_invalid_hash_and_a_valid_before_image_rolls_back_to_failed_not_journal_committed`, `journal_committed_with_no_existing_commit_commits_on_reconcile`, `git_committed_reaches_index_current_on_reconcile`) that construct each journal row directly and call `reconcile` without going through a live writer. Both files' tests cover the same 8 rows from different entry points. |
 | Retry idempotency (terminal and non-terminal states) | **PASS** | `retry_of_a_failed_operation_id_returns_failed_again_without_reapplying`, `retry_after_a_restart_returns_the_outcome_recovery_reached`, and the full `retry_*` family in Section 2.1. |
 | Argument-mismatch detection on retry (`OperationIdReused`) | **PASS** | `reusing_an_in_flight_operation_id_for_different_content_is_refused_as_reused_not_in_progress`, `reusing_an_operation_id_for_a_different_request_is_refused_not_reported_as_the_original_outcome`. |
 | Before-image rollback, never indistinguishable from success | **PASS** | Crash-matrix restore tests; `new_version_with_an_invalid_hash_is_detected_by_the_writer_and_restored_from_the_before_image`. |

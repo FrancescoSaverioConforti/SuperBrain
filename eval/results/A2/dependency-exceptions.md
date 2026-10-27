@@ -6,9 +6,11 @@ Mirrors `eval/results/A1/dependency-exceptions.md`'s format and discipline.
 ## Licensing: no new exception needed
 
 A2 adds three direct dependencies to `crates/storage/Cargo.toml`: `rusqlite` 0.31.0
-(`features = ["bundled"]`), `git2` 0.19.0, and `sha2` 0.10.9 (promoted from an existing
-transitive dependency via `policy`'s secret hashing to a direct `storage` dependency, per the
-plan's Tech Stack section).
+(`features = ["bundled"]`), `git2` (originally 0.19.0, as pinned by the plan; upgraded to
+0.21.0 later in this task's fix round — see "Advisories" below — still licensed MIT OR
+Apache-2.0, re-confirmed by `cargo deny check licenses` after the upgrade), and `sha2` 0.10.9
+(promoted from an existing transitive dependency via `policy`'s secret hashing to a direct
+`storage` dependency, per the plan's Tech Stack section).
 
 `cargo deny check licenses`, run as part of Task 10's closing verification
 (`eval/results/A2/evidence.md`, Section 2.2), returned **`licenses ok`** with zero violations
