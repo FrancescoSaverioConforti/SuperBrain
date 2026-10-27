@@ -76,6 +76,9 @@
 //! ```
 
 mod atomic;
+// The seam has no production caller until the write pipeline is instrumented in a later task.
+#[allow(dead_code)]
+mod fault;
 mod note_id;
 mod propose;
 mod vault;
