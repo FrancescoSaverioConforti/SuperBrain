@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::atomic::{atomic_write, AtomicWriteError};
@@ -282,6 +283,100 @@ fn ensure_resolves_inside_root(
     } else {
         Err(escapes())
     }
+}
+
+/// Dotfile directory, inside the vault root, that holds before-images. It is
+/// a sibling of the `.record` files, so the containment check applies to it
+/// exactly as it does to records.
+const BEFORE_IMAGE_DIR: &str = ".before-images";
+
+/// Hex-encoded SHA-256 of `bytes`.
+#[allow(dead_code)] // consumed by the Task 4 write path
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `<root>/.before-images/<note_id>-<operation_id>.record`. Pure path
+/// construction; nothing is created or checked here.
+#[allow(dead_code)] // consumed by the Task 4 write path
+pub(crate) fn before_image_path(root: &Path, note_id: &NoteId, operation_id: Uuid) -> PathBuf {
+    root.join(BEFORE_IMAGE_DIR)
+        .join(format!("{}-{}.record", note_id.as_str(), operation_id))
+}
+
+/// Resolves the before-image path and applies the same containment check as
+/// `record_path_checked`. If the `.before-images` directory does not exist,
+/// nothing can be reached through it, so the bare path is returned and the
+/// caller's I/O reports `NotFound` (or a no-op delete).
+fn before_image_path_checked(
+    root: &Path,
+    note_id: &NoteId,
+    operation_id: Uuid,
+) -> Result<PathBuf, StorageError> {
+    let candidate = before_image_path(root, note_id, operation_id);
+    let dir = root.join(BEFORE_IMAGE_DIR);
+    if let Err(e) = dir.symlink_metadata() {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(candidate);
+        }
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(StorageError::Io)?;
+    ensure_resolves_inside_root(&canonical_root, &candidate, note_id)?;
+    Ok(candidate)
+}
+
+/// Writes `current_record_bytes` as the before-image for `operation_id` via
+/// the crate-private `atomic_write`, and returns the content hash of the
+/// bytes written.
+#[allow(dead_code)] // consumed by the Task 4 write path
+pub(crate) fn persist_before_image(
+    root: &Path,
+    note_id: &NoteId,
+    operation_id: Uuid,
+    current_record_bytes: &[u8],
+) -> Result<String, StorageError> {
+    std::fs::create_dir_all(root.join(BEFORE_IMAGE_DIR)).map_err(StorageError::Io)?;
+    let path = before_image_path_checked(root, note_id, operation_id)?;
+    atomic_write(&path, current_record_bytes).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+    Ok(content_hash(current_record_bytes))
+}
+
+/// Removes the before-image for `operation_id`. Idempotent: a missing file
+/// is not an error.
+#[allow(dead_code)] // consumed by the Task 4 write path
+pub(crate) fn delete_before_image(
+    root: &Path,
+    note_id: &NoteId,
+    operation_id: Uuid,
+) -> Result<(), StorageError> {
+    let path = before_image_path_checked(root, note_id, operation_id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+/// Reads back the before-image for `operation_id`.
+#[allow(dead_code)] // consumed by the Task 4 write path
+pub(crate) fn read_before_image(
+    root: &Path,
+    note_id: &NoteId,
+    operation_id: Uuid,
+) -> Result<Vec<u8>, StorageError> {
+    let path = before_image_path_checked(root, note_id, operation_id)?;
+    std::fs::read(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StorageError::NotFound {
+                note_id: note_id.as_str().to_string(),
+            }
+        } else {
+            StorageError::Io(e)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -662,5 +757,45 @@ mod tests {
             .write_record_unchecked(&id, "retry with fresh version", current, Uuid::new_v4())
             .unwrap();
         assert_eq!(v, Version(2));
+    }
+
+    #[test]
+    fn before_image_persists_and_reads_back_identical_bytes() {
+        let root = unique_test_dir();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let bytes = b"1\n---\noriginal content";
+        let hash = persist_before_image(&root, &id, op, bytes).unwrap();
+        assert_eq!(hash, content_hash(bytes));
+        let read_back = read_before_image(&root, &id, op).unwrap();
+        assert_eq!(read_back, bytes);
+    }
+
+    #[test]
+    fn before_image_lives_inside_vault_root_under_dotfile_dir() {
+        let root = unique_test_dir();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        persist_before_image(&root, &id, op, b"content").unwrap();
+        let path = before_image_path(&root, &id, op);
+        assert!(path.starts_with(&root));
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn delete_before_image_twice_is_not_an_error() {
+        let root = unique_test_dir();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        persist_before_image(&root, &id, op, b"content").unwrap();
+        delete_before_image(&root, &id, op).unwrap();
+        delete_before_image(&root, &id, op).unwrap(); // second call: no error
+        assert!(read_before_image(&root, &id, op).is_err());
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_detects_any_byte_change() {
+        assert_eq!(content_hash(b"abc"), content_hash(b"abc"));
+        assert_ne!(content_hash(b"abc"), content_hash(b"abd"));
     }
 }
