@@ -158,9 +158,10 @@ pub(crate) fn commit_operation_contents(
     let signature = git2::Signature::now("SuperBrain", "superbrain@localhost")?;
     let message = format!("vault: update {note_id} {}", operation_marker(operation_id));
 
-    let branch_ref_name = head.name().ok_or_else(|| {
-        git2::Error::from_str("HEAD does not point at a named branch reference")
-    })?.to_string();
+    let branch_ref_name = head
+        .name()
+        .map_err(|_| git2::Error::from_str("HEAD does not point at a named branch reference"))?
+        .to_string();
 
     let commit_oid = repo.commit(
         Some(&branch_ref_name),
@@ -248,7 +249,7 @@ fn scan_history_for_marker(
         }
         let oid = oid_result?;
         let commit = repo.find_commit(oid)?;
-        if commit.message().is_some_and(|m| m.contains(marker)) {
+        if commit.message().is_ok_and(|m| m.contains(marker)) {
             return Ok(Some(oid));
         }
     }

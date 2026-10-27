@@ -1936,7 +1936,7 @@ mod tests {
         let marker = op.to_string();
         walk.filter(|oid| {
             let commit = repo.find_commit(*oid.as_ref().unwrap()).unwrap();
-            commit.message().is_some_and(|m| m.contains(&marker))
+            commit.message().is_ok_and(|m| m.contains(&marker))
         })
         .count()
     }
