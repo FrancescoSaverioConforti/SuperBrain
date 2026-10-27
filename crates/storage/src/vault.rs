@@ -131,9 +131,9 @@ pub enum StorageError {
     Git(String),
     /// A pipeline was stopped at `FaultPoint` by a test's armed
     /// `FaultInjector`. Production code passes `FaultInjector::none()`
-    /// everywhere and never produces this. Today the only source is
-    /// `Vault::open_with_injector` propagating an interrupted `reconcile`;
-    /// Task 8 adds the write-path source. `FaultPoint` is nominally `pub` but
+    /// everywhere and never produces this. It comes from
+    /// `Vault::open_with_injector` propagating an interrupted `reconcile`, and
+    /// from `write_record_unchecked_with_injector`. `FaultPoint` is nominally `pub` but
     /// lives in the private `fault` module, so code outside this crate can
     /// match this variant (`Interrupted(_)`) but cannot name the point.
     #[error("interrupted at {0:?}")]
@@ -514,14 +514,31 @@ impl Vault {
         expected_version: Version,
         operation_id: Uuid,
     ) -> Result<Version, StorageError> {
-        let injector = FaultInjector::none();
+        self.write_record_unchecked_with_injector(note_id, content, expected_version, operation_id, &FaultInjector::none())
+    }
+
+    /// [`Vault::write_record_unchecked`] with an explicit `injector`. Production
+    /// callers go through `write_record_unchecked`, which passes
+    /// `FaultInjector::none()`. An armed injector stops the write right after
+    /// the named step boundary and returns `StorageError::Interrupted(point)`.
+    /// Today only `AfterIntentRecorded` and `AfterRenameBeforeJournalCommitted`
+    /// are wired; Task 8 threads the remaining points.
+    pub(crate) fn write_record_unchecked_with_injector(
+        &self,
+        note_id: &NoteId,
+        content: &str,
+        expected_version: Version,
+        operation_id: Uuid,
+        injector: &FaultInjector,
+    ) -> Result<Version, StorageError> {
+        let interrupted = |crate::fault::Interrupted::At(point)| StorageError::Interrupted(point);
 
         let record_path = self.record_path_checked(note_id)?;
 
         // Step 1: intent_recorded. Deliberately before the per-note lock —
         // see the doc comment above for why that is safe.
         self.journal.lock().unwrap().insert_intent(operation_id, note_id.as_str(), expected_version.0).map_err(journal_err)?;
-        let _ = injector.check(FaultPoint::AfterIntentRecorded);
+        injector.check(FaultPoint::AfterIntentRecorded).map_err(interrupted)?;
 
         // Step 2: acquire the per-note lock, now shared with read_note, and
         // hold it for the rest of this critical section — reading the
@@ -564,7 +581,6 @@ impl Vault {
         let new_version = Version(actual_version.0 + 1);
         let buffer = serialize_record(content, new_version);
         atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
-        let _ = injector.check(FaultPoint::AfterRenameBeforeJournalCommitted);
         let new_hash = content_hash(&buffer);
         let fields = match &before_image_hash {
             Some(before_hash) => {
@@ -573,6 +589,16 @@ impl Vault {
             None => AdvanceFields::content(new_version.0, new_hash.clone()),
         };
         self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
+        // Checked AFTER the ContentPersisted advance, not between the rename
+        // and it (Task 7 fix round, finding I-1). The point now means "the
+        // rename happened AND the journal records it, with its hash", which is
+        // an orderly step boundary that recovery's row 2 can resolve. Before,
+        // it fired while the row was still IntentRecorded with the new bytes
+        // already on disk. Row 1 marked that row Failed without restoring the
+        // file, and the note then read as Inconsistent/NotFound for good. A
+        // real hardware crash between the rename and SQLite's write is
+        // inherent to any journal design and out of scope for this harness.
+        injector.check(FaultPoint::AfterRenameBeforeJournalCommitted).map_err(interrupted)?;
 
         // Step 5: verify the bytes actually on disk hash to what was just
         // recorded. This closes the "hash della nuova versione verificato"

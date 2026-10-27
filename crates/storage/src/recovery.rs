@@ -30,14 +30,21 @@
 //!   the row to `Failed`. Its `new_version` stays as the version it failed to
 //!   commit. No git commit is made: the restored content was already
 //!   linearized by the earlier operation that wrote it, which
-//!   `last_committed_for_note` still resolves to. If the restore is impossible
-//!   or does not verify, the result is `Inconsistent`.
+//!   `last_committed_for_note` still resolves to. If the row has no
+//!   `before_image_hash` (a first write, so there is nothing to restore), it
+//!   becomes `Failed`. If no operation has ever committed the note, the
+//!   unverified record is also removed. A recorded before-image that cannot be
+//!   restored or does not verify gives `Inconsistent`.
 //! - `JournalCommitted`: `find_commit_for_operation` with
 //!   `ScanDepth::Unbounded`, always. A bounded miss would be ambiguous, and a
 //!   `commit_operation` call on that ambiguity could duplicate a commit. A
 //!   found `Oid` (including a Tier 2 find the row never recorded) is written
-//!   back on the same advance to `GitCommitted`. If there is none,
-//!   `commit_operation` runs. If git is unavailable the row rests at
+//!   back on the same advance to `GitCommitted`. If there is none, this
+//!   operation's OWN bytes are committed, never just whatever is on disk:
+//!   either the record, if it still hashes to the row's `content_hash`, or
+//!   the before-image of the successor that overwrote it. If neither is
+//!   available, the row rests at `JournalCommitted` with that reason. If git
+//!   is unavailable the row also rests at
 //!   `JournalCommitted` and is reported as `git_pending`; this does not block
 //!   `Vault::open`. As `ScanDepth` documents, an unbounded miss proves absence
 //!   only among commits reachable from `HEAD`; rewriting history out of band
@@ -66,7 +73,7 @@ use uuid::Uuid;
 
 use crate::atomic::atomic_write;
 use crate::fault::{FaultInjector, FaultPoint, Interrupted};
-use crate::git::{commit_operation, find_commit_for_operation, GitError, ScanDepth};
+use crate::git::{commit_operation_contents, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal, JournalError, OperationRow};
 use crate::note_id::NoteId;
 use crate::vault::{content_hash, delete_before_image, read_before_image, record_path_checked, Indexer, StorageError};
@@ -97,11 +104,16 @@ pub(crate) enum ReconcileError {
 ///   and then hit an unavailable git appears in both `recovered` and
 ///   `git_pending`. One that was already at `JournalCommitted` appears only
 ///   in `git_pending`, since it made no progress.
+/// - `git_pending_reasons`: for each `git_pending` entry, in the same order,
+///   why the row could not be committed. That is either git being unavailable
+///   or this operation's own content not being recoverable (see row 3 in the
+///   module docs).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ReconcileReport {
     pub recovered: Vec<Uuid>,
     pub failed: Vec<Uuid>,
     pub git_pending: Vec<Uuid>,
+    pub git_pending_reasons: Vec<(Uuid, String)>,
 }
 
 /// How one row's cascade ended.
@@ -110,8 +122,8 @@ enum Outcome {
     Completed,
     /// Reached `Failed`.
     Failed,
-    /// Resting at `JournalCommitted`, git unavailable.
-    GitPending,
+    /// Resting at `JournalCommitted`, for the given reason.
+    GitPending(String),
 }
 
 /// Reconciles every non-terminal row in `journal` against the C1 fault
@@ -134,11 +146,12 @@ pub(crate) fn reconcile(
         match resolve(root, journal, repo_path, indexer, &row, origin)? {
             Outcome::Completed => report.recovered.push(op),
             Outcome::Failed => report.failed.push(op),
-            Outcome::GitPending => {
+            Outcome::GitPending(reason) => {
                 if origin != WriteState::JournalCommitted {
                     report.recovered.push(op);
                 }
                 report.git_pending.push(op);
+                report.git_pending_reasons.push((op, reason));
             }
         }
     }
@@ -189,15 +202,15 @@ fn resolve(
             },
             // Row 3: idempotent git commit, or rest as git_pending.
             WriteState::JournalCommitted => match fix_journal_committed(root, journal, repo_path, row)? {
-                Some(next) => next,
-                None => {
+                GitStep::Committed => WriteState::GitCommitted,
+                GitStep::Pending(reason) => {
                     // Only a row resumed directly from JournalCommitted is still
                     // persisted at Recovering here. One rolled forward this pass
                     // is already at JournalCommitted.
                     if current_state(journal, op)? == WriteState::Recovering {
                         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
                     }
-                    return Ok(Outcome::GitPending);
+                    return Ok(Outcome::GitPending(reason));
                 }
             },
             // Row 4: the index step (pipeline completion, not index freshness).
@@ -256,9 +269,25 @@ fn fix_content_persisted(root: &Path, journal: &Journal, row: &OperationRow) -> 
         return Ok(WriteState::JournalCommitted);
     }
 
-    let before_hash = row.before_image_hash.as_deref().ok_or_else(|| {
-        inconsistent(op, "record does not match the journal's content_hash and there is no before-image to restore")
-    })?;
+    // No before_image_hash means the record did not exist when this
+    // operation wrote it: a first write with no prior version to restore.
+    // Nothing was ever validly written, so the operation simply failed
+    // (Task 7 fix round, finding I-1(b)). Inconsistent is kept for a recorded
+    // before-image that cannot be restored. If no operation has ever committed
+    // this note, the unverified record is removed, which restores the
+    // pre-operation state of "no note". Otherwise the record is left alone
+    // rather than deleting content another row may describe.
+    let Some(before_hash) = row.before_image_hash.as_deref() else {
+        if on_disk_hash.is_some() && journal.last_committed_for_note(note_id.as_str())?.is_none() {
+            match std::fs::remove_file(&record_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ReconcileError::Io(e)),
+            }
+        }
+        journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
+        return Ok(WriteState::Failed);
+    };
 
     // If the record already holds the before-image, an earlier pass restored
     // it and crashed before advancing the row. The restore is idempotent, so
@@ -288,8 +317,10 @@ fn fix_content_persisted(root: &Path, journal: &Journal, row: &OperationRow) -> 
     Ok(WriteState::Failed)
 }
 
-/// Row 3. Returns `Some(GitCommitted)` once the row records its commit, or
-/// `None` when git is unavailable (the row is left for the caller to rest).
+/// Row 3. Returns `GitStep::Committed` once the row records its commit
+/// (now `GitCommitted`), or `GitStep::Pending(reason)` when git is
+/// unavailable or this operation's own content cannot be recovered. In the
+/// pending case the caller leaves the row resting.
 ///
 /// Any `GitError` other than a journal failure counts as "git unavailable".
 /// The content is already durable and readable at `JournalCommitted`, which
@@ -300,23 +331,31 @@ fn fix_journal_committed(
     journal: &Journal,
     repo_path: &Path,
     row: &OperationRow,
-) -> Result<Option<WriteState>, ReconcileError> {
+) -> Result<GitStep, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
     // Always Unbounded on the recovery path. See the module docs.
     let found = match find_commit_for_operation(journal, repo_path, op, ScanDepth::Unbounded) {
         Ok(found) => found,
         Err(GitError::Journal(e)) => return Err(e.into()),
-        Err(_) => return Ok(None),
+        Err(e) => return Ok(GitStep::Pending(format!("git unavailable: {e}"))),
     };
     let oid = match found {
         Some(oid) => oid,
         None => {
             let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
-            match commit_operation(repo_path, op, note_id.as_str(), &record_path) {
+            let Some(contents) = own_content(root, journal, row, &note_id, &record_path)? else {
+                return Ok(GitStep::Pending(
+                    "this operation's own content is no longer on disk and no successor's before-image \
+                     holding it could be read; refusing to commit another operation's content under \
+                     this operation's marker"
+                        .to_string(),
+                ));
+            };
+            match commit_operation_contents(repo_path, op, note_id.as_str(), &record_path, &contents) {
                 Ok(oid) => oid,
                 Err(GitError::Journal(e)) => return Err(e.into()),
-                Err(_) => return Ok(None),
+                Err(e) => return Ok(GitStep::Pending(format!("git unavailable: {e}"))),
             }
         }
     };
@@ -325,7 +364,61 @@ fn fix_journal_committed(
     journal.advance(op, WriteState::GitCommitted, AdvanceFields::git_oid(oid))?;
     // Per spec, the before-image is deleted only once GitCommitted is reached.
     delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
-    Ok(Some(WriteState::GitCommitted))
+    Ok(GitStep::Committed)
+}
+
+/// Row 3's result: committed (the row is now `GitCommitted`) or pending, with
+/// the reason.
+enum GitStep {
+    Committed,
+    Pending(String),
+}
+
+/// The bytes this operation itself persisted, i.e. the bytes that hash to
+/// its `content_hash` (Task 7 fix round, finding I-2).
+///
+/// The per-note lock serializes writers, but it does not stop a later
+/// operation from overwriting a note whose earlier operation is still resting
+/// at `JournalCommitted` (git pending). Committing "whatever is on disk" would
+/// then put the LATER operation's content under the EARLIER operation's
+/// marker. So the bytes come from:
+///
+/// 1. the record on disk, if it still hashes to this row's `content_hash`;
+///    otherwise
+/// 2. a successor's before-image. That is the operation on the same note
+///    whose `before_image_hash` equals this row's `content_hash`, since it
+///    overwrote exactly this content. It is used only if the file reads back
+///    with that hash.
+///
+/// `None` if neither is available. The caller then leaves the row pending
+/// rather than guessing.
+fn own_content(
+    root: &Path,
+    journal: &Journal,
+    row: &OperationRow,
+    note_id: &NoteId,
+    record_path: &Path,
+) -> Result<Option<Vec<u8>>, ReconcileError> {
+    let Some(expected) = row.content_hash.as_deref() else {
+        return Ok(None);
+    };
+    match std::fs::read(record_path) {
+        Ok(bytes) if content_hash(&bytes) == expected => return Ok(Some(bytes)),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ReconcileError::Io(e)),
+    }
+    for successor in journal.operations_with_before_image_hash(note_id.as_str(), expected)? {
+        if successor.operation_id == row.operation_id {
+            continue;
+        }
+        if let Ok(bytes) = read_before_image(root, note_id, successor.operation_id) {
+            if content_hash(&bytes) == expected {
+                return Ok(Some(bytes));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn current_state(journal: &Journal, op: Uuid) -> Result<WriteState, ReconcileError> {
@@ -675,5 +768,135 @@ mod tests {
         // An uninterrupted open resumes from previous_state and resolves it.
         let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
         assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::Failed);
+    }
+
+    // --- Fix round: independent review findings I-1 and I-2 ---
+
+    #[test]
+    fn crash_at_after_rename_on_a_first_write_rolls_forward_to_journal_committed_not_failed() {
+        // I-1: AfterRenameBeforeJournalCommitted used to fire after the rename
+        // but before the ContentPersisted advance. That left the row at
+        // IntentRecorded with new bytes on disk, which row 1 then marked
+        // Failed. The note read as NotFound for good. The point now fires after
+        // the ContentPersisted advance, so recovery verifies the hash and
+        // rolls forward.
+        let root = unique_test_dir(); // not a git repo: the row rests at JournalCommitted
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let result = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
+            assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::ContentPersisted, "the fault point fires only once the journal records the rename");
+        }
+        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted, "rolled forward via the hash-verify path, not marked Failed");
+        assert_eq!(vault.read_note(&id).unwrap().content, "content");
+    }
+
+    #[test]
+    fn crash_at_after_rename_over_a_prior_version_rolls_forward_through_to_index_current() {
+        // I-1, overwrite variant: before the fix, the prior row's hash no
+        // longer matched the new on-disk bytes, so read_note returned
+        // Inconsistent for good.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            let result = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(_))));
+        }
+        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent);
+        assert_eq!(row.previous_state, Some(WriteState::ContentPersisted));
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!((record.content.as_str(), record.version), ("v2", Version(2)));
+    }
+
+    #[test]
+    fn content_persisted_first_write_with_a_mismatched_record_resolves_to_failed_not_inconsistent() {
+        // I-1(b): no before_image_hash means there was nothing to restore.
+        // That is a failed operation, not an unrecoverable vault.
+        let (root, journal) = fresh_root_and_journal();
+        let op = Uuid::new_v4();
+        std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
+        journal.insert_intent(op, "note-a", 0).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, "hash-that-wont-match")).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
+        assert_eq!(report.failed, vec![op]);
+        assert!(!root.join("note-a.record").exists(), "no committed version exists, so the unverified record is removed (pre-operation state)");
+    }
+
+    /// The bytes of `note-a.record` in commit `oid`'s tree.
+    fn committed_record_bytes(repo_dir: &std::path::Path, oid: &str) -> Vec<u8> {
+        let repo = git2::Repository::open(repo_dir).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(oid).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        let entry = tree.get_name("note-a.record").unwrap();
+        let bytes = repo.find_blob(entry.id()).unwrap().content().to_vec();
+        bytes
+    }
+
+    #[test]
+    fn superseded_journal_committed_operation_commits_its_own_content_not_its_successors() {
+        // I-2, the reviewer's reproduction. A then B write the same note on a
+        // non-git root, so both rest at JournalCommitted. Then the root is
+        // git-initialized and the vault reopened. A's recovery commit used to
+        // capture B's bytes (whatever was on disk) under A's marker. It must
+        // carry A's own bytes, recovered from B's before-image.
+        let root = unique_test_dir();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            assert!(matches!(vault.write_record_unchecked(&id, "content A", Version(0), op_a), Err(StorageError::GitPending { .. })));
+            assert!(matches!(vault.write_record_unchecked(&id, "content B", Version(1), op_b), Err(StorageError::GitPending { .. })));
+        }
+        init_git_repo_at(&root);
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+
+        let row_a = vault.journal_row_for_test(op_a).unwrap();
+        let row_b = vault.journal_row_for_test(op_b).unwrap();
+        assert_eq!(row_a.state, WriteState::IndexCurrent);
+        assert_eq!(row_b.state, WriteState::IndexCurrent);
+        assert_eq!(
+            committed_record_bytes(&root, row_a.git_commit_oid.as_deref().unwrap()),
+            serialize_record_for_test("content A", Version(1)),
+            "A's commit carries A's OWN content, never B's"
+        );
+        assert_eq!(
+            committed_record_bytes(&root, row_b.git_commit_oid.as_deref().unwrap()),
+            serialize_record_for_test("content B", Version(2)),
+        );
+        assert_ne!(row_a.git_commit_oid, row_b.git_commit_oid);
+    }
+
+    #[test]
+    fn journal_committed_row_whose_own_content_is_unrecoverable_stays_pending_and_never_commits_other_content() {
+        // I-2 fallback: the record no longer holds this operation's bytes and
+        // no successor before-image holds them either. Never guess: no commit
+        // is made, and the row rests with a reason.
+        let (root, journal) = fresh_root_and_journal();
+        let repo_dir = init_test_repo_at(&root);
+        let op = Uuid::new_v4();
+        let own = serialize_record_for_test("mine", Version(1));
+        std::fs::write(root.join("note-a.record"), serialize_record_for_test("someone else's", Version(2))).unwrap();
+        journal.insert_intent(op, "note-a", 0).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&own))).unwrap();
+        journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted);
+        assert_eq!(report.git_pending, vec![op]);
+        assert!(report.git_pending_reasons[0].1.contains("own content"));
+        assert_eq!(find_commit_for_operation(&journal, &repo_dir, op, ScanDepth::Unbounded).unwrap(), None, "no commit under this marker");
     }
 }

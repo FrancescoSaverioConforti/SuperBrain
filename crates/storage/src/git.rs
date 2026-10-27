@@ -108,6 +108,28 @@ pub(crate) fn commit_operation(
     note_id: &str,
     record_path: &Path,
 ) -> Result<git2::Oid, GitError> {
+    // Opened first so a missing repository still reports NoRepository before
+    // any record read is attempted.
+    open_repo(repo_path)?;
+    let contents = std::fs::read(record_path).map_err(|e| {
+        git2::Error::from_str(&format!("failed to read {}: {e}", record_path.display()))
+    })?;
+    commit_operation_contents(repo_path, operation_id, note_id, record_path, &contents)
+}
+
+/// [`commit_operation`] with explicit `contents` instead of whatever is
+/// currently on disk at `record_path`. `record_path` only names the tree
+/// entry. Used by recovery (`reconcile` row 3) to commit an operation's OWN
+/// historical bytes once a later operation has overwritten the record
+/// (Task 7 fix round, finding I-2). Same isolation and idempotent re-entry as
+/// `commit_operation`.
+pub(crate) fn commit_operation_contents(
+    repo_path: &Path,
+    operation_id: Uuid,
+    note_id: &str,
+    record_path: &Path,
+    contents: &[u8],
+) -> Result<git2::Oid, GitError> {
     let repo = open_repo(repo_path)?;
 
     let head = repo.head()?;
@@ -126,10 +148,7 @@ pub(crate) fn commit_operation(
         git2::Error::from_str("record path is not valid UTF-8")
     })?;
 
-    let contents = std::fs::read(record_path).map_err(|e| {
-        git2::Error::from_str(&format!("failed to read {}: {e}", record_path.display()))
-    })?;
-    let blob_oid = repo.blob(&contents)?;
+    let blob_oid = repo.blob(contents)?;
 
     let mut builder = repo.treebuilder(Some(&base_tree))?;
     builder.insert(relative_path_str, blob_oid, git2::FileMode::Blob.into())?;

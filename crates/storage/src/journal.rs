@@ -257,6 +257,23 @@ impl Journal {
         Ok(row)
     }
 
+    /// Every operation on `note_id` whose recorded `before_image_hash` equals
+    /// `before_image_hash`, oldest first. These are the operations that
+    /// overwrote content with that hash. Used by `recovery::reconcile` row 3
+    /// to find a superseded operation's own bytes in its successor's
+    /// before-image (Task 7 fix round, finding I-2).
+    pub(crate) fn operations_with_before_image_hash(
+        &self,
+        note_id: &str,
+        before_image_hash: &str,
+    ) -> Result<Vec<OperationRow>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_ROWS} WHERE note_id = ?1 AND before_image_hash = ?2 ORDER BY rowid ASC"
+        ))?;
+        let rows = stmt.query_map(params![note_id, before_image_hash], row_from_sql)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Every operation that is neither `IndexCurrent` nor `Failed`, oldest
     /// first. Consumed by `recovery::reconcile` on `Vault::open`.
     pub(crate) fn non_terminal_operations(&self) -> Result<Vec<OperationRow>, JournalError> {
