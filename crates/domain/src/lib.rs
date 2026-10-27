@@ -1,9 +1,11 @@
+mod index_state;
 mod links;
 mod migration;
 mod note;
 mod schema;
 mod write_state;
 
+pub use index_state::IndexState;
 pub use links::{classify_links, LinkError, LinkState};
 pub use migration::{Migration, MigrationError, MigrationOutcome};
 pub use note::{parse_frontmatter, NoteMetadata, Relations};

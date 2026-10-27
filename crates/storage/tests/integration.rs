@@ -43,7 +43,7 @@ fn open_vault(root: PathBuf) -> Vault {
         repo.commit(Some("HEAD"), &signature, &signature, "initial empty commit", &tree, &[])
             .unwrap();
     }
-    Vault::open(root, &unique_test_dir().join("journal.sqlite")).unwrap()
+    Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap()
 }
 
 fn valid_yaml(id: &str) -> String {
@@ -754,7 +754,7 @@ fn valid_note_yaml(id: &str) -> String {
 /// code rather than the ordinary git-backed success path every other test
 /// here uses via `open_vault`.
 fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet<String>) {
-    let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+    let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     (vault, gate, HashSet::new(), HashSet::new())
 }

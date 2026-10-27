@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use domain::WriteState;
+use domain::{IndexState, WriteState};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -151,6 +151,32 @@ fn git_err(note_id: &NoteId, e: GitError) -> StorageError {
     }
 }
 
+/// The index step of the write pipeline (Task 6). Pre-B1 the only
+/// implementation is [`NullIndexer`]; a real indexer arrives in phase B1.
+pub(crate) trait Indexer: Send + Sync {
+    /// Called once a write has reached `GitCommitted`, to let the index record
+    /// that `note_id` is now at `version`.
+    fn mark_current(&self, note_id: &str, version: u64);
+
+    /// The index's own verdict on whether it reflects `note_id`'s current
+    /// content. This is an index-freshness claim, separate from the journal's
+    /// `WriteState`.
+    fn state_for(&self, note_id: &str) -> IndexState;
+}
+
+/// The A2 stand-in indexer. There is no index to update, so `mark_current` is
+/// a true no-op, and `state_for` always reports `Stale`: no indexer exists yet,
+/// so no note can honestly be claimed to be indexed and current.
+pub(crate) struct NullIndexer;
+
+impl Indexer for NullIndexer {
+    fn mark_current(&self, _note_id: &str, _version: u64) {}
+
+    fn state_for(&self, _note_id: &str) -> IndexState {
+        IndexState::Stale
+    }
+}
+
 /// The core storage type: a single-record-per-note vault rooted at `root`,
 /// with explicit optimistic-concurrency conflicts on write.
 pub struct Vault {
@@ -222,21 +248,44 @@ pub struct Vault {
     /// and no code path re-enters a per-note lock while already holding
     /// one, two threads can never form a lock-ordering cycle through it.
     git_lock: Mutex<()>,
+    /// The index step of the write pipeline (Task 6). Its `mark_current` runs
+    /// after `GitCommitted`, and its `state_for` backs `index_state_for`.
+    indexer: Box<dyn Indexer>,
 }
 
 impl Vault {
     /// Opens a vault rooted at `root`, backed by the write-operation journal
-    /// at `journal_path` (created if it does not yet exist). Replaces A1's
-    /// `Vault::new`: every caller now supplies a journal path, since A1 had
-    /// no production caller to break.
-    pub fn open(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
+    /// at `journal_path` (created if it does not yet exist), using `indexer`
+    /// for the index step. Crate-private because [`Indexer`] is: callers
+    /// outside this crate use [`Vault::open_with_default_indexer`].
+    pub(crate) fn open(root: PathBuf, journal_path: &Path, indexer: Box<dyn Indexer>) -> Result<Self, StorageError> {
         let journal = Journal::open(journal_path).map_err(journal_err)?;
         Ok(Vault {
             root,
             locks: Mutex::new(HashMap::new()),
             journal: Mutex::new(journal),
             git_lock: Mutex::new(()),
+            indexer,
         })
+    }
+
+    /// Opens a vault rooted at `root` with the A2 default indexer
+    /// ([`NullIndexer`]), backed by the journal at `journal_path`. Replaces
+    /// A1's `Vault::new`: every caller supplies a journal path, since A1 had
+    /// no production caller to break.
+    pub fn open_with_default_indexer(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
+        Self::open(root, journal_path, Box::new(NullIndexer))
+    }
+
+    /// The indexer's own verdict on whether the index reflects `note_id`'s
+    /// current content. Deliberately decoupled from the journal's `WriteState`:
+    /// reaching `WriteState::IndexCurrent` only means the write pipeline's
+    /// index step completed, and says nothing about index freshness. With
+    /// `NullIndexer` this is always `IndexState::Stale`.
+    // No non-test caller exists until a real index consumes it (phase B1).
+    #[allow(dead_code)]
+    pub(crate) fn index_state_for(&self, note_id: &NoteId) -> IndexState {
+        self.indexer.state_for(note_id.as_str())
     }
 
     pub fn current_version(&self, note_id: &NoteId) -> Result<Version, StorageError> {
@@ -397,8 +446,10 @@ impl Vault {
     /// 8. Release the per-note lock (by scope exit).
     /// 9. Return the new version.
     ///
-    /// Index (Task 6) is NOT part of this task: this stops at
-    /// `GitCommitted`. Task 6 extends the chain to `IndexCurrent`.
+    /// The chain ends at `IndexCurrent` (Task 6): after `GitCommitted`, the
+    /// index step calls `Indexer::mark_current` and advances the journal to
+    /// `WriteState::IndexCurrent`. That state marks pipeline completion only;
+    /// it does not claim the index is current (see `index_state_for`).
     pub(crate) fn write_record_unchecked(
         &self,
         note_id: &NoteId,
@@ -551,6 +602,17 @@ impl Vault {
 
         // Per spec: the before-image is deleted only after git_committed.
         delete_before_image(&self.root, note_id, operation_id)?;
+
+        // Step 7b (Task 6): the index step, GitCommitted -> IndexCurrent.
+        // `mark_current` is the indexer's hook (a no-op for `NullIndexer`).
+        // The journal advance records only that this pipeline step completed.
+        // It is NOT an index-freshness claim; that is `index_state_for`'s job.
+        self.indexer.mark_current(note_id.as_str(), new_version.0);
+        self.journal
+            .lock()
+            .unwrap()
+            .advance(operation_id, WriteState::IndexCurrent, AdvanceFields::none())
+            .map_err(journal_err)?;
 
         // Step 8: the per-note lock is released when `_guard` drops at the
         // end of this scope.
@@ -790,9 +852,38 @@ mod tests {
     /// `JournalCommitted` -> `GitCommitted` chain extension. Returns the
     /// vault and its root path (which is also the repo path).
     fn open_test_vault_with_git_repo() -> (Vault, PathBuf) {
+        open_test_vault_with_git_repo_and_default_indexer()
+    }
+
+    /// Same git-backed fixture as `open_test_vault_with_git_repo`, opened with
+    /// the A2 default indexer (`NullIndexer`) via `open_with_default_indexer`.
+    fn open_test_vault_with_git_repo_and_default_indexer() -> (Vault, PathBuf) {
         let root = crate::git::test_support::init_test_repo();
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         (vault, root)
+    }
+
+    // --- Task 6: IndexState stub, NullIndexer, and the IndexCurrent chain step ---
+
+    #[test]
+    fn null_indexer_never_reports_current_for_any_note_or_version() {
+        let indexer = NullIndexer;
+        // Property-style check over several arbitrary note ids/versions, not just one,
+        // so this cannot be satisfied by special-casing a single hard-coded input.
+        for note_id in ["note-a", "note-b", "freshly-written-note"] {
+            assert_eq!(indexer.state_for(note_id), IndexState::Stale, "NullIndexer must never claim Current — no indexer exists in A2");
+        }
+    }
+
+    #[test]
+    fn write_record_unchecked_reaches_index_current_pipeline_state_but_index_state_for_stays_stale() {
+        let (vault, _repo_dir) = open_test_vault_with_git_repo_and_default_indexer();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "content", Version(0), op).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::IndexCurrent, "the write pipeline has nothing further to do");
+        assert_eq!(vault.index_state_for(&id), IndexState::Stale, "but the index itself is honestly reported as not current — no indexer exists yet");
     }
 
     // --- Task 5: JournalCommitted -> GitCommitted chain extension ---
@@ -804,7 +895,8 @@ mod tests {
         let op = Uuid::new_v4();
         vault.write_record_unchecked(&id, "content", Version(0), op).unwrap();
         let row = vault.journal_row_for_test(op).unwrap();
-        assert_eq!(row.state, WriteState::GitCommitted);
+        // Task 6 extends the chain past GitCommitted; the Oid is still recorded.
+        assert_eq!(row.state, WriteState::IndexCurrent);
         assert!(row.git_commit_oid.is_some(), "the commit's Oid must be recorded on the row itself (Tier 1 idempotency source)");
         assert!(find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op, ScanDepth::Bounded(500)).unwrap().is_some());
     }
@@ -855,8 +947,8 @@ mod tests {
 
         let row_a = vault.journal_row_for_test(op_a).unwrap();
         let row_b = vault.journal_row_for_test(op_b).unwrap();
-        assert_eq!(row_a.state, WriteState::GitCommitted, "note-a's write must reach GitCommitted, not get stuck behind a lost ref race");
-        assert_eq!(row_b.state, WriteState::GitCommitted, "note-b's write must reach GitCommitted, not get stuck behind a lost ref race");
+        assert_eq!(row_a.state, WriteState::IndexCurrent, "note-a's write must reach the end of the chain, not get stuck behind a lost ref race");
+        assert_eq!(row_b.state, WriteState::IndexCurrent, "note-b's write must reach the end of the chain, not get stuck behind a lost ref race");
         assert!(row_a.git_commit_oid.is_some());
         assert!(row_b.git_commit_oid.is_some());
         assert_ne!(row_a.git_commit_oid, row_b.git_commit_oid, "each note's write must have its own distinct commit");
@@ -883,7 +975,7 @@ mod tests {
         // Deliberately NOT open_test_vault(): that helper's root is now a
         // git repository (Task 5), so this test builds its own non-git
         // vault to exercise the GitPending path specifically.
-        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let op = Uuid::new_v4();
         let result = vault.write_record_unchecked(&id, "content", Version(0), op);
@@ -910,7 +1002,7 @@ mod tests {
         let op = Uuid::new_v4();
         vault.write_record_unchecked(&id, "content v1", Version(0), op).unwrap();
         let row = vault.journal_row_for_test(op).unwrap();
-        assert_eq!(row.state, domain::WriteState::GitCommitted);
+        assert_eq!(row.state, domain::WriteState::IndexCurrent);
         assert_eq!(row.new_version, Some(1));
     }
 
@@ -932,7 +1024,7 @@ mod tests {
         // git-backed vault and expects the OPPOSITE of this assertion). This
         // test stops at JournalCommitted on purpose, so op2's before-image
         // is still there to observe.
-        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let err = vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StorageError::GitPending { .. }));
@@ -1078,7 +1170,7 @@ mod tests {
         // before-image BEFORE it is deleted, and A2 deletes it only after
         // GitCommitted (Task 5) — using a git-backed vault here would have
         // op2's before-image already gone by the time this test reads it.
-        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let op1 = Uuid::new_v4();
         let err = vault.write_record_unchecked(&id, "v1", Version(0), op1).unwrap_err();
@@ -1101,7 +1193,7 @@ mod tests {
         // that as StorageError::Io, not silently treat it as "note doesn't
         // exist yet" (Version(0)) and proceed to write over/through it.
         let root = unique_test_dir();
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         std::fs::create_dir_all(root.join("note-a.record")).unwrap();
         let err = vault
@@ -1145,7 +1237,7 @@ mod tests {
         let outside = unique_test_dir();
         symlink_dir(&outside, &root.join("escape"));
         crate::git::test_support::init_git_repo_at(&root);
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("escape").unwrap();
         let v = vault
             .write_record_unchecked(&id, "x", Version(0), Uuid::new_v4())
@@ -1202,7 +1294,7 @@ mod tests {
         let real = unique_test_dir();
         symlink_dir(&real, &base.join("via"));
         crate::git::test_support::init_git_repo_at(&real);
-        let vault = Vault::open(base.join("via"), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(base.join("via"), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         vault.write_record_unchecked(&id, "ok", Version(0), Uuid::new_v4()).unwrap();
         assert_eq!(vault.read_note(&id).unwrap().content, "ok");
@@ -1239,7 +1331,7 @@ mod tests {
     fn read_note_rejects_record_path_symlinked_to_a_file_outside_the_vault_root() {
         let (root, outside_file) = root_and_outside_record();
         symlink_file(&outside_file, &root.join("note-a.record"));
-        let vault = Vault::open(root, &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap();
         let result = vault.read_note(&NoteId::parse("note-a").unwrap());
         assert!(
             matches!(result, Err(StorageError::PathEscapesVaultRoot { ref note_id }) if note_id == "note-a"),
@@ -1256,7 +1348,7 @@ mod tests {
         let (root, outside_file) = root_and_outside_record();
         let link = root.join("note-a.record");
         symlink_file(&outside_file, &link);
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         // Version(7) is the OUTSIDE file's version: before the fix the version
         // check read it through the link and accepted this write.
@@ -1287,7 +1379,7 @@ mod tests {
         let outside_dir = unique_test_dir();
         let link = root.join("note-a.record");
         symlink_file(&outside_dir.join("does-not-exist.record"), &link);
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let read = vault.read_note(&id);
         assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
@@ -1306,7 +1398,7 @@ mod tests {
         let root = unique_test_dir();
         let link = root.join("note-a.record");
         symlink_file(&link, &link);
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let read = vault.read_note(&id);
         assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
@@ -1332,7 +1424,7 @@ mod tests {
         // journal-resolution check.
         let root = unique_test_dir();
         crate::git::test_support::init_git_repo_at(&root);
-        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         vault.write_record_unchecked(&id, "inside", Version(0), Uuid::new_v4()).unwrap();
         std::fs::create_dir(root.join("store")).unwrap();

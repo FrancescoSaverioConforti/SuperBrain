@@ -33,7 +33,7 @@
 //! use std::collections::HashSet;
 //! let dir = std::env::temp_dir().join(format!("superbrain-doctest-control-{}", uuid::Uuid::new_v4()));
 //! std::fs::create_dir_all(&dir).unwrap();
-//! let vault = storage::Vault::open(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+//! let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
 //! let id = storage::NoteId::parse("note-a").unwrap();
 //! let _ = vault.read_note(&id);
 //! let gate = policy::Gate::new(policy::SecretPolicy::new(1));
@@ -72,7 +72,7 @@
 //! ```compile_fail,E0624
 //! let dir = std::env::temp_dir().join(format!("superbrain-doctest-bypass-{}", uuid::Uuid::new_v4()));
 //! std::fs::create_dir_all(&dir).unwrap();
-//! let vault = storage::Vault::open(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+//! let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
 //! let id = storage::NoteId::parse("note-a").unwrap();
 //! let _ = vault.write_record_unchecked(&id, "bypass", storage::Version(0), uuid::Uuid::new_v4());
 //! ```
