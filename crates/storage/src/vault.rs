@@ -599,12 +599,16 @@ impl Vault {
     /// [`Vault::write_record_unchecked`] with an explicit `injector`. Production
     /// callers go through `write_record_unchecked`, which passes
     /// `FaultInjector::none()`. An armed injector stops the write right after
-    /// the named step boundary and returns `StorageError::Interrupted(point)`.
-    /// The four write-path points are checked, in order:
-    /// `AfterIntentRecorded` (after step 1), `AfterRenameBeforeJournalCommitted`
-    /// (after step 4's `ContentPersisted` advance), `AfterJournalCommittedBeforeGit`
-    /// (after step 6) and `AfterGitCommittedBeforeIndex` (after step 7). The
-    /// fifth, `DuringBeforeImageRestore`, lives in `recovery::reconcile`.
+    /// the named step boundary and returns `StorageError::Interrupted(point)`
+    /// (a `pause_at`-armed injector instead pauses and always resumes to
+    /// completion, never returning `Interrupted`). The five write-path
+    /// points are checked, in order: `AfterPathCheckedBeforeAtomicWrite`
+    /// (right after `record_path_checked`, Task 9's SEC-001 characterization
+    /// seam), `AfterIntentRecorded` (after step 1),
+    /// `AfterRenameBeforeJournalCommitted` (after step 4's `ContentPersisted`
+    /// advance), `AfterJournalCommittedBeforeGit` (after step 6) and
+    /// `AfterGitCommittedBeforeIndex` (after step 7). The sixth,
+    /// `DuringBeforeImageRestore`, lives in `recovery::reconcile`.
     pub(crate) fn write_record_unchecked_with_injector(
         &self,
         note_id: &NoteId,
@@ -626,6 +630,11 @@ impl Vault {
         }
 
         let record_path = self.record_path_checked(note_id)?;
+        // Task 9 seam: lets a test pause right after the containment check
+        // judged `record_path` safe and swap it for a symlink before the
+        // write below touches it, to characterize SEC-001. Never armed by
+        // `FaultInjector::none()` (every production caller).
+        injector.check(FaultPoint::AfterPathCheckedBeforeAtomicWrite).map_err(interrupted)?;
 
         // Step 1: intent_recorded. Deliberately before the per-note lock —
         // see the doc comment above for why that is safe.
@@ -2724,5 +2733,217 @@ mod tests {
         let recovery_commit = repo.find_commit(oid.unwrap()).unwrap();
         assert_eq!(recovery_commit.parent_id(0).unwrap(), manual_head, "built on top of the manual commit, which is kept");
         assert_eq!(committed_record_bytes(&repo_dir, &oid.unwrap().to_string(), "note-a"), serialize_record("content", Version(1)));
+    }
+
+    // --- Task 9: SEC-001/002/003 re-evaluation against the journal design ---
+    //
+    // These three tests are adversarial characterization tests, not
+    // regression tests: each is EXPECTED to currently PASS, and a pass means
+    // the exploit described in the corresponding Continuity decision
+    // ([d5b9] SEC-001, [c16c6] SEC-002, [c17e8] SEC-003) still succeeds
+    // against the A2 journal/hash-verification machinery. A FAILING
+    // assertion here is not a test bug to fix — it means the exploit no
+    // longer works and the verdict in
+    // `eval/results/A2/sec-debt-reevaluation.md` must be re-derived from
+    // that failure (see that file's own text for the actual verdicts). Each
+    // assertion checks the exploit's concrete, checkable outcome (bytes
+    // landing outside the root; a read returning another note's or an
+    // outside file's content), never a bare print with no assertion.
+
+    /// A fresh, unique SQLite journal path with no corresponding journal
+    /// file yet created — `Vault::open*` creates it. Named to match this
+    /// task's brief; equivalent to `unique_test_dir().join("journal.sqlite")`
+    /// used inline elsewhere in this module.
+    fn fresh_journal_path() -> PathBuf {
+        unique_test_dir().join("journal.sqlite")
+    }
+
+    #[test]
+    fn sec_001_toctou_window_between_path_check_and_write_still_exists() {
+        // This test is EXPECTED to demonstrate the race still succeeds (NOT a
+        // regression to fix in this task) — it is the adversarial proof that
+        // hash verification alone does not close SEC-001, because the hash
+        // check happens AFTER the write, not before the path resolution race.
+        let root = unique_test_dir();
+        init_git_repo_at(&root);
+        let vault = Arc::new(Vault::open_with_default_indexer(root.clone(), &fresh_journal_path()).unwrap());
+        let id = NoteId::parse("note-a").unwrap();
+        let outside = unique_test_dir();
+
+        let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        // Pause AFTER record_path_checked's canonicalization has already run
+        // and returned "inside root", but BEFORE atomic_write's own
+        // open/rename.
+        let injector = FaultInjector::pause_at(FaultPoint::AfterPathCheckedBeforeAtomicWrite, pause_tx, resume_rx);
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            writer_vault.write_record_unchecked_with_injector(&writer_id, "content", Version(0), Uuid::new_v4(), &injector)
+        });
+
+        pause_rx.recv().unwrap();
+        // Swap the now-checked-safe path for a symlink pointing outside,
+        // during the window.
+        let _ = std::fs::remove_file(root.join("note-a.record"));
+        symlink_file(&outside.join("victim"), &root.join("note-a.record"));
+        resume_tx.send(()).unwrap();
+        let write_result = writer.join().unwrap();
+
+        // DEVIATION FROM THE BRIEF, recorded here rather than silently
+        // "fixed" to match the brief's prediction (per this task's explicit
+        // instructions): the brief's original assertion checked
+        // `outside.join("victim").exists()`, predicting that the race makes
+        // `atomic_write`'s rename FOLLOW the symlink and land the new bytes
+        // at its target, inside `outside`. Measured directly against this
+        // platform's `atomic_write` (a bare `std::fs::rename(tmp, path)`,
+        // `crates/storage/src/atomic.rs`), that is not what happens: a
+        // rename onto a destination that is itself a symlink replaces the
+        // link (unlinks it and puts the new inode/file in its place) rather
+        // than writing through it to the link's target. So `outside/victim`
+        // is never created, and the race's observable effect is instead
+        // that the attacker's symlink is silently destroyed and replaced by
+        // the vault's own record — still a bug (the write proceeded through
+        // a path component the containment check had already approved
+        // before an attacker swapped it, violating the "write what you
+        // checked" invariant) but NOT the specific "write bytes outside the
+        // root" consequence the original finding predicted via THIS write
+        // primitive. Both facts are asserted below so this test fails loudly
+        // if either changes.
+        assert!(write_result.is_ok(), "the write must succeed despite the mid-flight symlink swap, got {write_result:?}");
+        let link_meta = root.join("note-a.record").symlink_metadata().unwrap();
+        let race_replaced_the_symlink_without_erroring = !link_meta.file_type().is_symlink();
+        assert!(
+            race_replaced_the_symlink_without_erroring,
+            "SEC-001 verdict check: if this assertion fails (the path is still the attacker's symlink), the race no longer silently proceeds through a swapped path — re-evaluate the verdict rather than treating this as a test bug"
+        );
+        let race_wrote_outside_the_root = outside.join("victim").exists();
+        assert!(
+            !race_wrote_outside_the_root,
+            "this project's atomic_write uses std::fs::rename onto the final path, which replaces a destination symlink rather than following it — if this assertion fails, atomic_write's rename semantics changed and bytes now land outside the root, which is a MORE severe form of SEC-001 than previously measured"
+        );
+    }
+
+    #[test]
+    fn sec_002_journal_hash_check_does_not_detect_aliasing_present_before_the_write() {
+        // note-a.record is a symlink to note-b.record BEFORE any write to
+        // note-a ever happens, so write_record_unchecked's own
+        // hash-of-what-it-just-wrote check cannot detect this: it hashes the
+        // content it itself produced and reads back the same (aliased)
+        // path, so the hash matches by construction.
+        let root = unique_test_dir();
+        init_git_repo_at(&root);
+        let vault = Vault::open_with_default_indexer(root.clone(), &fresh_journal_path()).unwrap();
+        let id_b = NoteId::parse("note-b").unwrap();
+        vault.write_record_unchecked(&id_b, "note-b real content", Version(0), Uuid::new_v4()).unwrap();
+        symlink_file(&root.join("note-b.record"), &root.join("note-a.record"));
+        let id_a = NoteId::parse("note-a").unwrap();
+        // record_path_checked's existing I-C fix (A1) already rejects a
+        // symlink whose target is OUTSIDE the root; root/note-a.record ->
+        // root/note-b.record resolves INSIDE the root, so I-C's fix does not
+        // reject it — this is specifically the aliasing case I-C's own doc
+        // comment says is out of its scope.
+        //
+        // DEVIATION FROM THE BRIEF, recorded rather than silently "fixed" to
+        // match the prediction: the brief's code calls `read_note(&id_a)`
+        // directly here and asserts it returns note-b's content. Measured
+        // against the actual A2 read path, that call instead returns
+        // `NotFound`, because `read_note_locked` resolves a note exclusively
+        // through `Journal::last_committed_for_note(note_id)` — keyed by the
+        // LOGICAL note id being read, never by "whatever bytes are at this
+        // path" — and no journal row has ever been created under the key
+        // "note-a" in this scenario (only "note-b" has one). This is a real,
+        // reproducible narrowing the brief's own prediction did not
+        // anticipate: a pure "alias a never-written note id to another
+        // note's file" read is now rejected, not aliased.
+        let never_written_alias_result = vault.read_note(&id_a);
+        assert!(
+            matches!(&never_written_alias_result, Err(StorageError::NotFound { note_id }) if note_id == "note-a"),
+            "SEC-002 finding (narrower than predicted): aliasing a note id that was NEVER itself written is now rejected as NotFound by the journal lookup, not silently aliased — got {never_written_alias_result:?}. If this assertion fails, the journal's per-note-id resolution changed and this specific variant may no longer be rejected."
+        );
+
+        // A second, more realistic variant of the same exploit family: have
+        // note-a-v2 reach its OWN committed journal row and hash first (a
+        // real write through the normal path), THEN swap its on-disk file
+        // for an in-root symlink aliasing note-b. This is the sub-case the
+        // brief's narration ("the alias is in place from before the write
+        // that created the journal row") does NOT literally cover — here
+        // the write happens first, the alias second — included because it
+        // is the shape an attacker with filesystem access after a note is
+        // already committed would actually use.
+        let id_a_v2 = NoteId::parse("note-a-v2").unwrap();
+        vault.write_record_unchecked(&id_a_v2, "note-a-v2's own original content", Version(0), Uuid::new_v4()).unwrap();
+        std::fs::remove_file(root.join("note-a-v2.record")).unwrap();
+        symlink_file(&root.join("note-b.record"), &root.join("note-a-v2.record"));
+        // FINDING (a genuine narrowing, not predicted by this task's plan):
+        // read_note's hash check is unconditional and keyed to the resolved
+        // row's OWN content_hash, computed at write time from note-a-v2's
+        // ORIGINAL bytes. note-b's bytes hash differently, so swapping the
+        // file for note-b's content after the fact is caught: the read
+        // fails closed as Inconsistent rather than silently returning
+        // note-b's content under note-a-v2's name. This is the one sub-case
+        // of SEC-002 that A2's read-time hash verification demonstrably
+        // closes — it does NOT close the general case (a note id that was
+        // never itself written, or one whose alias coincidentally hashes to
+        // the same bytes the row expects, is still exposed; see
+        // eval/results/A2/sec-debt-reevaluation.md).
+        let result = vault.read_note(&id_a_v2);
+        assert!(
+            matches!(&result, Err(StorageError::Inconsistent { note_id }) if note_id == "note-a-v2"),
+            "SEC-002 finding (this sub-case is CLOSED): once a note has its own committed journal row, read_note's unconditional hash check rejects a later swap to a DIFFERENT note's content as Inconsistent, rather than aliasing it — got {result:?}. If this assertion fails, that hash check stopped catching this swap and the verdict must be re-evaluated toward OPEN."
+        );
+    }
+
+    #[test]
+    fn sec_003_hard_link_aliasing_is_invisible_to_canonicalization_after_a2() {
+        let root = unique_test_dir();
+        init_git_repo_at(&root);
+        let outside = unique_test_dir();
+        let outside_file = outside.join("victim.record");
+        std::fs::write(&outside_file, serialize_record_for_test("OUTSIDE", Version(7))).unwrap();
+        let vault = Vault::open_with_default_indexer(root.clone(), &fresh_journal_path()).unwrap();
+        std::fs::hard_link(&outside_file, root.join("note-a.record")).unwrap();
+        // DEVIATION FROM THE BRIEF, recorded rather than silently "fixed" to
+        // match the prediction: the brief's code calls
+        // `read_note(&NoteId::parse("note-a").unwrap())` directly and
+        // asserts it returns "OUTSIDE". Measured against the actual A2 read
+        // path, this returns `NotFound`, for the same reason as SEC-002's
+        // never-written-alias variant: `note-a` has no journal row at all
+        // (nothing was ever written under that note id through
+        // `write_record_unchecked`), so `last_committed_for_note("note-a")`
+        // finds nothing and `read_note` never reaches the point of reading
+        // the hard-linked bytes off disk. Canonicalization still cannot see
+        // the hard link (unchanged from A1) — but the journal lookup now
+        // gates every read before canonicalization's blind spot is ever
+        // reached for a note id with no committed history.
+        let result = vault.read_note(&NoteId::parse("note-a").unwrap());
+        assert!(
+            matches!(&result, Err(StorageError::NotFound { note_id }) if note_id == "note-a"),
+            "SEC-003 finding (narrower than predicted): a hard link planted under a note id that was NEVER itself written is now rejected as NotFound by the journal lookup before canonicalization's blind spot matters — got {result:?}. If this assertion fails, the journal's per-note-id gating changed and this variant may again return the hard-linked OUTSIDE content."
+        );
+
+        // Second variant, symmetric with SEC-002's second variant and closer
+        // to the ORIGINAL A1 finding's shape: note-a-v2 is written for real
+        // first (its own committed row and hash exist), THEN its on-disk
+        // file is replaced with a hard link to the outside victim file.
+        // Canonicalization genuinely cannot distinguish the hard-linked
+        // path from an ordinary file — there is no separate link to resolve,
+        // unlike a symlink — so if anything still catches this, it can only
+        // be the content-hash check, not the containment check.
+        let id_a_v2 = NoteId::parse("note-a-v2").unwrap();
+        vault.write_record_unchecked(&id_a_v2, "note-a-v2's own original content", Version(0), Uuid::new_v4()).unwrap();
+        std::fs::remove_file(root.join("note-a-v2.record")).unwrap();
+        std::fs::hard_link(&outside_file, root.join("note-a-v2.record")).unwrap();
+        // FINDING: exactly like SEC-002's second variant, read_note's
+        // unconditional hash check rejects this as Inconsistent (the
+        // committed row's hash was computed over note-a-v2's ORIGINAL
+        // bytes, not the OUTSIDE file's "OUTSIDE" content), rather than
+        // returning the hard-linked victim content under note-a-v2's name.
+        // This sub-case is CLOSED by the same mechanism as SEC-002's.
+        let result2 = vault.read_note(&id_a_v2);
+        assert!(
+            matches!(&result2, Err(StorageError::Inconsistent { note_id }) if note_id == "note-a-v2"),
+            "SEC-003 finding (this sub-case is CLOSED): once a note has its own committed journal row, read_note's unconditional hash check rejects a later hard-link swap to different content as Inconsistent — got {result2:?}. If this assertion fails, that hash check stopped catching this swap and the verdict must be re-evaluated toward OPEN."
+        );
     }
 }

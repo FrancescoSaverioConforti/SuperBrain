@@ -19,6 +19,15 @@
 pub enum FaultPoint {
     /// `write_record_unchecked`: the intent row exists; nothing on disk changed.
     AfterIntentRecorded,
+    /// `write_record_unchecked`: `record_path_checked`'s containment check has
+    /// already run and returned a path it judged to resolve inside the vault
+    /// root, but `atomic_write`'s own create/rename has not yet touched that
+    /// path. Test-infrastructure-only seam (Task 9): a test can pause here
+    /// and swap the path for a symlink during the window, to characterize
+    /// whether SEC-001's check-then-use TOCTOU race still lands bytes through
+    /// an attacker-controlled link. Never armed in production, which always
+    /// passes `FaultInjector::none()`.
+    AfterPathCheckedBeforeAtomicWrite,
     /// `write_record_unchecked`: the record was renamed into place and the row
     /// advanced to `ContentPersisted` with its hash, before verification and
     /// before `JournalCommitted`.
