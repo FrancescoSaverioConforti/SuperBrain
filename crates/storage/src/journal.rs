@@ -189,6 +189,16 @@ impl Journal {
 
     /// Most recent row for `note_id` at `JournalCommitted` or later. Rows still at
     /// `IntentRecorded`/`ContentPersisted`/`Recovering` are ignored.
+    ///
+    /// Ordered by `new_version DESC`, not `rowid DESC` (storage Task 4
+    /// review, finding I1): `rowid` reflects `insert_intent` call order,
+    /// which happens BEFORE the per-note lock in `Vault::write_record_unchecked`
+    /// and is therefore not serialized across concurrent callers for the
+    /// same note. Two operations can call `insert_intent` in one order but
+    /// acquire the per-note lock — and so actually commit — in the other
+    /// order; `new_version` is assigned strictly `+1` per note under that
+    /// lock regardless of `insert_intent` timing, so it is the real
+    /// linearization order and `rowid` is not a reliable proxy for it.
     pub(crate) fn last_committed_for_note(
         &self,
         note_id: &str,
@@ -197,7 +207,7 @@ impl Journal {
             .conn
             .query_row(
                 &format!(
-                    "{SELECT_ROWS} WHERE note_id = ?1 AND state IN (?2, ?3, ?4) ORDER BY rowid DESC LIMIT 1"
+                    "{SELECT_ROWS} WHERE note_id = ?1 AND state IN (?2, ?3, ?4) ORDER BY new_version DESC LIMIT 1"
                 ),
                 params![
                     note_id,
@@ -327,6 +337,39 @@ mod tests {
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         let row = journal.last_committed_for_note("note-a").unwrap().unwrap();
         assert_eq!(row.operation_id, op);
+    }
+
+    #[test]
+    fn last_committed_for_note_resolves_by_new_version_not_insertion_order() {
+        // Storage Task 4 review, finding I1: insert_intent runs BEFORE the
+        // per-note lock in Vault::write_record_unchecked, so two operations
+        // for the same note can call insert_intent in one rowid order but
+        // actually acquire the lock, and so commit, in the OTHER order.
+        // Reproduces that directly against the Journal API: op_b's row is
+        // inserted (and so gets a LOWER rowid) before op_a's, but op_a
+        // commits first (lower new_version), and op_b commits second with
+        // the higher new_version — exactly as would happen if op_b called
+        // insert_intent first but lost the race for the per-note lock.
+        let journal = Journal::open_in_memory().unwrap();
+        let op_b = Uuid::new_v4();
+        journal.insert_intent(op_b, "note-a", 1).unwrap(); // lower rowid
+        let op_a = Uuid::new_v4();
+        journal.insert_intent(op_a, "note-a", 0).unwrap(); // higher rowid
+
+        // op_a committed first in real time, producing v2.
+        journal.advance(op_a, WriteState::ContentPersisted, AdvanceFields::content(2, "hash-a")).unwrap();
+        journal.advance(op_a, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+
+        // op_b committed second, producing v3 — the actually-current version.
+        journal.advance(op_b, WriteState::ContentPersisted, AdvanceFields::content(3, "hash-b")).unwrap();
+        journal.advance(op_b, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+
+        // op_b has the LOWER rowid (inserted first) but the HIGHER
+        // new_version (committed last). The resolved row must be op_b's:
+        // `ORDER BY rowid DESC` would wrongly return op_a's row here.
+        let row = journal.last_committed_for_note("note-a").unwrap().unwrap();
+        assert_eq!(row.operation_id, op_b, "must resolve to the row with the highest new_version, not the highest rowid");
+        assert_eq!(row.new_version, Some(3));
     }
 
     #[test]

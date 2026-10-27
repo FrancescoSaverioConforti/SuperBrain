@@ -719,6 +719,54 @@ mod tests {
     }
 
     #[test]
+    fn read_note_blocks_deterministically_while_another_thread_holds_the_notes_lock() {
+        // Storage Task 4 review, finding I2: the barrier-started race in
+        // `concurrent_read_during_rename_never_observes_uncommitted_bytes_against_the_wrong_row`
+        // above is too narrow a window to reliably prove `read_note` takes
+        // the per-note lock at all — the reviewer confirmed that test still
+        // passes 40/40 runs even with the lock acquisition deleted from
+        // `read_note`. This test holds the lock explicitly, with no race
+        // window, and asserts the reader thread is still blocked after a
+        // fixed sleep: it fails deterministically if `read_note` does not
+        // actually take `self.note_lock(note_id)`.
+        let vault = Arc::new(open_test_vault());
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+
+        let note_lock = vault.note_lock(&id);
+        let _guard = note_lock.lock().unwrap();
+
+        // Simulate the window between the writer's rename (step 4) and its
+        // JournalCommitted advance (step 6): new, not-yet-committed bytes
+        // are on disk, but the lock is still held, exactly as
+        // write_record_unchecked holds it across that whole span. These
+        // bytes would hash-mismatch against v1's committed row if a reader
+        // ever reached them, which is exactly why the lock must keep any
+        // reader out until they are put back.
+        let record_path = vault.root_for_test().join("note-a.record");
+        let original_bytes = std::fs::read(&record_path).unwrap();
+        atomic_write(&record_path, &serialize_record("v2-in-flight", Version(2))).unwrap();
+
+        let reader_vault = Arc::clone(&vault);
+        let reader_id = id.clone();
+        let handle = std::thread::spawn(move || reader_vault.read_note(&reader_id));
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !handle.is_finished(),
+            "read_note must still be blocked on the per-note lock while this thread holds it"
+        );
+
+        // Restore the committed bytes before releasing the lock, so the
+        // reader (once unblocked) observes a consistent, fully-committed
+        // record rather than the in-flight bytes this test planted.
+        atomic_write(&record_path, &original_bytes).unwrap();
+        drop(_guard);
+        let result = handle.join().unwrap();
+        assert_eq!(result.unwrap().content, "v1", "after the lock is released, the reader sees the last fully-committed record");
+    }
+
+    #[test]
     fn read_note_returns_inconsistent_on_hash_mismatch_never_a_before_image_substitution() {
         // Pins the second user architectural review's correction to issue 1: a
         // corrupted on-disk file for the committed row must surface as
