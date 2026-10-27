@@ -23,11 +23,14 @@ recorded here as the authority that confirmed it, per the brief's explicit instr
 `deny.toml` entry pre-dating A2 (`RUSTSEC-2024-0449`, `unsafe-libyaml`) is unrelated to A2's new
 dependencies and is unchanged; see `eval/results/A1/dependency-exceptions.md`.
 
-## Advisories: one new finding, left OPEN — not resolved by this task
+## Advisories: one finding, found OPEN by this task, RESOLVED by a later commit
 
-`cargo deny check advisories`, run in the same pass, **FAILED**. Three RustSec advisories were
-found against `git2` 0.19.0, the exact version pinned by `crates/storage/Cargo.toml`
-(`git2 = "0.19"`):
+`cargo deny check advisories`, run as part of this task's first pass, **FAILED**. Three
+RustSec advisories were found against `git2` 0.19.0, the version pinned by
+`crates/storage/Cargo.toml` at that time (`git2 = "0.19"`). **This finding is now resolved** —
+see "Resolution" at the end of this section — but the original finding and the reasoning
+behind each option considered are preserved below as the acceptance-evidence record of how it
+was found and closed, not because it is still open.
 
 ### Finding: RUSTSEC-2026-0008
 
@@ -44,7 +47,8 @@ found against `git2` 0.19.0, the exact version pinned by `crates/storage/Cargo.t
   constructs or dereferences a `git2::Buf`. This project's own code does not take the trigger
   path, though this does not rule out the advisory's root cause being reachable through some
   other `git2`/`libgit2` internal call this project does make.
-- **Status:** **OPEN, not exempted, not fixed.** See "Why this was not resolved" below.
+- **Status:** **RESOLVED.** Found open at this task's first pass; fixed by the `git2` 0.21
+  upgrade described in "Resolution" below.
 
 ### Finding: RUSTSEC-2026-0183
 
@@ -56,7 +60,8 @@ found against `git2` 0.19.0, the exact version pinned by `crates/storage/Cargo.t
 - **Applicability to this project:** `crates/storage/src/git.rs` never calls
   `Remote::list()` — this project has no remote-related git functionality at all (A2 commits
   only to the local repository; no push/fetch/remote operations exist anywhere in `storage`).
-- **Status:** **OPEN, not exempted, not fixed.**
+- **Status:** **RESOLVED.** Found open at this task's first pass; fixed by the `git2` 0.21
+  upgrade described in "Resolution" below.
 
 ### Finding: RUSTSEC-2026-0184
 
@@ -67,40 +72,61 @@ found against `git2` 0.19.0, the exact version pinned by `crates/storage/Cargo.t
 - **Fixed upstream in:** `git2 >= 0.21.0`.
 - **Applicability to this project:** `crates/storage/src/git.rs` never uses `Blame` or
   `BlameHunk` — this project has no blame/history-attribution functionality.
-- **Status:** **OPEN, not exempted, not fixed.**
+- **Status:** **RESOLVED.** Found open at this task's first pass; fixed by the `git2` 0.21
+  upgrade described in "Resolution" below.
 
-### Why this was not resolved
+### Two remediation paths were considered at this task's first pass; this task performed neither itself
 
-Two remediation paths exist, and this task performed neither:
-
-1. **Upgrade `git2` to `>= 0.21`.** This requires changing the version constraint in
-   `crates/storage/Cargo.toml` (currently `git2 = "0.19"`, which `cargo update -p git2
-   --dry-run` confirms has no compatible newer version available under that constraint — the
-   fix versions are a minor/major bump away). This is a production dependency-manifest change.
-   Task 10's brief is explicit that this task makes **no code changes** ("this is a
-   documentation/evidence task"); a version bump, even without touching any `.rs` file, is a
-   change to a committed production artifact (`Cargo.toml`/`Cargo.lock`) that could alter
-   `git2`'s behavior or API surface in ways this task is not chartered to review or test.
+1. **Upgrade `git2` to `>= 0.21`.** Requires changing the version constraint in
+   `crates/storage/Cargo.toml` (at the time, `git2 = "0.19"`, and `cargo update -p git2
+   --dry-run` confirmed no compatible newer version existed under that constraint — the fix
+   versions were a minor/major bump away). This is a production dependency-manifest change.
+   Task 10's brief is explicit that this documentation task makes **no code changes** itself;
+   a version bump, even without touching any `.rs` file by this task's own hand, is a change to
+   a committed production artifact that this task was not chartered to make or review.
 2. **Add a time-bound `deny.toml` exception**, following the exact pattern of the existing
-   `RUSTSEC-2024-0449` entry, backed by the applicability analysis above (none of the three
-   advisories' trigger APIs are called by this project's code). A draft of this exception was
-   prepared during this task but the `Edit` to `deny.toml` was **blocked by the coding agent's
-   own permission system**, which classified adding advisory-ignore entries to a
-   security-relevant configuration file as a "Security Weaken" action requiring explicit human
-   approval before proceeding. This task respected that block rather than finding a workaround,
-   since granting an exception to unsoundness advisories is exactly the kind of decision that
-   should require explicit, visible human sign-off rather than being made unilaterally by an
-   agent — even one executing a brief that anticipated exceptions might be needed.
+   `RUSTSEC-2024-0449` entry, backed by the applicability analysis above. A draft of this
+   exception was prepared during this task's first pass but the `Edit` to `deny.toml` was
+   **blocked by the coding agent's own permission system**, which classified adding
+   advisory-ignore entries to a security-relevant configuration file as a "Security Weaken"
+   action requiring explicit human approval before proceeding.
 
-**Net result:** `cargo deny check` is left genuinely failing (`advisories FAILED`) at A2's
-close. This is recorded as an open item for the plan owner / user to resolve before merge, by
-explicitly choosing one of the two paths above (or a third option, such as pinning to a patched
-`git2` fork or vendoring a fix) — not by this task silently picking one.
+### Resolution: the user chose to upgrade `git2`; no `deny.toml` exception was ultimately needed
 
-**Recorded in:** `eval/results/A2/evidence.md` Section 2.2 and Section 4 ("What A2 does NOT
-guarantee"). `deny.toml` itself is **unchanged** by this task — confirmed via
-`git status --short deny.toml` showing no diff at the time this file was written.
+This finding, along with both options above, was presented to the user as part of this task's
+`evidence.md`. **The user chose option 1** — upgrade `git2` — rather than granting an
+exception or leaving the check red. The coordinator made that upgrade directly, in a separate
+commit **`247df9e35d23eeec58003442a1b18bb91dc6a0e7`**
+(`fix(storage): upgrade git2 to 0.21 to resolve three unsound advisories`), landed on top of
+this task's own evidence commit:
 
-**Re-review:** whichever path the plan owner chooses, it should happen before this branch
-merges to `main`, since `cargo deny check` is part of this project's standing acceptance
-criteria and is not currently green.
+- `crates/storage/Cargo.toml`: `git2 = "0.19"` → `git2 = "0.21"`.
+- `crates/storage/src/git.rs` and `crates/storage/src/vault.rs`: two call sites adapted for
+  `git2 0.21`'s API change (`Reference::name()` and `Commit::message()` changed from
+  `Option`-returning to `Result`-returning, as part of the same unsound-pointer-dereference fix
+  the three advisories describe) — `.ok_or_else(...)` → `.map_err(|_| ...)` and
+  `.is_some_and(...)` → `.is_ok_and(...)`, both verified to preserve the exact prior behavior
+  (a missing/non-UTF8 name or message is still treated as "doesn't match," never newly
+  propagated as a hard error).
+- `Cargo.lock`: the transitive dependency tree shrank (net 318 lines removed in the diff)
+  because `git2`/`libgit2-sys` 0.21 drops the `openssl-sys`/`url`/ICU chain that only the old
+  network-transport features needed — this project's git usage is local-filesystem-only, so
+  that chain was unused dead weight the upgrade incidentally sheds.
+- `deny.toml`: **unchanged** — confirmed via `git diff 9771c1e..247df9e -- deny.toml`, which is
+  empty. No exception of any kind was ultimately added to it, through either this task's first
+  pass or the later upgrade commit.
+
+**Independently re-verified by this task** after the upgrade landed (not taken on faith from
+the coordinator's own report):
+
+```
+cargo deny check   → advisories ok, bans ok, licenses ok, sources ok
+cargo test --workspace   → 199 passed, 0 failed (same count as before the upgrade)
+cargo clippy --workspace -- -D warnings   → clean
+```
+
+**Net result:** `cargo deny check` passes cleanly. No `deny.toml` or `dependency-exceptions.md`
+exception entry exists for `git2`, and none was needed — the version upgrade resolved the
+underlying advisories rather than suppressing them.
+
+**Recorded in:** `eval/results/A2/evidence.md` Section 2.2 and Section 2.2.1.
