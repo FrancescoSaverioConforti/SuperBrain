@@ -152,6 +152,13 @@ pub enum StorageError {
     /// reports that outcome.
     #[error("operation {operation_id} is still in flight; nothing was applied")]
     OperationInProgress { operation_id: Uuid },
+    /// A call reused an existing `operation_id` for a DIFFERENT request: a
+    /// different note, expected version or content than the operation the
+    /// journal recorded under that id. It is not a retry, so neither the
+    /// original outcome nor the new request is applied or reported. The
+    /// caller must use a new `operation_id`.
+    #[error("operation {operation_id} already names a different request (note, expected version or content differ)")]
+    OperationIdReused { operation_id: Uuid },
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -186,6 +193,36 @@ fn reconcile_err(note_id: &NoteId, e: ReconcileError) -> StorageError {
             note_id: note_id.as_str().to_string(),
         },
     }
+}
+
+/// Step 0's guard (Task 8 fix round, finding I1): a call reusing an existing
+/// `operation_id` is a retry only if it asks for exactly what the original
+/// call asked for. Checked against the journal row: the same note id, the
+/// same expected version and, once the row records a `content_hash`
+/// (`ContentPersisted` onward), the same content, compared by hashing the
+/// record this call would have written at the row's `new_version`. Any
+/// mismatch is `OperationIdReused`. Otherwise the original outcome would be
+/// reported for a request that was never applied (for example
+/// `propose_and_commit` pairing the original version with link state
+/// computed from the new, unapplied text).
+fn ensure_retry_matches(
+    row: &crate::journal::OperationRow,
+    note_id: &NoteId,
+    content: &str,
+    expected_version: Version,
+) -> Result<(), StorageError> {
+    let content_differs = match (&row.content_hash, row.new_version) {
+        (Some(recorded), Some(new_version)) => {
+            content_hash(&serialize_record(content, Version(new_version))) != *recorded
+        }
+        _ => false,
+    };
+    if row.note_id != note_id.as_str() || row.expected_version != expected_version.0 || content_differs {
+        return Err(StorageError::OperationIdReused {
+            operation_id: row.operation_id,
+        });
+    }
+    Ok(())
 }
 
 /// The version a journal row at `JournalCommitted` or later committed.
@@ -493,8 +530,10 @@ impl Vault {
     /// `FaultInjector::none()`, so this never interrupts them — the seam
     /// exists for Task 8's crash tests):
     ///
-    /// 0. If the journal already has a row for `operation_id`, return that
-    ///    operation's outcome via `resume_existing_operation` (`Failed` ->
+    /// 0. If the journal already has a row for `operation_id`: unless this
+    ///    call asks for exactly the same note, expected version and content
+    ///    (`ensure_retry_matches`), return `OperationIdReused`. Otherwise return
+    ///    that operation's outcome via `resume_existing_operation` (`Failed` ->
     ///    `OperationFailed`, finished -> its version, mid-flight ->
     ///    `OperationInProgress`, `JournalCommitted`/`GitCommitted` -> finish
     ///    the remaining git/index steps). Nothing is written twice.
@@ -582,6 +621,7 @@ impl Vault {
         // a local first so the journal guard is released before resuming.
         let existing = self.journal.lock().unwrap().get(operation_id).map_err(journal_err)?;
         if let Some(row) = existing {
+            ensure_retry_matches(&row, note_id, content, expected_version)?;
             return self.resume_existing_operation(row);
         }
 
@@ -712,9 +752,9 @@ impl Vault {
     /// can be finished safely, and never writes the record again (C1, "Retry
     /// dello stesso operation_id in ciascuno stato").
     ///
-    /// The operation_id alone identifies the operation: the retry's own
-    /// note id, content and expected version are not consulted, and all work
-    /// is done against the row's own note.
+    /// The caller has already checked, via `ensure_retry_matches`, that the
+    /// retry asks for the same note, expected version and content as `row`;
+    /// a call that does not is `OperationIdReused` and never reaches here.
     ///
     /// - `Failed`: `OperationFailed`. The caller must use a new id.
     /// - `IndexCurrent`: `Ok` with the version it committed.
@@ -2316,10 +2356,14 @@ mod tests {
         vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
         let op = Uuid::new_v4();
         assert!(matches!(vault.write_record_unchecked(&id, "stale", Version(0), op), Err(StorageError::Conflict { .. })));
-        // The same operation_id, now with an expected version that WOULD
-        // match: the outcome already reached (Failed) stands.
-        let retry = vault.write_record_unchecked(&id, "stale", Version(1), op);
+        // A genuine retry (identical request): the outcome already reached
+        // (Failed) stands; the conflicting write is not attempted again.
+        let retry = vault.write_record_unchecked(&id, "stale", Version(0), op);
         assert!(matches!(retry, Err(StorageError::OperationFailed { operation_id }) if operation_id == op), "got {retry:?}");
+        // The same id with an expected version that WOULD now match is not a
+        // retry but a different request (fix round, finding I1).
+        let reused = vault.write_record_unchecked(&id, "stale", Version(1), op);
+        assert!(matches!(reused, Err(StorageError::OperationIdReused { operation_id }) if operation_id == op), "got {reused:?}");
         assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
     }
 
@@ -2403,7 +2447,7 @@ mod tests {
         assert!(matches!(vault.write_record_unchecked(&id, "content B", Version(1), op_b), Err(StorageError::GitPending { .. })));
         init_test_repo_at(&root);
 
-        assert_eq!(vault.write_record_unchecked(&id, "ignored", Version(0), op_a).unwrap(), Version(1));
+        assert_eq!(vault.write_record_unchecked(&id, "content A", Version(0), op_a).unwrap(), Version(1));
         let row_a = vault.journal_row_for_test(op_a).unwrap();
         assert_eq!(committed_record_bytes(&root, row_a.git_commit_oid.as_deref().unwrap(), "note-a"), serialize_record("content A", Version(1)));
         assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content B".into(), version: Version(2) }, "the retry never touched the record");
@@ -2439,13 +2483,153 @@ mod tests {
         assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
         let bytes = std::fs::read(root.join("note-a.record")).unwrap();
 
-        // Different content and expected version: the operation_id alone
-        // decides, and its outcome is already reached.
-        assert_eq!(vault.write_record_unchecked(&id, "other content", Version(1), op).unwrap(), Version(1));
+        // A genuine retry, the identical request: its outcome is already reached.
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
         assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), bytes, "no second write");
         assert_eq!(commits_for_operation(&root, op), 1, "no second commit");
         assert_eq!(calls.lock().unwrap().len(), 1, "no second index step");
         assert!(read_before_image(&root, &id, op).is_err(), "no before-image was taken for the retry");
+    }
+
+    #[test]
+    fn reusing_an_operation_id_for_a_different_request_is_refused_not_reported_as_the_original_outcome() {
+        // Fix round, finding I1: the journal row records what the original
+        // request was (note, expected version, content hash). A call that
+        // reuses the id for anything else must not get the original outcome
+        // back, and must not be applied either.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let (indexer, calls) = counting_indexer();
+        let vault = Vault::open(root.clone(), &journal_path, indexer).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let other_id = NoteId::parse("note-b").unwrap();
+        let op = Uuid::new_v4();
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1));
+        let bytes = std::fs::read(root.join("note-a.record")).unwrap();
+
+        for (label, note, content, expected) in [
+            ("different content", &id, "other content", Version(0)),
+            ("different expected version", &id, "content", Version(1)),
+            ("different note", &other_id, "content", Version(0)),
+            ("everything different", &other_id, "other content", Version(1)),
+        ] {
+            let result = vault.write_record_unchecked(note, content, expected, op);
+            assert!(
+                matches!(result, Err(StorageError::OperationIdReused { operation_id }) if operation_id == op),
+                "{label}: got {result:?}"
+            );
+        }
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), bytes, "nothing applied");
+        assert!(!root.join("note-b.record").exists(), "nothing applied to the other note");
+        assert_eq!(commits_for_operation(&root, op), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent, "the original row is untouched");
+    }
+
+    #[test]
+    fn reusing_an_in_flight_operation_id_for_different_content_is_refused_as_reused_not_in_progress() {
+        // The content check also applies before the operation resolves, once
+        // the row records a content_hash (ContentPersisted onward).
+        let (vault, root) = open_test_vault_with_git_repo();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+        let _ = vault.write_record_unchecked_with_injector(&id, "content", Version(0), op, &injector);
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::ContentPersisted);
+
+        let reused = vault.write_record_unchecked(&id, "other content", Version(0), op);
+        assert!(matches!(reused, Err(StorageError::OperationIdReused { .. })), "got {reused:?}");
+        let same = vault.write_record_unchecked(&id, "content", Version(0), op);
+        assert!(matches!(same, Err(StorageError::OperationInProgress { .. })), "got {same:?}");
+        assert_eq!(commits_for_operation(&root, op), 0);
+    }
+
+    #[test]
+    fn retry_concurrent_with_a_live_writer_paused_before_journal_committed_returns_in_progress_without_blocking() {
+        // Fix round, finding I2(a): the original writer is genuinely still
+        // running (paused at AfterRenameBeforeJournalCommitted, holding the
+        // per-note lock). The retry checks the row at step 0, before any lock,
+        // so it must return OperationInProgress promptly rather than wait.
+        let (vault, root) = open_test_vault_with_git_repo();
+        let vault = Arc::new(vault);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+
+        let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterRenameBeforeJournalCommitted, pause_tx, resume_rx);
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            writer_vault.write_record_unchecked_with_injector(&writer_id, "content", Version(0), op, &injector)
+        });
+        pause_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("writer must pause");
+
+        let retry_vault = Arc::clone(&vault);
+        let retry_id = id.clone();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = retry_tx.send(retry_vault.write_record_unchecked(&retry_id, "content", Version(0), op));
+        });
+        let retry = retry_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the retry must return while the writer still holds the lock, not block on it");
+        assert!(matches!(retry, Err(StorageError::OperationInProgress { operation_id }) if operation_id == op), "got {retry:?}");
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), Version(1), "the live writer completes normally");
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(vault.write_record_unchecked(&id, "content", Version(0), op).unwrap(), Version(1), "a later retry sees the outcome");
+        assert_eq!(commits_for_operation(&root, op), 1);
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content".into(), version: Version(1) });
+    }
+
+    #[test]
+    fn retry_concurrent_with_a_live_writer_paused_after_journal_committed_waits_then_resolves_without_a_second_commit() {
+        // Fix round, finding I2(b): the writer is paused at
+        // AfterJournalCommittedBeforeGit, still holding the per-note lock. The
+        // retry sees JournalCommitted at step 0, so it goes for the lock to
+        // finish the remaining steps, and must wait there. Once the writer
+        // completes and releases the lock, the retry re-reads the row, finds
+        // IndexCurrent, and reports it: no second commit, no second index call.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let (indexer, calls) = counting_indexer();
+        let vault = Arc::new(Vault::open(root.clone(), &journal_path, indexer).unwrap());
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+
+        let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterJournalCommittedBeforeGit, pause_tx, resume_rx);
+        let writer_vault = Arc::clone(&vault);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            writer_vault.write_record_unchecked_with_injector(&writer_id, "content", Version(0), op, &injector)
+        });
+        pause_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("writer must pause");
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted);
+
+        let retry_vault = Arc::clone(&vault);
+        let retry_id = id.clone();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = retry_tx.send(retry_vault.write_record_unchecked(&retry_id, "content", Version(0), op));
+        });
+        assert!(
+            retry_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "the retry must wait on the per-note lock while the writer holds it"
+        );
+        assert_eq!(commits_for_operation(&root, op), 0, "nobody has committed yet");
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), Version(1));
+        let retry = retry_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the retry unblocks once the writer releases the lock");
+        assert_eq!(retry.unwrap(), Version(1), "the retry reports the outcome the writer reached");
+
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(commits_for_operation(&root, op), 1, "exactly one commit");
+        assert_eq!(*calls.lock().unwrap(), vec![("note-a".to_string(), 1)], "exactly one index step");
     }
 
     #[test]
