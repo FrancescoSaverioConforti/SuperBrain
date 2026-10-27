@@ -62,6 +62,7 @@ pub(crate) struct AdvanceFields {
     content_hash: Option<String>,
     before_image_hash: Option<String>,
     before_image_path: Option<String>,
+    git_commit_oid: Option<String>,
 }
 
 impl AdvanceFields {
@@ -85,6 +86,17 @@ impl AdvanceFields {
         Self {
             before_image_hash: Some(before_image_hash.into()),
             ..Self::content(new_version, content_hash)
+        }
+    }
+
+    /// Records the git commit `Oid` for this operation on the SAME journal
+    /// write that advances its state to `GitCommitted` — not a separate
+    /// write, so there is no window where the state says `GitCommitted` but
+    /// `git_commit_oid` is still unset (Task 5's chain-extension invariant).
+    pub(crate) fn git_oid(oid: git2::Oid) -> Self {
+        Self {
+            git_commit_oid: Some(oid.to_string()),
+            ..Self::default()
         }
     }
 }
@@ -154,8 +166,9 @@ impl Journal {
                     content_hash = COALESCE(?4, content_hash), \
                     before_image_hash = COALESCE(?5, before_image_hash), \
                     before_image_path = COALESCE(?6, before_image_path), \
+                    git_commit_oid = COALESCE(?7, git_commit_oid), \
                     updated_at = {NOW_SQL} \
-                 WHERE operation_id = ?1 AND state = ?7"
+                 WHERE operation_id = ?1 AND state = ?8"
             ),
             params![
                 operation_id.to_string(),
@@ -164,6 +177,7 @@ impl Journal {
                 fields.content_hash,
                 fields.before_image_hash,
                 fields.before_image_path,
+                fields.git_commit_oid,
                 state_to_sql(current.state),
             ],
         )?;

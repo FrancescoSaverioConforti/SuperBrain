@@ -48,6 +48,31 @@ pub struct CommitOutcome {
     pub link_state: domain::LinkState,
 }
 
+/// `propose_and_commit`'s `Ok` type. The spec requires `commit_write` to
+/// distinguish a full success from "git_pending, non un successo" — a
+/// distinction `Result<CommitOutcome, ProposeError>` alone cannot express,
+/// since git unavailability is an expected, non-error outcome, not a
+/// failure of the proposal itself.
+///
+/// `ProposeError::Storage(StorageError::GitPending { .. })` is caught
+/// inside `propose_and_commit` and converted to `Ok(CommitResult::GitPending { .. })`
+/// rather than propagated as an error: the note's content IS durably
+/// persisted and journal-readable (it reached `WriteState::JournalCommitted`)
+/// even though the write has not yet reached `WriteState::GitCommitted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitResult {
+    /// The write reached `WriteState::GitCommitted` (and, if applicable,
+    /// beyond) — a full, ordinary success.
+    Committed(CommitOutcome),
+    /// The write reached `WriteState::JournalCommitted` and is durably
+    /// persisted and readable, but the vault root was not (yet) a git
+    /// repository, so it could not be advanced to `WriteState::GitCommitted`.
+    /// A later retry of the SAME `operation_id` (via a fresh
+    /// `write_record_unchecked` chain extension attempt, once a repository
+    /// exists at the vault root) advances it the rest of the way.
+    GitPending { note_id: String, operation_id: Uuid },
+}
+
 /// The single public write path out of `storage`, and therefore out of the
 /// whole workspace (the raw primitives `atomic_write` and
 /// `Vault::write_record_unchecked` are both `pub(crate)`): parses the
@@ -94,9 +119,16 @@ pub struct CommitOutcome {
 ///   they cannot alias a record file. Matching is exact (byte-for-byte):
 ///   the caller declares exactly which references are pending.
 ///
-/// On success the result is a [`CommitOutcome`]: the new [`Version`] plus
-/// the note's link state, so a note committed with pending references is
-/// reported as `LinkState::Pending` rather than accepted silently.
+/// On success the result is a [`CommitResult`]. The ordinary case is
+/// `CommitResult::Committed(CommitOutcome)`: the new [`Version`] plus the
+/// note's link state, so a note committed with pending references is
+/// reported as `LinkState::Pending` rather than accepted silently. If the
+/// vault root is not (yet) a git repository, the write still durably
+/// persists and reaches `WriteState::JournalCommitted`, but cannot advance
+/// to `WriteState::GitCommitted`; that case is reported as
+/// `Ok(CommitResult::GitPending { .. })`, not an error — git unavailability
+/// is an expected, non-error outcome per spec, not a failure of the
+/// proposal itself.
 pub fn propose_and_commit(
     vault: &Vault,
     note_text: &str,
@@ -105,7 +137,7 @@ pub fn propose_and_commit(
     known_ids: &HashSet<NoteId>,
     pending_ids: &HashSet<String>,
     gate: &policy::Gate,
-) -> Result<CommitOutcome, ProposeError> {
+) -> Result<CommitResult, ProposeError> {
     let note = match domain::parse_frontmatter(frontmatter_of(note_text)) {
         Ok(note) => note,
         Err(err) => {
@@ -158,10 +190,15 @@ pub fn propose_and_commit(
     // appears only in the body is still caught before the vault is touched.
     match gate.evaluate(&note, note_text, Ok(link_state)) {
         policy::GateDecision::Reject(rejection) => Err(ProposeError::Rejected(rejection)),
-        policy::GateDecision::Pass => vault
-            .write_record_unchecked(&note_id, note_text, expected_version, operation_id)
-            .map(|version| CommitOutcome { version, link_state })
-            .map_err(ProposeError::Storage),
+        policy::GateDecision::Pass => {
+            match vault.write_record_unchecked(&note_id, note_text, expected_version, operation_id) {
+                Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
+                Err(StorageError::GitPending { note_id }) => {
+                    Ok(CommitResult::GitPending { note_id, operation_id })
+                }
+                Err(other) => Err(ProposeError::Storage(other)),
+            }
+        }
     }
 }
 

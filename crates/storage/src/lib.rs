@@ -79,6 +79,7 @@
 
 mod atomic;
 mod fault;
+mod git;
 mod journal;
 mod note_id;
 mod propose;
@@ -88,7 +89,7 @@ mod vault;
 // ungated, unvalidated filesystem primitive and must stay crate-private (see
 // the crate docs above and Finding C1 of the A1 final review).
 pub use note_id::{NoteId, NoteIdError};
-pub use propose::{propose_and_commit, CommitOutcome, ProposeError};
+pub use propose::{propose_and_commit, CommitOutcome, CommitResult, ProposeError};
 pub use vault::{StorageError, Vault, VaultRecord, Version};
 
 #[test]

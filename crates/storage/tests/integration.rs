@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use storage::{CommitOutcome, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
+use storage::{CommitOutcome, CommitResult, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
 
 fn unique_test_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -22,7 +22,27 @@ fn unique_test_dir() -> PathBuf {
 /// the mechanical A2 replacement for A1's `Vault::new(root)` at every call
 /// site in this file. This integration test continues to exercise only
 /// `propose_and_commit`'s genuinely public surface; this is its only change.
+///
+/// Task 5 note: `root` is ALSO git-initialized (with an initial empty
+/// commit), so a successful `propose_and_commit` call reaches the new
+/// terminus, `WriteState::GitCommitted`, and reports
+/// `Ok(CommitResult::Committed(_))` rather than `Ok(CommitResult::GitPending { .. })`.
+/// Every call site in this file exercises the ordinary, git-backed success
+/// path; `propose_and_commit_surfaces_git_pending_as_ok_not_err` below is
+/// the one test that deliberately builds its own non-git vault instead.
 fn open_vault(root: PathBuf) -> Vault {
+    git2::Repository::init(&root).unwrap();
+    {
+        let repo = git2::Repository::open(&root).unwrap();
+        let signature = git2::Signature::now("SuperBrain Test", "test@localhost").unwrap();
+        let tree_oid = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial empty commit", &tree, &[])
+            .unwrap();
+    }
     Vault::open(root, &unique_test_dir().join("journal.sqlite")).unwrap()
 }
 
@@ -175,7 +195,10 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
         &gate,
     )
     .unwrap();
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Unlinked });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Unlinked })
+    );
 }
 
 #[test]
@@ -314,10 +337,15 @@ fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
 
 // --- A1 final review, Finding C2: case-insensitive filesystem collision ---
 
+/// Entries directly inside `dir`, excluding `.git` (Task 5: `open_vault`
+/// now git-initializes its root as a side effect of making the vault
+/// git-backed, so `.git` is a vault-setup artifact, not note content — the
+/// "nothing may be written" assertions in this file are about note content).
 fn files_in(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".git")
         .collect();
     names.sort();
     names
@@ -430,7 +458,10 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
         &gate,
     )
     .unwrap();
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Resolved });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Resolved })
+    );
 }
 
 // --- A1 second whole-branch review, Finding I-A: pending references are opaque ---
@@ -458,7 +489,10 @@ fn assert_pending_ref_commits(relation: &str, target: &str) {
         &gate,
     )
     .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending })
+    );
     let id = NoteId::parse("note-p").unwrap();
     assert_eq!(vault.read_note(&id).unwrap().content, yaml);
 }
@@ -505,7 +539,7 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
     // result itself flags it; the caller does not have to re-classify.
     assert_eq!(
         outcome,
-        CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending }
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending })
     );
 }
 
@@ -568,6 +602,13 @@ fn full_note(id: &str, body: &str) -> String {
     format!("---\n{}---\n{body}", valid_yaml(id).trim_start())
 }
 
+/// Thin wrapper over `propose_and_commit` for this section's tests, which
+/// only care about the ordinary `CommitOutcome` (every call site here uses
+/// `open_vault`, which is git-backed, so a successful commit always reaches
+/// `CommitResult::Committed`). `GitPending` has its own dedicated test
+/// (`propose_and_commit_surfaces_git_pending_as_ok_not_err`), so unwrapping
+/// it away here would hide a real regression rather than paper over an
+/// irrelevant case.
 fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome, ProposeError> {
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     storage::propose_and_commit(
@@ -579,6 +620,12 @@ fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome,
         &HashSet::new(),
         &gate,
     )
+    .map(|result| match result {
+        CommitResult::Committed(outcome) => outcome,
+        CommitResult::GitPending { note_id, operation_id } => panic!(
+            "commit() test helper expects a git-backed vault to reach CommitResult::Committed, got GitPending for note {note_id:?} operation {operation_id}"
+        ),
+    })
 }
 
 #[test]
@@ -692,4 +739,30 @@ fn frontmatter_only_note_without_delimiters_still_commits_unchanged() {
     assert!(!yaml.contains("---"));
     assert_eq!(commit(&vault, &yaml, Version(0)).unwrap().version, Version(1));
     assert_eq!(vault.read_note(&NoteId::parse("note-legacy").unwrap()).unwrap().content, yaml);
+}
+
+// --- Task 5: git_pending as a non-error CommitResult ---
+
+/// Alias for `valid_yaml`, under the name the Task 5 brief's own test uses.
+fn valid_note_yaml(id: &str) -> String {
+    valid_yaml(id)
+}
+
+/// A vault whose root is deliberately NOT a git repository, plus the other
+/// fixtures `propose_and_commit` needs (a gate, empty known/pending sets),
+/// for the one test in this file that exercises the `GitPending` response
+/// code rather than the ordinary git-backed success path every other test
+/// here uses via `open_vault`.
+fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet<String>) {
+    let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    (vault, gate, HashSet::new(), HashSet::new())
+}
+
+#[test]
+fn propose_and_commit_surfaces_git_pending_as_ok_not_err() {
+    let (vault, gate, known, pending) = test_fixtures_no_git_repo();
+    let note_text = valid_note_yaml("note-a");
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate);
+    assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "git unavailability is a non-error outcome, got {result:?}");
 }

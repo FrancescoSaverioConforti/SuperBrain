@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::atomic::{atomic_write, AtomicWriteError};
 use crate::fault::{FaultInjector, FaultPoint};
+use crate::git::{commit_operation, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal};
 use crate::note_id::NoteId;
 
@@ -109,6 +110,24 @@ pub enum StorageError {
     /// read substituting a different operation's before-image.
     #[error("note {note_id} is inconsistent: on-disk content does not match the journal's committed record")]
     Inconsistent { note_id: String },
+    /// The vault root is not (yet) a git repository, so this operation's
+    /// content is durably persisted and journal-readable (it reached
+    /// `WriteState::JournalCommitted`) but could not be advanced to
+    /// `GitCommitted`. This is the spec's `git_pending` *response code*, a
+    /// non-error outcome from `propose_and_commit`'s perspective — distinct
+    /// from a persisted `WriteState` — not a write failure: the journal row
+    /// legitimately stays at `JournalCommitted` until a later retry
+    /// succeeds in committing it to git.
+    #[error("git commit pending for note {note_id}: no git repository at the vault root yet")]
+    GitPending { note_id: String },
+    /// Any other failure from the git-commit step of the write chain
+    /// (Task 5). The crate-private `git::GitError` is folded into this
+    /// variant (rendered message aside, its `Git2`/`Journal` variants are
+    /// kept structured via `#[from]` on `GitError` itself, but `GitError`
+    /// cannot appear directly in this `pub` enum's field — same reasoning
+    /// as `StorageError::Journal` above).
+    #[error("git error: {0}")]
+    Git(String),
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -116,6 +135,20 @@ pub enum StorageError {
 /// stored in a `pub` enum's field (see `StorageError::Journal`'s doc comment).
 fn journal_err(e: crate::journal::JournalError) -> StorageError {
     StorageError::Journal(e.to_string())
+}
+
+/// Folds a crate-private `git::GitError` into `StorageError`: `NoRepository`
+/// becomes the non-error `GitPending` response code (per spec C1), anything
+/// else becomes `StorageError::Git` by its rendered message (same reasoning
+/// as `journal_err` above — `GitError` cannot appear directly in a `pub`
+/// enum's field).
+fn git_err(note_id: &NoteId, e: GitError) -> StorageError {
+    match e {
+        GitError::NoRepository => StorageError::GitPending {
+            note_id: note_id.as_str().to_string(),
+        },
+        other => StorageError::Git(other.to_string()),
+    }
 }
 
 /// The core storage type: a single-record-per-note vault rooted at `root`,
@@ -311,11 +344,29 @@ impl Vault {
     ///    finds it and also fails closed.
     /// 6. On successful verification, advance the journal to
     ///    `JournalCommitted` — the linearization point.
-    /// 7. Release the per-note lock (by scope exit).
-    /// 8. Return the new version.
+    /// 7. (Task 5) Extend the chain from `JournalCommitted` to
+    ///    `GitCommitted`: call `find_commit_for_operation(..., ScanDepth::Bounded(500))`
+    ///    first. If it returns `Some(oid)` (via either tier), make sure the
+    ///    row's `git_commit_oid` is set to that `oid` and advance to
+    ///    `GitCommitted` (an idempotent re-entry). If it returns `None`,
+    ///    call `commit_operation`; on success, advance to `GitCommitted`
+    ///    with `AdvanceFields::git_oid(oid)` on the SAME journal write that
+    ///    advances the state, so there is never a window where the state
+    ///    says `GitCommitted` but `git_commit_oid` is unset. Either way,
+    ///    once `GitCommitted` is reached, delete the before-image (per
+    ///    spec: "La before-image si elimina solo dopo git_committed"). On
+    ///    `GitError::NoRepository`, do NOT advance the journal past
+    ///    `JournalCommitted`; return `StorageError::GitPending` instead of
+    ///    an error (the spec's `git_pending` response code, not a
+    ///    persisted `WriteState` — the row legitimately stays at
+    ///    `JournalCommitted` until a later retry succeeds). On any other
+    ///    `GitError`, return `StorageError::Git` without advancing — same
+    ///    "stays recoverable at `JournalCommitted`" behavior.
+    /// 8. Release the per-note lock (by scope exit).
+    /// 9. Return the new version.
     ///
-    /// Git commit/index are NOT part of this task: this stops at
-    /// `JournalCommitted`. Task 5 (git) and Task 6 (index) extend the chain.
+    /// Index (Task 6) is NOT part of this task: this stops at
+    /// `GitCommitted`. Task 6 extends the chain to `IndexCurrent`.
     pub(crate) fn write_record_unchecked(
         &self,
         note_id: &NoteId,
@@ -415,9 +466,42 @@ impl Vault {
         // Step 6: the linearization point.
         self.journal.lock().unwrap().advance(operation_id, WriteState::JournalCommitted, AdvanceFields::none()).map_err(journal_err)?;
 
-        // Step 7: the per-note lock is released when `_guard` drops at the
+        // Step 7 (Task 5): extend the chain from JournalCommitted to
+        // GitCommitted. find_commit_for_operation is consulted FIRST (its
+        // own Tier 1 is the journal's own git_commit_oid column, O(1) and
+        // authoritative; Tier 2 is a bounded defensive history scan) so a
+        // re-entrant call for an operation that already has a commit never
+        // creates a second one.
+        let existing_oid = find_commit_for_operation(
+            &self.journal.lock().unwrap(),
+            &self.root,
+            operation_id,
+            ScanDepth::Bounded(500),
+        )
+        .map_err(|e| git_err(note_id, e))?;
+
+        let git_oid = match existing_oid {
+            Some(oid) => oid,
+            None => commit_operation(&self.root, operation_id, note_id.as_str(), &record_path)
+                .map_err(|e| git_err(note_id, e))?,
+        };
+        // Recording the Oid and advancing to GitCommitted happen on the SAME
+        // journal write (AdvanceFields::git_oid), so there is no window
+        // where the state says GitCommitted but git_commit_oid is unset —
+        // this covers both the idempotent re-entry (Tier 2 found it but the
+        // journal row didn't have it recorded yet) and the fresh-commit case.
+        self.journal
+            .lock()
+            .unwrap()
+            .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
+            .map_err(journal_err)?;
+
+        // Per spec: the before-image is deleted only after git_committed.
+        delete_before_image(&self.root, note_id, operation_id)?;
+
+        // Step 8: the per-note lock is released when `_guard` drops at the
         // end of this scope.
-        // Step 8:
+        // Step 9:
         Ok(new_version)
     }
 
@@ -443,6 +527,16 @@ impl Vault {
     #[cfg(test)]
     pub(crate) fn root_for_test(&self) -> &Path {
         &self.root
+    }
+
+    /// Test-only introspection: a locked handle onto this vault's journal,
+    /// so a test can call crate-private `Journal`-taking functions (like
+    /// `find_commit_for_operation`) directly against the exact journal
+    /// `write_record_unchecked` drove, without widening any production
+    /// visibility.
+    #[cfg(test)]
+    pub(crate) fn journal_for_test(&self) -> std::sync::MutexGuard<'_, Journal> {
+        self.journal.lock().unwrap()
     }
 
     /// Resolves the on-disk record path for `note_id` — `root/<id>.record`,
@@ -574,7 +668,6 @@ pub(crate) fn persist_before_image(
 
 /// Removes the before-image for `operation_id`. Idempotent: a missing file
 /// is not an error.
-#[allow(dead_code)] // consumed by Task 5's git-committed cleanup
 pub(crate) fn delete_before_image(
     root: &Path,
     note_id: &NoteId,
@@ -625,20 +718,87 @@ mod tests {
 
     /// `Vault::open` with a fresh root and a fresh journal path, for tests
     /// that don't care about sharing either across calls.
+    /// `Vault::open` with a fresh root and a fresh journal path.
+    ///
+    /// Task 5 note: the root is ALSO a fresh git repository (with an
+    /// initial empty commit, so `HEAD` exists), because `write_record_unchecked`
+    /// now extends the chain past `JournalCommitted` to `GitCommitted` —
+    /// every pre-Task-5 test calling this helper expects a write to fully
+    /// succeed (readable, committed content), which now requires a real
+    /// repo at the root. The one test that deliberately exercises the
+    /// no-repository case (`write_to_a_vault_root_that_is_not_a_git_repo_returns_git_pending_not_an_error`)
+    /// builds its own non-git vault instead of using this helper.
     fn open_test_vault() -> Vault {
-        Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap()
+        open_test_vault_with_git_repo().0
+    }
+
+    /// A vault whose root is ALSO a fresh git repository (with an initial
+    /// empty commit, so `HEAD` exists), for tests that exercise the
+    /// `JournalCommitted` -> `GitCommitted` chain extension. Returns the
+    /// vault and its root path (which is also the repo path).
+    fn open_test_vault_with_git_repo() -> (Vault, PathBuf) {
+        let root = crate::git::test_support::init_test_repo();
+        let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        (vault, root)
+    }
+
+    // --- Task 5: JournalCommitted -> GitCommitted chain extension ---
+
+    #[test]
+    fn write_record_unchecked_reaches_git_committed_when_repo_exists() {
+        let (vault, repo_dir) = open_test_vault_with_git_repo();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "content", Version(0), op).unwrap();
+        let row = vault.journal_row_for_test(op).unwrap();
+        assert_eq!(row.state, WriteState::GitCommitted);
+        assert!(row.git_commit_oid.is_some(), "the commit's Oid must be recorded on the row itself (Tier 1 idempotency source)");
+        assert!(find_commit_for_operation(&vault.journal_for_test(), &repo_dir, op, ScanDepth::Bounded(500)).unwrap().is_some());
+    }
+
+    #[test]
+    fn before_image_is_deleted_only_after_git_committed() {
+        let (vault, _repo_dir) = open_test_vault_with_git_repo();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let op2 = Uuid::new_v4();
+        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        assert!(read_before_image(vault.root_for_test(), &id, op2).is_err(), "before-image for a git-committed op must be gone");
+    }
+
+    #[test]
+    fn write_to_a_vault_root_that_is_not_a_git_repo_returns_git_pending_not_an_error() {
+        // Deliberately NOT open_test_vault(): that helper's root is now a
+        // git repository (Task 5), so this test builds its own non-git
+        // vault to exercise the GitPending path specifically.
+        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let result = vault.write_record_unchecked(&id, "content", Version(0), op);
+        assert!(matches!(result, Err(StorageError::GitPending { .. })));
+        // but the content IS persisted and journal-readable — git_pending is not a write failure
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!(record.content, "content");
     }
 
     // --- Task 4: journal- and before-image-wired write/read path ---
 
     #[test]
     fn write_record_unchecked_advances_journal_to_journal_committed_on_success() {
+        // Task 4 named this test for its own stopping point, JournalCommitted.
+        // Task 5 extends the chain past it to GitCommitted (open_test_vault's
+        // root is now a git repository), so the row this test observes is at
+        // the NEW terminus — a row that reached JournalCommitted necessarily
+        // passed through it on the way, which is still what this test's name
+        // is pinning. The dedicated Task 5 test
+        // `write_record_unchecked_reaches_git_committed_when_repo_exists`
+        // covers the git_commit_oid/find_commit_for_operation specifics.
         let vault = open_test_vault();
         let id = NoteId::parse("note-a").unwrap();
         let op = Uuid::new_v4();
         vault.write_record_unchecked(&id, "content v1", Version(0), op).unwrap();
         let row = vault.journal_row_for_test(op).unwrap();
-        assert_eq!(row.state, domain::WriteState::JournalCommitted);
+        assert_eq!(row.state, domain::WriteState::GitCommitted);
         assert_eq!(row.new_version, Some(1));
     }
 
@@ -654,13 +814,21 @@ mod tests {
 
     #[test]
     fn before_image_is_persisted_and_old_content_recoverable_before_deletion() {
-        let vault = open_test_vault();
+        // Deliberately a non-git vault: A2 deletes the before-image only
+        // after GitCommitted (pinned by Task 5's own
+        // `before_image_is_deleted_only_after_git_committed`, which uses a
+        // git-backed vault and expects the OPPOSITE of this assertion). This
+        // test stops at JournalCommitted on purpose, so op2's before-image
+        // is still there to observe.
+        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
-        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let err = vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StorageError::GitPending { .. }));
         let op2 = Uuid::new_v4();
-        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        let err = vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap_err();
+        assert!(matches!(err, StorageError::GitPending { .. }));
         // the before-image for op2 (the v1->v2 transition) must still exist:
-        // A1/A2 delete it only after git_committed, which this task does not yet reach.
+        // A2 deletes it only after git_committed, which this (non-git) vault never reaches.
         let before = read_before_image(vault.root_for_test(), &id, op2).unwrap();
         assert!(String::from_utf8(before).unwrap().contains("v1"));
     }
@@ -793,12 +961,19 @@ mod tests {
         // review flagged — now verified directly against the persistence
         // primitive (Task 3) rather than through read_note, since read_note no
         // longer consults before-images at all (see the correction above).
-        let vault = open_test_vault();
+        //
+        // Deliberately a non-git vault: this test wants to observe op2's
+        // before-image BEFORE it is deleted, and A2 deletes it only after
+        // GitCommitted (Task 5) — using a git-backed vault here would have
+        // op2's before-image already gone by the time this test reads it.
+        let vault = Vault::open(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         let op1 = Uuid::new_v4();
-        vault.write_record_unchecked(&id, "v1", Version(0), op1).unwrap();
+        let err = vault.write_record_unchecked(&id, "v1", Version(0), op1).unwrap_err();
+        assert!(matches!(err, StorageError::GitPending { .. }));
         let op2 = Uuid::new_v4();
-        vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap();
+        let err = vault.write_record_unchecked(&id, "v2", Version(1), op2).unwrap_err();
+        assert!(matches!(err, StorageError::GitPending { .. }));
         // op2's before-image (persisted under op2's own operation_id) must hold
         // what op2 itself overwrote ("v1"); no before-image should exist under op1.
         let op2_before = read_before_image(vault.root_for_test(), &id, op2).unwrap();
@@ -857,6 +1032,7 @@ mod tests {
         let root = unique_test_dir();
         let outside = unique_test_dir();
         symlink_dir(&outside, &root.join("escape"));
+        crate::git::test_support::init_git_repo_at(&root);
         let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("escape").unwrap();
         let v = vault
@@ -913,6 +1089,7 @@ mod tests {
         let base = unique_test_dir();
         let real = unique_test_dir();
         symlink_dir(&real, &base.join("via"));
+        crate::git::test_support::init_git_repo_at(&real);
         let vault = Vault::open(base.join("via"), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         vault.write_record_unchecked(&id, "ok", Version(0), Uuid::new_v4()).unwrap();
@@ -1042,6 +1219,7 @@ mod tests {
         // so this test still isolates the containment check from the
         // journal-resolution check.
         let root = unique_test_dir();
+        crate::git::test_support::init_git_repo_at(&root);
         let vault = Vault::open(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
         let id = NoteId::parse("note-a").unwrap();
         vault.write_record_unchecked(&id, "inside", Version(0), Uuid::new_v4()).unwrap();
