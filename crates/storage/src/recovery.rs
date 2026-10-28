@@ -46,7 +46,12 @@
 //!   `last_committed_for_note` still resolves to. If the row has no
 //!   `before_image_hash` (a first write, so there is nothing to restore), it
 //!   becomes `Failed`. If no operation has ever committed the note, the
-//!   unverified record is also removed. A recorded before-image that cannot be
+//!   unverified record is also removed. If a later operation has already
+//!   committed the note at or past this row's `new_version` (this row
+//!   stalled live and a later write committed on top of it), nothing is
+//!   restored: the before-image is deleted and the row becomes `Failed`,
+//!   leaving the later operation's record untouched (evidence item 26). A
+//!   recorded before-image that cannot be
 //!   restored or does not verify gives `Inconsistent`. A pass interrupted
 //!   after the restore (`FaultPoint::DuringBeforeImageRestore`) is resumed
 //!   idempotently: the next pass finds the record already equal to the
@@ -355,6 +360,22 @@ fn fix_content_persisted(
         journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
         return Ok(WriteState::Failed);
     };
+
+    // A later operation on this note has already committed at or past this
+    // row's version (evidence item 26: this row stalled live, and a later
+    // write, accepted against the raw file, committed on top of it). The
+    // record on disk belongs to that operation, so restoring this row's
+    // before-image would destroy committed content. Skip the restore: the
+    // before-image is superseded, and this row simply failed, as in row 1.
+    // The later row and the record are left untouched; if the record does
+    // not match that row's hash, `read_note` still reports `Inconsistent`.
+    if let Some(later) = journal.last_committed_for_note(note_id.as_str())? {
+        if matches!((later.new_version, row.new_version), (Some(l), Some(mine)) if l >= mine) {
+            delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+            journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
+            return Ok(WriteState::Failed);
+        }
+    }
 
     // If the record already holds the before-image, an earlier pass restored
     // it and crashed before advancing the row. The restore is idempotent, so
@@ -1043,5 +1064,135 @@ mod tests {
         assert_eq!(report.git_pending, vec![op]);
         assert!(report.git_pending_reasons[0].1.contains("own content"));
         assert_eq!(find_commit_for_operation(&journal, &repo_dir, op, ScanDepth::Unbounded).unwrap(), None, "no commit under this marker");
+    }
+
+    // --- Evidence item 26: a stalled ContentPersisted row superseded live ---
+
+    /// Builds the evidence item 26 state on a git-backed vault and drops it:
+    /// v1 committed by a first write; op_a (v1 -> v2) stalls live after the
+    /// rename and the ContentPersisted advance (the same `Vault` keeps being
+    /// used, nothing is reopened); then op_b (v2 -> v3), accepted because the
+    /// raw file says v2, commits all the way to IndexCurrent.
+    fn stalled_a_then_committed_b(root: &std::path::Path, journal_path: &std::path::Path, op_a: Uuid, op_b: Uuid) {
+        let id = NoteId::parse("note-a").unwrap();
+        let vault = Vault::open_with_default_indexer(root.to_path_buf(), journal_path).unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+        let stalled = vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector);
+        assert!(matches!(stalled, Err(StorageError::Interrupted(_))));
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::ContentPersisted);
+        assert_eq!(vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b).unwrap(), Version(3));
+        assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(vault.read_note(&id).unwrap().content, "v3 from B", "live, B is readable before any reopen");
+    }
+
+    #[test]
+    fn live_writes_after_a_stall_and_a_later_commit_stay_on_the_journal_and_survive_reopen() {
+        // The live, pre-reopen window. While A is stalled at
+        // ContentPersisted, a write at the journal's version is refused
+        // (Conflict) and read_note fails closed (Inconsistent). Once B
+        // commits, the journal and the record agree again, so every further
+        // live write is checked against B's version and stays consistent,
+        // and reopening keeps it.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            assert!(vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector).is_err());
+            assert!(matches!(vault.read_note(&id), Err(StorageError::Inconsistent { .. })));
+            let err = vault.write_record_unchecked(&id, "x", Version(1), Uuid::new_v4()).unwrap_err();
+            assert!(matches!(err, StorageError::Conflict { actual: Version(2), .. }), "got {err:?}");
+            vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b).unwrap();
+            let err = vault.write_record_unchecked(&id, "x", Version(1), Uuid::new_v4()).unwrap_err();
+            assert!(matches!(err, StorageError::Conflict { actual: Version(3), .. }), "got {err:?}");
+            assert_eq!(vault.write_record_unchecked(&id, "v4 from C", Version(3), Uuid::new_v4()).unwrap(), Version(4));
+            assert_eq!(vault.read_note(&id).unwrap().content, "v4 from C");
+        }
+        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!((record.content.as_str(), record.version), ("v4 from C", Version(4)));
+    }
+
+    #[test]
+    fn superseded_content_persisted_row_resolves_idempotently_across_interrupted_and_repeated_passes() {
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        stalled_a_then_committed_b(&root, &journal_path, op_a, op_b);
+        let b_bytes = serialize_record_for_test("v3 from B", Version(3));
+
+        // A pass interrupted right after marking A Recovering.
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
+        let interrupted = Vault::open_with_injector(root.clone(), &journal_path, &injector);
+        assert!(matches!(interrupted, Err(StorageError::Interrupted(_))));
+
+        // A pass that deleted A's before-image and stopped before the Failed
+        // advance: the guard does not depend on the before-image existing.
+        delete_before_image(&root, &id, op_a).unwrap();
+        let journal = Journal::open(&journal_path).unwrap();
+        let first = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(first.failed, vec![op_a]);
+        let second = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(second, ReconcileReport::default(), "a second pass finds nothing left to do");
+        drop(journal);
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
+        assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), b_bytes);
+        assert_eq!(vault.read_note(&id).unwrap().content, "v3 from B");
+    }
+
+    #[test]
+    fn superseded_row_over_a_corrupted_record_fails_closed_and_leaves_the_record_alone() {
+        // The guard never "repairs" anything: if the record no longer
+        // matches the later committed row, it is left as it is and read_note
+        // still reports Inconsistent.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        stalled_a_then_committed_b(&root, &journal_path, op_a, op_b);
+        std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), b"CORRUPTED", "nothing restored over it");
+        assert!(matches!(vault.read_note(&id), Err(StorageError::Inconsistent { .. })));
+    }
+
+    #[test]
+    fn row_2_never_restores_a_before_image_over_a_later_operation_that_already_committed() {
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        stalled_a_then_committed_b(&root, &journal_path, op_a, op_b);
+        let b_row_before = Journal::open(&journal_path).unwrap().get(op_b).unwrap().unwrap();
+        let b_bytes = serialize_record_for_test("v3 from B", Version(3));
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+
+        // (b) A resolves to Failed, its before-image gone.
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
+        assert!(read_before_image(&root, &id, op_a).is_err(), "A's superseded before-image is deleted");
+        // (a) B's content and B's row are untouched.
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), b_bytes, "B's committed bytes survive recovery");
+        assert_eq!(vault.journal_row_for_test(op_b).unwrap(), b_row_before, "B's journal row is untouched");
+        // (c) The note reads at B's version and content, not Inconsistent.
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!((record.content.as_str(), record.version), ("v3 from B", Version(3)));
+        // Step 7 of the item-26 sequence: a write at A's rolled-back version
+        // (v1) must be refused, not accepted on top of diverged content.
+        let err = vault.write_record_unchecked(&id, "diverging", Version(1), Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StorageError::Conflict { actual: Version(3), .. }), "got {err:?}");
+        // The legitimate next write still works.
+        assert_eq!(vault.write_record_unchecked(&id, "v4", Version(3), Uuid::new_v4()).unwrap(), Version(4));
     }
 }
