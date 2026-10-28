@@ -840,6 +840,7 @@ dependencies = [
  "base64",
  "domain",
  "getrandom",
+ "rusqlite",
  "serde",
  "serde_yaml",
  "sha2",
