@@ -901,6 +901,74 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     `reconcile_resolves_pending_operations_on_a_note_in_version_order_not_insertion_order`. For
     `operations_with_before_image_hash` the order is not load-bearing (any verifying match is
     equally good); it was changed for consistency.
+29. **(Item 26, second variant — user-requested follow-up after presenting the branch) — RESOLVED
+    (commit `88b20f6`).** Item 26's fix wave closed the case where a stalled operation A's
+    rollback would destroy a LATER operation B's already-`JournalCommitted` content: before
+    restoring a before-image, row 2 (`fix_content_persisted`) now checks
+    `Journal::last_committed_for_note`; if it names a row at or past this row's own version, the
+    restore is skipped and this row resolves straight to `Failed` instead, leaving B's content
+    and journal row untouched. A scoped re-review independently traced this guard against the
+    code (not just the tests) and confirmed it: B's bytes and journal row unchanged, A resolves
+    `Failed`, a write at A's stale version correctly gets `Conflict`. 199→213 total tests (the
+    4 new tests cover the repro, idempotency across an interrupted/repeated pass, and the
+    fail-closed case where the guard fires but the record is independently corrupted).
+30. **(Item 26, second variant, continued) — RESOLVED (commit `e5e2506`).** A narrower case
+    remained: TWO stalled operations on the same note where NEITHER ever committed (A stalls at
+    `ContentPersisted`, B stalls at `ContentPersisted` on top of A). Item 29's guard does not
+    fire here, because no later row ever committed. Without a further fix, recovery would
+    process A first (rolling it back correctly), then B — but B's own before-image is A's
+    never-committed content, so B's rollback would put that never-committed content back on
+    disk as if it were legitimate, and the note would stay `Inconsistent` permanently while git
+    history silently skipped a version. Two complementary, narrowly-scoped guards close this,
+    with no change to `domain::WriteState` or its transition table, no new public write API, and
+    exactly one new `StorageError` variant:
+    - **Live write guard** (`vault.rs`, step 2a, after the per-note lock is acquired and before
+      the record is read or anything is renamed): a new write to a note is refused with
+      `StorageError::UnresolvedOperation` if another row on that note is at `ContentPersisted`,
+      `Recovering`, or `IntentRecorded` with its `content_hash` already set (the C1 window where
+      the rename may have landed). `JournalCommitted` rows are deliberately NOT blocked — that
+      state is committed, readable content only waiting on git, and blocking it would break the
+      `7989cf6` (I1) git-pending flow, confirmed unaffected by a dedicated test. The refused call
+      causes no filesystem effect: no rename, no before-image, only its own row resolving to
+      `Failed`.
+    - **Recovery correctness guard** (`recovery.rs`'s `fix_content_persisted`, right after item
+      29's guard): before restoring a before-image, if that content's hash is carried only by
+      other never-committed rows on the same note (and by no committed row — a committed row
+      carrying the same hash, e.g. byte-identical content re-committed at the same version,
+      still restores normally, pinned by a dedicated non-regression test), the restore is
+      skipped and the row resolves to `Failed` instead, so never-committed content can never
+      become "official" on disk via a sibling's rollback.
+    213→220 total tests. A scoped independent review traced both guards against the actual code
+    (not the implementer's self-report), confirmed the blocked-state set is exhaustive given
+    where the record is actually mutated, confirmed `JournalCommitted` truly isn't blocked and
+    I1 still works, confirmed item 29's guard and C1's roll-forward still work unchanged, and
+    confirmed `non_terminal_operations`' version-ascending order (item 28) is still what makes
+    the recovery guard correct. No Critical or Important findings.
+    **One test was deliberately removed as part of this fix, not merely refactored:**
+    `live_writes_after_a_stall_and_a_later_commit_stay_on_the_journal_and_survive_reopen` pinned
+    the OLD, now-incorrect behavior that this fix removes — a write being silently accepted on
+    top of a stalled operation's raw, never-committed bytes. The reviewer independently confirmed
+    this removal is justified (the old behavior was the exact entry point for both this item's
+    variants) and that what it covered beyond that is still covered by other tests.
+    **A related, narrower residual was analyzed, not fixed as new code, and found to already be
+    closed live by the write guard above:** a stall where A is `IntentRecorded` with a hash and B
+    stalls at `ContentPersisted` on top of it. The live write guard blocks B from ever reaching
+    that state under the per-note lock, so this ordering cannot arise from a journal written
+    under these guards. The reviewer confirmed this by direct trace and by probing what recovery
+    does with such a journal if one existed anyway (none does, since A2 is unmerged): if B's
+    on-disk record still verifies, A fails via row 1 (no restore) and B rolls forward, so content
+    built on A's never-committed bytes becomes officially committed at B's version — a
+    compare-and-swap anomaly, not data loss, and only reachable from a pre-this-fix journal that
+    cannot exist in this branch's history; if B's record is independently corrupted, recovery
+    fails closed as `Inconsistent`, which is correct. Not implemented as a fix, because closing
+    it in general (for any journal, including a hypothetical pre-this-fix one) would require
+    redesigning row 1's resolution to look at successor rows, which is out of this fix's scope.
+    **Known, accepted trade-off (not a defect):** the live write guard means that once any
+    operation stalls at `ContentPersisted`, `Recovering`, or `IntentRecorded`-with-hash on a
+    note, every further write to that SAME note is refused until the next `Vault::open` resolves
+    it — a deliberate availability cost in exchange for the correctness guarantee above.
+    `read_note` already failed closed in this exact window before this fix, so no previously
+    available read path is lost; only a previously-incorrect write acceptance is removed.
 
 ---
 
@@ -908,7 +976,7 @@ Flagged here per Step 5's own requirement, not silently absorbed.
 
 | Acceptance criterion | Status | Evidence |
 |---|---|---|
-| Test suite green (workspace) | **PASS** | Section 2.1: 199/199 at Task 10; **209/209** after the final-review fix wave (head `5843be1`), 0 failed. |
+| Test suite green (workspace) | **PASS** | Section 2.1: 199/199 at Task 10; 209/209 after the final-review fix wave (head `5843be1`); **220/220** after items 29-30's second-variant fixes (head `e5e2506`, plus a comment-only follow-up from that fix's scoped review), 0 failed, confirmed stable across repeated runs. |
 | Every C1 fault-matrix row covered by a dedicated crash test | **PASS** | Six `crash_*` tests plus the double-crash test (`crates/storage/src/vault.rs`, exercising each row via the full write pipeline + fault injector), **plus** a parallel, more direct set of row-specific `reconcile`-calling tests in `crates/storage/src/recovery.rs` (e.g. `intent_recorded_with_no_further_progress_is_marked_failed_on_reconcile`, `content_persisted_with_valid_hash_rolls_forward_to_journal_committed`, `content_persisted_with_invalid_hash_and_a_valid_before_image_rolls_back_to_failed_not_journal_committed`, `journal_committed_with_no_existing_commit_commits_on_reconcile`, `git_committed_reaches_index_current_on_reconcile`) that construct each journal row directly and call `reconcile` without going through a live writer. Both files' tests cover the same 8 rows from different entry points. **Final-review correction (C1):** the "after the rename, before `journal_committed`" row was covered only from `ContentPersisted` onward until commit `53153ac`. The earlier part of that window (row still `IntentRecorded`) was unhandled and stranded the note. It is now covered by `crash_after_rename_before_content_persisted_rolls_forward_on_reopen_not_stranded` and its first-write variant (`FaultPoint::AfterRenameBeforeContentPersisted`), plus the `recovery.rs` row-1 tests listed in Section 2.1. |
 | Retry idempotency (terminal and non-terminal states) | **PASS** | `retry_of_a_failed_operation_id_returns_failed_again_without_reapplying`, `retry_after_a_restart_returns_the_outcome_recovery_reached`, and the full `retry_*` family in Section 2.1. |
 | Argument-mismatch detection on retry (`OperationIdReused`) | **PASS** | `reusing_an_in_flight_operation_id_for_different_content_is_refused_as_reused_not_in_progress`, `reusing_an_operation_id_for_a_different_request_is_refused_not_reported_as_the_original_outcome`. |
@@ -931,12 +999,16 @@ A2 does not provide anything beyond what this plan implements. In particular: no
 no deletion registry, no backup/restore (A3); no real index (B1); SEC-001/002/003 remain open
 or only narrowed, not closed, and require re-evaluation before Fase D (Continuity [d5b9]).
 
-As of this file's final update (after the final-review fix wave, head `5843be1`), `cargo test
---workspace` (209/209), `cargo clippy --workspace -- -D warnings` (clean), and `cargo deny check` (`advisories ok, bans ok, licenses ok, sources
-ok`) all pass cleanly. The `git2` advisory finding this task's first pass reported as an open
-gap (Section 2.2) was resolved by a later `git2` 0.21 upgrade (commit `247df9e`), chosen and
-landed after this evidence was first presented to the user, and independently re-verified here
-(Section 2.2.1) rather than taken on faith.
+As of this file's final update (head `e5e2506` plus one comment-only follow-up commit from that
+fix's scoped review), `cargo test --workspace` (**220/220**, confirmed stable across repeated
+runs), `cargo clippy --workspace -- -D warnings` (clean), `cargo clippy --workspace
+--all-targets -- -D warnings` (only the 3 pre-existing `assertions_on_constants`), and `cargo
+deny check` (`advisories ok, bans ok, licenses ok, sources ok`) all pass cleanly. The `git2`
+advisory finding this task's first pass reported as an open gap (Section 2.2) was resolved by a
+later `git2` 0.21 upgrade (commit `247df9e`). The item-26 residual first presented to the user
+as a known, non-blocking limitation was, at the user's explicit request, subsequently closed in
+full by two further scoped fixes (items 29-30 above), each independently re-reviewed rather than
+taken on faith.
 
 Per the brief's Step 7 and the pattern established in A1 (Continuity [c12av]): **this branch is
 not to be merged to main without explicit user approval**, even though every automated check is

@@ -388,10 +388,12 @@ fn fix_content_persisted(
     // was accepted against them. No committed row carries that hash, while
     // a non-committed one does. Restoring it would put content nobody
     // committed back on disk, where the raw-version check would build on it.
-    // Skip the restore, as above: the earlier sibling's own rollback (it is
-    // resolved first, in version order) already put the last committed
-    // content back. Decided from the journal alone, so a pass that already
-    // deleted the before-image resolves the same way.
+    // Skip the restore, as above. The earlier sibling (resolved first, in
+    // version order) either restored the last committed content via row 2,
+    // or, if it was still IntentRecorded, row 1 left the record alone
+    // without restoring anything. Either way this row's before-image is not
+    // legitimate committed content. Decided from the journal alone, so a
+    // pass that already deleted the before-image resolves the same way.
     if before_image_is_uncommitted_sibling_content(journal, &note_id, op, before_hash)? {
         delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
         journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
