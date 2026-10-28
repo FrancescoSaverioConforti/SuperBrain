@@ -1,18 +1,30 @@
 //! A3 confidentiality-boundary audit: the enumerated surfaces that must never
 //! see plaintext or key material.
 //!
-//! Contract C3 (`docs/Spec_mvp.md`, line 364) names nine surfaces: file,
+//! Contract C3 (`docs/Spec_mvp.md`, line 364) names TEN surfaces: file,
 //! frontmatter e metadati, allegati, file generati, cache, log, indici,
-//! embedding, riassunti, backup. The tests in this file cover the surfaces
-//! that exist today or land in A3: git history, the A2 journal, before-images,
-//! error/log output, temp files, and backup blobs.
+//! embedding, riassunti, backup. The stubs in this file map onto them as
+//! follows.
 //!
-//! OUT OF SCOPE for this file: `indici` (search index), `embedding`, and
-//! `riassunti` (summaries). Those subsystems do not exist in this codebase yet
-//! (no Fase B or Fase C work has started), so there is nothing to audit. This
-//! is a deliberate deferral, not an oversight. B1/B2 and C2's own plans must
-//! re-audit the sensitive-classification boundary against the index, embedding
-//! and summary surfaces once they exist.
+//! COVERED by the stubs below:
+//! - file content and frontmatter/metadata: the git-history stub (every
+//!   reachable blob, via the pointer scheme) and the A2 journal stub.
+//! - log and error output: the `Debug`/`Display` stub (Task 6).
+//! - file generati (generated files): the temp-file stub. Temp files written
+//!   during an interrupted sensitive write ARE generated files, so this surface
+//!   is covered by that stub, not deferred separately.
+//! - backup: the backup-blob stub (Task 7).
+//!
+//! DEFERRED, deliberately, because the subsystem does not exist yet and so
+//! there is nothing to audit:
+//! - `indici` (search index), `embedding`, `riassunti` (summaries): Fase B and
+//!   Fase C work has not started.
+//! - `allegati` (attachments) and `cache`: no attachment-handling or caching
+//!   subsystem exists anywhere in this codebase today.
+//!
+//! This is a deliberate deferral, not an oversight. B1/B2, C2, and any plan
+//! that introduces attachments or a cache must re-audit the
+//! sensitive-classification boundary against those surfaces once they exist.
 //!
 //! Every test below is a `#[ignore]`d stub. Its body is a `todo!()` placeholder
 //! that compiles today but must not be run until the owning task lands. Each
@@ -55,16 +67,16 @@ fn before_images_for_sensitive_notes_never_contain_plaintext_pointer_target_byte
     todo!("implement in Task 6: assert before-images hold only the pointer-only file")
 }
 
-/// Surface: error and log output (`Debug` and `Display`). Task 7 (`PiiStore`).
+/// Surface: error and log output (`Debug` and `Display`). Task 6 (`PiiStore`).
 ///
 /// Un-ignore by: forcing every `PiiStoreError` variant and the sensitive-path
 /// `ProposeError` variants. Assert that their `{:?}` and `{}` output never
 /// contains the fixture's plaintext or raw key or data-key bytes. Only note
 /// ids, generation numbers and hashes may appear.
 #[test]
-#[ignore = "A3 Task 7: needs PiiStoreError and the sensitive-path ProposeError variants"]
+#[ignore = "A3 Task 6: needs PiiStoreError and the sensitive-path ProposeError variants"]
 fn no_error_variant_debug_or_display_output_from_pii_store_or_propose_and_commit_echoes_plaintext_or_key_bytes() {
-    todo!("implement in Task 7: exercise each error variant and check Debug/Display output")
+    todo!("implement in Task 6: exercise each error variant and check Debug/Display output")
 }
 
 /// Surface: temp files under the vault root. Task 6 (`FaultPoints`).
@@ -79,14 +91,14 @@ fn an_interrupted_sensitive_write_leaves_no_recoverable_plaintext_in_any_temp_fi
     todo!("implement in Task 6: interrupt via FaultPoints and scan the whole vault root")
 }
 
-/// Surface: backup blobs. Task 8 (backup and restore).
+/// Surface: backup blobs. Task 7 (backup and restore).
 ///
 /// Un-ignore by: taking a backup of a vault that holds a sensitive note. Read
 /// the raw bytes that `BackupTarget::write_blob` received, not the bytes that
 /// `restore()` returns. Assert that the plaintext does not appear as a
 /// substring anywhere in that blob.
 #[test]
-#[ignore = "A3 Task 8: needs backup and restore with BackupTarget::write_blob"]
+#[ignore = "A3 Task 7: needs backup and restore with BackupTarget::write_blob"]
 fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_content_outside_its_aead_envelope() {
-    todo!("implement in Task 8: capture the raw bytes passed to write_blob and scan them")
+    todo!("implement in Task 7: capture the raw bytes passed to write_blob and scan them")
 }
