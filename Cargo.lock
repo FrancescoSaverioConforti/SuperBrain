@@ -540,6 +540,7 @@ dependencies = [
  "domain",
  "regex",
  "sha2",
+ "vault-security",
 ]
 
 [[package]]

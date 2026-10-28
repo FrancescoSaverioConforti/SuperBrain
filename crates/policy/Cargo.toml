@@ -11,3 +11,6 @@ description = "SuperBrain policy gate (placeholder)."
 domain = { path = "../domain" }
 regex = "1"
 sha2 = "0.10"
+# Path dependency for the plain EncryptedStoreAvailability/StoreUnavailableReason
+# data types only — policy takes on no crypto or I/O surface from this.
+vault-security = { path = "../vault-security" }
