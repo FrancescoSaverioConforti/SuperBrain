@@ -863,14 +863,27 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     fails after the rename (the `ContentPersisted` or `JournalCommitted` advance) and the same
     process keeps using the vault without reopening, then until the next `Vault::open`,
     `read_note` returns `Inconsistent`, a write at the journal's version gets `Conflict`, and a
-    write at the raw file's version is accepted. If such a later write then commits, and the
-    stuck operation was at `ContentPersisted`, the next `Vault::open`'s row 2 sees a hash
-    mismatch and restores the stuck operation's before-image over the later, committed
-    content. The note then reads `Inconsistent` (fail closed; the later content is still in git
-    and in the journal's hash, but no longer on disk). A row still at `IntentRecorded` is not
-    affected, because row 1 never writes the record. Closing this needs the version check to
-    resolve through the journal, which was not done here: it changes A1-inherited write
-    semantics and is beyond the final review's findings. Recorded as a known residual risk.
+    write at the raw file's version is accepted — and that acceptance keeps happening: the
+    scoped re-review of this fix wave reproduced the sequence concretely (stuck operation A at
+    `ContentPersisted`, then a second write B that commits all the way to `IndexCurrent`, then
+    reopen) and found the effect is **worse than a one-time clobber**. Row 2 restores A's
+    before-image over B's already-committed content and marks A `Failed`, after which
+    `read_note` stays `Inconsistent` **permanently** (`last_committed_for_note` now names B, not
+    A, so no further reopen resolves it), while a *subsequent* raw-version write on top of the
+    rolled-back disk content is accepted and succeeds, silently diverging further from the
+    journal and from git. This defect already existed before the final review's fix wave (the
+    re-review reproduced it unchanged at the pre-fix-wave commit `1292d32`); C1's fix narrows it
+    (an `IntentRecorded` row is never affected, since row 1 never writes the record) but does
+    not remove it, since it is specific to rows already at `ContentPersisted` when the stall
+    happens. Closing it does **not** require resolving the live-path version check through the
+    journal (that would indeed touch A1-inherited write semantics and is correctly out of this
+    review's scope) — a narrower, recovery-side guard suffices: in row 2's rollback branch
+    (`fix_content_persisted`), if `Journal::last_committed_for_note` already names a row at or
+    past this row's `new_version`, skip the before-image restore and resolve straight to
+    `Failed` (the same outcome row 1 already takes on a hash mismatch), rather than restoring
+    over content a later operation has since committed. Not implemented in this fix wave;
+    recorded as a known, pre-existing, non-blocking residual risk with a concrete, low-cost fix
+    identified for a future pass.
 27. **(Task 4, deferred Minor (f) — added by the final review's fix wave, I4) — resolved by
     design.** The `before_image_path` journal column is never filled by
     `AdvanceFields::content_with_before_image`; only the hash is recorded. Task 7 chose to
