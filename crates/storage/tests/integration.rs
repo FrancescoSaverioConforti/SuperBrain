@@ -770,3 +770,20 @@ fn propose_and_commit_surfaces_git_pending_as_ok_not_err() {
     let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate);
     assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "git unavailability is a non-error outcome, got {result:?}");
 }
+
+#[test]
+fn propose_and_commit_on_a_git_repo_with_no_commits_yet_is_git_pending_not_an_error() {
+    // Final whole-branch review, finding I2: `git init` with zero commits
+    // (an unborn HEAD) used to make a durably-persisted write come back as a
+    // hard `Err(Storage(Git(..)))`, while recovery treated the same condition
+    // as git_pending. The write has happened, so it must not be an error.
+    let root = unique_test_dir();
+    git2::Repository::init(&root).unwrap(); // no initial commit
+    let vault = Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap();
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let note_text = valid_note_yaml("note-a");
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate);
+    assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "got {result:?}");
+    let note_id = NoteId::parse("note-a").unwrap();
+    assert_eq!(vault.read_note(&note_id).unwrap().content, note_text, "the write durably happened");
+}

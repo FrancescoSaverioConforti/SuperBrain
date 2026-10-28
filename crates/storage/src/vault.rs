@@ -111,22 +111,26 @@ pub enum StorageError {
     /// read substituting a different operation's before-image.
     #[error("note {note_id} is inconsistent: on-disk content does not match the journal's committed record")]
     Inconsistent { note_id: String },
-    /// The vault root is not (yet) a git repository, so this operation's
-    /// content is durably persisted and journal-readable (it reached
-    /// `WriteState::JournalCommitted`) but could not be advanced to
-    /// `GitCommitted`. This is the spec's `git_pending` *response code*, a
-    /// non-error outcome from `propose_and_commit`'s perspective — distinct
-    /// from a persisted `WriteState` — not a write failure: the journal row
-    /// legitimately stays at `JournalCommitted` until a later retry
-    /// succeeds in committing it to git.
-    #[error("git commit pending for note {note_id}: no git repository at the vault root yet")]
+    /// This operation's content is durably persisted and journal-readable
+    /// (it reached `WriteState::JournalCommitted`) but could not be advanced
+    /// to `GitCommitted`: the vault root is not (yet) a git repository, the
+    /// repository has no commits yet (unborn `HEAD`), or git otherwise failed
+    /// to commit. This is the spec's `git_pending` *response code* ("se git
+    /// fallisce restituisce git_pending"), a non-error outcome from
+    /// `propose_and_commit`'s perspective — distinct from a persisted
+    /// `WriteState` — not a write failure: the journal row legitimately stays
+    /// at `JournalCommitted` until a retry of the same `operation_id` or the
+    /// next `Vault::open` commits it. Also returned when this operation's own
+    /// bytes can no longer be recovered for its commit (see
+    /// `recovery::own_content`).
+    #[error("git commit pending for note {note_id}: the content is durably persisted, but git could not commit it yet")]
     GitPending { note_id: String },
-    /// Any other failure from the git-commit step of the write chain
-    /// (Task 5). The crate-private `git::GitError` is folded into this
-    /// variant (rendered message aside, its `Git2`/`Journal` variants are
-    /// kept structured via `#[from]` on `GitError` itself, but `GitError`
-    /// cannot appear directly in this `pub` enum's field — same reasoning
-    /// as `StorageError::Journal` above).
+    /// Reserved for a failure of the git-commit step that is not
+    /// `git_pending`. Since the final whole-branch review (finding I2) the
+    /// write path classifies git failures exactly as recovery does — every
+    /// git failure after `JournalCommitted` is `GitPending` — so A2 never
+    /// constructs this variant. It is kept so the public error type does not
+    /// change shape within A2.
     #[error("git error: {0}")]
     Git(String),
     /// A pipeline was stopped at `FaultPoint` by a test's armed
@@ -168,17 +172,30 @@ fn journal_err(e: crate::journal::JournalError) -> StorageError {
     StorageError::Journal(e.to_string())
 }
 
-/// Folds a crate-private `git::GitError` into `StorageError`: `NoRepository`
-/// becomes the non-error `GitPending` response code (per spec C1), anything
-/// else becomes `StorageError::Git` by its rendered message (same reasoning
-/// as `journal_err` above — `GitError` cannot appear directly in a `pub`
-/// enum's field).
+/// Folds a crate-private `git::GitError` from the git step of the write chain
+/// into `StorageError`, with exactly the classification recovery's row 3
+/// (`recovery::fix_journal_committed`) applies to the same errors:
+///
+/// - `GitError::Journal`: a journal failure, not a git one, so it surfaces as
+///   `StorageError::Journal`.
+/// - every other `GitError` (`NoRepository`, and any `Git2` failure, such as
+///   an unborn `HEAD` on a repository with no commits yet): the non-error
+///   `GitPending` response code. Spec C1: "se git fallisce restituisce
+///   git_pending". The git step only ever runs once the row is
+///   `JournalCommitted`, so the content is already durable and readable and
+///   the row rests there until a retry or the next `Vault::open` commits it.
+///
+/// Before the final whole-branch review (finding I2) only `NoRepository`
+/// mapped to `GitPending` and everything else became a hard
+/// `StorageError::Git`, so the live path reported a write that had durably
+/// happened as an error, while recovery treated the identical condition as
+/// pending.
 fn git_err(note_id: &NoteId, e: GitError) -> StorageError {
     match e {
-        GitError::NoRepository => StorageError::GitPending {
+        GitError::Journal(e) => journal_err(e),
+        GitError::NoRepository | GitError::Git2(_) => StorageError::GitPending {
             note_id: note_id.as_str().to_string(),
         },
-        other => StorageError::Git(other.to_string()),
     }
 }
 
@@ -577,13 +594,14 @@ impl Vault {
     ///    says `GitCommitted` but `git_commit_oid` is unset. Either way,
     ///    once `GitCommitted` is reached, delete the before-image (per
     ///    spec: "La before-image si elimina solo dopo git_committed"). On
-    ///    `GitError::NoRepository`, do NOT advance the journal past
-    ///    `JournalCommitted`; return `StorageError::GitPending` instead of
-    ///    an error (the spec's `git_pending` response code, not a
-    ///    persisted `WriteState` — the row legitimately stays at
-    ///    `JournalCommitted` until a later retry succeeds). On any other
-    ///    `GitError`, return `StorageError::Git` without advancing — same
-    ///    "stays recoverable at `JournalCommitted`" behavior.
+    ///    any git failure (`NoRepository`, an unborn `HEAD`, any other
+    ///    `git2` error), do NOT advance the journal past
+    ///    `JournalCommitted`; return `StorageError::GitPending` (the spec's
+    ///    `git_pending` response code, not a persisted `WriteState` — the
+    ///    row legitimately stays at `JournalCommitted` until a later retry
+    ///    succeeds). This is the same classification recovery's row 3 uses
+    ///    (see `git_err`). Only a journal failure inside the git step is a
+    ///    hard `StorageError::Journal`.
     /// 8. Release the per-note lock (by scope exit).
     /// 9. Return the new version.
     ///
@@ -2050,6 +2068,39 @@ mod tests {
         assert!(!before_image_path(&root, &id, op2).exists(), "the before-image is consumed by the restore");
         assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
         assert_eq!(commits_for_operation(&root, op2), 0, "a rolled-back operation is never committed to git");
+    }
+
+    // Final whole-branch review, finding I2: the live path must classify git
+    // failures exactly as recovery does.
+
+    #[test]
+    fn write_on_a_git_repo_with_no_commits_is_git_pending_then_commits_once_head_exists() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        git2::Repository::init(&root).unwrap(); // unborn HEAD: no commits yet
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let result = vault.write_record_unchecked(&id, "content", Version(0), op);
+            assert!(matches!(result, Err(StorageError::GitPending { .. })), "a durably-persisted write must not be a hard git error, got {result:?}");
+            assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::JournalCommitted);
+            assert_eq!(vault.read_note(&id).unwrap().content, "content");
+        }
+        // Once HEAD exists, the next open commits it, exactly as recovery
+        // already did for this same condition.
+        commit_initial_for_test(&root);
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(commits_for_operation(&root, op), 1);
+    }
+
+    /// Makes an initial empty commit in an already-initialized repository.
+    fn commit_initial_for_test(root: &Path) {
+        let repo = git2::Repository::open(root).unwrap();
+        let signature = git2::Signature::now("SuperBrain Test", "test@localhost").unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial empty commit", &tree, &[]).unwrap();
     }
 
     // Matrix row 2 at its earliest point (final whole-branch review, finding

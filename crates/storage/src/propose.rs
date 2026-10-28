@@ -65,11 +65,12 @@ pub enum CommitResult {
     /// beyond) — a full, ordinary success.
     Committed(CommitOutcome),
     /// The write reached `WriteState::JournalCommitted` and is durably
-    /// persisted and readable, but the vault root was not (yet) a git
-    /// repository, so it could not be advanced to `WriteState::GitCommitted`.
-    /// A later retry of the SAME `operation_id` (via a fresh
-    /// `write_record_unchecked` chain extension attempt, once a repository
-    /// exists at the vault root) advances it the rest of the way.
+    /// persisted and readable, but git could not commit it (the vault root
+    /// is not yet a git repository, the repository has no commits yet, or
+    /// git otherwise failed), so it could not be advanced to
+    /// `WriteState::GitCommitted`. A later retry of the SAME `operation_id`,
+    /// or the next `Vault::open`, advances it the rest of the way once git
+    /// can commit.
     GitPending { note_id: String, operation_id: Uuid },
 }
 
@@ -81,10 +82,17 @@ pub enum CommitResult {
 /// against `known_ids`/`pending_ids`, runs `gate.evaluate` over the **whole**
 /// `note_text` (or `gate.evaluate_schema_error` if parsing already failed),
 /// and — only on `policy::GateDecision::Pass` — calls the crate-private
-/// `Vault::write_record_unchecked` with the whole `note_text`. No
-/// `ProposeError` variant is returned after a write has happened; every
-/// rejection path returns before the vault is ever touched, so a rejected
-/// note's record file is never created.
+/// `Vault::write_record_unchecked` with the whole `note_text`. Every
+/// rejection path (schema, note id, link, gate) returns before the vault is
+/// ever touched, so a rejected note's record file is never created. Once the
+/// write has reached `WriteState::JournalCommitted` (durably happened), a
+/// git failure is never reported as a `ProposeError`: it is
+/// `Ok(CommitResult::GitPending { .. })`, whatever the git failure was
+/// (final whole-branch review, finding I2). The `ProposeError::Storage`
+/// variants that can still follow a durable write are journal (SQLite)
+/// failures in the steps after `JournalCommitted`; the operation then rests
+/// at a recoverable state that a retry of the same `operation_id`, or the
+/// next `Vault::open`, completes.
 ///
 /// `note_text` is a complete note, in one of two forms (the private helper
 /// `frontmatter_of` documents the exact splitting rule):
@@ -122,10 +130,11 @@ pub enum CommitResult {
 /// On success the result is a [`CommitResult`]. The ordinary case is
 /// `CommitResult::Committed(CommitOutcome)`: the new [`Version`] plus the
 /// note's link state, so a note committed with pending references is
-/// reported as `LinkState::Pending` rather than accepted silently. If the
-/// vault root is not (yet) a git repository, the write still durably
-/// persists and reaches `WriteState::JournalCommitted`, but cannot advance
-/// to `WriteState::GitCommitted`; that case is reported as
+/// reported as `LinkState::Pending` rather than accepted silently. If git
+/// cannot commit (no repository at the vault root yet, no commits yet, or any
+/// other git failure), the write still durably persists and reaches
+/// `WriteState::JournalCommitted`, but cannot advance to
+/// `WriteState::GitCommitted`; that case is reported as
 /// `Ok(CommitResult::GitPending { .. })`, not an error — git unavailability
 /// is an expected, non-error outcome per spec, not a failure of the
 /// proposal itself.
