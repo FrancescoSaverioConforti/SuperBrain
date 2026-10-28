@@ -20,6 +20,14 @@
 //!    `JournalCommitted` therefore reaches `GitCommitted` and then
 //!    `IndexCurrent` in one call.
 //!
+//! Rows are processed in ascending `new_version` order
+//! (`Journal::non_terminal_operations`), so within one note an earlier
+//! operation is always resolved before a later one. That matters for row 3:
+//! an earlier git-pending operation's own bytes may survive only in its
+//! successor's before-image, which the successor deletes once it commits
+//! (final whole-branch review, findings I1 and M2). The live write path
+//! enforces the same order in `Vault::commit_to_git`.
+//!
 //! The five rows, keyed by the state being resumed from:
 //!
 //! - `IntentRecorded`: if the row carries an intended `content_hash` (the
@@ -986,6 +994,35 @@ mod tests {
             serialize_record_for_test("content B", Version(2)),
         );
         assert_ne!(row_a.git_commit_oid, row_b.git_commit_oid);
+    }
+
+    #[test]
+    fn reconcile_resolves_pending_operations_on_a_note_in_version_order_not_insertion_order() {
+        // Final whole-branch review, M2 (a dependency of I1's fix): insert_intent
+        // runs before the per-note lock, so a later-committing operation can
+        // have the LOWER rowid. Here op_b (version 2) was inserted first. In
+        // rowid order reconcile would commit op_b first and delete its
+        // before-image, the only copy of op_a's bytes, stranding op_a.
+        let (root, journal) = fresh_root_and_journal();
+        let repo_dir = init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let a_bytes = serialize_record_for_test("content A", Version(1));
+        let b_bytes = serialize_record_for_test("content B", Version(2));
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        journal.insert_intent(op_b, id.as_str(), 1).unwrap(); // lower rowid
+        journal.insert_intent(op_a, id.as_str(), 0).unwrap();
+        journal.advance(op_a, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&a_bytes))).unwrap();
+        journal.advance(op_a, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        let before_b = persist_before_image(&root, &id, op_b, &a_bytes).unwrap();
+        std::fs::write(root.join("note-a.record"), &b_bytes).unwrap();
+        journal.advance(op_b, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(2, content_hash(&b_bytes), before_b)).unwrap();
+        journal.advance(op_b, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+
+        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(report.recovered, vec![op_a, op_b], "resolved in version order");
+        assert!(report.git_pending.is_empty(), "nothing stranded: {:?}", report.git_pending_reasons);
+        assert_eq!(journal.get(op_a).unwrap().unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(journal.get(op_b).unwrap().unwrap().state, WriteState::IndexCurrent);
     }
 
     #[test]

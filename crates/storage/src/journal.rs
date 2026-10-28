@@ -302,33 +302,71 @@ impl Journal {
     }
 
     /// Every operation on `note_id` whose recorded `before_image_hash` equals
-    /// `before_image_hash`, oldest first. These are the operations that
-    /// overwrote content with that hash. Used by `recovery::reconcile` row 3
-    /// to find a superseded operation's own bytes in its successor's
-    /// before-image (Task 7 fix round, finding I-2).
+    /// `before_image_hash`, in ascending `new_version` order. These are the
+    /// operations that overwrote content with that hash. Used by
+    /// `recovery::own_content` to find a superseded operation's own bytes in
+    /// its successor's before-image (Task 7 fix round, finding I-2). Any
+    /// match whose before-image verifies is equally good, so the order is
+    /// not load-bearing here; it is `new_version`, not `rowid`, only for
+    /// consistency with the other per-note queries (final whole-branch
+    /// review, M2).
     pub(crate) fn operations_with_before_image_hash(
         &self,
         note_id: &str,
         before_image_hash: &str,
     ) -> Result<Vec<OperationRow>, JournalError> {
         let mut stmt = self.conn.prepare(&format!(
-            "{SELECT_ROWS} WHERE note_id = ?1 AND before_image_hash = ?2 ORDER BY rowid ASC"
+            "{SELECT_ROWS} WHERE note_id = ?1 AND before_image_hash = ?2 ORDER BY new_version ASC, rowid ASC"
         ))?;
         let rows = stmt.query_map(params![note_id, before_image_hash], row_from_sql)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Every operation that is neither `IndexCurrent` nor `Failed`, oldest
-    /// first. Consumed by `recovery::reconcile` on `Vault::open`.
+    /// Every operation that is neither `IndexCurrent` nor `Failed`, in
+    /// ascending `new_version` order (rows with no `new_version` yet first,
+    /// then `rowid` as the tie-break). Consumed by `recovery::reconcile` on
+    /// `Vault::open`.
+    ///
+    /// Not `rowid` order (final whole-branch review, M2): `rowid` is
+    /// `insert_intent` order, which runs BEFORE the per-note lock, so a
+    /// later-committing operation on a note can have the lower `rowid` (the
+    /// same reason `last_committed_for_note` orders by `new_version`, Task 4
+    /// I1). Within one note, recovery must resolve operations oldest version
+    /// first: a git-pending operation's own bytes may survive only in its
+    /// successor's before-image, which the successor deletes once it
+    /// commits, so committing the successor first would strand the earlier
+    /// operation (finding I1). Across different notes the order is
+    /// irrelevant.
     pub(crate) fn non_terminal_operations(&self) -> Result<Vec<OperationRow>, JournalError> {
         let mut stmt = self.conn.prepare(&format!(
-            "{SELECT_ROWS} WHERE state NOT IN (?1, ?2) ORDER BY rowid ASC"
+            "{SELECT_ROWS} WHERE state NOT IN (?1, ?2) ORDER BY new_version ASC, rowid ASC"
         ))?;
         let rows = stmt.query_map(
             params![
                 state_to_sql(WriteState::IndexCurrent),
                 state_to_sql(WriteState::Failed),
             ],
+            row_from_sql,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every operation on `note_id` resting at `JournalCommitted` (git
+    /// pending) with a `new_version` below `below_version`, in ascending
+    /// `new_version` order. The git step commits these before an operation
+    /// at `below_version`, so that operation never deletes a before-image an
+    /// earlier pending operation still needs (final whole-branch review,
+    /// finding I1).
+    pub(crate) fn git_pending_operations_before(
+        &self,
+        note_id: &str,
+        below_version: u64,
+    ) -> Result<Vec<OperationRow>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_ROWS} WHERE note_id = ?1 AND state = ?2 AND new_version < ?3 ORDER BY new_version ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![note_id, state_to_sql(WriteState::JournalCommitted), below_version as i64],
             row_from_sql,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

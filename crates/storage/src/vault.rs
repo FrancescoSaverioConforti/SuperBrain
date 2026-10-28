@@ -339,7 +339,10 @@ pub struct Vault {
     /// `write_record_unchecked`'s step 2, before this lock is ever touched.
     /// This lock is acquired only within that per-note critical section,
     /// held only for the duration of the git-commit sequence itself (step
-    /// 7), and is never held while attempting to acquire a per-note lock or
+    /// 7, which since the final whole-branch review's finding I1 also
+    /// commits, and takes through the index step, any earlier git-pending
+    /// operation on the SAME note, whose per-note lock is the one already
+    /// held), and is never held while attempting to acquire a per-note lock or
     /// the journal mutex's own short-lived locks (which are taken and
     /// released individually, not held across the git sequence). Since this
     /// lock is always acquired after the per-note lock and never before it,
@@ -778,7 +781,7 @@ impl Vault {
         // record this call just wrote and verified (still under the per-note
         // lock). A brand-new operation cannot already have a commit far back
         // in history, so the bounded scan suffices here.
-        self.commit_to_git(note_id, &record_path, operation_id, ScanDepth::Bounded(500), None)?;
+        self.commit_to_git(note_id, &record_path, operation_id, new_version, ScanDepth::Bounded(500), None)?;
         injector.check(FaultPoint::AfterGitCommittedBeforeIndex).map_err(interrupted)?;
 
         // Step 7b (Task 6): the index step, GitCommitted -> IndexCurrent.
@@ -848,7 +851,7 @@ impl Vault {
         match row.state {
             WriteState::IndexCurrent => return Ok(version),
             WriteState::JournalCommitted => {
-                self.commit_to_git(&note_id, &record_path, operation_id, ScanDepth::Unbounded, Some(&row))?;
+                self.commit_to_git(&note_id, &record_path, operation_id, version, ScanDepth::Unbounded, Some(&row))?;
             }
             WriteState::GitCommitted => {}
             // Nothing moves a JournalCommitted/GitCommitted row anywhere else
@@ -885,40 +888,92 @@ impl Vault {
     /// also under `git_lock`, so there is no window where the state says
     /// GitCommitted but `git_commit_oid` is unset, and no second thread can
     /// re-run the lookup between the commit and that write.
+    ///
+    /// Earlier git-pending operations on the same note are committed FIRST,
+    /// in ascending `new_version` order, under the same `git_lock` (final
+    /// whole-branch review, finding I1). An earlier operation resting at
+    /// `JournalCommitted` may have its own bytes only in a later operation's
+    /// before-image (the later write overwrote the record), and this method
+    /// deletes `operation_id`'s before-image once it commits. Committing the
+    /// earlier ones first, each from its own recovered bytes and each then
+    /// taken through the index step, means no before-image is deleted while
+    /// an earlier operation still needs it. It also makes commits for one
+    /// note land in version order, so `HEAD` never moves back to older
+    /// content. An earlier operation whose own bytes cannot be recovered is
+    /// left resting (no commit is ever made from another operation's
+    /// bytes); a git failure on any of them is `GitPending` for this call
+    /// too, leaving every row at `JournalCommitted`.
     fn commit_to_git(
         &self,
         note_id: &NoteId,
         record_path: &Path,
         operation_id: Uuid,
+        version: Version,
         scan: ScanDepth,
         own_content_of: Option<&crate::journal::OperationRow>,
     ) -> Result<(), StorageError> {
         {
             let _git_guard = self.git_lock.lock().unwrap();
 
-            let existing_oid = find_commit_for_operation(&self.journal.lock().unwrap(), &self.root, operation_id, scan)
-                .map_err(|e| git_err(note_id, e))?;
-
-            let git_oid = match (existing_oid, own_content_of) {
-                (Some(oid), _) => oid,
-                (None, None) => commit_operation(&self.root, operation_id, note_id.as_str(), record_path)
-                    .map_err(|e| git_err(note_id, e))?,
-                (None, Some(row)) => {
-                    let contents = own_content(&self.root, &self.journal.lock().unwrap(), row, note_id, record_path)
-                        .map_err(|e| reconcile_err(note_id, e))?
-                        .ok_or_else(|| StorageError::GitPending { note_id: note_id.as_str().to_string() })?;
-                    commit_operation_contents(&self.root, operation_id, note_id.as_str(), record_path, &contents)
-                        .map_err(|e| git_err(note_id, e))?
-                }
-            };
-            self.journal
+            let earlier = self
+                .journal
                 .lock()
                 .unwrap()
-                .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
+                .git_pending_operations_before(note_id.as_str(), version.0)
                 .map_err(journal_err)?;
+            for row in earlier.iter().filter(|row| row.operation_id != operation_id) {
+                // Unbounded: an earlier operation is not just-written, so a
+                // bounded miss could not prove it has no commit yet.
+                if self.commit_one_locked(note_id, record_path, row.operation_id, ScanDepth::Unbounded, Some(row))? {
+                    delete_before_image(&self.root, note_id, row.operation_id)?;
+                    self.mark_index_current(note_id, row.operation_id, committed_version(row)?)?;
+                }
+            }
+
+            if !self.commit_one_locked(note_id, record_path, operation_id, scan, own_content_of)? {
+                return Err(StorageError::GitPending { note_id: note_id.as_str().to_string() });
+            }
             // _git_guard drops here, releasing git_lock.
         }
         delete_before_image(&self.root, note_id, operation_id)
+    }
+
+    /// One operation's JournalCommitted -> GitCommitted step. The caller must
+    /// hold the note's per-note lock and `git_lock`. Returns `Ok(false)`,
+    /// committing nothing, when `own_content_of` is given and that row's own
+    /// bytes can no longer be recovered; `Ok(true)` once the row is
+    /// `GitCommitted` with its Oid recorded on the same journal write.
+    fn commit_one_locked(
+        &self,
+        note_id: &NoteId,
+        record_path: &Path,
+        operation_id: Uuid,
+        scan: ScanDepth,
+        own_content_of: Option<&crate::journal::OperationRow>,
+    ) -> Result<bool, StorageError> {
+        let existing_oid = find_commit_for_operation(&self.journal.lock().unwrap(), &self.root, operation_id, scan)
+            .map_err(|e| git_err(note_id, e))?;
+
+        let git_oid = match (existing_oid, own_content_of) {
+            (Some(oid), _) => oid,
+            (None, None) => commit_operation(&self.root, operation_id, note_id.as_str(), record_path)
+                .map_err(|e| git_err(note_id, e))?,
+            (None, Some(row)) => {
+                let contents = own_content(&self.root, &self.journal.lock().unwrap(), row, note_id, record_path)
+                    .map_err(|e| reconcile_err(note_id, e))?;
+                let Some(contents) = contents else {
+                    return Ok(false);
+                };
+                commit_operation_contents(&self.root, operation_id, note_id.as_str(), record_path, &contents)
+                    .map_err(|e| git_err(note_id, e))?
+            }
+        };
+        self.journal
+            .lock()
+            .unwrap()
+            .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
+            .map_err(journal_err)?;
+        Ok(true)
     }
 
     /// The index step, GitCommitted -> IndexCurrent (Task 6). `mark_current`
@@ -2068,6 +2123,71 @@ mod tests {
         assert!(!before_image_path(&root, &id, op2).exists(), "the before-image is consumed by the restore");
         assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v1".into(), version: Version(1) });
         assert_eq!(commits_for_operation(&root, op2), 0, "a rolled-back operation is never committed to git");
+    }
+
+    // Final whole-branch review, finding I1: an earlier git-pending operation
+    // must not be stranded when a later write to the same note commits and
+    // deletes the before-image that held the earlier operation's bytes.
+
+    #[test]
+    fn a_git_pending_operation_is_committed_first_when_a_later_write_to_the_same_note_commits() {
+        let (root, journal_path) = fresh_root_and_journal_path(); // not a git repository yet
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            assert!(matches!(vault.write_record_unchecked(&id, "content A", Version(0), op_a), Err(StorageError::GitPending { .. })));
+            // The ordinary workflow: git is initialized while the vault is in use.
+            init_test_repo_at(&root);
+            assert_eq!(vault.write_record_unchecked(&id, "content B", Version(1), op_b).unwrap(), Version(2));
+
+            let row_a = vault.journal_row_for_test(op_a).unwrap();
+            assert_eq!(row_a.state, WriteState::IndexCurrent, "A is committed before B, not left behind");
+            assert_eq!(
+                committed_record_bytes(&root, row_a.git_commit_oid.as_deref().unwrap(), "note-a"),
+                serialize_record("content A", Version(1)),
+                "A's commit carries A's own bytes, recovered from B's before-image before it was deleted"
+            );
+            let row_b = vault.journal_row_for_test(op_b).unwrap();
+            assert_eq!(row_b.state, WriteState::IndexCurrent);
+            // Commits land in version order, so HEAD ends at the newest content.
+            let repo = git2::Repository::open(&root).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(head.id().to_string(), row_b.git_commit_oid.clone().unwrap());
+            assert_eq!(head.parent_id(0).unwrap().to_string(), row_a.git_commit_oid.clone().unwrap());
+            assert!(!before_image_path(&root, &id, op_b).exists());
+        }
+        for _ in 0..2 {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let row_a = vault.journal_row_for_test(op_a).unwrap();
+            assert_eq!(row_a.state, WriteState::IndexCurrent, "not stuck at JournalCommitted across reopens");
+            assert!(row_a.git_commit_oid.is_some());
+            assert_eq!(commits_for_operation(&root, op_a), 1);
+            assert_eq!(commits_for_operation(&root, op_b), 1);
+            assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "content B".into(), version: Version(2) });
+        }
+    }
+
+    #[test]
+    fn a_retry_of_the_newer_git_pending_operation_commits_the_older_one_first_so_head_never_moves_backward() {
+        // Closes Task 8's deferred I3 as a side effect: the caller retries
+        // the NEWER git-pending operation before the older one. The older one
+        // is committed first, then the newer one, so HEAD ends at the newest
+        // content; the later retry of the older one creates nothing new.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let _ = vault.write_record_unchecked(&id, "content A", Version(0), op_a);
+        let _ = vault.write_record_unchecked(&id, "content B", Version(1), op_b);
+        init_test_repo_at(&root);
+        assert_eq!(vault.write_record_unchecked(&id, "content B", Version(1), op_b).unwrap(), Version(2));
+        assert_eq!(vault.write_record_unchecked(&id, "content A", Version(0), op_a).unwrap(), Version(1));
+        assert_eq!(commits_for_operation(&root, op_a), 1);
+        assert_eq!(commits_for_operation(&root, op_b), 1);
+        let repo = git2::Repository::open(&root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(Some(head.id().to_string()), vault.journal_row_for_test(op_b).unwrap().git_commit_oid);
     }
 
     // Final whole-branch review, finding I2: the live path must classify git
