@@ -30,7 +30,7 @@
 //! that compiles today but must not be run until the owning task lands. Each
 //! stub's comment says what must be implemented to un-ignore it.
 
-/// Surface: git history. Task 6 (write path) and Task 7 (`PiiStore`).
+/// Surface: git history. Task 6 (write path and `PiiStore`).
 ///
 /// Un-ignore by: calling `propose_and_commit` with a sensitive note, then
 /// walking every blob reachable from every ref of the vault repo (for example
@@ -39,9 +39,9 @@
 /// is not. This covers C3's "doppio controllo ... scansione periodica della
 /// cronologia".
 #[test]
-#[ignore = "A3 Task 6/7: needs propose_and_commit sensitive path and PiiStore"]
+#[ignore = "A3 Task 6: needs propose_and_commit sensitive path and PiiStore"]
 fn no_git_blob_at_any_commit_ever_contains_sensitive_plaintext_or_the_pii_pointers_target_bytes() {
-    todo!("implement in Task 6/7: scan every reachable blob for the sensitive plaintext")
+    todo!("implement in Task 6: scan every reachable blob for the sensitive plaintext")
 }
 
 /// Surface: A2 SQLite journal. Task 6 (write path).
