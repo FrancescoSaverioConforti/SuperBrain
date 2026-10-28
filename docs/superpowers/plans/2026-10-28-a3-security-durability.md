@@ -217,12 +217,12 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Create: `crates/storage/tests/a3_confidentiality_boundary.rs`
 
 **Interfaces:**
-- Consumes: `storage::propose_and_commit` and `storage::Vault::read_note` (existing, A1/A2), `vault_security::pii_store::PiiStore` (Task 7 — this task's tests are written now but can only fully compile and run once Task 7 lands; see Step 0 below for ordering).
+- Consumes: `storage::propose_and_commit` and `storage::Vault::read_note` (existing, A1/A2), `vault_security::pii_store::PiiStore` (Task 6 — this task's tests are written now but can only fully compile and run once Task 6 lands; see Step 0 below for ordering).
 - Produces: a standing regression suite later tasks must keep green; no new production types.
 
-This task exists because the plan's own Review Focus item 5 identified that no single round-trip test proves confidentiality — it only proves the *intended* path behaves. This task is the dedicated, enumerated check across every *other* path data could leak through, mapping directly to contract C3's explicit list of boundaries ("file, frontmatter e metadati, allegati, file generati, cache, log, indici, embedding, riassunti, backup").
+This task exists because the plan's own Review Focus item 5 identified that no single round-trip test proves confidentiality — it only proves the *intended* path behaves. This task is the dedicated, enumerated check across every *other* path data could leak through, mapping directly to contract C3's explicit list of boundaries ("file, frontmatter e metadati, allegati, file generati, cache, log, indici, embedding, riassunti, backup" — ten items).
 
-- [ ] **Step 0 (ordering note): write these tests now as failing/`#[ignore]`d stubs naming each surface; un-ignore and complete each one as the subsystem it tests (Task 6's write path, Task 7's `PiiStore`, Task 8's backup) lands.** This keeps the enumeration itself — the actual deliverable of this task — reviewable up front, per the user's request to resolve this boundary before implementation proceeds, rather than having it discovered piecemeal.
+- [ ] **Step 0 (ordering note): write these tests now as failing/`#[ignore]`d stubs naming each surface; un-ignore and complete each one as the subsystem it tests (Task 6's write path and `PiiStore`, Task 7's backup) lands.** This keeps the enumeration itself — the actual deliverable of this task — reviewable up front, per the user's request to resolve this boundary before implementation proceeds, rather than having it discovered piecemeal.
 
 - [ ] **Step 1: Write the git-history surface test**
 
@@ -269,7 +269,7 @@ fn before_images_for_sensitive_notes_never_contain_plaintext_pointer_target_byte
 ```rust
 #[test]
 fn no_error_variant_debug_or_display_output_from_pii_store_or_propose_and_commit_echoes_plaintext_or_key_bytes() {
-    // Force each PiiStoreError and the sensitive-path ProposeError variants
+    // Once Task 6 lands: force each PiiStoreError and the sensitive-path ProposeError variants
     // and assert their {:?} and {} output never contains the plaintext
     // content or raw key/data-key bytes used in the test fixture — only
     // note ids, generation numbers, and hashes are expected to appear.
@@ -293,16 +293,16 @@ fn an_interrupted_sensitive_write_leaves_no_recoverable_plaintext_in_any_temp_fi
 ```rust
 #[test]
 fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_content_outside_its_aead_envelope() {
-    // Once Task 8 lands: take a backup of a vault containing a sensitive
+    // Once Task 7 lands: take a backup of a vault containing a sensitive
     // note; read the raw bytes BackupTarget::write_blob received (not
     // through restore()) and assert the plaintext does not appear as a
     // substring anywhere in that blob.
 }
 ```
 
-- [ ] **Step 6b: Record, explicitly, which of C3's listed surfaces this task does NOT cover and why.** C3 (`docs/Spec_mvp.md` line 364) names nine surfaces: "file, frontmatter e metadati, allegati, file generati, cache, log, indici, embedding, riassunti, backup." This task's Steps 1–6 cover file content, frontmatter/metadata (via the pointer scheme), log/error output, temp files, and backup. **Indici (search index), embedding, and riassunti (summaries) are out of scope here because those subsystems do not exist yet** — they belong to Fase B (index) and Fase C (summaries), neither implemented. This is a deliberate deferral, not an oversight: add a doc comment at the top of `a3_confidentiality_boundary.rs` stating exactly this, and record a Continuity open item so B1/B2 and C2's own plans re-audit the sensitive-classification boundary against an index/embedding/summary surface that will exist by then.
+- [ ] **Step 6b: Record, explicitly, which of C3's listed surfaces this task does NOT cover and why.** C3 (`docs/Spec_mvp.md` line 364) names TEN surfaces: "file, frontmatter e metadati, allegati, file generati, cache, log, indici, embedding, riassunti, backup." This task's Steps 1–6 cover: file content and frontmatter/metadata (via the pointer scheme, Step 1's git-history test), log/error output (Step 4), temp files (Step 5, which is also "file generati" — generated files — so that surface is covered, not deferred), and backup (Step 6). **Indici (search index), embedding, and riassunti (summaries) are out of scope here because those subsystems do not exist yet** — they belong to Fase B (index) and Fase C (summaries), neither implemented. **Allegati (attachments) and cache are likewise out of scope: no attachment-handling or caching subsystem exists anywhere in this codebase today**, so there is nothing to audit; this is a deliberate deferral, not an oversight. Add a doc comment at the top of `a3_confidentiality_boundary.rs` stating exactly this (all five deferred/covered-elsewhere surfaces, not just three), and record a Continuity open item so B1/B2 and C2's own plans re-audit the sensitive-classification boundary against an index/embedding/summary/attachment/cache surface once any of those exist.
 
-- [ ] **Step 7: As each dependency lands (Tasks 6–8), un-ignore and run the corresponding test; all must PASS before Task 9's whole-branch review.**
+- [ ] **Step 7: As each dependency lands (Task 6, then Task 7), un-ignore and run the corresponding test; all must PASS before Task 8's whole-branch review.**
 
 - [ ] **Step 8: Commit** (initial stub version now; later tasks' commits amend this file's `#[ignore]` status as they land, each in that task's own commit)
 
