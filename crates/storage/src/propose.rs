@@ -5,7 +5,7 @@ use uuid::Uuid;
 use vault_security::{PiiPointer, PiiStore};
 
 use crate::note_id::{NoteId, NoteIdError};
-use crate::vault::{StorageError, Vault, Version};
+use crate::vault::{PendingDeletion, StorageError, Vault, Version};
 
 /// A reserved body marker that signals "this `Sensitive`-note write is a
 /// DELETION, not a content update" to `propose_and_commit`'s sensitive
@@ -48,14 +48,6 @@ pub enum ProposeError {
     Link(domain::LinkError),
     Rejected(policy::GateRejection),
     Storage(StorageError),
-    /// A failure inside `vault-security`'s `DeletionLog` while recording a
-    /// sensitive-note deletion (see `SENSITIVE_TOMBSTONE_BODY`). Folded to a
-    /// rendered message for the same crate-boundary-visibility reason
-    /// `StorageError::Journal`/`StorageError::PiiStore` are: `DeletionLog`'s
-    /// own `DeletionLogError` carries no plaintext (deletion log rows are
-    /// note ids, generations and hashes only), so this capture cannot leak
-    /// sensitive content either.
-    DeletionLog(String),
 }
 
 /// What a successful [`propose_and_commit`] reports back to the caller.
@@ -169,12 +161,20 @@ pub enum CommitResult {
 ///
 /// `pii_store` is the `PiiStore` this call uses to answer the gate's
 /// `EncryptedStoreAvailability` question and, for a `Sensitive` note, to
-/// actually stage and commit its ciphertext (Task 6). It is the caller's
-/// job to open it once (typically at `<vault_root>/.pii-store`, mirroring
-/// how `vault.rs`'s `BEFORE_IMAGE_DIR` is a fixed, documented sibling of the
-/// vault root) and pass the SAME `PiiStore` across calls, so repeated calls
-/// share one master key and one on-disk store rather than re-deriving a
-/// fingerprint and potentially re-keying on every call.
+/// actually stage and commit its ciphertext (Task 6). `None` means no
+/// encrypted store is configured/reachable for this call — the gate then
+/// sees `EncryptedStoreAvailability::Unavailable { NotYetConfigured }` and
+/// rejects a `Sensitive` note exactly as it always has, per Task 4's
+/// design, while an `Internal`/`Public` write proceeds completely
+/// unaffected (A3 review round, IMPORTANT finding #2: a mandatory
+/// `&PiiStore` would have made even non-sensitive writes depend on a
+/// working encrypted store, which is backwards — Task 4 exists precisely
+/// so a broken/unconfigured store blocks ONLY `Sensitive` writes). It is
+/// the caller's job to open it once (typically at `<vault_root>/.pii-store`,
+/// mirroring how `vault.rs`'s `BEFORE_IMAGE_DIR` is a fixed, documented
+/// sibling of the vault root) and pass the SAME `PiiStore` across calls, so
+/// repeated calls share one master key and one on-disk store rather than
+/// re-deriving a fingerprint and potentially re-keying on every call.
 #[allow(clippy::too_many_arguments)]
 pub fn propose_and_commit(
     vault: &Vault,
@@ -184,7 +184,7 @@ pub fn propose_and_commit(
     known_ids: &HashSet<NoteId>,
     pending_ids: &HashSet<String>,
     gate: &policy::Gate,
-    pii_store: &PiiStore,
+    pii_store: Option<&PiiStore>,
 ) -> Result<CommitResult, ProposeError> {
     let note = match domain::parse_frontmatter(frontmatter_of(note_text)) {
         Ok(note) => note,
@@ -234,15 +234,20 @@ pub fn propose_and_commit(
         Err(link_err) => return Err(ProposeError::Link(link_err)),
     };
 
-    // Task 6: whether the encrypted store is available for THIS call. A
-    // `PiiStore` value already in hand (the caller opened it successfully)
-    // is always `Available` — there is nothing left to try. `open`'s own
-    // error mapping (`vault_security::unavailable_reason_for`) is for a
-    // caller that has NOT yet managed to open one at all; since
-    // `propose_and_commit` requires an already-open `&PiiStore`, that
-    // mapping is exercised by whatever constructs the `PiiStore` before
-    // calling in, not here.
-    let availability = vault_security::EncryptedStoreAvailability::Available;
+    // Task 6 (A3 review round, IMPORTANT finding #2): whether the encrypted
+    // store is available for THIS call, computed for real rather than
+    // hardcoded. `pii_store: None` means no store is configured/reachable
+    // at all -> `NotYetConfigured`. A `Some` value already in hand (the
+    // caller opened it successfully) is `Available` — there is nothing
+    // left to try; `vault_security::unavailable_reason_for`'s mapping is
+    // for a caller that has NOT yet managed to open one at all, exercised
+    // by whatever constructs the `PiiStore` before calling in, not here.
+    let availability = match pii_store {
+        Some(_) => vault_security::EncryptedStoreAvailability::Available,
+        None => vault_security::EncryptedStoreAvailability::Unavailable {
+            reason: vault_security::StoreUnavailableReason::NotYetConfigured,
+        },
+    };
 
     // The gate scans the WHOLE note text, body included, so a secret that
     // appears only in the body is still caught before the vault is touched.
@@ -250,6 +255,11 @@ pub fn propose_and_commit(
         policy::GateDecision::Reject(rejection) => Err(ProposeError::Rejected(rejection)),
         policy::GateDecision::Pass => {
             if matches!(note.classification, Classification::Sensitive) {
+                // The gate already required `Available` to reach `Pass`
+                // for a `Sensitive` note (see `availability` above), so
+                // `pii_store` is always `Some` here — this `expect` can
+                // never fire without the gate itself having a bug.
+                let pii_store = pii_store.expect("gate passed a Sensitive note without an available PiiStore");
                 commit_sensitive(vault, &note_id, note_text, expected_version, operation_id, pii_store, link_state)
             } else {
                 match vault.write_record_unchecked(&note_id, note_text, expected_version, operation_id) {
@@ -274,17 +284,22 @@ pub fn propose_and_commit(
 ///   frontmatter (verbatim, so relations/classification/metadata stay
 ///   queryable) plus a `pii://<note_id>` pointer body — see
 ///   [`pointer_record`].
-/// - Deletion (the body is exactly the tombstone marker): `DeletionLog::
-///   record_deletion` runs FIRST, inside the surrounding journal operation
-///   boundary that `write_sensitive_record_unchecked` establishes for this
-///   `operation_id` (the deletion log's own three-step protocol is a
-///   SEPARATE, independently-authenticated mechanism per spec contract C5 —
-///   it is not folded into the A2 journal's `WriteState` machine — but it
-///   is still run to completion before the tombstone pointer is committed,
-///   so a reader can never observe a committed tombstone pointer whose
-///   deletion was never logged). The tombstone's "plaintext" staged into
-///   `PiiStore` is empty: a deleted note has no more sensitive content to
-///   protect, and `PiiStore::get` on it is never a meaningful operation
+/// - Deletion (the body is exactly the tombstone marker): a
+///   [`PendingDeletion`] is built here and handed into
+///   `Vault::write_sensitive_record_unchecked`, which calls
+///   `DeletionLog::record_deletion` itself, AFTER its own per-note lock is
+///   held and its own version check has passed (A3 review round, IMPORTANT
+///   finding #1 — see `PendingDeletion`'s doc comment in `vault.rs` for why
+///   this must not happen here, before the lock). The deletion log's own
+///   three-step protocol is a SEPARATE, independently-authenticated
+///   mechanism per spec contract C5 — it is not folded into the A2
+///   journal's `WriteState` machine — but running it only once this
+///   operation has already proven it is a legitimate write means a reader
+///   can never observe a committed tombstone pointer whose deletion was
+///   never logged, NOR a logged deletion whose tombstone write was
+///   actually a stale, rejected attempt. The tombstone's "plaintext" staged
+///   into `PiiStore` is empty: a deleted note has no more sensitive content
+///   to protect, and `PiiStore::get` on it is never a meaningful operation
 ///   again once the deletion log also marks it deleted.
 fn commit_sensitive(
     vault: &Vault,
@@ -298,20 +313,22 @@ fn commit_sensitive(
     let body = body_of(note_text);
     let is_deletion = body.trim() == SENSITIVE_TOMBSTONE_BODY;
 
-    if is_deletion {
-        let deletion_log = vault_security::DeletionLog::open(&deletion_log_db_path(pii_store))
-            .map_err(|e| ProposeError::DeletionLog(e.to_string()))?;
-        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(deletion_log_reference_path(pii_store));
-        deletion_log
-            .record_deletion(note_id.as_str(), &trusted_ref)
-            .map_err(|e| ProposeError::DeletionLog(e.to_string()))?;
-    }
-
     let frontmatter = frontmatter_of(note_text);
     let pointer_content = pointer_record(frontmatter, note_id);
     let plaintext: &[u8] = if is_deletion { b"" } else { body.as_bytes() };
 
-    match vault.write_sensitive_record_unchecked(note_id, &pointer_content, plaintext, expected_version, operation_id, pii_store) {
+    let deletion_log;
+    let trusted_ref;
+    let deletion = if is_deletion {
+        deletion_log = vault_security::DeletionLog::open(&deletion_log_db_path(pii_store))
+            .map_err(|e| ProposeError::Storage(StorageError::DeletionLog(e.to_string())))?;
+        trusted_ref = vault_security::DpapiTrustedReferenceStore::new(deletion_log_reference_path(pii_store));
+        Some(PendingDeletion { log: &deletion_log, trusted_ref: &trusted_ref })
+    } else {
+        None
+    };
+
+    match vault.write_sensitive_record_unchecked(note_id, &pointer_content, plaintext, expected_version, operation_id, pii_store, deletion) {
         Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
         Err(StorageError::GitPending { note_id }) => Ok(CommitResult::GitPending { note_id, operation_id }),
         Err(other) => Err(ProposeError::Storage(other)),

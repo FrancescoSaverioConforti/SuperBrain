@@ -110,7 +110,7 @@ fn no_git_blob_at_any_commit_ever_contains_sensitive_plaintext_or_the_pii_pointe
     let (vault, pii_store) = open_vault_and_pii_store(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let note_text = sensitive_note("note-git-audit", SENSITIVE_PLAINTEXT);
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
     let repo = git2::Repository::open(&root).unwrap();
@@ -152,7 +152,7 @@ fn the_a2_sqlite_journals_columns_never_contain_sensitive_plaintext() {
     let (vault, journal_path, pii_store) = open_vault_and_pii_store_with_journal(root);
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let note_text = sensitive_note("note-journal-audit", SENSITIVE_PLAINTEXT);
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
     let journal_bytes = std::fs::read(&journal_path).unwrap();
@@ -200,14 +200,14 @@ fn before_images_for_sensitive_notes_never_contain_plaintext_pointer_target_byte
     let (vault, pii_store) = open_vault_and_pii_store(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let note_text_v1 = sensitive_note("note-before-image-audit", SENSITIVE_PLAINTEXT);
-    storage::propose_and_commit(&vault, &note_text_v1, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text_v1, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
     let id = NoteId::parse("note-before-image-audit").unwrap();
     let current = vault.current_version(&id).unwrap();
 
     let other_secret = "A_DIFFERENT_SECOND_SECRET_value_for_the_update";
     let note_text_v2 = sensitive_note("note-before-image-audit", other_secret);
-    storage::propose_and_commit(&vault, &note_text_v2, current, Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text_v2, current, Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
     // By the time a successful write returns, GitCommitted has already been
@@ -244,7 +244,7 @@ fn no_error_variant_debug_or_display_output_from_pii_store_or_propose_and_commit
     let (vault, pii_store) = open_vault_and_pii_store(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let note_text = sensitive_note("note-error-audit", SENSITIVE_PLAINTEXT);
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
     // PiiStoreError::Inconsistent, forced by tampering the live ciphertext.
@@ -270,7 +270,7 @@ fn no_error_variant_debug_or_display_output_from_pii_store_or_propose_and_commit
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     let conflict_debug = format!("{conflict_err:?}");
@@ -295,7 +295,7 @@ fn a_completed_sensitive_write_leaves_no_recoverable_plaintext_in_any_temp_file_
     let (vault, pii_store) = open_vault_and_pii_store(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let note_text = sensitive_note("note-tempfile-audit", SENSITIVE_PLAINTEXT);
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store)
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
     for path in all_files_under(&root) {

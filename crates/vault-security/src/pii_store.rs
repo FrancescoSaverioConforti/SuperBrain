@@ -21,6 +21,21 @@
 //!   fsynced staging file, not yet visible as the live ciphertext. Mirrors
 //!   `storage::vault`'s `.before-images` convention: a dotfile directory
 //!   sibling of the live files, keyed by `(note_id, operation_id)`.
+//! - `<root>/.before-images/<note_id>-<operation_id>.pii` — the PRIOR live
+//!   ciphertext, preserved for the duration of ONE operation, exactly
+//!   mirroring `storage::vault`'s own `.before-images` mechanism for
+//!   Markdown content (`persist_before_image`/`read_before_image`/
+//!   `delete_before_image`). `PiiStore`'s live path is keyed by `note_id`
+//!   ALONE (not by version), so [`PiiStore::commit_staged`] on an UPDATE
+//!   overwrites the only copy of the prior, already-committed ciphertext —
+//!   without this before-image, an operation that commits its new
+//!   ciphertext and then crashes (or fails) before its pointer rename lands
+//!   would permanently destroy the one copy of the content the PRIOR,
+//!   already-committed pointer still legitimately describes. The caller
+//!   (`storage`) is responsible for calling [`PiiStore::commit_staged`]
+//!   (which persists this before-image internally, before overwriting the
+//!   live file) and, on rollback, [`PiiStore::restore_before_image`]; on
+//!   success past the point of no return, [`PiiStore::delete_before_image`].
 //!
 //! On-disk format of both staging and live `.pii` files, one buffer, written
 //! in one go (mirroring `storage::vault::serialize_record`'s "replace
@@ -57,6 +72,14 @@ use crate::keys::{KeyError, MasterKey, StoreFingerprint, MASTER_KEY_LEN};
 /// committed) ciphertext. Sibling of the live `.pii` files, exactly as
 /// `storage::vault::BEFORE_IMAGE_DIR` is a sibling of `.record` files.
 const STAGING_DIR: &str = ".staging";
+
+/// Dotfile directory, inside the PII store root, that holds PII
+/// before-images: the prior live ciphertext an update is about to overwrite,
+/// preserved for the duration of one operation. Mirrors
+/// `storage::vault::BEFORE_IMAGE_DIR` exactly, as its own sibling directory
+/// (never the same directory as `STAGING_DIR`, so a crash can never confuse
+/// "not yet committed" with "the content a commit is about to overwrite").
+const BEFORE_IMAGE_DIR: &str = ".before-images";
 
 /// AES-GCM nonce length in bytes.
 const NONCE_LEN: usize = 12;
@@ -295,6 +318,11 @@ impl PiiStore {
         self.root.join(STAGING_DIR).join(format!("{note_id}-{operation_id}.pii"))
     }
 
+    /// `<root>/.before-images/<note_id>-<operation_id>.pii`.
+    fn before_image_path(&self, note_id: &str, operation_id: Uuid) -> PathBuf {
+        self.root.join(BEFORE_IMAGE_DIR).join(format!("{note_id}-{operation_id}.pii"))
+    }
+
     /// Serializes `wrapped_key`, `wrap_nonce`, `content_nonce` and
     /// `ciphertext` into the single on-disk buffer format (module docs).
     fn serialize(wrapped_key: &[u8], wrap_nonce: &[u8; NONCE_LEN], content_nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
@@ -360,11 +388,97 @@ impl PiiStore {
     /// the live `<root>/<note_id>.pii` path, then removes the staging entry
     /// (idempotent: a missing staging file at that point is not an error,
     /// since the rename already consumed it).
+    ///
+    /// Before overwriting, if a live file already exists (an UPDATE, not a
+    /// first write), its bytes are durably copied to this operation's own
+    /// before-image (`<root>/.before-images/<note_id>-<operation_id>.pii`,
+    /// fsynced) FIRST — mirroring `storage::vault`'s "persist the
+    /// before-image before the rename" discipline exactly. `PiiStore`'s live
+    /// path is keyed by `note_id` alone, not by version, so without this,
+    /// overwriting it would destroy the only copy of the PRIOR,
+    /// already-committed operation's ciphertext — the content a crash or a
+    /// later rollback (`restore_before_image`) might still need to recover.
+    /// The caller is responsible for calling [`PiiStore::delete_before_image`]
+    /// once this operation has reached a point of no return (mirroring
+    /// `storage::vault`'s "only delete the before-image once `GitCommitted`
+    /// is reached"), and [`PiiStore::restore_before_image`] on rollback.
     pub fn commit_staged(&self, note_id: &str, operation_id: Uuid) -> Result<(), PiiStoreError> {
         let staged = self.staging_path(note_id, operation_id);
         let live = self.live_path(note_id);
+
+        if let Ok(prior_bytes) = std::fs::read(&live) {
+            let before_image_dir = self.root.join(BEFORE_IMAGE_DIR);
+            std::fs::create_dir_all(&before_image_dir)?;
+            let before_image_path = self.before_image_path(note_id, operation_id);
+            atomic_write(&before_image_path, &prior_bytes)?;
+        }
+
         std::fs::rename(&staged, &live)?;
         Ok(())
+    }
+
+    /// Restores the live `<note_id>.pii` file from this operation's own
+    /// before-image (as persisted by [`PiiStore::commit_staged`]), verifying
+    /// the restored bytes decrypt and re-hash to `expected_plaintext_hash`
+    /// before accepting them. Used by `storage`'s crash-recovery and
+    /// live-write rollback paths to undo a committed ciphertext when the
+    /// pointer that was meant to accompany it never landed — the sensitive
+    /// analogue of `storage::vault::read_before_image` plus the write-back
+    /// `atomic_write` call that restores a Markdown before-image.
+    ///
+    /// Returns `Ok(true)` if a before-image existed and was restored and
+    /// verified; `Ok(false)` if no before-image exists for this
+    /// `(note_id, operation_id)` (a first write has nothing to restore —
+    /// the caller should fall back to [`PiiStore::remove_live`] instead).
+    /// A before-image that exists but fails to verify is
+    /// [`PiiStoreError::Inconsistent`] — never silently discarded, and the
+    /// live file is left untouched in that case.
+    pub fn restore_before_image(
+        &self,
+        note_id: &str,
+        operation_id: Uuid,
+        expected_plaintext_hash: &str,
+    ) -> Result<bool, PiiStoreError> {
+        let before_image_path = self.before_image_path(note_id, operation_id);
+        let before_bytes = match std::fs::read(&before_image_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(PiiStoreError::Io(e)),
+        };
+        let plaintext = self.decrypt_buffer(note_id, &before_bytes)?;
+        if content_hash(&plaintext) != expected_plaintext_hash {
+            return Err(PiiStoreError::Inconsistent { note_id: note_id.to_string() });
+        }
+        let live = self.live_path(note_id);
+        atomic_write(&live, &before_bytes)?;
+        // Re-read and re-verify the bytes actually on disk, exactly as
+        // `storage::vault`'s own rollback path re-reads after writing the
+        // Markdown before-image back.
+        let written = std::fs::read(&live)?;
+        let written_plaintext = self.decrypt_buffer(note_id, &written)?;
+        if content_hash(&written_plaintext) != expected_plaintext_hash {
+            return Err(PiiStoreError::Inconsistent { note_id: note_id.to_string() });
+        }
+        Ok(true)
+    }
+
+    /// Removes this operation's before-image, if one exists. Idempotent.
+    /// Mirrors `storage::vault::delete_before_image`. Must be called only
+    /// once this operation has reached a point of no return (per
+    /// `commit_staged`'s doc comment) — never while the operation's
+    /// pointer-rename outcome is still unresolved.
+    pub fn delete_before_image(&self, note_id: &str, operation_id: Uuid) -> Result<(), PiiStoreError> {
+        let path = self.before_image_path(note_id, operation_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PiiStoreError::Io(e)),
+        }
+    }
+
+    /// Whether a before-image exists for `(note_id, operation_id)`.
+    pub fn has_before_image(&self, note_id: &str, operation_id: Uuid) -> bool {
+        self.before_image_path(note_id, operation_id).is_file()
     }
 
     /// Unwraps the data key, decrypts, and returns the plaintext for
@@ -607,6 +721,74 @@ mod tests {
         assert_eq!(parsed.note_id(), "note-a");
         assert!(PiiPointer::parse("not-a-pointer").is_none());
         assert!(PiiPointer::parse("pii://").is_none());
+    }
+
+    #[test]
+    fn commit_staged_on_an_update_preserves_the_prior_live_ciphertext_as_a_before_image() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op1 = Uuid::new_v4();
+        store.stage("note-a", b"v1 plaintext", op1).unwrap();
+        store.commit_staged("note-a", op1).unwrap();
+        assert!(!store.has_before_image("note-a", op1), "a first write has no prior live file to preserve");
+
+        let op2 = Uuid::new_v4();
+        store.stage("note-a", b"v2 plaintext", op2).unwrap();
+        store.commit_staged("note-a", op2).unwrap();
+        assert!(store.has_before_image("note-a", op2), "an update must preserve the prior live ciphertext as op2's before-image");
+
+        // The live file is now v2's.
+        assert_eq!(store.get("note-a").unwrap(), b"v2 plaintext");
+        // op2's before-image, independently decrypted, is v1's content.
+        let before_hash = content_hash(b"v1 plaintext");
+        let restored = store.restore_before_image("note-a", op2, &before_hash).unwrap();
+        assert!(restored);
+        assert_eq!(store.get("note-a").unwrap(), b"v1 plaintext", "restoring op2's before-image rolls the live file back to v1");
+    }
+
+    #[test]
+    fn restore_before_image_on_a_first_write_with_no_before_image_returns_false() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op = Uuid::new_v4();
+        store.stage("note-a", b"v1", op).unwrap();
+        store.commit_staged("note-a", op).unwrap();
+        let restored = store.restore_before_image("note-a", op, &content_hash(b"irrelevant")).unwrap();
+        assert!(!restored, "a first write has nothing to restore");
+    }
+
+    #[test]
+    fn restore_before_image_with_a_hash_mismatch_is_inconsistent_and_leaves_the_live_file_untouched() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op1 = Uuid::new_v4();
+        store.stage("note-a", b"v1 plaintext", op1).unwrap();
+        store.commit_staged("note-a", op1).unwrap();
+        let op2 = Uuid::new_v4();
+        store.stage("note-a", b"v2 plaintext", op2).unwrap();
+        store.commit_staged("note-a", op2).unwrap();
+
+        let wrong_hash = content_hash(b"not the actual before-image content");
+        let err = store.restore_before_image("note-a", op2, &wrong_hash).unwrap_err();
+        assert!(matches!(err, PiiStoreError::Inconsistent { note_id } if note_id == "note-a"));
+        // The live file (v2) must be untouched by the failed restore attempt.
+        assert_eq!(store.get("note-a").unwrap(), b"v2 plaintext");
+    }
+
+    #[test]
+    fn delete_before_image_is_idempotent_and_removes_the_file() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op1 = Uuid::new_v4();
+        store.stage("note-a", b"v1", op1).unwrap();
+        store.commit_staged("note-a", op1).unwrap();
+        let op2 = Uuid::new_v4();
+        store.stage("note-a", b"v2", op2).unwrap();
+        store.commit_staged("note-a", op2).unwrap();
+        assert!(store.has_before_image("note-a", op2));
+        store.delete_before_image("note-a", op2).unwrap();
+        assert!(!store.has_before_image("note-a", op2));
+        store.delete_before_image("note-a", op2).unwrap(); // idempotent
     }
 
     #[test]

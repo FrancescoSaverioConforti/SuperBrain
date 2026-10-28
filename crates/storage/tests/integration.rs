@@ -208,7 +208,7 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap();
     assert_eq!(
@@ -231,7 +231,7 @@ fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     assert!(matches!(
@@ -260,7 +260,7 @@ fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_i
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     assert!(matches!(err, ProposeError::Link(domain::LinkError::BrokenLink { .. })));
@@ -285,7 +285,7 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap();
     let err = storage::propose_and_commit(
@@ -296,7 +296,7 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     assert!(matches!(err, ProposeError::Storage(StorageError::Conflict { .. })));
@@ -321,7 +321,7 @@ fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_creat
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     match err {
@@ -348,7 +348,7 @@ fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     assert!(
@@ -399,7 +399,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap();
     let id = NoteId::parse("note-a").unwrap();
@@ -416,7 +416,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
             &HashSet::new(),
             &HashSet::new(),
             &gate,
-            &pii_store,
+            Some(&pii_store),
         )
         .unwrap_err();
         match err {
@@ -459,7 +459,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
         &known,
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     match err {
@@ -489,7 +489,7 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
         &known,
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap();
     assert_eq!(
@@ -522,7 +522,7 @@ fn assert_pending_ref_commits(relation: &str, target: &str) {
         &HashSet::new(),
         &pending(&[target]),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
     assert_eq!(
@@ -570,7 +570,7 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
         &known,
         &pending_refs,
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap();
     // Spec C6: a pending reference is "accettato e segnalato". The commit
@@ -599,7 +599,7 @@ fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id(
         &HashSet::new(),
         &pending(&["https://example.com/other"]),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     match err {
@@ -627,7 +627,7 @@ fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
         &HashSet::new(),
         &pending(&["https://example.com/unrelated"]),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .unwrap_err();
     assert!(
@@ -662,7 +662,7 @@ fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome,
         &HashSet::new(),
         &HashSet::new(),
         &gate,
-        &pii_store,
+        Some(&pii_store),
     )
     .map(|result| match result {
         CommitResult::Committed(outcome) => outcome,
@@ -808,7 +808,7 @@ fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet
 fn propose_and_commit_surfaces_git_pending_as_ok_not_err() {
     let (vault, gate, known, pending, pii_store) = test_fixtures_no_git_repo();
     let note_text = valid_note_yaml("note-a");
-    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store);
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
     assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "git unavailability is a non-error outcome, got {result:?}");
 }
 
@@ -824,7 +824,7 @@ fn propose_and_commit_on_a_git_repo_with_no_commits_yet_is_git_pending_not_an_er
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let pii_store = test_pii_store();
     let note_text = valid_note_yaml("note-a");
-    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store);
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store));
     assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "got {result:?}");
     let note_id = NoteId::parse("note-a").unwrap();
     assert_eq!(vault.read_note(&note_id).unwrap().content, note_text, "the write durably happened");

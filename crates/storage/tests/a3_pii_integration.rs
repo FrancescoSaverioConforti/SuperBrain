@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use storage::{CommitOutcome, CommitResult, NoteId, Vault, Version};
+use storage::{CommitOutcome, CommitResult, NoteId, ProposeError, StorageError, Vault, Version};
 use vault_security::PiiStore;
 
 fn unique_test_dir() -> PathBuf {
@@ -116,7 +116,7 @@ fn a_sensitive_note_is_written_to_the_pii_store_and_the_markdown_record_holds_on
     let gate = gate();
     let note_text = sensitive_note("note-secret", "my actual sensitive content: SSN 123-45-6789");
 
-    let outcome = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store)
+    let outcome = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store))
         .expect("sensitive write with an available store must succeed");
     assert!(matches!(outcome, CommitResult::Committed(CommitOutcome { version: Version(1), .. })), "got {outcome:?}");
 
@@ -134,6 +134,44 @@ fn a_sensitive_note_is_written_to_the_pii_store_and_the_markdown_record_holds_on
 }
 
 #[test]
+fn reusing_an_operation_id_with_different_sensitive_content_is_refused_as_reused() {
+    // A3 review round, IMPORTANT finding #3: for a Sensitive note, the
+    // Markdown pointer bytes are IDENTICAL regardless of the real
+    // plaintext (frontmatter plus the fixed pii://<id> URI), so a
+    // pointer-hash-only retry check could never catch a reused
+    // operation_id carrying genuinely different sensitive content. The
+    // first call commits fully; a second call with the SAME operation_id
+    // but a note whose real content differs must be refused as
+    // `OperationIdReused`, not silently treated as a no-op retry of the
+    // first call (which would under-report what actually happened) nor as
+    // a second write (which would violate operation_id idempotency).
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let op = Uuid::new_v4();
+
+    let note_text_a = sensitive_note("note-reuse", "first plaintext content");
+    storage::propose_and_commit(&vault, &note_text_a, Version(0), op, &known, &pending, &gate, Some(&pii_store)).unwrap();
+
+    // Reuse the SAME operation_id, same note, same expected_version, but
+    // DIFFERENT real sensitive content. The pointer bytes propose.rs builds
+    // are identical (same frontmatter, same fixed pii:// URI), so only a
+    // pii_content_hash-aware check can catch this.
+    let note_text_b = sensitive_note("note-reuse", "a completely different second plaintext");
+    let result = storage::propose_and_commit(&vault, &note_text_b, Version(0), op, &known, &pending, &gate, Some(&pii_store));
+    assert!(
+        matches!(result, Err(ProposeError::Storage(StorageError::OperationIdReused { operation_id })) if operation_id == op),
+        "got {result:?}"
+    );
+
+    // The original write's content must be completely unaffected.
+    let id = NoteId::parse("note-reuse").unwrap();
+    assert_eq!(pii_store.get("note-reuse").unwrap(), b"first plaintext content");
+    let _ = vault.read_note(&id).unwrap();
+}
+
+#[test]
 fn a_non_sensitive_note_write_is_completely_unaffected_by_the_pii_pipeline() {
     // Pins that Internal/Public notes go through the UNCHANGED
     // write_record_unchecked path: no pointer substitution, no PiiStore
@@ -145,11 +183,44 @@ fn a_non_sensitive_note_write_is_completely_unaffected_by_the_pii_pipeline() {
     let note_text =
         "---\nid: note-plain\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: p\nsource: agent:coder@prompt-v3\ncreated: 2026-10-23\nupdated: 2026-10-23\nevent_period: 2026-10-23\nrelations:\n  supports: []\n  contradicts: []\n  derived_from: []\n  supersedes: []\n  applies_to: []\n---\nplain body text\n"
             .to_string();
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store).unwrap();
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
     let id = NoteId::parse("note-plain").unwrap();
     let record = vault.read_note(&id).unwrap();
     assert_eq!(record.content, note_text, "non-sensitive content is stored byte-for-byte, unchanged");
     assert!(!pii_store.has_live("note-plain"), "the PiiStore must never be touched for a non-sensitive note");
+}
+
+#[test]
+fn a_non_sensitive_write_succeeds_with_no_pii_store_configured_at_all() {
+    // A3 review round, IMPORTANT finding #2: a mandatory &PiiStore would
+    // make even an Internal/Public write depend on a working encrypted
+    // store. With `pii_store: None`, an ordinary write must succeed exactly
+    // as it always has.
+    let root = unique_test_dir();
+    let (vault, _unused_pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let note_text = "---\nid: note-no-store\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: p\nsource: agent:coder@prompt-v3\ncreated: 2026-10-23\nupdated: 2026-10-23\nevent_period: 2026-10-23\nrelations:\n  supports: []\n  contradicts: []\n  derived_from: []\n  supersedes: []\n  applies_to: []\n---\nplain body\n";
+    let result = storage::propose_and_commit(&vault, note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, None);
+    assert!(matches!(result, Ok(CommitResult::Committed(_))), "a non-sensitive write with no PiiStore at all must still succeed, got {result:?}");
+}
+
+#[test]
+fn a_sensitive_write_is_rejected_when_no_pii_store_is_configured() {
+    // The flip side of the above: a Sensitive note with `pii_store: None`
+    // must be rejected by the gate exactly as Task 4 designed — a broken
+    // or unconfigured store blocks ONLY Sensitive writes, never ordinary
+    // ones (see the test above).
+    let root = unique_test_dir();
+    let (vault, _unused_pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let note_text = sensitive_note("note-no-store-sensitive", "some sensitive content");
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, None);
+    assert!(
+        matches!(result, Err(storage::ProposeError::Rejected(policy::GateRejection::SensitiveRequiresEncryptedStore { .. }))),
+        "a Sensitive write with no PiiStore must be rejected by the gate, got {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -163,7 +234,7 @@ fn deleting_the_pointer_note_without_going_through_the_deletion_log_leaves_detec
     let (known, pending) = empty();
     let gate = gate();
     let note_text = sensitive_note("note-improper-delete", "secret to be improperly deleted");
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store).unwrap();
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
     assert!(pii_store.has_live("note-improper-delete"));
 
     // Simulate an improper deletion: the pointer note is never retracted
@@ -182,12 +253,12 @@ fn a_properly_deleted_sensitive_note_goes_through_the_deletion_log_and_is_not_fl
     let (known, pending) = empty();
     let gate = gate();
     let note_text = sensitive_note("note-proper-delete", "secret to be properly deleted");
-    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store).unwrap();
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
     let id = NoteId::parse("note-proper-delete").unwrap();
     let current = vault.current_version(&id).unwrap();
 
     let tombstone_text = sensitive_tombstone("note-proper-delete");
-    let result = storage::propose_and_commit(&vault, &tombstone_text, current, Uuid::new_v4(), &known, &pending, &gate, &pii_store)
+    let result = storage::propose_and_commit(&vault, &tombstone_text, current, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store))
         .expect("a tombstone write must succeed");
     assert!(matches!(result, CommitResult::Committed(_)), "got {result:?}");
 
@@ -205,4 +276,53 @@ fn a_properly_deleted_sensitive_note_goes_through_the_deletion_log_and_is_not_fl
     known_pointers.insert("note-proper-delete".to_string());
     let orphans = pii_store.find_orphans(&known_pointers);
     assert!(!orphans.contains(&"note-proper-delete".to_string()), "a deletion-logged note must not be an unexplained orphan");
+}
+
+#[test]
+fn a_tombstone_write_with_a_stale_expected_version_is_rejected_and_never_recorded_in_the_deletion_log() {
+    // A3 review round, IMPORTANT finding #1 regression test: the deletion
+    // log write must happen AFTER the version check inside the same
+    // journaled operation, never before it. Proven here by attempting a
+    // tombstone write at version 0 against a note that has already moved
+    // on to version 2 (one real update after the initial sensitive write) —
+    // the write must be rejected as a Conflict, and the note's actual
+    // content must remain fully live and unaffected: no deletion-log entry,
+    // no pointer change, no removed ciphertext.
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+
+    let note_text_v1 = sensitive_note("note-stale-tombstone", "v1 secret content");
+    storage::propose_and_commit(&vault, &note_text_v1, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let id = NoteId::parse("note-stale-tombstone").unwrap();
+
+    let note_text_v2 = sensitive_note("note-stale-tombstone", "v2 secret content");
+    let current = vault.current_version(&id).unwrap();
+    storage::propose_and_commit(&vault, &note_text_v2, current, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let v2_record = vault.read_note(&id).unwrap();
+    assert_eq!(v2_record.version, Version(2));
+
+    // Attempt a stale tombstone at version 0 (the note's ORIGINAL version,
+    // long since superseded).
+    let stale_tombstone = sensitive_tombstone("note-stale-tombstone");
+    let result = storage::propose_and_commit(&vault, &stale_tombstone, Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
+    assert!(result.is_err(), "a stale-version tombstone must be rejected, got {result:?}");
+
+    // The note must be completely unaffected: still at v2, pointer and
+    // ciphertext both intact.
+    let after = vault.read_note(&id).unwrap();
+    assert_eq!(after, v2_record, "the note must be entirely unaffected by the rejected tombstone attempt");
+    assert_eq!(pii_store.get("note-stale-tombstone").unwrap(), b"v2 secret content");
+
+    // Critically: the deletion log must NOT have recorded this note as
+    // deleted. Before the fix, DeletionLog::record_deletion ran BEFORE the
+    // version check, so this exact call would have marked the note deleted
+    // in the log while its real content stayed fully live.
+    let deletion_log_path = pii_store.root().join("deletion-log.sqlite");
+    let deletion_log = vault_security::DeletionLog::open(&deletion_log_path).unwrap();
+    assert!(
+        !deletion_log.is_deleted("note-stale-tombstone").unwrap(),
+        "a rejected (stale-version) tombstone must NEVER be recorded in the deletion log"
+    );
 }

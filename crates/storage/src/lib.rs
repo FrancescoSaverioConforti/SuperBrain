@@ -41,7 +41,7 @@
 //! let pending: HashSet<String> = HashSet::new();
 //! let pii_store = vault_security::PiiStore::open(dir.join(".pii-store"), &dir.join(".pii-store").join("master.key")).unwrap();
 //! let result = storage::propose_and_commit(
-//!     &vault, "not: frontmatter", storage::Version(0), uuid::Uuid::new_v4(), &known, &pending, &gate, &pii_store,
+//!     &vault, "not: frontmatter", storage::Version(0), uuid::Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store),
 //! );
 //! assert!(matches!(result, Err(storage::ProposeError::Rejected(_))));
 //! let _unused: (&std::path::Path, &[u8]) = (&dir.join("x"), b"bypass");
