@@ -1,0 +1,16 @@
+[package]
+name = "vault-security"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain encrypted PII vault, deletion log and backup (scaffold)."
+
+[dependencies]
+domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "1"
+uuid = "1"
