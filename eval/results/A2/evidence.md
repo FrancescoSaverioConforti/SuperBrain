@@ -14,6 +14,19 @@ evidence and chose to upgrade `git2` rather than accept an exception or leave th
 (see Section 2.2/2.2.1). This file is updated in place to reflect that resolution rather than
 left describing a now-stale finding.
 
+**Final whole-branch review fix wave (2026-10-28, on top of `1292d32`).** The final
+whole-branch review (`.superpowers/sdd/2026-10-27-a2-recovery/progress.md`, last section)
+found one Critical (C1), three Important (I1, I2, I3/I4 evidence accuracy) and two Minor (M1,
+M2) issues. They were fixed in these commits, and this file is corrected in place to match:
+
+| Commit | Finding | What changed |
+|---|---|---|
+| `53153ac` | C1 (production) | A completed rename whose row is still `IntentRecorded` is now rolled forward, not marked `Failed`. |
+| `bf5a0c5` | I2 (production) | The live write path classifies git failures exactly as recovery does: unborn `HEAD` is `git_pending`, not a hard error. |
+| `7989cf6` | I1 + M2 (production) | Earlier git-pending operations on a note are committed first, in version order; recovery processes rows in `new_version` order, not `rowid` order. |
+| `5843be1` | M1 (test code) | Nine `needless_borrows_for_generic_args` lints removed from `recovery.rs`'s tests. |
+| this file's own commit | I3, I4, M1, M2 (evidence) | Corrections in Sections 2.1, 2.3, 2.4.1, 3, 5 and 6. |
+
 **Plan:** `docs/superpowers/plans/2026-10-27-a2-recovery.md`
 **Task brief:** `.superpowers/sdd/2026-10-27-a2-recovery/task-10-brief.md`
 
@@ -80,6 +93,29 @@ row and the retry/idempotency/concurrency guarantees are exercised (full list in
 
 No test was added, removed, or edited by this task. These counts are the output of Task 9's
 closing tree, re-run verbatim.
+
+**Update after the final-review fix wave (head `5843be1`): 209 passed, 0 failed** — `domain` 32,
+`policy` 12, `storage` unit 136 (+9), `storage` integration 24 (+1), `storage` doc-tests 5.
+The 10 new tests, each written first and seen failing before its fix:
+
+- C1: `crash_after_rename_before_content_persisted_rolls_forward_on_reopen_not_stranded`,
+  `crash_after_rename_before_content_persisted_on_a_first_write_rolls_forward_on_reopen`
+  (`vault.rs`, driven by the new `FaultPoint::AfterRenameBeforeContentPersisted`);
+  `intent_recorded_whose_intended_bytes_are_on_disk_rolls_forward_like_content_persisted`,
+  `intent_recorded_with_intended_fields_but_no_rename_is_failed_and_its_before_image_cleaned_up`
+  (`recovery.rs`, the roll-forward and the inverse "rename never happened" case);
+  `record_fields_sets_fields_without_changing_state_and_only_at_the_named_state` (`journal.rs`).
+  The existing `crash_after_intent_recorded_before_any_write_results_in_failed_no_file_touched`
+  and `intent_recorded_with_no_further_progress_is_marked_failed_on_reconcile` still pass
+  unchanged. The new fault point was also added to
+  `a_read_concurrent_with_each_write_fault_point_returns_only_a_committed_version`.
+- I1: `a_git_pending_operation_is_committed_first_when_a_later_write_to_the_same_note_commits`
+  (the review's exact workflow: write without git, `git init`, write again, reopen twice) and
+  `a_retry_of_the_newer_git_pending_operation_commits_the_older_one_first_so_head_never_moves_backward`.
+- M2 (dependency of I1): `reconcile_resolves_pending_operations_on_a_note_in_version_order_not_insertion_order`.
+- I2: `write_on_a_git_repo_with_no_commits_is_git_pending_then_commits_once_head_exists`
+  (`vault.rs`) and `propose_and_commit_on_a_git_repo_with_no_commits_yet_is_git_pending_not_an_error`
+  (`tests/integration.rs`, public surface only).
 
 ### 2.2 `cargo deny check` — **RESOLVED** (originally FAILED on `advisories`; fixed by a later, separate commit)
 
@@ -228,6 +264,16 @@ zero warnings and zero errors emitted** (confirmed by grepping the full output f
 `error|warning`, which matched nothing beyond the build-step summary line). This satisfies
 Continuity [c11mp]'s standing requirement that clippy must pass clean before any task is
 reported done, re-run one final time across the whole branch as the brief's Step 3 requires.
+Re-run after the final-review fix wave (head `5843be1`): still clean.
+
+**Scope of this claim (final-review correction, M1).** The plan's Global Constraint and
+Continuity [c11mp] require only the form above, which lints library targets, not test code. An
+earlier version of this file and of the ledger read as if test targets were lint-clean too.
+They were not: `cargo clippy --workspace --all-targets -- -D warnings` failed with 9
+`needless_borrows_for_generic_args` errors in `recovery.rs`'s test module, introduced by this
+plan, plus 3 `assertions_on_constants` errors. Commit `5843be1` removed the 9. The command now
+fails only on the 3 `assertions_on_constants` (`assert!(true)` scaffold tests in `domain`,
+`policy` and `storage` that predate A2), which are pre-existing and out of this plan's scope.
 
 ### 2.4 Mutation testing (`cargo mutants`)
 
@@ -263,7 +309,16 @@ per-mutant tracing against the actual source (re-done for this fix round), that 
 hold uniformly. The 13 split into two groups with genuinely different closing cost, plus one
 mutant with its own distinct root cause — three groups below, not one.
 
-**Group A — genuinely need a non-`NotFound` I/O error to kill (5 of 14 survivors).** These
+**Line numbers in this section refer to the tree the mutation run was made against
+(`28ae8ff`; `git.rs` adjusted for `247df9e`, as noted).** The final-review fix wave (commits
+`53153ac`..`5843be1`) shifted lines in `recovery.rs`, `vault.rs` and `journal.rs` and changed
+the code around some of these sites (row 1 now reads the record too; `own_content` is now also
+reached from the live write path's predecessor commits). `cargo mutants` was **not** re-run
+after the fix wave, so the survivor set below describes the pre-fix-wave tree; it is not
+claimed to be the current one.
+
+**Group A — genuinely need a non-`NotFound` I/O error to kill (7 of 14 survivors, across 5
+lines).** These
 call sites only branch away from their current behavior if the underlying I/O call fails for a
 reason *other than* "file genuinely missing" (permission denied, a locked file, a directory
 substituted for a file, disk-full, or — for the `remove_file` case below — the file vanishing
@@ -310,7 +365,10 @@ test infrastructure, not a documentation fix.
    already gone. **Justified as hard to close.**
 
 **Group B — ordinary, untested `NotFound` paths; cheap to close, not a platform-specific
-problem (7 of 14 survivors).** Each of these is reachable by an everyday "the file genuinely
+problem (5 of 14 survivors, across 4 lines).** (Final-review correction, I3: the Group A and
+Group B labels previously read "5" and "7", the reverse of what the lists contain. Counted
+mutant by mutant, Group A lists 1 + 1 + 3 + 1 + 1 = 7 and Group B lists 1 + 2 + 1 + 1 = 5. The
+total of 14 was right only because the two errors cancelled.) Each of these is reachable by an everyday "the file genuinely
 isn't there" scenario that no existing test happens to construct — closing any of them needs
 nothing more exotic than deleting a file and checking the resulting variant, which works
 identically on Windows, Linux, and macOS. These are acknowledged as real, currently-untested
@@ -379,8 +437,29 @@ this is a **mutant-equivalence false positive**, not a real coverage gap. No tes
 distinguish these two expressions because they produce bit-for-bit identical values by
 construction. **Justified as inherently unkillable**, not a defect in test coverage.
 
-**Tally check:** Group A (5) + Group B (7) + Group C (1) + the equivalent mutant (1) = 14,
+**Tally check:** Group A (7) + Group B (5) + Group C (1) + the equivalent mutant (1) = 14,
 matching the full survivor count.
+
+**Parked, unresolved observation: a likely 15th survivor (`recovery.rs:272`, guard-to-`false`).**
+During Task 10's fix-round re-review, the re-reviewer independently re-ran `cargo mutants`
+on lines 272, 293 and 423 of `recovery.rs` and got **MISSED** for `recovery.rs:272`'s
+guard-to-`false` mutant (the `NotFound` guard on `fix_content_persisted`'s record read). That
+mutant does **not** appear in the original run's 14-survivor list, although Group B's own
+reasoning predicts it should survive: no test reconciles a `ContentPersisted` row whose record
+is genuinely missing. The likeliest explanation is that the original run's result for that one
+mutant was flaky (killed by chance, not by any test that targets it), which would make the
+true count 15, with an 8th cheap Group-B-style mutant. This was observed once, by one targeted
+re-run. It has not been confirmed by a second run or by a full re-run, so this file does
+**not** claim it as a confirmed survivor and does not change the 14 above. It was parked in
+the progress ledger at Task 10 and is recorded here per the final review (I3).
+
+**Precision note on Group A item 3 (also parked from Task 10's re-review).** The conclusion
+that all three `recovery.rs:293` mutants are hard to close stands, as the re-reviewer confirmed
+by tracing the code. The reason differs by mutant, though. Guard-to-`false` is killed only by
+the record vanishing between the earlier read and `remove_file` (a `NotFound` that would then
+propagate). Guard-to-`true` is killed only by `remove_file` failing with a non-`NotFound`
+error (which would then be swallowed). `==`→`!=` is killed by either. Neither condition can be set up by deleting the file beforehand, because that sets
+`on_disk_hash` to `None` and skips the `remove_file` branch entirely.
 
 **The 1 timeout**, `crates/storage/src/fault.rs:115` (`pause.point == point` → `!=`, inside
 `FaultInjector::check`'s `#[cfg(test)]`-only pause-handling branch): this line decides whether
@@ -396,15 +475,17 @@ in a production build. **Not a coverage gap**: the mutant is effectively caught 
 test failure under `cargo-mutants`' own accounting it just classifies separately from a clean
 `MISSED`/`CAUGHT` outcome), and no production guarantee is affected.
 
-**Summary disposition:** 0 of the 14 survivors represent a production correctness defect. 5
-(Group A) genuinely need a non-`NotFound` I/O error and are fairly accepted as hard to close on
-this platform without new, injectable-I/O test infrastructure. 7 (Group B) are ordinary,
+**Summary disposition:** 0 of the 14 survivors represent a production correctness defect. 7
+(Group A) genuinely need a non-`NotFound` I/O error (or, for one `:293` mutant, a mid-call
+race) and are fairly accepted as hard to close on this platform without new, injectable-I/O
+test infrastructure. 5 (Group B) are ordinary,
 untested `NotFound`-path gaps — real and currently uncovered, but cheap to close with a
 straightforward "delete the file, check the specific result variant" test, not a platform
 limitation. 1 (Group C, `recovery.rs:290`) has its own distinct root cause: a missing boolean
 test-combination, not an I/O-error-path issue at all. 1 (`journal.rs:79`) is a
 mutant-equivalence false positive. The 1 timeout is scaffolding-only and not a production-code
-gap. Raw tool output (`missed.txt`, `timeout.txt`, `caught.txt`, `unviable.txt`) was produced
+gap. A likely 15th survivor (`recovery.rs:272`, guard-to-`false`) is parked as unconfirmed;
+see above. Raw tool output (`missed.txt`, `timeout.txt`, `caught.txt`, `unviable.txt`) was produced
 by `cargo mutants --package domain --package storage --package policy` and is not committed to
 the repository (it is a local, regenerable tool artifact, consistent with A1's own practice of
 not committing `mutants.out/` directories).
@@ -415,7 +496,7 @@ entire code diff is two call sites adapted from an `Option`-returning to a `Resu
 git2 API (`Reference::name()`, `Commit::message()`), each a mechanical combinator swap
 (`.ok_or_else` → `.map_err`; `.is_some_and` → `.is_ok_and`) that preserves the exact prior
 branch behavior — it introduces no new branch, no new guard, and no new I/O-error-path
-distinction of the kind this mutation run's 13 real survivors are about. `cargo test
+distinction of the kind this mutation run's 13 non-equivalent survivors are about. `cargo test
 --workspace` after the upgrade still passes exactly 199/199 (Section 2.2.1), the same count as
 before the upgrade, confirming no test's observable behavior changed. Re-running `cargo
 mutants` over an unrelated, behavior-preserving dependency bump would not produce a materially
@@ -437,10 +518,24 @@ implements:
   edges added for correctness (`ContentPersisted -> Failed` for a rolled-back write, and the
   narrowed `Recovering`-outgoing set matching C1's actual recovery table rather than A1's
   broader placeholder). A crash at any of the 8 named fault-matrix points is recovered
-  deterministically by `Vault::recover()`/`reconcile`, run at every `Vault::open`, before any
-  other `storage` call is permitted to proceed — proven by the six `crash_*` tests in
-  `crates/storage/src/vault.rs` (Section 2.1) plus the dedicated double-crash test
+  deterministically by `reconcile`, run inside every `Vault::open`, before any `Vault` value
+  exists — proven by the `crash_*` tests in `crates/storage/src/vault.rs` (Section 2.1) plus
+  the dedicated double-crash test
   (`second_crash_during_recovery_of_the_same_operation_still_converges`).
+
+  **Final-review correction (C1).** Until commit `53153ac` this claim was overstated. The
+  spec's row "Dopo il rename, prima di `journal_committed`" was handled only from the point
+  where the row had already advanced to `ContentPersisted`. A crash, or any journal I/O error,
+  between `atomic_write`'s rename and that advance left the row at `IntentRecorded` with the
+  new bytes on disk, and row 1 marked it `Failed` without looking at the file. The note was
+  then stranded: `read_note` returned `Inconsistent` for good, a write at the old
+  `expected_version` got a false `Conflict`, and the before-image was orphaned. Task 7's I-1 fix
+  had moved the test fault point past that window rather than closing it. The write path now
+  records the intended `new_version`, `content_hash` and `before_image_hash` on the
+  `IntentRecorded` row before the rename (`Journal::record_fields`, which changes no state).
+  Row 1 compares the record on disk with that hash: on a match it rolls forward through row
+  2's logic, otherwise it deletes any before-image and marks the row `Failed`. The window is
+  now pinned end to end by `FaultPoint::AfterRenameBeforeContentPersisted`.
 - **Idempotent retry, including argument-mismatch detection.** Retrying the same
   `operation_id` against a terminal `Failed` operation returns `Failed` again without
   reapplying anything (`retry_of_a_failed_operation_id_returns_failed_again_without_reapplying`).
@@ -468,8 +563,16 @@ implements:
   from different operations. The journal's own `git_commit_oid` column is the primary O(1)
   idempotency source; a bounded history scan backs the live write path, while `reconcile` uses
   an unbounded scan (Section 5, item 12 discusses its residual risk). Commits are serialized via a
-  repo-wide lock, closing the git-commit-concurrency gap found during Task 5's review (subject
-  to the residual `HEAD`-ordering limitation in Section 5, item 5).
+  repo-wide lock, closing the git-commit-concurrency gap found during Task 5's review. Since
+  commit `7989cf6` (final review, I1), committing an operation first commits every earlier
+  git-pending operation on the same note, in version order, each from its own bytes. So a later
+  write no longer strands an earlier pending one, and commits for one note land in version
+  order (see Section 5, items 5 and 10, for what remains).
+- **Git failures after the linearization point are always `git_pending`.** Since commit
+  `bf5a0c5` (final review, I2), the live write path classifies git failures exactly as
+  recovery does. No repository, a repository with no commits (unborn `HEAD`), or any other
+  `git2` failure after `JournalCommitted` is `StorageError::GitPending` /
+  `Ok(CommitResult::GitPending)`, never a hard error for a write that durably happened.
 - **Reads resolve through the journal, verified by hash, and share the writer's lock.**
   `read_note`/`current_version` resolve exclusively through
   `Journal::last_committed_for_note`, keyed by note id, verified by content hash against the
@@ -532,9 +635,16 @@ re-verification.)
 These were surfaced and explicitly deferred across Tasks 5–9's independent review rounds.
 Flagged here per Step 5's own requirement, not silently absorbed.
 
-1. **(Task 5, deferred Minor)** An unborn `HEAD` (user ran `git init` but has no commits yet)
-   makes `repo.head()` fail, surfacing as a hard `StorageError::Git` on every write rather than
-   being handled gracefully.
+1. **RESOLVED (final review, I2, commit `bf5a0c5`). (Task 5, deferred Minor)** An unborn
+   `HEAD` (user ran `git init` but has no commits yet) made `repo.head()` fail, surfacing as a
+   hard `StorageError::Git` on every write, after the write had durably reached
+   `JournalCommitted`, while recovery treated the same condition as `git_pending`. That also
+   contradicted `propose_and_commit`'s own doc comment. Now every git failure after
+   `JournalCommitted` is `GitPending` on both paths. Remaining, by design: A2 does not create
+   a root commit on an unborn branch. Such a write rests at `JournalCommitted` until the
+   repository has a first commit, and is then committed by the next retry or `Vault::open`.
+   `StorageError::Git` is no longer constructed by A2; it is kept so the public error type
+   does not change shape.
 2. **(Task 5, deferred Minor)** Hot-path cost: a new operation's git-commit lookup always
    walks the full `Bounded(500)` history on both `find_commit_for_operation` and
    `commit_operation`'s own re-entry check — up to 1000 commit reads per write once history is
@@ -559,6 +669,13 @@ Flagged here per Step 5's own requirement, not silently absorbed.
    transiently disagree with the vault's true current state until the next write to that note.
    Self-heals on the next write. Narrow trigger: needs a specific
    transient-git-failure-then-recovery-then-live-success ordering.
+   **Largely closed by the final review's I1 fix (commit `7989cf6`):** a live commit of a newer
+   operation now first commits every older operation on that note that is resting at
+   `JournalCommitted`, and recovery processes rows in version order. So the older operation is
+   committed before the newer one rather than after it. Residual: an older operation that was
+   NOT yet at `JournalCommitted` when the newer one committed (stuck at `IntentRecorded` or
+   `ContentPersisted` by a live, non-crash journal error while the process kept writing; see
+   item 26, Task 4 (e)) can still be committed after it, by a later `Vault::open`.
 6. **(Task 7, fix round, deferred Minor)** Tautological git-existence assertions in some tests
    check only that the journal's recorded `git_commit_oid` is set, not that a real commit
    object with that Oid actually exists in the repository — a real but narrow test-rigor gap,
@@ -583,6 +700,12 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     crash-timing-dependent, unlike item 5 above), though it requires a caller to deliberately
     retry out of order. Reads are unaffected. No guard was implemented; the plan owner (not
     Task 10) explicitly deferred this.
+    **Closed as a side effect of the final review's I1 fix (commit `7989cf6`):** retrying the
+    newer operation now commits the older one first, then the newer one, so `HEAD` ends at the
+    newest content. The later retry of the older operation finds its commit (Tier 1) and makes
+    none. Pinned by
+    `a_retry_of_the_newer_git_pending_operation_commits_the_older_one_first_so_head_never_moves_backward`.
+    The residual case in item 5 still applies.
 11. **(Task 9, the task's own primary deliverable)** SEC-001/002/003 — see Section 4 above for
     the restated verdicts and `eval/results/A2/sec-debt-reevaluation.md` for full detail. The
     mandatory Fase-D re-evaluation obligation (Continuity [d5b9]) applies to all three.
@@ -593,6 +716,15 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     `git_commit_oid` yet — not on every ordinary `Vault::open`). No timeout or bounded
     first-pass was implemented; flagged here for revisit if it proves too slow in practice, not
     silently absorbed.
+
+    **Final-review correction (I1).** "Not on every ordinary `Vault::open`" was too strong. A
+    row that stays git-pending also gets the unbounded scan on every open for as long as it
+    stays pending. Before commit `7989cf6`, the ordinary workflow "write before `git init`,
+    `git init`, write again" stranded such a row permanently, because the later write deleted
+    the before-image holding the earlier operation's bytes. That made the repeated scan
+    permanent too. That stranding is fixed. What remains: a row whose own bytes are genuinely
+    unrecoverable (`recovery::own_content`'s "never commit another operation's bytes" rule), or one resting because git is
+    unavailable, is still re-scanned on every `Vault::open` until it resolves.
 
     **Fifth-review correction, recorded verbatim (per the plan's explicit instruction):** an
     `Unbounded` scan proves non-existence only among commits reachable from `HEAD`, not
@@ -630,13 +762,15 @@ Flagged here per Step 5's own requirement, not silently absorbed.
 15. **(Task 10, new finding from this task's own mutation-testing pass, Section 2.4.1;
     corrected in this task's fix round — see below)** `storage`'s 14 surviving mutants split
     into three groups, not one uniform cause:
-    - **Group A (5 survivors)** genuinely need a non-`NotFound` I/O error to kill
+    - **Group A (7 survivors; corrected from "5" by the final review, I3)** genuinely need a
+      non-`NotFound` I/O error (or a mid-call race) to kill
       (`git.rs:222`'s guard-to-`true`; `recovery.rs:272`'s guard-to-`true`;
       `recovery.rs:293`'s all three mutants, which require a file to vanish in a narrow
       single-threaded window between an earlier read and this `remove_file` call;
       `recovery.rs:423`'s guard-to-`true`; `vault.rs:1088`'s guard-to-`true`). Accepted as hard
       to close on this platform without new, injectable-I/O test infrastructure.
-    - **Group B (7 survivors)** are ordinary, untested `NotFound`-path gaps — reachable by an
+    - **Group B (5 survivors; corrected from "7" by the final review, I3)** are ordinary,
+      untested `NotFound`-path gaps — reachable by an
       everyday "delete the file" scenario no existing test happens to construct
       (`recovery.rs:272`'s `==`→`!=`; `recovery.rs:423`'s guard-to-`false` and `==`→`!=`;
       `vault.rs:468`'s `==`→`!=`; `vault.rs:1101`'s `==`→`!=`). These are real, currently
@@ -650,7 +784,10 @@ Flagged here per Step 5's own requirement, not silently absorbed.
       `Self::default()`/`Default::default()` on the same type) — not a coverage gap.
     None were closed in this pass (documentation-only scope), but all are now described
     accurately rather than with a uniform "Windows-hard" framing. Full per-mutant detail in
-    Section 2.4.1.
+    Section 2.4.1. Also parked, unconfirmed: a likely 15th survivor, `recovery.rs:272`'s
+    guard-to-`false`, MISSED in one targeted re-run but absent from the original list, which
+    suggests a flaky result in the original run (Section 2.4.1). The run predates the
+    final-review fix wave and was not repeated after it.
 16. **(Task 8, deferred Minor M1 — added in this task's fix round; the progress ledger
     explicitly routes it here and it was missing from this file's first pass)** A race on the
     journal's `UNIQUE` constraint when two first-time inserts for the same `operation_id`
@@ -674,6 +811,83 @@ Flagged here per Step 5's own requirement, not silently absorbed.
     (`vault.rs` instead of `recovery.rs`) for where Task 7's fix-round tests actually live.
     Not a product limitation; recorded here only because the ledger routed it to this file
     alongside M1–M3.
+20. **(Task 7, deferred Minor M3 — added by the final review's fix wave, I4)** The rollback
+    test `content_persisted_with_invalid_hash_and_a_valid_before_image_rolls_back_to_failed_not_journal_committed`
+    (`recovery.rs`) does not assert that the rolled-back operation's before-image is deleted
+    afterward. The cleanup is implemented (row 2 deletes it before advancing to `Failed`) and is
+    asserted by the end-to-end tests in `vault.rs`
+    (`crash_after_rename_with_an_invalid_hash_restores_the_exact_before_image_on_reopen`,
+    `crash_during_before_image_restore_restarts_idempotently_on_the_next_open`), but not by
+    this particular recovery-level test. Test-rigor gap only.
+21. **(Task 7, deferred Minor M6 — added by the final review's fix wave, I4)** Suggestion,
+    not acted on: mark `StorageError::Interrupted` `#[doc(hidden)]`. It is produced only by a
+    test-armed `FaultInjector` and never by production code, yet it is a visible variant of
+    the public error type.
+22. **(Task 4, deferred Minor (a) — added by the final review's fix wave, I4)** Stale doc
+    comments in `vault.rs`. Still partly true: the `Vault::locks` doc comment still refers to
+    "two separate `Vault::new` calls" and says crash guarantees "require the A2 journal and
+    are explicitly not provided here", which predates A2. `Vault::new` no longer exists
+    (replaced by `Vault::open_with_default_indexer`). Cosmetic.
+23. **(Task 4, deferred Minor (b) — added by the final review's fix wave, I4)**
+    `StorageError::Journal(String)` keeps only the rendered message of the crate-private
+    `JournalError`, so a caller cannot tell a SQLite failure from an `InvalidState` (illegal
+    or concurrent transition) by matching. Accepted: `JournalError` cannot appear in the
+    public enum (`private_interfaces`), and no A2 caller branches on the distinction.
+24. **(Task 4, deferred Minor (c) — added by the final review's fix wave, I4; still live,
+    unchanged by the C1 fix)** `StorageError::Inconsistent`'s doc comment says it means the
+    on-disk bytes do not match the committed hash "and an attempted rollback to the
+    before-image also failed verification (or none existed)". But the write path's own step-5
+    verification also returns `Inconsistent` after a **successful** rollback: the operation is
+    then `Failed`, the before-image restored and verified, and the vault perfectly consistent
+    at the previous version. A caller therefore cannot tell "your write did not land, the vault
+    is fine" from "the vault is inconsistent" by the variant alone. The doc wording is
+    misleading for the first case. A distinct variant, or a doc fix, would resolve it; neither
+    was done. The C1 fix does not touch step 5, so this is unchanged.
+25. **(Task 4, deferred Minor (d) — added by the final review's fix wave, I4) — RESOLVED.**
+    Task 4 left the fault-injector checks as `let _ = injector.check(...)` placeholders with
+    only two step boundaries wired. Task 8 replaced them with real, propagating checks at every
+    write-path boundary, and the final-review C1 fix added one more
+    (`AfterRenameBeforeContentPersisted`). No placeholder remains.
+26. **(Task 4, deferred Minor (e) — added by the final review's fix wave, I4; narrowed by the
+    C1 fix, not removed)** The write path's version check (step 2) reads the version header of
+    the raw record file, not the journal-resolved committed row
+    (`Journal::last_committed_for_note`). Task 4's brief asked for exactly this ("the same way
+    A1 did"), so it is not a Task 4 defect, but the raw file and the journal can disagree.
+    Before the C1 fix this was the direct enabler of C1's false-`Conflict` symptom. After a
+    crash between the rename and the `ContentPersisted` advance, recovery marked the row
+    `Failed` while the raw file kept the new version, so the two disagreed **permanently**: a
+    write at the journal's version got `Conflict`, and a write at the raw file's version was
+    accepted on top of never-linearized bytes. **After the C1 fix**, recovery rolls a completed
+    rename forward, so after any crash in that window the raw file and the journal agree again
+    once `Vault::open` has run. **What remains** is the live, non-crash case. If a journal write
+    fails after the rename (the `ContentPersisted` or `JournalCommitted` advance) and the same
+    process keeps using the vault without reopening, then until the next `Vault::open`,
+    `read_note` returns `Inconsistent`, a write at the journal's version gets `Conflict`, and a
+    write at the raw file's version is accepted. If such a later write then commits, and the
+    stuck operation was at `ContentPersisted`, the next `Vault::open`'s row 2 sees a hash
+    mismatch and restores the stuck operation's before-image over the later, committed
+    content. The note then reads `Inconsistent` (fail closed; the later content is still in git
+    and in the journal's hash, but no longer on disk). A row still at `IntentRecorded` is not
+    affected, because row 1 never writes the record. Closing this needs the version check to
+    resolve through the journal, which was not done here: it changes A1-inherited write
+    semantics and is beyond the final review's findings. Recorded as a known residual risk.
+27. **(Task 4, deferred Minor (f) — added by the final review's fix wave, I4) — resolved by
+    design.** The `before_image_path` journal column is never filled by
+    `AdvanceFields::content_with_before_image`; only the hash is recorded. Task 7 chose to
+    derive the path from `(root, note_id, operation_id)` via `before_image_path` instead, since
+    `operation_id` identifies the before-image uniquely (documented on
+    `recovery::fix_content_persisted`). The column stays in the schema, unused.
+28. **(Final review, Minor M2) — RESOLVED (commit `7989cf6`).**
+    `Journal::non_terminal_operations` and `operations_with_before_image_hash` ordered by
+    `rowid` (`insert_intent` order), the ordering Task 4's I1 had already shown unsound for
+    commit order, because `insert_intent` runs before the per-note lock. For
+    `non_terminal_operations` this was a real dependency of I1. Recovery could commit a later
+    operation on a note before an earlier one and delete the before-image the earlier one
+    needed. Both now order by `new_version ASC, rowid ASC`: ascending, because recovery must
+    resolve the oldest version first. Pinned by
+    `reconcile_resolves_pending_operations_on_a_note_in_version_order_not_insertion_order`. For
+    `operations_with_before_image_hash` the order is not load-bearing (any verifying match is
+    equally good); it was changed for consistency.
 
 ---
 
@@ -681,19 +895,19 @@ Flagged here per Step 5's own requirement, not silently absorbed.
 
 | Acceptance criterion | Status | Evidence |
 |---|---|---|
-| Test suite green (workspace) | **PASS** | Section 2.1: 199/199 passed, 0 failed. |
-| Every C1 fault-matrix row covered by a dedicated crash test | **PASS** | Six `crash_*` tests plus the double-crash test (`crates/storage/src/vault.rs`, exercising each row via the full write pipeline + fault injector), **plus** a parallel, more direct set of row-specific `reconcile`-calling tests in `crates/storage/src/recovery.rs` (e.g. `intent_recorded_with_no_further_progress_is_marked_failed_on_reconcile`, `content_persisted_with_valid_hash_rolls_forward_to_journal_committed`, `content_persisted_with_invalid_hash_and_a_valid_before_image_rolls_back_to_failed_not_journal_committed`, `journal_committed_with_no_existing_commit_commits_on_reconcile`, `git_committed_reaches_index_current_on_reconcile`) that construct each journal row directly and call `reconcile` without going through a live writer. Both files' tests cover the same 8 rows from different entry points. |
+| Test suite green (workspace) | **PASS** | Section 2.1: 199/199 at Task 10; **209/209** after the final-review fix wave (head `5843be1`), 0 failed. |
+| Every C1 fault-matrix row covered by a dedicated crash test | **PASS** | Six `crash_*` tests plus the double-crash test (`crates/storage/src/vault.rs`, exercising each row via the full write pipeline + fault injector), **plus** a parallel, more direct set of row-specific `reconcile`-calling tests in `crates/storage/src/recovery.rs` (e.g. `intent_recorded_with_no_further_progress_is_marked_failed_on_reconcile`, `content_persisted_with_valid_hash_rolls_forward_to_journal_committed`, `content_persisted_with_invalid_hash_and_a_valid_before_image_rolls_back_to_failed_not_journal_committed`, `journal_committed_with_no_existing_commit_commits_on_reconcile`, `git_committed_reaches_index_current_on_reconcile`) that construct each journal row directly and call `reconcile` without going through a live writer. Both files' tests cover the same 8 rows from different entry points. **Final-review correction (C1):** the "after the rename, before `journal_committed`" row was covered only from `ContentPersisted` onward until commit `53153ac`. The earlier part of that window (row still `IntentRecorded`) was unhandled and stranded the note. It is now covered by `crash_after_rename_before_content_persisted_rolls_forward_on_reopen_not_stranded` and its first-write variant (`FaultPoint::AfterRenameBeforeContentPersisted`), plus the `recovery.rs` row-1 tests listed in Section 2.1. |
 | Retry idempotency (terminal and non-terminal states) | **PASS** | `retry_of_a_failed_operation_id_returns_failed_again_without_reapplying`, `retry_after_a_restart_returns_the_outcome_recovery_reached`, and the full `retry_*` family in Section 2.1. |
 | Argument-mismatch detection on retry (`OperationIdReused`) | **PASS** | `reusing_an_in_flight_operation_id_for_different_content_is_refused_as_reused_not_in_progress`, `reusing_an_operation_id_for_a_different_request_is_refused_not_reported_as_the_original_outcome`. |
 | Before-image rollback, never indistinguishable from success | **PASS** | Crash-matrix restore tests; `new_version_with_an_invalid_hash_is_detected_by_the_writer_and_restored_from_the_before_image`. |
 | Reads resolve through journal, verified by hash, sharing writer's lock | **PASS** | `read_note_resolves_through_the_journal_not_the_raw_file`, `read_blocks_behind_a_paused_writer_holding_the_same_note_lock_and_then_sees_the_fully_committed_result`. |
-| Idempotent git commit, isolated staging, repo-wide serialization | **PASS** (subject to limitation 5) | `retry_of_a_git_pending_operation_commits_its_own_content_once_git_exists`, `retry_of_a_git_pending_operation_after_a_successor_overwrote_it_commits_its_own_content_not_the_successors`. |
+| Idempotent git commit, isolated staging, repo-wide serialization, per-note version order | **PASS** (residual: Section 5, item 5) | `retry_of_a_git_pending_operation_commits_its_own_content_once_git_exists`, `retry_of_a_git_pending_operation_after_a_successor_overwrote_it_commits_its_own_content_not_the_successors`; since `7989cf6` (final review, I1), `a_git_pending_operation_is_committed_first_when_a_later_write_to_the_same_note_commits` and `a_retry_of_the_newer_git_pending_operation_commits_the_older_one_first_so_head_never_moves_backward`. |
 | `domain::WriteState::valid_transition` tightened to C1's exact table | **PASS** | `crates/domain/src/write_state.rs`; see Section 3. |
 | `domain::IndexState` never reports `Current` in A2 | **PASS** | `crates/domain/src/index_state.rs`; `write_record_unchecked_reaches_index_current_pipeline_state_but_index_state_for_stays_stale`. |
 | `storage`'s only `pub` write entry point is `propose_and_commit` | **PASS** | `storage_exposes_exactly_one_public_write_function` (unchanged from A1, re-verified running). |
-| `cargo clippy --workspace -- -D warnings` clean | **PASS** | Section 2.3. |
+| `cargo clippy --workspace -- -D warnings` clean (the form the Global Constraint requires) | **PASS** | Section 2.3. Also noted there: `--all-targets` (test code) fails only on 3 pre-existing `assertions_on_constants`; this plan's own 9 test-code lints were removed in `5843be1`. |
 | Dependency/license allowlist check (`cargo deny check`) | **PASS** (originally FAILED on advisories at first pass; resolved by a later `git2` 0.21 upgrade, commit `247df9e`, independently re-verified) | Section 2.2/2.2.1: `advisories ok, bans ok, licenses ok, sources ok` — see `eval/results/A2/dependency-exceptions.md` for the full resolved history. |
-| Mutation testing examined (`domain`, `policy`, `storage`) | **PASS** (every survivor examined and justified, per spec threshold) | Section 2.4.1: 196 mutants, 131 caught, 50 unviable, 1 timeout, 14 missed — all 14 individually examined; 13 share one documented I/O-error-path coverage gap, 1 is a mutant-equivalence false positive; 0 are production defects. `domain`/`policy`: 34 mutants, 0 survivors. |
+| Mutation testing examined (`domain`, `policy`, `storage`) | **PASS** (every survivor examined and justified, per spec threshold) | Section 2.4.1: 196 mutants, 131 caught, 50 unviable, 1 timeout, 14 missed, all 14 individually examined, in three groups with different causes: Group A, 7 survivors that genuinely need a non-`NotFound` I/O error or a mid-call race (all three `recovery.rs:293` mutants are here, as the Task 10 re-reviewer confirmed by tracing the code); Group B, 5 ordinary untested `NotFound` paths, cheap to close; Group C, 1 missing boolean test combination (`recovery.rs:290`); plus 1 mutant-equivalence false positive. 0 are production defects. A likely 15th survivor (`recovery.rs:272` guard-to-`false`, probably a flaky result in the original run) is parked as unconfirmed. The run predates the final-review fix wave and was not repeated. `domain`/`policy`: 34 mutants, 0 survivors. |
 | SEC-001/002/003 re-evaluated against the actual A2 design | **DONE (all three remain open/narrowed, not closed)** | Section 4; `eval/results/A2/sec-debt-reevaluation.md`. |
 
 ---
@@ -704,8 +918,8 @@ A2 does not provide anything beyond what this plan implements. In particular: no
 no deletion registry, no backup/restore (A3); no real index (B1); SEC-001/002/003 remain open
 or only narrowed, not closed, and require re-evaluation before Fase D (Continuity [d5b9]).
 
-As of this file's final update, `cargo test --workspace` (199/199), `cargo clippy --workspace
--- -D warnings` (clean), and `cargo deny check` (`advisories ok, bans ok, licenses ok, sources
+As of this file's final update (after the final-review fix wave, head `5843be1`), `cargo test
+--workspace` (209/209), `cargo clippy --workspace -- -D warnings` (clean), and `cargo deny check` (`advisories ok, bans ok, licenses ok, sources
 ok`) all pass cleanly. The `git2` advisory finding this task's first pass reported as an open
 gap (Section 2.2) was resolved by a later `git2` 0.21 upgrade (commit `247df9e`), chosen and
 landed after this evidence was first presented to the user, and independently re-verified here
