@@ -319,28 +319,74 @@ pub(crate) enum FaultPoint {
 pub(crate) struct Interrupted(pub(crate) FaultPoint);
 
 /// A minimal crash-simulation seam, scoped to this module. Production code
-/// always uses [`FaultInjector::none`], which never interrupts. Only
-/// `trigger_at` is needed: this module's tests simulate a crash by having
-/// `record_deletion` return early right after a named point's effect has
-/// happened, then open a fresh `DeletionLog` to simulate a restart. No test
-/// here needs true concurrent pausing (unlike `storage::fault`'s
-/// `pause_at`), so that variant is intentionally not duplicated here.
+/// always uses [`FaultInjector::none`], which never interrupts or pauses.
+/// `trigger_at` simulates a crash by having `record_deletion` return early
+/// right after a named point's effect has happened, then a fresh
+/// `DeletionLog` is opened to simulate a restart.
+///
+/// `pause_at` (Task 7) genuinely pauses `record_deletion` on whatever thread
+/// called it, mid-protocol, until a test resumes it — mirroring
+/// `storage::fault::FaultInjector::pause_at` exactly. This was deliberately
+/// NOT duplicated here when this module was first written (see the prior
+/// version of this comment), on the premise that no test here needed true
+/// concurrent pausing. Task 7's backup-during-pending-deletion test is
+/// exactly that test: it needs `backup()` to run on a second thread while
+/// `record_deletion` is stopped, mid-flight, with the log row written
+/// `Pending` and the trusted reference not yet updated — a window a
+/// `trigger_at`-simulated "crash" cannot model, because returning early
+/// loses the still-running call's stack/thread, whereas here the backup
+/// must observe the SAME paused call's on-disk state while it is still
+/// technically in progress and will later complete normally.
 #[derive(Debug, Default)]
 pub(crate) struct FaultInjector {
     trigger: Option<FaultPoint>,
+    #[cfg(test)]
+    pause: Option<Pause>,
+}
+
+/// Test-only: where to pause, and the two channel ends used to tell the test
+/// "paused" and to wait for "resume". Mirrors `storage::fault::Pause`.
+#[cfg(test)]
+#[derive(Debug)]
+struct Pause {
+    point: FaultPoint,
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl FaultInjector {
     pub(crate) fn none() -> Self {
-        Self { trigger: None }
+        Self { trigger: None, #[cfg(test)] pause: None }
     }
 
     #[cfg(test)]
     pub(crate) fn trigger_at(point: FaultPoint) -> Self {
-        Self { trigger: Some(point) }
+        Self { trigger: Some(point), pause: None }
+    }
+
+    /// An injector that, when `record_deletion` reaches `point`, sends `()`
+    /// on `paused` and then blocks until `()` arrives on `resume` (or the
+    /// resume sender is dropped), then lets the call continue normally. It
+    /// never returns `Interrupted`.
+    #[cfg(test)]
+    pub(crate) fn pause_at(
+        point: FaultPoint,
+        paused: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self { trigger: None, pause: Some(Pause { point, paused, resume }) }
     }
 
     pub(crate) fn check(&self, point: FaultPoint) -> Result<(), Interrupted> {
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            if pause.point == point {
+                // A test that already went away is not an error here: the
+                // call just continues.
+                let _ = pause.paused.send(());
+                let _ = pause.resume.recv();
+            }
+        }
         if self.trigger == Some(point) {
             Err(Interrupted(point))
         } else {

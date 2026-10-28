@@ -1,0 +1,1011 @@
+//! Encrypted backup/restore of the Markdown vault + `PiiStore`, gated on the
+//! LIVE deletion log, per spec contract C5/C7 ("Un dato cancellato non
+//! riappare" must hold through a backup/restore cycle, not just through
+//! ordinary reads).
+//!
+//! # Why two checks, not one
+//!
+//! A naive restore might check only the backup's OWN embedded
+//! [`GenerationRef`] snapshot (taken at backup time) against... itself,
+//! which is trivially always satisfied, or against the live reference,
+//! which catches a STALE backup but not a note deleted strictly AFTER the
+//! backup was taken but BEFORE the restore runs. [`restore`] therefore runs
+//! two independent checks before writing anything to `destination_root`:
+//!
+//! 1. [`DeletionLog::verify_safe_to_expose_after_restore`] — the backup's
+//!    own embedded reference snapshot against the LIVE trusted reference.
+//!    This catches a backup blob that is itself stale relative to deletions
+//!    the log already knew about when the backup was taken (Task 5b's
+//!    check, reused verbatim).
+//! 2. A per-note cross-check: every note id the backup would restore is
+//!    checked against `live_deletion_log.is_deleted(note_id)`. This catches
+//!    the case check 1 CANNOT: a note deleted strictly after this backup
+//!    was taken. The backup's own embedded snapshot has no way to know
+//!    about a deletion that happened after it was created; only the LIVE
+//!    log can.
+//!
+//! Both checks must pass before ANY byte is written to `destination_root`.
+//! On any ambiguity — an I/O error reading either reference, a corrupt or
+//! tampered reference, a missing live reference — this fails closed
+//! ([`BackupError::DeletionLogRejected`]) and extracts nothing, per the same
+//! discipline Task 6 arrived at only after several rounds: a destructive or
+//! exposing action is gated on a POSITIVE, VERIFIED "safe," never on a
+//! default taken when something is merely absent or unreadable.
+//!
+//! # Key separation
+//!
+//! The snapshot is encrypted under an HKDF-SHA256 subkey derived from the
+//! live `MasterKey`, NOT the master key directly:
+//!
+//! ```text
+//! backup_subkey = HKDF-SHA256-Expand(
+//!     HKDF-SHA256-Extract(salt = None, ikm = master_key_bytes),
+//!     info = b"superbrain-backup-v1",
+//!     length = 32,
+//! )
+//! ```
+//!
+//! This keeps backup ciphertext cryptographically independent from
+//! `PiiStore`'s live per-record data keys (which are themselves wrapped
+//! directly under the master key): a compromise of one derived key's use
+//! context does not help an attacker with the other, and the fixed `info`
+//! string domain-separates this one purpose from any future HKDF use of
+//! the same master key.
+//!
+//! # Blob format
+//!
+//! The on-disk blob `BackupTarget::write_blob` receives is:
+//!
+//! ```text
+//! [12 bytes: AEAD nonce]
+//! [remaining bytes: AES-256-GCM(backup_subkey, nonce) ciphertext, tag
+//!  included, of the serialized plaintext snapshot]
+//! ```
+//!
+//! The plaintext snapshot (what the hash in [`BackupManifest`] is computed
+//! over, and what AEAD decrypts back to) is a simple length-prefixed
+//! container, chosen for the same reason `pii_store.rs` chose its own
+//! buffer format: no untrusted parser needs defending against, only
+//! unambiguous round-tripping:
+//!
+//! ```text
+//! [8 bytes: generation, little-endian u64]
+//! [4 bytes: chain_hash length, little-endian u32][chain_hash bytes (hex ascii)]
+//! [4 bytes: vault file count, little-endian u32]
+//! for each vault file, in a stable (sorted-by-name) order:
+//!   [4 bytes: name length][name bytes (relative path, forward-slash separated)]
+//!   [8 bytes: content length, little-endian u64][content bytes]
+//! [4 bytes: pii file count, little-endian u32]
+//! for each live `.pii` file, in a stable (sorted-by-name) order:
+//!   [4 bytes: note_id length][note_id bytes]
+//!   [8 bytes: content length, little-endian u64][content bytes (the
+//!    already-AEAD-wrapped `.pii` buffer, re-encrypted again as part of
+//!    this outer backup envelope — the live per-record encryption is left
+//!    intact, this is defense in depth, not a substitute for it)]
+//! ```
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use hkdf::Hkdf;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::deletion_log::{DeletionLog, DeletionLogError, GenerationRef, TrustedReferenceStore};
+use crate::keys::{MasterKey, MASTER_KEY_LEN};
+use crate::pii_store::PiiStore;
+
+/// AES-GCM nonce length in bytes.
+const NONCE_LEN: usize = 12;
+
+/// Fixed HKDF `info` string domain-separating the backup subkey from any
+/// other derived use of the master key. See module docs.
+const HKDF_INFO: &[u8] = b"superbrain-backup-v1";
+
+/// Name of the single blob a backup writes/reads through [`BackupTarget`].
+/// A backup target holds exactly one logical backup at a time (Task 7's
+/// "second backup cycle" test replaces it in place, under this same name,
+/// rather than accumulating historical blobs — the physical retention
+/// policy for multiple generations of backups is out of scope here, per
+/// the brief).
+const BLOB_NAME: &str = "superbrain-backup.enc";
+
+/// Errors from backup/restore operations.
+#[derive(Debug, Error)]
+pub enum BackupError {
+    #[error("I/O error in backup/restore: {0}")]
+    Io(String),
+
+    /// [`restore`] was asked to read from a target that has never had
+    /// anything written to it ([`BackupTarget::is_empty`] reported `true`,
+    /// or the blob is simply absent).
+    #[error("backup target is empty: nothing to restore")]
+    TargetEmpty,
+
+    /// The decrypted snapshot's recomputed hash does not match what the
+    /// manifest expected it to be, or the snapshot's own serialized form is
+    /// malformed. Never a silent partial restore.
+    #[error("backup content hash verification failed")]
+    HashMismatch,
+
+    /// Either of [`restore`]'s two deletion-log checks failed for a reason
+    /// the deletion log itself names (corrupt/tampered/missing reference,
+    /// stale generation, etc.) — distinct from [`BackupError::DeletedSinceBackup`],
+    /// which is this module's OWN check (not `vault-security`'s deletion-log
+    /// crate code), naming the specific notes deleted after the backup.
+    #[error("deletion log rejected this restore: {0}")]
+    DeletionLogRejected(DeletionLogError),
+
+    /// Check 2 (see module docs): at least one note the backup would have
+    /// restored has since been deleted in the LIVE deletion log, after this
+    /// backup was taken. Named explicitly and distinctly from
+    /// [`BackupError::DeletionLogRejected`] so a caller can tell "the
+    /// reference itself is unusable" apart from "specific notes must not be
+    /// exposed."
+    #[error("note(s) deleted since this backup was taken must not be exposed by restore: {note_ids:?}")]
+    DeletedSinceBackup { note_ids: Vec<String> },
+
+    /// [`restore`] was asked to write into a non-empty `destination_root`.
+    /// Fails closed rather than silently merging or overwriting.
+    #[error("destination already contains files; refusing to restore into a non-empty directory")]
+    AlreadyExists,
+}
+
+impl From<io::Error> for BackupError {
+    fn from(e: io::Error) -> Self {
+        BackupError::Io(e.to_string())
+    }
+}
+
+/// Where a backup is written to and read from. Implementors need not be
+/// durable in any particular way beyond "what was written can be read
+/// back" — [`FilesystemBackupTarget`] is the only implementation this crate
+/// ships; the physical backup medium (external disk, cloud object store,
+/// ...) stays an explicitly open decision per the spec's own closing
+/// section, out of scope here.
+pub trait BackupTarget {
+    fn write_blob(&self, name: &str, bytes: &[u8]) -> Result<(), BackupError>;
+    fn read_blob(&self, name: &str) -> Result<Vec<u8>, BackupError>;
+    fn list_blobs(&self) -> Result<Vec<String>, BackupError>;
+    fn is_empty(&self) -> Result<bool, BackupError>;
+}
+
+/// A [`BackupTarget`] backed by a plain directory on disk. Each blob is one
+/// file, named `dir/<name>`, written via a sibling-temp-file-then-rename
+/// (the same atomic-write discipline used throughout this crate) so a
+/// crash mid-write can never leave a half-written blob visible under its
+/// final name.
+pub struct FilesystemBackupTarget {
+    dir: PathBuf,
+}
+
+impl FilesystemBackupTarget {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn blob_path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl BackupTarget for FilesystemBackupTarget {
+    fn write_blob(&self, name: &str, bytes: &[u8]) -> Result<(), BackupError> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.blob_path(name);
+        let tmp_name = format!(
+            "{name}.tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+        );
+        let tmp_path = self.dir.join(tmp_name);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    fn read_blob(&self, name: &str) -> Result<Vec<u8>, BackupError> {
+        match std::fs::read(self.blob_path(name)) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(BackupError::TargetEmpty),
+            Err(e) => Err(BackupError::Io(e.to_string())),
+        }
+    }
+
+    fn list_blobs(&self) -> Result<Vec<String>, BackupError> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BackupError::Io(e.to_string())),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.path().is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else { continue };
+            if name.contains(".tmp-") {
+                continue;
+            }
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    fn is_empty(&self) -> Result<bool, BackupError> {
+        Ok(self.list_blobs()?.is_empty())
+    }
+}
+
+/// What [`backup`] reports on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupManifest {
+    /// Hex-encoded SHA-256 of the PLAINTEXT snapshot, computed before
+    /// encryption, so it can be verified again after decryption at restore
+    /// time without needing to re-derive anything secret to check it.
+    pub hash: String,
+    /// The deletion log's generation at the moment this backup's
+    /// `GenerationRef` snapshot was taken.
+    pub generation: u64,
+    pub created_at: SystemTime,
+}
+
+/// What [`restore`] reports on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// Recomputed hash of the restored plaintext snapshot, for the caller to
+    /// compare against a previously recorded [`BackupManifest::hash`].
+    pub hash: String,
+    /// The generation embedded in the restored backup's own `GenerationRef`
+    /// snapshot.
+    pub generation: u64,
+    /// Note ids (vault notes, i.e. Markdown record files minus their
+    /// extension) that were actually written to `destination_root`.
+    pub restored_note_ids: Vec<String>,
+}
+
+/// Derives the HKDF-SHA256 backup subkey from `master_key`. See module docs
+/// for the exact construction.
+fn derive_backup_subkey(master_key: &MasterKey) -> [u8; MASTER_KEY_LEN] {
+    let hk = Hkdf::<Sha256>::new(None, master_key.expose_secret());
+    let mut subkey = [0u8; MASTER_KEY_LEN];
+    hk.expand(HKDF_INFO, &mut subkey).expect("32-byte output is within HKDF-SHA256's valid expand length");
+    subkey
+}
+
+fn fresh_nonce() -> [u8; NONCE_LEN] {
+    let mut bytes = [0u8; NONCE_LEN];
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG must be available to generate an AEAD nonce");
+    bytes
+}
+
+fn aead_encrypt(key_bytes: &[u8; MASTER_KEY_LEN], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key_bytes));
+    cipher.encrypt(&Nonce::from(*nonce), plaintext).expect("AES-256-GCM encryption of a bounded in-memory buffer cannot fail")
+}
+
+fn aead_decrypt(key_bytes: &[u8; MASTER_KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key_bytes));
+    cipher.decrypt(&Nonce::from(*nonce), ciphertext).map_err(|_| ())
+}
+
+/// Hex-encoded SHA-256 of `bytes`. Independent copy of the same helper in
+/// `pii_store.rs` (same algorithm, same encoding).
+fn content_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_len_prefixed_u32(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn write_len_prefixed_u64(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let v = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().ok()?);
+    *offset += 4;
+    Some(v)
+}
+
+fn read_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let v = u64::from_le_bytes(bytes.get(*offset..*offset + 8)?.try_into().ok()?);
+    *offset += 8;
+    Some(v)
+}
+
+fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let slice = bytes.get(*offset..*offset + len)?;
+    *offset += len;
+    Some(slice)
+}
+
+/// Every regular file under `root`, recursively, excluding `.git` and
+/// dotfile directories (`.staging`, `.before-images`, ...), returned as
+/// `(relative_path_forward_slash, contents)` pairs in a stable, sorted
+/// order (a `BTreeMap` is used purely to get that ordering for free).
+fn collect_vault_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, BackupError> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(BackupError::Io(e.to_string())),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name == ".git" || file_name.starts_with('.') {
+                // Dotfile directories/files (`.git`, `.before-images`,
+                // `.staging`, `.pii-store`'s own dotfiles if nested here)
+                // are never part of the plain Markdown vault snapshot. The
+                // PII store's live records are collected separately, by
+                // `collect_pii_files`, directly from `PiiStore`, never by
+                // walking its root as a plain directory here.
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                let bytes = std::fs::read(&path)?;
+                out.insert(relative, bytes);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every live `.pii` file in `pii_store`'s root, as `(note_id, raw ciphertext
+/// bytes)` pairs in sorted order. Reads the already-AEAD-wrapped on-disk
+/// buffer directly (never calls `PiiStore::get`, which would decrypt it) —
+/// the backup envelope re-encrypts this already-ciphertext blob as a second,
+/// independent layer; it never handles the plaintext PII content at all.
+fn collect_pii_files(pii_store: &PiiStore) -> Result<BTreeMap<String, Vec<u8>>, BackupError> {
+    let mut out = BTreeMap::new();
+    let entries = match std::fs::read_dir(pii_store.root()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(BackupError::Io(e.to_string())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pii") {
+            continue;
+        }
+        let Some(note_id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let bytes = std::fs::read(&path)?;
+        out.insert(note_id.to_string(), bytes);
+    }
+    Ok(out)
+}
+
+/// Serializes the full snapshot (deletion-log reference + vault files + PII
+/// files) into the plaintext buffer format documented at the top of this
+/// module.
+fn serialize_snapshot(reference: &GenerationRef, vault_files: &BTreeMap<String, Vec<u8>>, pii_files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&reference.generation.to_le_bytes());
+    write_len_prefixed_u32(&mut buf, reference.chain_hash.as_bytes());
+
+    buf.extend_from_slice(&(vault_files.len() as u32).to_le_bytes());
+    for (name, content) in vault_files {
+        write_len_prefixed_u32(&mut buf, name.as_bytes());
+        write_len_prefixed_u64(&mut buf, content);
+    }
+
+    buf.extend_from_slice(&(pii_files.len() as u32).to_le_bytes());
+    for (note_id, content) in pii_files {
+        write_len_prefixed_u32(&mut buf, note_id.as_bytes());
+        write_len_prefixed_u64(&mut buf, content);
+    }
+
+    buf
+}
+
+/// A fully-parsed snapshot, as returned by [`deserialize_snapshot`].
+struct Snapshot {
+    reference: GenerationRef,
+    vault_files: BTreeMap<String, Vec<u8>>,
+    pii_files: BTreeMap<String, Vec<u8>>,
+}
+
+/// Inverse of [`serialize_snapshot`]. `None` on any structural malformation
+/// — the caller maps that to [`BackupError::HashMismatch`] (a snapshot that
+/// does not even parse can never have been the one the manifest hashed).
+fn deserialize_snapshot(bytes: &[u8]) -> Option<Snapshot> {
+    let mut offset = 0usize;
+    let generation = u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?);
+    offset += 8;
+    let chain_hash_len = read_u32(bytes, &mut offset)? as usize;
+    let chain_hash = std::str::from_utf8(read_bytes(bytes, &mut offset, chain_hash_len)?).ok()?.to_string();
+    let reference = GenerationRef { generation, chain_hash };
+
+    let vault_count = read_u32(bytes, &mut offset)?;
+    let mut vault_files = BTreeMap::new();
+    for _ in 0..vault_count {
+        let name_len = read_u32(bytes, &mut offset)? as usize;
+        let name = std::str::from_utf8(read_bytes(bytes, &mut offset, name_len)?).ok()?.to_string();
+        let content_len = read_u64(bytes, &mut offset)? as usize;
+        let content = read_bytes(bytes, &mut offset, content_len)?.to_vec();
+        vault_files.insert(name, content);
+    }
+
+    let pii_count = read_u32(bytes, &mut offset)?;
+    let mut pii_files = BTreeMap::new();
+    for _ in 0..pii_count {
+        let id_len = read_u32(bytes, &mut offset)? as usize;
+        let note_id = std::str::from_utf8(read_bytes(bytes, &mut offset, id_len)?).ok()?.to_string();
+        let content_len = read_u64(bytes, &mut offset)? as usize;
+        let content = read_bytes(bytes, &mut offset, content_len)?.to_vec();
+        pii_files.insert(note_id, content);
+    }
+
+    Some(Snapshot { reference, vault_files, pii_files })
+}
+
+/// The `GenerationRef` embedded in a backup snapshot when the deletion log
+/// has never recorded a single deletion (no row has ever existed, and so
+/// the trusted reference has never been written either). Mirrors
+/// `DeletionLog::reconcile`'s own `(None, None) => AlreadyConsistent`
+/// judgment: generation 0 with an all-zero chain hash the same width as a
+/// real sha256 hex digest (same convention as
+/// [`crate::deletion_log::GENESIS_PREV_CHAIN_HASH`]) is never a value a real
+/// deletion can produce (the first real deletion is always generation 1),
+/// so this sentinel can never collide with genuine backup content.
+fn no_deletions_ever_reference() -> GenerationRef {
+    GenerationRef { generation: 0, chain_hash: "0".repeat(64) }
+}
+
+/// Encrypts a snapshot of the Markdown vault at `vault_root`, `pii_store`'s
+/// live ciphertext files, and a [`GenerationRef`] snapshot of
+/// `deletion_log`'s current trusted reference, and writes the result via
+/// `target.write_blob`. See module docs for the exact key derivation and
+/// blob format.
+///
+/// The `GenerationRef` snapshot is read from the LIVE trusted reference at
+/// the moment this call runs — the real, DPAPI-authenticated
+/// [`crate::deletion_log::DpapiTrustedReferenceStore`], rooted at
+/// `<pii_store.root()>/deletion-log-reference.dpapi`, the exact same fixed
+/// sibling path `storage`'s sensitive-write pipeline uses — never
+/// reconstructed from the log's own latest row independently of the
+/// reference (the reference, not the raw log, is the authenticated value
+/// `restore`'s checks compare against). If no deletion has ever been
+/// recorded, the reference file does not exist yet; this is captured as
+/// [`no_deletions_ever_reference`], not treated as an I/O error.
+pub fn backup(
+    vault_root: &Path,
+    pii_store: &PiiStore,
+    deletion_log: &DeletionLog,
+    master_key: &MasterKey,
+    target: &dyn BackupTarget,
+) -> Result<BackupManifest, BackupError> {
+    let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(
+        pii_store.root().join("deletion-log-reference.dpapi"),
+    );
+    backup_with_reference(vault_root, pii_store, deletion_log, master_key, target, &trusted_ref)
+}
+
+/// [`backup`], but lets a caller/test supply the exact [`TrustedReferenceStore`]
+/// to read the snapshot's `GenerationRef` from. Production code always uses
+/// [`backup`], which always pairs `pii_store`'s fixed, documented
+/// `deletion-log-reference.dpapi` sibling path with the real
+/// `DpapiTrustedReferenceStore`; this function exists so Task 7's own tests
+/// can use the same plain, unauthenticated `FileTrustedReferenceStore`
+/// `deletion_log.rs`'s own tests use, for the same reason that module gives
+/// (DPAPI is awkward to drive in a tight unit-test loop) — the SAME
+/// instance (or another instance pointed at the same on-disk file) the
+/// test's own `DeletionLog::record_deletion` calls go through.
+pub(crate) fn backup_with_reference(
+    vault_root: &Path,
+    pii_store: &PiiStore,
+    _deletion_log: &DeletionLog,
+    master_key: &MasterKey,
+    target: &dyn BackupTarget,
+    trusted_ref: &dyn TrustedReferenceStore,
+) -> Result<BackupManifest, BackupError> {
+    // A missing reference means "no deletion has ever been recorded," not
+    // an error to fail closed on — `DeletionLog::reconcile` makes the exact
+    // same judgment for `(None, None)`. Any OTHER error reading the
+    // reference (corrupt, tampered) DOES propagate: backup must not
+    // silently embed a fabricated reference over a reference that exists
+    // but cannot be trusted.
+    let reference = trusted_ref.read().map_err(BackupError::DeletionLogRejected)?.unwrap_or_else(no_deletions_ever_reference);
+
+    let vault_files = collect_vault_files(vault_root)?;
+    let pii_files = collect_pii_files(pii_store)?;
+
+    let plaintext_snapshot = serialize_snapshot(&reference, &vault_files, &pii_files);
+    let hash = content_hash(&plaintext_snapshot);
+
+    let subkey = derive_backup_subkey(master_key);
+    let nonce = fresh_nonce();
+    let ciphertext = aead_encrypt(&subkey, &nonce, &plaintext_snapshot);
+
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+
+    target.write_blob(BLOB_NAME, &blob)?;
+
+    Ok(BackupManifest { hash, generation: reference.generation, created_at: SystemTime::now() })
+}
+
+/// Reads the single blob from `target`, decrypts it under `master_key`'s
+/// HKDF subkey, verifies its hash, then runs BOTH deletion-log checks
+/// described in the module docs before writing anything to
+/// `destination_root`. Only if both checks pass does extraction proceed.
+///
+/// `destination_root` must not already exist, or must exist and be empty —
+/// restoring into a non-empty directory is refused
+/// ([`BackupError::AlreadyExists`]) rather than silently merging or
+/// overwriting whatever is already there.
+pub fn restore(
+    target: &dyn BackupTarget,
+    master_key: &MasterKey,
+    destination_root: &Path,
+    live_deletion_log: &DeletionLog,
+    live_trusted_ref: &dyn TrustedReferenceStore,
+) -> Result<RestoreOutcome, BackupError> {
+    if target.is_empty()? {
+        return Err(BackupError::TargetEmpty);
+    }
+
+    // Refuse to write into a non-empty destination BEFORE touching the
+    // blob at all: an empty destination is the only state this function
+    // ever writes into.
+    match std::fs::read_dir(destination_root) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(BackupError::AlreadyExists);
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BackupError::Io(e.to_string())),
+    }
+
+    let blob = target.read_blob(BLOB_NAME)?;
+    if blob.len() < NONCE_LEN {
+        return Err(BackupError::HashMismatch);
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+    let nonce: [u8; NONCE_LEN] = nonce_bytes.try_into().expect("exactly NONCE_LEN bytes by construction above");
+
+    let subkey = derive_backup_subkey(master_key);
+    let plaintext_snapshot = aead_decrypt(&subkey, &nonce, ciphertext).map_err(|_| BackupError::HashMismatch)?;
+
+    let recomputed_hash = content_hash(&plaintext_snapshot);
+
+    let snapshot = deserialize_snapshot(&plaintext_snapshot).ok_or(BackupError::HashMismatch)?;
+
+    // Both checks (module docs) must pass before anything is written. They
+    // run in this order — check 2 (the specific per-note cross-check)
+    // BEFORE check 1 (the backup's own embedded reference snapshot vs the
+    // live reference) — so that whenever a restorable note was actually
+    // deleted after this backup was taken, the caller gets the precise,
+    // actionable `DeletedSinceBackup { note_ids }` naming it, rather than
+    // the generic `ReferenceStale` that a live-reference generation bump
+    // for ANY reason would also produce. This does not weaken check 1: it
+    // still runs (below) and still fails closed on its own terms (a stale
+    // generation with no specific deleted note identifiable, a corrupt or
+    // tampered reference, or a missing reference that isn't the legitimate
+    // "no deletion has ever happened" case) — it only yields precedence to
+    // the more specific error when both would otherwise fire.
+
+    // Check 2: cross-check every note id the backup would restore against
+    // the LIVE deletion log's is_deleted. This is the check the backup's
+    // own embedded snapshot cannot perform, because it predates deletions
+    // recorded after the backup was taken. A note is named here if EITHER
+    // its Markdown record (vault_files, keyed by relative path ending in
+    // ".record") OR its PII ciphertext (pii_files, keyed by bare note id)
+    // is present in the snapshot.
+    let mut candidate_note_ids: Vec<String> = Vec::new();
+    for name in snapshot.vault_files.keys() {
+        if let Some(stem) = name.strip_suffix(".record") {
+            candidate_note_ids.push(stem.to_string());
+        }
+    }
+    for note_id in snapshot.pii_files.keys() {
+        candidate_note_ids.push(note_id.clone());
+    }
+    candidate_note_ids.sort();
+    candidate_note_ids.dedup();
+
+    let mut deleted_since_backup = Vec::new();
+    for note_id in &candidate_note_ids {
+        // Any error here (I/O failure reading the log) must fail closed:
+        // never treat "couldn't check" as "not deleted."
+        if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
+            deleted_since_backup.push(note_id.clone());
+        }
+    }
+    if !deleted_since_backup.is_empty() {
+        return Err(BackupError::DeletedSinceBackup { note_ids: deleted_since_backup });
+    }
+
+    // Check 1: the backup's OWN embedded reference snapshot against the
+    // LIVE trusted reference. Any error here (corrupt, tampered, missing
+    // reference, or a genuinely stale generation) fails closed as
+    // DeletionLogRejected — never proceeds as if "unreadable" meant "safe."
+    // The one exception, mirroring `backup`'s own and
+    // `DeletionLog::reconcile`'s `(None, None) => AlreadyConsistent`
+    // judgment: if the backup's own snapshot says no deletion had EVER
+    // happened by backup time ([`no_deletions_ever_reference`]) AND the
+    // live reference genuinely does not exist either (not an error reading
+    // it — a clean, positive "nothing has ever been written here"), there
+    // is nothing to verify: no deletion the backup could possibly be stale
+    // about has ever occurred on either side. This is the common case for
+    // any vault that has never had a PII deletion, and without it `restore`
+    // would be permanently impossible for such a vault.
+    let live_reference_for_check1 = live_trusted_ref.read().map_err(BackupError::DeletionLogRejected)?;
+    let both_sides_have_never_seen_a_deletion =
+        snapshot.reference == no_deletions_ever_reference() && live_reference_for_check1.is_none();
+    if !both_sides_have_never_seen_a_deletion {
+        live_deletion_log
+            .verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
+            .map_err(BackupError::DeletionLogRejected)?;
+    }
+
+    // Both checks passed: NOW, and only now, extract.
+    std::fs::create_dir_all(destination_root)?;
+    for (name, content) in &snapshot.vault_files {
+        let dest_path = destination_root.join(name);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest_path, content)?;
+    }
+
+    let restored_note_ids: Vec<String> = snapshot
+        .vault_files
+        .keys()
+        .filter_map(|name| name.strip_suffix(".record").map(|s| s.to_string()))
+        .collect();
+
+    Ok(RestoreOutcome { hash: recomputed_hash, generation: snapshot.reference.generation, restored_note_ids })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deletion_log::{FaultInjector, FaultPoint, FileTrustedReferenceStore};
+    use crate::keys::MasterKey;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    fn write_file(path: &Path, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn fresh_master_key(dir: &Path) -> MasterKey {
+        MasterKey::load_or_create(&dir.join("backup-master.key"), None).unwrap()
+    }
+
+    fn open_pii_store(dir: &Path) -> PiiStore {
+        PiiStore::open(dir.join("pii-store"), &dir.join("pii-master.key")).unwrap()
+    }
+
+    fn open_deletion_log_and_ref(dir: &Path) -> (DeletionLog, FileTrustedReferenceStore) {
+        let log = DeletionLog::open(&dir.join("deletion-log.sqlite")).unwrap();
+        let reference = FileTrustedReferenceStore::new(dir.join("trusted-reference.bin"));
+        (log, reference)
+    }
+
+    fn all_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn full_backup_then_restore_to_an_empty_directory_yields_byte_identical_content_with_verified_hashes() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\nhello world");
+        write_file(&vault_root.join("note-b.record"), b"0\n---\nanother note");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(manifest.generation, 0, "no deletions have happened yet");
+
+        let destination = dir.path().join("restored");
+        let outcome = restore(&target, &master_key, &destination, &log, &reference).unwrap();
+        assert_eq!(outcome.hash, manifest.hash, "restore must verify the same plaintext hash backup computed");
+
+        assert_eq!(std::fs::read(destination.join("note-a.record")).unwrap(), b"0\n---\nhello world");
+        assert_eq!(std::fs::read(destination.join("note-b.record")).unwrap(), b"0\n---\nanother note");
+        assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string(), "note-b".to_string()]);
+    }
+
+    #[test]
+    fn restore_refuses_to_write_anything_when_the_backups_own_reference_snapshot_is_stale() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\nhello world");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Take the backup while the reference is still at generation 0.
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // Now advance the LIVE log/reference past what the backup captured.
+        log.record_deletion("note-unrelated", &reference).unwrap();
+        let live = reference.read().unwrap().unwrap();
+        assert_eq!(live.generation, 1, "the live reference must now be ahead of the backup's embedded snapshot");
+
+        let destination = dir.path().join("restored");
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        assert!(
+            matches!(result, Err(BackupError::DeletionLogRejected(DeletionLogError::ReferenceStale { .. }))),
+            "got {result:?}"
+        );
+        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty, not partially populated");
+    }
+
+    #[test]
+    fn a_note_deleted_after_the_backup_was_taken_does_not_reappear_on_restore_even_though_the_backups_own_snapshot_predates_the_deletion(
+    ) {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"sensitive content", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Backup taken while note-a is still live.
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // THEN delete note-a through the same deletion-log mechanism
+        // `storage`'s Task 6 sensitive-write pipeline drives
+        // (`DeletionLog::record_deletion` against the live trusted
+        // reference), recording it in the LIVE log.
+        log.record_deletion("note-a", &reference).unwrap();
+        assert!(log.is_deleted("note-a").unwrap());
+
+        // Restore from the EARLIER backup against that now-updated live log.
+        let destination = dir.path().join("restored");
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        assert!(
+            matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &vec!["note-a".to_string()]),
+            "got {result:?}"
+        );
+        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty");
+    }
+
+    #[test]
+    fn a_backup_taken_while_a_deletion_is_still_pending_and_then_restored_does_not_expose_the_note_that_deletion_targets(
+    ) {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"sensitive content", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Pause record_deletion exactly at AfterGenerationWrittenPending:
+        // the log row exists and is Pending, the trusted reference has NOT
+        // been updated yet.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterGenerationWrittenPending, paused_tx, resume_rx);
+
+        let deleter_log = &log;
+        let deleter_reference_path = dir.path().join("trusted-reference.bin");
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let reference_for_thread = FileTrustedReferenceStore::new(deleter_reference_path.clone());
+                deleter_log.record_deletion_with_injector("note-a", &reference_for_thread, &injector).unwrap()
+            });
+
+            // Wait until record_deletion is paused mid-protocol.
+            paused_rx.recv().unwrap();
+
+            // While paused: the log row is Pending (note-a already reads as
+            // deleted), but the trusted reference has NOT been updated. The
+            // deleter thread is parked INSIDE record_deletion_with_injector
+            // holding `log`'s own in-process connection mutex for the whole
+            // pause (by design, mirroring storage::fault's pause_at), so
+            // this check opens a SEPARATE DeletionLog connection onto the
+            // same SQLite file rather than calling `log.is_deleted` here,
+            // which would deadlock against that held mutex.
+            let concurrent_reader = DeletionLog::open(log.db_path()).unwrap();
+            assert!(concurrent_reader.is_deleted("note-a").unwrap(), "is_deleted must already be true inside the pending window");
+            assert!(reference.read().unwrap().is_none(), "the trusted reference must not be updated yet, mid-pause");
+
+            // Run backup() against this same vault WHILE paused.
+            let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+            assert_eq!(manifest.generation, 0, "the backup's own snapshot predates the pending deletion's reference update");
+
+            // Resume and let record_deletion complete normally.
+            resume_tx.send(()).unwrap();
+            let receipt = handle.join().unwrap();
+            assert_eq!(receipt.generation, 1);
+        });
+
+        // Now the live trusted reference is fully updated (generation 1).
+        let live = reference.read().unwrap().unwrap();
+        assert_eq!(live.generation, 1);
+
+        // Restore from the backup taken mid-pending-window against the NOW
+        // fully-updated live trusted ref.
+        let destination = dir.path().join("restored");
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        // Check 2 (the specific per-note cross-check) runs before check 1,
+        // so this surfaces as DeletedSinceBackup naming note-a explicitly —
+        // the same outcome the deleted-after-backup test asserts, because
+        // is_deleted's "pending window is already non-consultable" rule
+        // (C5 line 409) holds for a backup taken mid-window exactly as it
+        // holds for an ordinary read taken mid-window: the live log already
+        // reports note-a deleted at the moment restore's check 2 runs,
+        // regardless of whether record_deletion's step 2/3 had completed
+        // yet when the backup itself was taken.
+        assert!(
+            matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &vec!["note-a".to_string()]),
+            "got {result:?}"
+        );
+        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty");
+        // note-a must not be readable/present in any form.
+        if destination.exists() {
+            for path in all_files_under(&destination) {
+                assert!(!path.to_string_lossy().contains("note-a"), "note-a must not appear in the restored output at all");
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_backup_to_an_already_used_target_replaces_rather_than_corrupts_the_prior_one_and_restore_still_round_trips(
+    ) {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\nfirst version");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        let first_manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // Mutate the vault and record a deletion so generation advances.
+        write_file(&vault_root.join("note-a.record"), b"1\n---\nsecond version");
+        write_file(&vault_root.join("note-c.record"), b"0\n---\nbrand new note");
+        log.record_deletion("note-unrelated-for-generation-bump", &reference).unwrap();
+
+        let second_manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_ne!(second_manifest.hash, first_manifest.hash);
+        assert_eq!(second_manifest.generation, 1, "the embedded reference snapshot must be the SECOND backup's own generation, not stale from the first");
+
+        let destination = dir.path().join("restored");
+        let outcome = restore(&target, &master_key, &destination, &log, &reference).unwrap();
+        assert_eq!(outcome.hash, second_manifest.hash, "restore must reflect the SECOND backup, not a corrupted merge");
+        assert_eq!(outcome.generation, 1);
+
+        assert_eq!(std::fs::read(destination.join("note-a.record")).unwrap(), b"1\n---\nsecond version");
+        assert_eq!(std::fs::read(destination.join("note-c.record")).unwrap(), b"0\n---\nbrand new note");
+        assert_eq!(outcome.restored_note_ids.len(), 2, "exactly the second backup's two notes, not a merge of both backups' files");
+    }
+
+    #[test]
+    fn restore_on_an_empty_target_is_target_empty_not_a_panic_or_silent_success() {
+        let dir = tempdir().unwrap();
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let destination = dir.path().join("restored");
+
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        assert!(matches!(result, Err(BackupError::TargetEmpty)), "got {result:?}");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn restore_refuses_to_write_into_a_non_empty_destination() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\nhello world");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        let destination = dir.path().join("restored");
+        write_file(&destination.join("pre-existing.txt"), b"already here");
+
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        assert!(matches!(result, Err(BackupError::AlreadyExists)), "got {result:?}");
+        // Pre-existing content must be untouched.
+        assert_eq!(std::fs::read(destination.join("pre-existing.txt")).unwrap(), b"already here");
+    }
+
+    #[test]
+    fn restore_with_a_tampered_blob_fails_as_hash_mismatch_never_as_a_silent_wrong_result() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\nhello world");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target_dir = dir.path().join("backup-target");
+        let target = FilesystemBackupTarget::new(target_dir.clone());
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        let blob_path = target_dir.join(BLOB_NAME);
+        let mut bytes = std::fs::read(&blob_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&blob_path, &bytes).unwrap();
+
+        let destination = dir.path().join("restored");
+        let result = restore(&target, &master_key, &destination, &log, &reference);
+        assert!(matches!(result, Err(BackupError::HashMismatch)), "got {result:?}");
+        assert!(!destination.exists() || all_files_under(&destination).is_empty());
+    }
+
+    #[test]
+    fn the_backup_blob_is_encrypted_under_a_subkey_distinct_from_the_master_key_itself() {
+        // The HKDF subkey must not simply equal the master key bytes.
+        let dir = tempdir().unwrap();
+        let master_key = fresh_master_key(dir.path());
+        let subkey = derive_backup_subkey(&master_key);
+        assert_ne!(&subkey, master_key.expose_secret(), "the backup subkey must be cryptographically distinct from the raw master key");
+    }
+}

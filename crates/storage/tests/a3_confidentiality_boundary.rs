@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use storage::{NoteId, Vault, Version};
-use vault_security::PiiStore;
+use vault_security::{backup as vault_backup, restore as vault_restore, DeletionLog, DpapiTrustedReferenceStore, FilesystemBackupTarget, MasterKey, PiiStore};
 
 fn unique_test_dir() -> PathBuf {
     static UNIQUE_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -318,12 +318,48 @@ fn a_completed_sensitive_write_leaves_no_recoverable_plaintext_in_any_temp_file_
 
 /// Surface: backup blobs. Task 7 (backup and restore).
 ///
-/// Un-ignore by: taking a backup of a vault that holds a sensitive note. Read
-/// the raw bytes that `BackupTarget::write_blob` received, not the bytes that
-/// `restore()` returns. Assert that the plaintext does not appear as a
-/// substring anywhere in that blob.
+/// Takes a backup of a vault that holds a sensitive note, then reads the RAW
+/// bytes `BackupTarget::write_blob` received directly off disk (never going
+/// back through `restore()`, which would decrypt them) and asserts the
+/// plaintext does not appear as a substring anywhere in that blob.
 #[test]
-#[ignore = "A3 Task 7: needs backup and restore with BackupTarget::write_blob"]
 fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_content_outside_its_aead_envelope() {
-    todo!("implement in Task 7: capture the raw bytes passed to write_blob and scan them")
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root.clone());
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let note_text = sensitive_note("note-backup-audit", SENSITIVE_PLAINTEXT);
+    storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
+        .unwrap();
+
+    let deletion_log = DeletionLog::open(&pii_store.root().join("deletion-log.sqlite")).unwrap();
+    let master_key = MasterKey::load_or_create(&root.join("backup-master.key"), None).unwrap();
+    let backup_target_dir = unique_test_dir();
+    let target = FilesystemBackupTarget::new(backup_target_dir.clone());
+
+    vault_backup(&root, &pii_store, &deletion_log, &master_key, &target).unwrap();
+
+    let raw_blob_bytes: Vec<u8> = all_files_under(&backup_target_dir)
+        .into_iter()
+        .flat_map(|path| std::fs::read(&path).unwrap())
+        .collect();
+    assert!(!raw_blob_bytes.is_empty(), "the audit must actually have scanned at least one byte");
+
+    // The plaintext must not appear anywhere in the raw blob bytes,
+    // including split across a UTF-8 boundary that `String::from_utf8`
+    // alone might miss: scan as a raw byte substring, not as decoded text.
+    let needle = SENSITIVE_PLAINTEXT.as_bytes();
+    assert!(
+        !raw_blob_bytes.windows(needle.len()).any(|w| w == needle),
+        "the backup blob written to BackupTarget::write_blob must never contain the sensitive plaintext outside its AEAD envelope"
+    );
+
+    // Sanity: a different-but-also-sensitive-looking correct decrypt DOES
+    // produce the pointer (proving the backup path actually ran, not that
+    // it silently skipped the note).
+    let destination = unique_test_dir().join("restored-for-audit");
+    let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.root().join("deletion-log-reference.dpapi"));
+    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref).unwrap();
+    assert!(outcome.restored_note_ids.contains(&"note-backup-audit".to_string()));
+    let restored_record = std::fs::read_to_string(destination.join("note-backup-audit.record")).unwrap();
+    assert!(restored_record.contains("pii://note-backup-audit"), "the pointer itself is allowed and expected in the restored Markdown record");
 }

@@ -2,12 +2,14 @@
 //! data only.
 
 pub mod availability;
+pub mod backup;
 pub mod deletion_log;
 pub mod keys;
 pub mod pii_store;
 pub mod recovery_kit;
 
 pub use availability::{EncryptedStoreAvailability, StoreUnavailableReason};
+pub use backup::{backup, restore, BackupError, BackupManifest, BackupTarget, FilesystemBackupTarget, RestoreOutcome};
 pub use deletion_log::{
     DeletionLog, DeletionLogError, DeletionLogState, DeletionReceipt, DpapiTrustedReferenceStore, GenerationRef,
     ReconcileOutcome, TrustedReferenceStore,
