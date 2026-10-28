@@ -22,8 +22,13 @@
 //!
 //! The five rows, keyed by the state being resumed from:
 //!
-//! - `IntentRecorded`: advanced to `Failed`. The caller must retry with a new
-//!   `operation_id`.
+//! - `IntentRecorded`: if the row carries an intended `content_hash` (the
+//!   write path records it before the rename) and the record on disk matches
+//!   it, the rename completed and only the `ContentPersisted` advance was
+//!   lost: handed to the `ContentPersisted` row below, which rolls it
+//!   forward. Otherwise nothing new reached the record: any before-image is
+//!   deleted and the row advanced to `Failed`. The caller must retry with a
+//!   new `operation_id` (final whole-branch review, finding C1).
 //! - `ContentPersisted`: if the record on disk hashes to the row's
 //!   `content_hash`, roll forward to `JournalCommitted`. Otherwise restore this
 //!   operation's before-image, verify it, delete the before-image and advance
@@ -194,11 +199,12 @@ fn resolve(
     let mut at = origin;
     loop {
         at = match at {
-            // Row 1: the write never got past its intent.
-            WriteState::IntentRecorded => {
-                journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
-                return Ok(Outcome::Failed);
-            }
+            // Row 1: the write never got past its intent, unless its rename
+            // already landed (then it is row 2's roll-forward case).
+            WriteState::IntentRecorded => match fix_intent_recorded(root, journal, row)? {
+                WriteState::Failed => return Ok(Outcome::Failed),
+                next => next,
+            },
             // Row 2: roll forward on a verified hash, else roll back to Failed.
             WriteState::ContentPersisted => match fix_content_persisted(root, journal, row, injector)? {
                 WriteState::Failed => return Ok(Outcome::Failed),
@@ -242,6 +248,50 @@ fn resolve(
             }
         };
     }
+}
+
+/// Row 1. Returns `ContentPersisted` (the rename landed: hand over to row 2,
+/// which re-verifies the hash and rolls forward) or `Failed`.
+///
+/// The write path records the operation's intended `content_hash` on its
+/// `IntentRecorded` row BEFORE the rename (final whole-branch review, finding
+/// C1). So an `IntentRecorded` row is one of:
+///
+/// - no `content_hash`: the process stopped before the rename could start.
+///   Nothing new is on disk.
+/// - a `content_hash` the record on disk matches: the rename completed and
+///   only the `ContentPersisted` advance is missing. This is the spec's
+///   "Dopo il rename, prima di journal_committed" row with a valid hash, so
+///   it rolls forward exactly as row 2 does. The hash covers the version
+///   header too, so a match means these exact intended bytes, at the
+///   intended version, are on disk.
+/// - a `content_hash` the record does not match (or no record): the rename
+///   never happened, so the record still holds the prior version (or no note
+///   exists yet).
+///
+/// In the two "never happened" cases the record is not touched, any
+/// before-image this operation persisted is deleted (it is no longer needed
+/// and would otherwise be orphaned under a terminal row), and the row
+/// becomes `Failed`.
+fn fix_intent_recorded(root: &Path, journal: &Journal, row: &OperationRow) -> Result<WriteState, ReconcileError> {
+    let op = row.operation_id;
+    let note_id = parse_note_id(row)?;
+    if let Some(intended) = row.content_hash.as_deref() {
+        let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
+        let on_disk_hash = match std::fs::read(&record_path) {
+            Ok(bytes) => Some(content_hash(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(ReconcileError::Io(e)),
+        };
+        if on_disk_hash.as_deref() == Some(intended) {
+            return Ok(WriteState::ContentPersisted);
+        }
+    }
+    // Deleted BEFORE the terminal advance, as in row 2, so a crash in
+    // between cannot orphan it under a row that is never revisited.
+    delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+    journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
+    Ok(WriteState::Failed)
 }
 
 /// Row 2. Returns `JournalCommitted` (rolled forward) or `Failed` (rolled back).
@@ -501,6 +551,49 @@ mod tests {
         let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
         assert_eq!(report.failed, vec![op]);
+    }
+
+    #[test]
+    fn intent_recorded_with_intended_fields_but_no_rename_is_failed_and_its_before_image_cleaned_up() {
+        // C1 inverse: the write path recorded the intended hash and persisted
+        // a before-image, then stopped before the rename. The record still
+        // holds the prior version, so the operation never landed: Failed,
+        // record untouched, before-image removed rather than orphaned.
+        let (root, journal) = fresh_root_and_journal();
+        let id = NoteId::parse("note-a").unwrap();
+        let old = serialize_record_for_test("old", Version(1));
+        std::fs::write(root.join("note-a.record"), &old).unwrap();
+        let op = Uuid::new_v4();
+        let before_hash = persist_before_image(&root, &id, op, &old).unwrap();
+        journal.insert_intent(op, id.as_str(), 1).unwrap();
+        let intended = serialize_record_for_test("new", Version(2));
+        journal
+            .record_fields(op, WriteState::IntentRecorded, AdvanceFields::content_with_before_image(2, content_hash(&intended), before_hash))
+            .unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
+        assert_eq!(report.failed, vec![op]);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), old, "the prior version is left exactly as it was");
+        assert!(read_before_image(&root, &id, op).is_err(), "the unused before-image is deleted, not orphaned");
+    }
+
+    #[test]
+    fn intent_recorded_whose_intended_bytes_are_on_disk_rolls_forward_like_content_persisted() {
+        // C1 at the recovery level: the rename landed, the ContentPersisted
+        // advance did not.
+        let (root, journal) = fresh_root_and_journal();
+        let op = Uuid::new_v4();
+        let bytes = serialize_record_for_test("new", Version(1));
+        std::fs::write(root.join("note-a.record"), &bytes).unwrap();
+        journal.insert_intent(op, "note-a", 0).unwrap();
+        journal.record_fields(op, WriteState::IntentRecorded, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let row = journal.get(op).unwrap().unwrap();
+        assert_eq!(row.state, WriteState::JournalCommitted, "rolled forward (no git repo here, so it rests as git_pending)");
+        assert_eq!(row.previous_state, Some(WriteState::IntentRecorded));
+        assert_eq!(report.recovered, vec![op]);
+        assert_eq!(report.git_pending, vec![op]);
+        assert_eq!(journal.last_committed_for_note("note-a").unwrap().unwrap().operation_id, op);
     }
 
     #[test]

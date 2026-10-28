@@ -548,9 +548,14 @@ impl Vault {
     ///    attempt is terminal) and return `Conflict`.
     /// 3. If a record already exists, persist its current bytes as the
     ///    before-image for this `operation_id`.
-    /// 4. Write the new record via `atomic_write`, then advance the
-    ///    journal to `ContentPersisted`, attaching both the new content's
-    ///    hash and (if one exists) the before-image's hash on the SAME row.
+    /// 4. Record the intended `new_version`, new content hash and (if one
+    ///    exists) before-image hash on the still-`IntentRecorded` row
+    ///    (`Journal::record_fields`, no state change), then write the new
+    ///    record via `atomic_write`, then advance the journal to
+    ///    `ContentPersisted` with the same fields. Recording the hash before
+    ///    the rename is what lets recovery tell a rename that landed from
+    ///    one that never happened if the process stops in between (final
+    ///    whole-branch review, finding C1).
     /// 5. Re-read the just-written file and verify its hash. On mismatch,
     ///    attempt rollback to the before-image and verify THAT hash (on
     ///    success the before-image is deleted, the row advanced to `Failed`,
@@ -601,11 +606,12 @@ impl Vault {
     /// `FaultInjector::none()`. An armed injector stops the write right after
     /// the named step boundary and returns `StorageError::Interrupted(point)`
     /// (a `pause_at`-armed injector instead pauses and always resumes to
-    /// completion, never returning `Interrupted`). The five write-path
+    /// completion, never returning `Interrupted`). The six write-path
     /// points are checked, in order: `AfterPathCheckedBeforeAtomicWrite`
     /// (right after `record_path_checked`, Task 9's SEC-001 characterization
     /// seam), `AfterIntentRecorded` (after step 1),
-    /// `AfterRenameBeforeJournalCommitted` (after step 4's `ContentPersisted`
+    /// `AfterRenameBeforeContentPersisted` (right after step 4's rename, row
+    /// still `IntentRecorded`), `AfterRenameBeforeJournalCommitted` (after step 4's `ContentPersisted`
     /// advance), `AfterJournalCommittedBeforeGit` (after step 6) and
     /// `AfterGitCommittedBeforeIndex` (after step 7). The sixth,
     /// `DuringBeforeImageRestore`, lives in `recovery::reconcile`.
@@ -681,7 +687,6 @@ impl Vault {
         // ContentPersisted carrying both hashes on the same row.
         let new_version = Version(actual_version.0 + 1);
         let buffer = serialize_record(content, new_version);
-        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
         let new_hash = content_hash(&buffer);
         let fields = match &before_image_hash {
             Some(before_hash) => {
@@ -689,16 +694,28 @@ impl Vault {
             }
             None => AdvanceFields::content(new_version.0, new_hash.clone()),
         };
+        // Step 4a (final whole-branch review, finding C1): record the
+        // INTENDED version and hashes on the still-IntentRecorded row before
+        // the rename. If the process stops between the rename below and the
+        // ContentPersisted advance, recovery's row 1 can then check the
+        // record on disk against this hash: a match means the rename landed
+        // and the operation rolls forward; anything else means it never did.
+        // Without this, both cases looked identical and row 1 marked a
+        // completed rename Failed, stranding the note.
+        self.journal
+            .lock()
+            .unwrap()
+            .record_fields(operation_id, WriteState::IntentRecorded, fields.clone())
+            .map_err(journal_err)?;
+        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+        injector.check(FaultPoint::AfterRenameBeforeContentPersisted).map_err(interrupted)?;
         self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
-        // Checked AFTER the ContentPersisted advance, not between the rename
-        // and it (Task 7 fix round, finding I-1). The point now means "the
-        // rename happened AND the journal records it, with its hash", which is
-        // an orderly step boundary that recovery's row 2 can resolve. Before,
-        // it fired while the row was still IntentRecorded with the new bytes
-        // already on disk. Row 1 marked that row Failed without restoring the
-        // file, and the note then read as Inconsistent/NotFound for good. A
-        // real hardware crash between the rename and SQLite's write is
-        // inherent to any journal design and out of scope for this harness.
+        // Checked AFTER the ContentPersisted advance (Task 7 fix round,
+        // finding I-1): "the rename happened AND the journal records it".
+        // The earlier window, after the rename but before this advance, is
+        // `AfterRenameBeforeContentPersisted` above; it is recoverable
+        // because step 4a recorded the intended hash first (final
+        // whole-branch review, finding C1).
         injector.check(FaultPoint::AfterRenameBeforeJournalCommitted).map_err(interrupted)?;
 
         // Step 5: verify the bytes actually on disk hash to what was just
@@ -2035,6 +2052,57 @@ mod tests {
         assert_eq!(commits_for_operation(&root, op2), 0, "a rolled-back operation is never committed to git");
     }
 
+    // Matrix row 2 at its earliest point (final whole-branch review, finding
+    // C1): the rename landed but the row is still IntentRecorded, because the
+    // crash (or a journal I/O error) came before the ContentPersisted advance.
+    // Recovery must verify the intended hash recorded before the rename and
+    // roll forward, not mark the row Failed and strand the new bytes.
+
+    #[test]
+    fn crash_after_rename_before_content_persisted_rolls_forward_on_reopen_not_stranded() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeContentPersisted);
+            let result = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeContentPersisted))));
+            assert_eq!(vault.journal_row_for_test(op2).unwrap().state, WriteState::IntentRecorded, "the crash came before the ContentPersisted advance");
+            assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), serialize_record("v2", Version(2)), "but the rename already landed the new bytes");
+        }
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        let row2 = vault.journal_row_for_test(op2).unwrap();
+        assert_eq!(row2.state, WriteState::IndexCurrent, "rolled forward through the rest of the chain, not marked Failed");
+        assert_eq!(row2.previous_state, Some(WriteState::IntentRecorded));
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "v2".into(), version: Version(2) }, "readable at the new version, not Inconsistent");
+        assert_eq!(commits_for_operation(&root, op2), 1);
+        assert!(!before_image_path(&root, &id, op2).exists(), "deleted once git_committed is reached, not orphaned");
+        // The vault is not stuck: the next write builds on v2, with no false Conflict.
+        assert_eq!(vault.write_record_unchecked(&id, "v3", Version(2), Uuid::new_v4()).unwrap(), Version(3));
+    }
+
+    #[test]
+    fn crash_after_rename_before_content_persisted_on_a_first_write_rolls_forward_on_reopen() {
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeContentPersisted);
+            let result = vault.write_record_unchecked_with_injector(&id, "first", Version(0), op, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(_))));
+            assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IntentRecorded);
+        }
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent);
+        assert_eq!(vault.read_note(&id).unwrap(), VaultRecord { content: "first".into(), version: Version(1) });
+    }
+
     // Matrix row 3: "Nuova versione con hash non valido -> Ripristino della
     // before-image", detected by the writer's own step-5 verification.
 
@@ -2277,6 +2345,7 @@ mod tests {
         // exists, so no concurrent reader is possible there.)
         for point in [
             FaultPoint::AfterIntentRecorded,
+            FaultPoint::AfterRenameBeforeContentPersisted,
             FaultPoint::AfterRenameBeforeJournalCommitted,
             FaultPoint::AfterJournalCommittedBeforeGit,
             FaultPoint::AfterGitCommittedBeforeIndex,

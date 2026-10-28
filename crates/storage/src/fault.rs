@@ -28,6 +28,15 @@ pub enum FaultPoint {
     /// an attacker-controlled link. Never armed in production, which always
     /// passes `FaultInjector::none()`.
     AfterPathCheckedBeforeAtomicWrite,
+    /// `write_record_unchecked`: the new record was renamed into place, but
+    /// the row is still `IntentRecorded` (the `ContentPersisted` advance has
+    /// not run). This is the spec's "Dopo il rename, prima di
+    /// journal_committed" window at its earliest point. The row already
+    /// carries the operation's intended `new_version`/`content_hash` (and
+    /// `before_image_hash`), recorded before the rename, so recovery can tell
+    /// a completed rename from one that never happened (final whole-branch
+    /// review, finding C1).
+    AfterRenameBeforeContentPersisted,
     /// `write_record_unchecked`: the record was renamed into place and the row
     /// advanced to `ContentPersisted` with its hash, before verification and
     /// before `JournalCommitted`.

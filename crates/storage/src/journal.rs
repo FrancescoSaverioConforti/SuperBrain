@@ -177,6 +177,50 @@ impl Journal {
                 current.state, to
             )));
         }
+        self.update_row(operation_id, current.state, to, fields)
+            .map_err(|e| match e {
+                JournalError::InvalidState(_) => JournalError::InvalidState(format!(
+                    "operation {operation_id} changed state concurrently; advance to {to:?} not applied"
+                )),
+                other => other,
+            })
+    }
+
+    /// Records `fields` on a row that is at `at`, WITHOUT changing its state.
+    ///
+    /// Used by the write path to persist an operation's intended
+    /// `new_version`, `content_hash` and `before_image_hash` on its
+    /// still-`IntentRecorded` row BEFORE the rename that lands the new bytes
+    /// (final whole-branch review, finding C1). A crash between that rename
+    /// and the `ContentPersisted` advance then leaves a row recovery can
+    /// verify against the record on disk, instead of one indistinguishable
+    /// from "nothing was ever written". No transition happens, so
+    /// `valid_transition` is not consulted; the `state = at` guard still
+    /// refuses the write if the row has moved on.
+    pub(crate) fn record_fields(
+        &self,
+        operation_id: Uuid,
+        at: WriteState,
+        fields: AdvanceFields,
+    ) -> Result<(), JournalError> {
+        self.update_row(operation_id, at, at, fields).map_err(|e| match e {
+            JournalError::InvalidState(_) => JournalError::InvalidState(format!(
+                "operation {operation_id} is not at {at:?}; fields not recorded"
+            )),
+            other => other,
+        })
+    }
+
+    /// The single UPDATE behind `advance` and `record_fields`: sets the state
+    /// to `to` and every `Some` field in `fields`, only if the row is still at
+    /// `from`. Returns `InvalidState` if no row matched.
+    fn update_row(
+        &self,
+        operation_id: Uuid,
+        from: WriteState,
+        to: WriteState,
+        fields: AdvanceFields,
+    ) -> Result<(), JournalError> {
         // The `state = ?8` guard makes the update a no-op if another writer moved the row first.
         let updated = self.conn.execute(
             &format!(
@@ -199,13 +243,13 @@ impl Journal {
                 fields.before_image_hash,
                 fields.before_image_path,
                 fields.git_commit_oid,
-                state_to_sql(current.state),
+                state_to_sql(from),
                 fields.previous_state.map(state_to_sql),
             ],
         )?;
         if updated != 1 {
             return Err(JournalError::InvalidState(format!(
-                "operation {operation_id} changed state concurrently; advance to {to:?} not applied"
+                "operation {operation_id} is not at {from:?}"
             )));
         }
         Ok(())
@@ -383,6 +427,20 @@ mod tests {
         let row = journal.get(op).unwrap().unwrap();
         assert_eq!(row.state, WriteState::IndexCurrent);
         assert_eq!(row.new_version, Some(1));
+    }
+
+    #[test]
+    fn record_fields_sets_fields_without_changing_state_and_only_at_the_named_state() {
+        let journal = Journal::open_in_memory().unwrap();
+        let op = Uuid::new_v4();
+        journal.insert_intent(op, "note-a", 0).unwrap();
+        journal.record_fields(op, WriteState::IntentRecorded, AdvanceFields::content_with_before_image(1, "h", "b")).unwrap();
+        let row = journal.get(op).unwrap().unwrap();
+        assert_eq!(row.state, WriteState::IntentRecorded, "no transition");
+        assert_eq!((row.new_version, row.content_hash.as_deref(), row.before_image_hash.as_deref()), (Some(1), Some("h"), Some("b")));
+        let err = journal.record_fields(op, WriteState::ContentPersisted, AdvanceFields::content(9, "x")).unwrap_err();
+        assert!(matches!(err, JournalError::InvalidState(_)), "a row not at the named state is refused");
+        assert_eq!(journal.get(op).unwrap().unwrap().new_version, Some(1), "and left unchanged");
     }
 
     #[test]
