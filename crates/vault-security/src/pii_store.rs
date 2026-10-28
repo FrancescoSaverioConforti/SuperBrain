@@ -406,7 +406,19 @@ impl PiiStore {
         let staged = self.staging_path(note_id, operation_id);
         let live = self.live_path(note_id);
 
-        if let Ok(prior_bytes) = std::fs::read(&live) {
+        // A3 review round 2, item #3: a missing live file (NotFound) is the
+        // only case that legitimately means "nothing to preserve" (a first
+        // write). Any OTHER I/O error (permission denied, a sharing
+        // violation, ...) must fail closed and propagate, never be treated
+        // as if the file were absent — silently proceeding to overwrite the
+        // live path in that case could destroy a live file this call could
+        // not even read, with no before-image ever taken of it.
+        let prior_bytes = match std::fs::read(&live) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(PiiStoreError::Io(e)),
+        };
+        if let Some(prior_bytes) = prior_bytes {
             let before_image_dir = self.root.join(BEFORE_IMAGE_DIR);
             std::fs::create_dir_all(&before_image_dir)?;
             let before_image_path = self.before_image_path(note_id, operation_id);
@@ -744,6 +756,38 @@ mod tests {
         let restored = store.restore_before_image("note-a", op2, &before_hash).unwrap();
         assert!(restored);
         assert_eq!(store.get("note-a").unwrap(), b"v1 plaintext", "restoring op2's before-image rolls the live file back to v1");
+    }
+
+    #[test]
+    fn commit_staged_fails_closed_on_a_non_notfound_io_error_reading_the_live_file_instead_of_silently_overwriting() {
+        // A3 review round 2, item #3: `commit_staged` must propagate any
+        // I/O error OTHER than NotFound when reading the current live file
+        // — never silently treat it as "nothing to preserve" (a first
+        // write) and proceed to overwrite. Simulated here by making the
+        // live path a DIRECTORY instead of a file: `std::fs::read` on a
+        // directory fails with `PermissionDenied` on this platform, not
+        // `NotFound`, so a pre-fix `if let Ok(..) = std::fs::read(...)`
+        // would silently skip the before-image and still attempt the
+        // rename — which itself would then fail for an unrelated reason
+        // (renaming onto an existing directory), masking the real bug.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let note_id = "note-live-is-a-directory";
+        // Make the live .pii path a directory before any write ever
+        // touches it, so there is no legitimate prior ciphertext at all —
+        // only an unreadable obstruction.
+        std::fs::create_dir_all(store.live_path(note_id)).unwrap();
+
+        let op = Uuid::new_v4();
+        store.stage(note_id, b"some plaintext", op).unwrap();
+        let result = store.commit_staged(note_id, op);
+        assert!(
+            matches!(result, Err(PiiStoreError::Io(_))),
+            "a non-NotFound I/O error reading the live path must propagate as PiiStoreError::Io, not be silently swallowed, got {result:?}"
+        );
+        // No before-image must have been fabricated from a read that never
+        // actually succeeded.
+        assert!(!store.has_before_image(note_id, op), "no before-image must exist when the live-file read never succeeded");
     }
 
     #[test]

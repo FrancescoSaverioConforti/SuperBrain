@@ -233,7 +233,7 @@ fn resolve(
                 next => next,
             },
             // Row 3: idempotent git commit, or rest as git_pending.
-            WriteState::JournalCommitted => match fix_journal_committed(root, journal, repo_path, row)? {
+            WriteState::JournalCommitted => match fix_journal_committed(root, journal, repo_path, pii_store, row)? {
                 GitStep::Committed => WriteState::GitCommitted,
                 GitStep::Pending(reason) => {
                     // Only a row resumed directly from JournalCommitted is still
@@ -324,6 +324,41 @@ fn fix_intent_recorded(
             // pairing.
             if pii_is_consistent(pii_store, &note_id, op, row) {
                 return Ok(WriteState::ContentPersisted);
+            }
+            // A3 review round 2, item #4: the pointer that just landed is
+            // the NEW version (whose PII pairing is inconsistent), so it
+            // must be rolled BACK to the PRIOR version — restored from the
+            // Markdown before-image, exactly as `fix_content_persisted`
+            // restores its own before-image on a mismatch — never just
+            // deleted out from under a pointer that is left stuck at the
+            // bad new version. Only reachable via `.pii` corruption or
+            // tampering upstream (never a live-traffic path, since
+            // `AfterPiiCommittedBeforePointerRename`'s own invariant
+            // guarantees consistency when nothing else interferes), but a
+            // row still needs a safe, non-`Inconsistent` resolution here.
+            if let Some(before_hash) = row.before_image_hash.as_deref() {
+                let before_bytes = read_before_image(root, &note_id, op)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot read before-image: {e}")))?;
+                if content_hash(&before_bytes) != before_hash {
+                    return Err(inconsistent(op, "before-image restore failed: before-image does not match its recorded hash"));
+                }
+                atomic_write(&record_path, &before_bytes)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: write failed: {e}")))?;
+                let restored = std::fs::read(&record_path)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot re-read record: {e}")))?;
+                if content_hash(&restored) != before_hash {
+                    return Err(inconsistent(op, "before-image restore failed: restored record does not verify"));
+                }
+            } else if journal.last_committed_for_note(note_id.as_str())?.is_none() {
+                // No before-image means this was a first write with no
+                // prior pointer; nothing to restore to, so the record (if
+                // any landed) is removed, mirroring `fix_content_persisted`'s
+                // own first-write rollback.
+                match std::fs::remove_file(&record_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(ReconcileError::Io(e)),
+                }
             }
             roll_back_pii(journal, pii_store, &note_id, op, row)?;
             delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
@@ -454,6 +489,23 @@ fn roll_back_pii(
     };
     let live_is_ours = matches!(store.get(note_id.as_str()), Ok(live_plaintext) if content_hash(&live_plaintext) == expected);
     if !live_is_ours {
+        // A3 review round 2, NEW finding #1 ("not ours" branch): the live
+        // file belongs to a different, already-resolved operation (an
+        // earlier one this row never got to overwrite, or a LATER
+        // legitimate operation that has since overwritten it again), so
+        // the live file itself is correctly left untouched. But if THIS
+        // failing operation's OWN `commit_staged` call ran before it was
+        // superseded, it left its OWN before-image on disk
+        // (`<note_id>-{op}.pii`, keyed by this op's own operation_id) —
+        // an orphan now that this row is being failed, never reachable
+        // through the live file again. Delete it unconditionally; it is
+        // never legitimate content for ANY other operation (a
+        // before-image is created only under the operation_id of the
+        // write that is about to overwrite the live file, so no other
+        // row's recovery could ever need THIS op's before-image).
+        store
+            .delete_before_image(note_id.as_str(), op)
+            .map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
         return Ok(());
     }
     if !store.has_before_image(note_id.as_str(), op) {
@@ -680,6 +732,7 @@ fn fix_journal_committed(
     root: &Path,
     journal: &Journal,
     repo_path: &Path,
+    pii_store: Option<&PiiStore>,
     row: &OperationRow,
 ) -> Result<GitStep, ReconcileError> {
     let op = row.operation_id;
@@ -714,6 +767,20 @@ fn fix_journal_committed(
     journal.advance(op, WriteState::GitCommitted, AdvanceFields::git_oid(oid))?;
     // Per spec, the before-image is deleted only once GitCommitted is reached.
     delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+    // A3 review round 2, NEW finding #1: the PII before-image must be
+    // deleted on the EXACT SAME schedule as the Markdown one — once
+    // GitCommitted is reached — never left behind. This is the only place
+    // in `recovery.rs` a row resumed directly from `JournalCommitted` (a
+    // crash after the linearization point but before the git commit)
+    // reaches its point of no return; the live-write path's equivalent
+    // moment is `Vault::commit_to_git`, which already does this. Before
+    // this fix, a tombstone/deletion write's PII before-image (the REAL,
+    // now-deleted content) could survive a successful roll-forward
+    // recovery indefinitely, still decryptable by the live master key —
+    // directly undermining spec contract C5.
+    if let Some(store) = pii_store {
+        store.delete_before_image(note_id.as_str(), op).map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
+    }
     Ok(GitStep::Committed)
 }
 
@@ -1636,5 +1703,66 @@ mod tests {
         // The ordinary stale-version case is still Conflict.
         let err = vault.write_record_unchecked(&id, "stale", Version(1), Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StorageError::Conflict { expected: Version(1), actual: Version(2), .. }), "got {err:?}");
+    }
+
+    // --- A3 review round 2, item #4: fix_intent_recorded restores the
+    // Markdown pointer from its before-image on a PII-inconsistent rollback ---
+
+    #[test]
+    fn fix_intent_recorded_restores_the_markdown_pointer_from_its_before_image_on_a_pii_inconsistent_rollback() {
+        // Simulates the defensive, upstream-invariant-violation window
+        // `fix_intent_recorded`'s pointer-landed branch guards: the v2
+        // pointer rename landed and its content_hash matches, but
+        // pii_content_hash names ciphertext that does not exist anywhere
+        // (neither live nor staged) — never reachable via live traffic
+        // (AfterPiiCommittedBeforePointerRename's own invariant prevents
+        // it), but recovery must still resolve the row safely rather than
+        // leaving the pointer stuck at the bad v2 version. Before the fix,
+        // this branch called delete_before_image without ever restoring
+        // the pointer from it, leaving the Markdown record directly at v2
+        // although the row resolves to Failed.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let pii_root = unique_test_dir();
+        let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+
+        // v1 fully committed: a real pointer record plus real PiiStore ciphertext.
+        let op1 = Uuid::new_v4();
+        let v1_plaintext = b"v1 secret";
+        let v1_pointer = serialize_record_for_test("pii://note-a", Version(1));
+        pii_store.stage("note-a", v1_plaintext, op1).unwrap();
+        pii_store.commit_staged("note-a", op1).unwrap();
+        std::fs::write(root.join("note-a.record"), &v1_pointer).unwrap();
+        let journal = Journal::open(&journal_path).unwrap();
+        journal.insert_intent(op1, id.as_str(), 0).unwrap();
+        let v1_fields = AdvanceFields::content(1, content_hash(&v1_pointer)).merge_pii_content_hash(content_hash(v1_plaintext));
+        journal.advance(op1, WriteState::ContentPersisted, v1_fields).unwrap();
+        journal.advance(op1, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op1, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op1, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
+
+        // v2's pointer rename landed (bytes on disk match its intended
+        // content_hash), its Markdown before-image (v1's pointer) was
+        // persisted under op2, but its pii_content_hash names ciphertext
+        // that was never staged or committed anywhere.
+        let op2 = Uuid::new_v4();
+        let v2_pointer = serialize_record_for_test("pii://note-a", Version(2));
+        let before_hash = persist_before_image(&root, &id, op2, &v1_pointer).unwrap();
+        std::fs::write(root.join("note-a.record"), &v2_pointer).unwrap();
+        journal.insert_intent(op2, id.as_str(), 1).unwrap();
+        let v2_fields = AdvanceFields::content_with_before_image(2, content_hash(&v2_pointer), before_hash)
+            .merge_pii_content_hash(content_hash(b"never actually staged or committed"));
+        journal.record_fields(op2, WriteState::IntentRecorded, v2_fields).unwrap();
+
+        let report = reconcile(&root, &journal, &root, &NullIndexer, Some(&pii_store), &FaultInjector::none()).unwrap();
+        assert_eq!(report.failed, vec![op2]);
+        assert_eq!(journal.get(op2).unwrap().unwrap().state, WriteState::Failed);
+
+        // THE ASSERTION THAT MATTERS: the Markdown pointer must have been
+        // restored to v1's, not left stuck at v2's bad pointer.
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), v1_pointer, "the pointer must be restored to v1's, not left at v2's inconsistent pointer");
+        assert!(read_before_image(&root, &id, op2).is_err(), "the consumed before-image must be deleted, not orphaned");
+        assert_eq!(pii_store.get("note-a").unwrap(), v1_plaintext, "v1's ciphertext, never touched by this rollback, must remain readable");
     }
 }
