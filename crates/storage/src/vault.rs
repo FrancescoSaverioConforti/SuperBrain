@@ -6,6 +6,8 @@ use domain::{IndexState, WriteState};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use vault_security::PiiStore;
+
 use crate::atomic::{atomic_write, AtomicWriteError};
 use crate::fault::{FaultInjector, FaultPoint};
 use crate::git::{commit_operation, commit_operation_contents, find_commit_for_operation, GitError, ScanDepth};
@@ -175,6 +177,15 @@ pub enum StorageError {
     /// retries with a new `operation_id`.
     #[error("note {note_id} has an unresolved earlier operation {operation_id}; nothing was applied, reopen the vault to recover it")]
     UnresolvedOperation { note_id: String, operation_id: Uuid },
+    /// A failure inside `PiiStore` itself (Task 6), folded the same way
+    /// `JournalError` is: `vault-security`'s `PiiStoreError` cannot be
+    /// stored directly in this `pub` enum's field for the same
+    /// crate-boundary-visibility reason `StorageError::Journal` documents,
+    /// so its rendered message is captured instead. No variant of
+    /// `PiiStoreError` ever carries plaintext or key material (see its own
+    /// doc comment), so this capture cannot leak either.
+    #[error("PII store error: {0}")]
+    PiiStore(String),
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -182,6 +193,12 @@ pub enum StorageError {
 /// stored in a `pub` enum's field (see `StorageError::Journal`'s doc comment).
 fn journal_err(e: crate::journal::JournalError) -> StorageError {
     StorageError::Journal(e.to_string())
+}
+
+/// Folds a `vault_security::PiiStoreError` into `StorageError::PiiStore` by
+/// capturing its rendered message (see that variant's doc comment).
+fn pii_store_err(e: vault_security::PiiStoreError) -> StorageError {
+    StorageError::PiiStore(e.to_string())
 }
 
 /// Folds a crate-private `git::GitError` from the git step of the write chain
@@ -381,7 +398,7 @@ impl Vault {
     /// unresolved. Rows left at `JournalCommitted` because git is unavailable
     /// (`git_pending`) are an allowed resting state and do not block opening.
     pub(crate) fn open(root: PathBuf, journal_path: &Path, indexer: Box<dyn Indexer>) -> Result<Self, StorageError> {
-        Self::open_reconciled(root, journal_path, indexer, &FaultInjector::none())
+        Self::open_reconciled(root, journal_path, indexer, None, &FaultInjector::none())
     }
 
     /// Opens a vault rooted at `root` with the A2 default indexer
@@ -389,8 +406,26 @@ impl Vault {
     /// A1's `Vault::new`: every caller supplies a journal path, since A1 had
     /// no production caller to break. Runs the same startup reconciliation
     /// as `Vault::open` and fails closed the same way.
+    ///
+    /// No `PiiStore` is available to this constructor's recovery pass, so a
+    /// non-terminal row left by a `Sensitive`-note write (one with a
+    /// non-null `pii_content_hash`) cannot be verified against its staged
+    /// ciphertext here; see [`Vault::open_with_pii_store`] for a vault whose
+    /// recovery pass CAN resolve those rows. A caller that never writes
+    /// `Sensitive` notes (or that always pairs this constructor with its own
+    /// separate reconciliation of the PII store) is unaffected.
     pub fn open_with_default_indexer(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
         Self::open(root, journal_path, Box::new(NullIndexer))
+    }
+
+    /// [`Vault::open_with_default_indexer`], but also threads `pii_store`
+    /// into the startup reconciliation pass (Task 6), so a non-terminal row
+    /// left by an interrupted `Sensitive`-note write can be verified against
+    /// its staged-or-committed ciphertext and rolled forward or back
+    /// accordingly. This is the constructor a production caller that writes
+    /// `Sensitive` notes must use.
+    pub fn open_with_pii_store(root: PathBuf, journal_path: &Path, pii_store: &PiiStore) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, Box::new(NullIndexer), Some(pii_store), &FaultInjector::none())
     }
 
     /// Test-only sibling of [`Vault::open_with_default_indexer`] (also uses
@@ -401,20 +436,34 @@ impl Vault {
     /// comes back as `StorageError::Interrupted`, never as a usable `Vault`.
     #[cfg(test)]
     pub(crate) fn open_with_injector(root: PathBuf, journal_path: &Path, injector: &FaultInjector) -> Result<Self, StorageError> {
-        Self::open_reconciled(root, journal_path, Box::new(NullIndexer), injector)
+        Self::open_reconciled(root, journal_path, Box::new(NullIndexer), None, injector)
+    }
+
+    /// Test-only sibling that threads BOTH a `PiiStore` and an `injector`
+    /// into the recovery pass, for crash-recovery tests over the sensitive
+    /// write path.
+    #[cfg(test)]
+    pub(crate) fn open_with_pii_store_and_injector(
+        root: PathBuf,
+        journal_path: &Path,
+        pii_store: &PiiStore,
+        injector: &FaultInjector,
+    ) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, Box::new(NullIndexer), Some(pii_store), injector)
     }
 
     fn open_reconciled(
         root: PathBuf,
         journal_path: &Path,
         indexer: Box<dyn Indexer>,
+        pii_store: Option<&PiiStore>,
         injector: &FaultInjector,
     ) -> Result<Self, StorageError> {
         let journal = Journal::open(journal_path).map_err(journal_err)?;
         // No Vault lock is taken here: this runs before the Vault exists, so
         // nothing else can be writing or committing through it. See
         // `recovery`'s module docs, "Concurrency".
-        match reconcile(&root, &journal, &root, indexer.as_ref(), injector) {
+        match reconcile(&root, &journal, &root, indexer.as_ref(), pii_store, injector) {
             Ok(_report) => {}
             Err(ReconcileError::Inconsistent { operation_id, reason: _ }) => {
                 let note_id = journal
@@ -829,6 +878,235 @@ impl Vault {
         // Step 8: the per-note lock is released when `_guard` drops at the
         // end of this scope.
         // Step 9:
+        Ok(new_version)
+    }
+
+    /// The `Sensitive`-note sibling of [`Vault::write_record_unchecked`]
+    /// (Task 6). Production callers (`propose::propose_and_commit`) reach
+    /// this instead of `write_record_unchecked` when, and only when, the
+    /// note being written is `Sensitive`-classified; every other
+    /// classification is completely unaffected — this method shares the
+    /// SAME journal, the SAME `WriteState` machine and the SAME per-note
+    /// lock as `write_record_unchecked`, but is a separate method rather
+    /// than a parameter on it so that none of `write_record_unchecked`'s
+    /// ~90 existing call sites (across this crate's own test suite) need to
+    /// change.
+    ///
+    /// This is deliberately ONE crash-recoverable operation, not two
+    /// independently-recovered stores: `pointer_content` (what actually
+    /// lands in the Markdown record — the frontmatter plus a `pii://<id>`
+    /// pointer body) and `plaintext` (the real sensitive content, staged
+    /// into `pii_store`) are both driven through this one `operation_id`'s
+    /// journal row. The row's `content_hash` describes the POINTER bytes
+    /// (exactly as it always has for `write_record_unchecked`); the new,
+    /// additive `pii_content_hash` column describes the PLAINTEXT staged
+    /// into `PiiStore`. `recovery::reconcile` treats a row with a non-null
+    /// `pii_content_hash` as needing its staged-or-committed ciphertext
+    /// verified before rolling forward — see that module's docs.
+    ///
+    /// Sequence (steps 0-3 identical to `write_record_unchecked_with_injector`;
+    /// divergence starts at step 4):
+    ///
+    /// 0-3. Same retry/idempotency check, per-note lock acquisition, stalled-
+    ///    operation guard, version check and before-image persistence as
+    ///    `write_record_unchecked_with_injector`.
+    /// 4. `PiiStore::stage(note_id, plaintext, operation_id)` — durably
+    ///    fsyncs the ciphertext to the staging location, NOT yet the live
+    ///    `.pii` file. Its returned `content_hash` (of the PLAINTEXT) is
+    ///    recorded on the still-`IntentRecorded` row as `pii_content_hash`,
+    ///    alongside the pointer's own intended `content_hash`, before
+    ///    `FaultPoint::AfterPiiStagedBeforeCommit` is checked — mirroring
+    ///    exactly how the ordinary path records its intended hash before
+    ///    the rename (final whole-branch review, finding C1).
+    /// 5. `PiiStore::commit_staged` — renames the staged ciphertext onto the
+    ///    live `.pii` path. `FaultPoint::AfterPiiCommittedBeforePointerRename`
+    ///    is checked immediately after.
+    /// 6. The Markdown pointer is written via `atomic_write` and the journal
+    ///    advanced to `ContentPersisted`, exactly as step 4 of the ordinary
+    ///    path does for ordinary content — `FaultPoint::AfterRenameBeforeContentPersisted`
+    ///    is checked at the same point in the sequence.
+    /// 7 onward: identical to `write_record_unchecked_with_injector`'s steps
+    ///    5-9 (verify, `JournalCommitted`, git, index).
+    pub(crate) fn write_sensitive_record_unchecked(
+        &self,
+        note_id: &NoteId,
+        pointer_content: &str,
+        plaintext: &[u8],
+        expected_version: Version,
+        operation_id: Uuid,
+        pii_store: &PiiStore,
+    ) -> Result<Version, StorageError> {
+        self.write_sensitive_record_unchecked_with_injector(
+            note_id,
+            pointer_content,
+            plaintext,
+            expected_version,
+            operation_id,
+            pii_store,
+            &FaultInjector::none(),
+        )
+    }
+
+    /// [`Vault::write_sensitive_record_unchecked`] with an explicit
+    /// `injector`. See that method's doc comment for the full sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_sensitive_record_unchecked_with_injector(
+        &self,
+        note_id: &NoteId,
+        pointer_content: &str,
+        plaintext: &[u8],
+        expected_version: Version,
+        operation_id: Uuid,
+        pii_store: &PiiStore,
+        injector: &FaultInjector,
+    ) -> Result<Version, StorageError> {
+        let interrupted = |crate::fault::Interrupted::At(point)| StorageError::Interrupted(point);
+
+        // Step 0: identical retry/idempotency handling.
+        let existing = self.journal.lock().unwrap().get(operation_id).map_err(journal_err)?;
+        if let Some(row) = existing {
+            ensure_retry_matches(&row, note_id, pointer_content, expected_version)?;
+            return self.resume_existing_operation(row);
+        }
+
+        let record_path = self.record_path_checked(note_id)?;
+        injector.check(FaultPoint::AfterPathCheckedBeforeAtomicWrite).map_err(interrupted)?;
+
+        // Step 1: intent_recorded.
+        self.journal.lock().unwrap().insert_intent(operation_id, note_id.as_str(), expected_version.0).map_err(journal_err)?;
+        injector.check(FaultPoint::AfterIntentRecorded).map_err(interrupted)?;
+
+        // Step 2: per-note lock, held for the rest of this critical section.
+        let note_lock = self.note_lock(note_id);
+        let _guard = note_lock.lock().unwrap();
+
+        let unresolved = self
+            .journal
+            .lock()
+            .unwrap()
+            .unresolved_operation_on_note(note_id.as_str(), operation_id)
+            .map_err(journal_err)?;
+        if let Some(blocking) = unresolved {
+            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+            return Err(StorageError::UnresolvedOperation {
+                note_id: note_id.as_str().to_string(),
+                operation_id: blocking.operation_id,
+            });
+        }
+
+        let current_bytes = match std::fs::read(&record_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let actual_version = match &current_bytes {
+            Some(bytes) => parse_record(bytes, note_id)?.version,
+            None => Version(0),
+        };
+
+        if actual_version != expected_version {
+            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+            return Err(StorageError::Conflict {
+                note_id: note_id.as_str().to_string(),
+                expected: expected_version,
+                actual: actual_version,
+            });
+        }
+
+        // Step 3: before-image of the POINTER record (never the plaintext —
+        // the before-image mechanism guards the Markdown vault's own
+        // optimistic-concurrency rollback; it is never asked to carry
+        // sensitive content). A sensitive note being overwritten always had
+        // a pointer-only before-image in the first place, since no path
+        // ever writes plaintext into the Markdown record.
+        let before_image_hash = match &current_bytes {
+            Some(bytes) => Some(persist_before_image(&self.root, note_id, operation_id, bytes)?),
+            None => None,
+        };
+
+        // Step 4 (Task 6, the new step): stage the ciphertext durably BEFORE
+        // the pointer rename. The staged file's content_hash is the
+        // PLAINTEXT's hash; recorded on the row as `pii_content_hash`
+        // alongside the pointer's own intended `content_hash`, both on the
+        // still-IntentRecorded row, before either effect is checked against
+        // its fault point.
+        let staged = pii_store.stage(note_id.as_str(), plaintext, operation_id).map_err(pii_store_err)?;
+
+        let new_version = Version(actual_version.0 + 1);
+        let buffer = serialize_record(pointer_content, new_version);
+        let new_hash = content_hash(&buffer);
+        let mut fields = match &before_image_hash {
+            Some(before_hash) => {
+                AdvanceFields::content_with_before_image(new_version.0, new_hash.clone(), before_hash.clone())
+            }
+            None => AdvanceFields::content(new_version.0, new_hash.clone()),
+        };
+        fields = AdvanceFields::merge_pii_content_hash(fields, staged.content_hash);
+
+        self.journal
+            .lock()
+            .unwrap()
+            .record_fields(operation_id, WriteState::IntentRecorded, fields.clone())
+            .map_err(journal_err)?;
+        injector.check(FaultPoint::AfterPiiStagedBeforeCommit).map_err(interrupted)?;
+
+        // Step 5: commit the staged ciphertext onto the live `.pii` path.
+        pii_store.commit_staged(note_id.as_str(), operation_id).map_err(pii_store_err)?;
+        injector.check(FaultPoint::AfterPiiCommittedBeforePointerRename).map_err(interrupted)?;
+
+        // Step 6: the Markdown pointer rename, exactly as ordinary content's
+        // rename works.
+        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+        injector.check(FaultPoint::AfterRenameBeforeContentPersisted).map_err(interrupted)?;
+        self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
+        injector.check(FaultPoint::AfterRenameBeforeJournalCommitted).map_err(interrupted)?;
+
+        // Step 7: verify the pointer bytes actually on disk, exactly as the
+        // ordinary path does. A mismatch here rolls back the POINTER only
+        // (restoring its before-image); the committed `.pii` file is left
+        // as is — a `.pii` file with no live pointer is exactly what
+        // `find_orphans` exists to detect, and `recovery::reconcile`'s new
+        // branch (see its module docs) is what actually resolves this
+        // specific window during crash recovery rather than at live-write
+        // time, since a live-write verification failure immediately after
+        // writing the bytes is not the crash scenario this task targets.
+        let written_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        if content_hash(&written_bytes) != new_hash {
+            if let Some(before_hash) = &before_image_hash {
+                if let Ok(before_bytes) = read_before_image(&self.root, note_id, operation_id) {
+                    if content_hash(&before_bytes) == *before_hash
+                        && atomic_write(&record_path, &before_bytes).is_ok()
+                    {
+                        let rolled_back = std::fs::read(&record_path).map_err(StorageError::Io)?;
+                        if content_hash(&rolled_back) == *before_hash {
+                            delete_before_image(&self.root, note_id, operation_id)?;
+                            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+                            return Err(StorageError::Inconsistent {
+                                note_id: note_id.as_str().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            return Err(StorageError::Inconsistent {
+                note_id: note_id.as_str().to_string(),
+            });
+        }
+
+        // Step 8: the linearization point.
+        self.journal.lock().unwrap().advance(operation_id, WriteState::JournalCommitted, AdvanceFields::none()).map_err(journal_err)?;
+        injector.check(FaultPoint::AfterJournalCommittedBeforeGit).map_err(interrupted)?;
+
+        // Step 9: JournalCommitted -> GitCommitted, committing the pointer
+        // record (never the plaintext — this is the whole point of the
+        // pointer scheme: git history, which this project cannot selectively
+        // purge, never sees sensitive content).
+        self.commit_to_git(note_id, &record_path, operation_id, new_version, ScanDepth::Bounded(500), None)?;
+        injector.check(FaultPoint::AfterGitCommittedBeforeIndex).map_err(interrupted)?;
+
+        // Step 10: the index step.
+        self.mark_index_current(note_id, operation_id, new_version)?;
+
         Ok(new_version)
     }
 
@@ -3427,4 +3705,312 @@ mod tests {
     // anything. If any of those four tests is renamed, moved, or changes
     // behavior, update this comment in the same change, together with the
     // Continuity record for the status.
+
+    // --- Task 6: the single, crash-recoverable sensitive-write pipeline ---
+    //
+    // These tests exercise `write_sensitive_record_unchecked`/
+    // `_with_injector` directly (crate-private, so they must live here
+    // rather than in an external `tests/*.rs` file — see
+    // `a3_pii_integration.rs`'s module doc comment for the split). The
+    // public-surface happy-path and orphan-detection tests
+    // (`a_sensitive_note_is_written_to_the_pii_store_...`, etc.) live in
+    // `crates/storage/tests/a3_pii_integration.rs` instead, driven through
+    // `propose_and_commit` alone.
+    mod a3_sensitive_write_pipeline {
+        use super::*;
+        use vault_security::PiiStore;
+
+        fn unique_dir() -> PathBuf {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "superbrain-a3-sensitive-pipeline-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn open_pii_store(vault_root: &Path) -> PiiStore {
+            let pii_root = vault_root.join(".pii-store");
+            PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap()
+        }
+
+        fn pointer_content_for(note_id: &str) -> String {
+            format!(
+                "id: {note_id}\nschema_version: 1\nclassification: sensitive\n---\npii://{note_id}"
+            )
+        }
+
+        #[test]
+        fn crash_after_pii_staged_before_pointer_committed_recovers_without_a_readable_half_written_pointer() {
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-crash").unwrap();
+            let op = Uuid::new_v4();
+            let pointer_content = pointer_content_for("note-crash");
+
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterPiiStagedBeforeCommit);
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id,
+                    &pointer_content,
+                    b"secret content v1",
+                    Version(0),
+                    op,
+                    &pii_store,
+                    &injector,
+                );
+                assert!(
+                    matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterPiiStagedBeforeCommit))),
+                    "got {result:?}"
+                );
+
+                // (a) Before recovery runs, the note must never read as a
+                // pointer to ciphertext that doesn't exist yet: this is a
+                // first write, so the only correct observable state is
+                // NotFound.
+                let before_recovery = vault.read_note(&id);
+                assert!(
+                    matches!(before_recovery, Err(StorageError::NotFound { .. })),
+                    "a note that never existed before must read NotFound, not a dangling pointer, got {before_recovery:?}"
+                );
+            }
+
+            // (b) After Vault::open (reconcile) runs, the operation resolves
+            // deterministically — either rolled forward (pointer now
+            // committed, PiiStore::get works) or rolled back (Failed, no
+            // orphaned staged ciphertext left behind) — never left
+            // ambiguous.
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            let after = reopened.read_note(&id);
+            match after {
+                Ok(record) => {
+                    assert!(record.content.contains("pii://note-crash"));
+                    let plaintext = pii_store.get("note-crash").expect("rolled forward: ciphertext must be readable");
+                    assert_eq!(plaintext, b"secret content v1");
+                }
+                Err(StorageError::NotFound { .. }) => {
+                    assert!(!pii_store.has_live("note-crash"), "rolled back: no live ciphertext must survive");
+                    assert!(
+                        pii_store.get_staged("note-crash", op).is_err(),
+                        "rolled back: no orphaned staged ciphertext must survive either"
+                    );
+                }
+                other => panic!("must resolve deterministically to either a readable pointer or NotFound, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn crash_mid_update_of_an_already_sensitive_note_never_exposes_a_pointer_whose_ciphertext_is_the_wrong_version() {
+            // The single most important test in this task (Review Focus item
+            // 2, update path): write v1 fully, start an update to v2 with an
+            // injector at AfterPiiStagedBeforeCommit, and verify that at
+            // every observable point — mid-crash and after recovery
+            // completes — read_note plus PiiStore::get together are
+            // self-consistent: either the full v1 pair (pointer + v1
+            // ciphertext) or the full v2 pair, NEVER a v2 pointer reading
+            // back v1 ciphertext or vice versa.
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-update").unwrap();
+            let pointer_content = pointer_content_for("note-update");
+
+            // v1 fully committed.
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let op1 = Uuid::new_v4();
+                vault
+                    .write_sensitive_record_unchecked(&id, &pointer_content, b"v1 secret", Version(0), op1, &pii_store)
+                    .unwrap();
+            }
+            let v1_record = {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                vault.read_note(&id).unwrap()
+            };
+            assert_eq!(pii_store.get("note-update").unwrap(), b"v1 secret");
+
+            // Start an update to v2, crashing at AfterPiiStagedBeforeCommit:
+            // the new ciphertext is durably staged, but the live `.pii` has
+            // NOT been updated and the pointer has NOT been renamed.
+            let op2 = Uuid::new_v4();
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterPiiStagedBeforeCommit);
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id,
+                    &pointer_content,
+                    b"v2 secret",
+                    v1_record.version,
+                    op2,
+                    &pii_store,
+                    &injector,
+                );
+                assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterPiiStagedBeforeCommit))));
+
+                // Mid-crash: the pointer must still read as v1, and its
+                // ciphertext must still be v1's. Never a v2 pointer / v1
+                // ciphertext mismatch, and never a v1 pointer / v2
+                // ciphertext mismatch.
+                let mid_crash_record = vault.read_note(&id).unwrap();
+                assert_eq!(mid_crash_record.content, v1_record.content, "mid-crash: pointer must still be v1's");
+                assert_eq!(pii_store.get("note-update").unwrap(), b"v1 secret", "mid-crash: ciphertext must still be v1's");
+            }
+
+            // After recovery: still self-consistent, either fully v1 or
+            // fully v2 — never a mismatched pairing.
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            let after_record = reopened.read_note(&id).unwrap();
+            let after_plaintext = pii_store.get("note-update").unwrap();
+            if after_record.version == v1_record.version {
+                assert_eq!(after_record.content, v1_record.content, "rolled back: pointer must be exactly v1's");
+                assert_eq!(after_plaintext, b"v1 secret", "rolled back: ciphertext must be exactly v1's");
+            } else {
+                assert_eq!(after_plaintext, b"v2 secret", "rolled forward: ciphertext must be exactly v2's");
+                assert!(after_record.content.contains("pii://note-update"));
+            }
+        }
+
+        #[test]
+        fn before_image_of_a_sensitive_notes_prior_pointer_never_holds_plaintext_while_it_exists() {
+            // Part of the A3 confidentiality-boundary audit (Task 6): proves
+            // the before-image persisted DURING a sensitive-note update is
+            // the pointer-only record, never the real content, at the exact
+            // moment it exists on disk (paused via
+            // `AfterJournalCommittedBeforeGit` -- the latest point before
+            // `commit_to_git` deletes the before-image once `GitCommitted`
+            // is reached -- so this is a true mid-write observation, not an
+            // after-the-fact steady-state check like the public-surface
+            // test in `a3_confidentiality_boundary.rs`).
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-before-image-pause").unwrap();
+            let pointer_content = pointer_content_for("note-before-image-pause");
+
+            let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+            vault
+                .write_sensitive_record_unchecked(&id, &pointer_content, b"v1 plaintext secret", Version(0), Uuid::new_v4(), &pii_store)
+                .unwrap();
+
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let injector = FaultInjector::pause_at(FaultPoint::AfterJournalCommittedBeforeGit, paused_tx, resume_rx);
+            let op2 = Uuid::new_v4();
+            let vault_arc = std::sync::Arc::new(vault);
+            let pii_store_arc = std::sync::Arc::new(pii_store);
+            let (v, p, pc) = (std::sync::Arc::clone(&vault_arc), std::sync::Arc::clone(&pii_store_arc), pointer_content.clone());
+            let id2 = id.clone();
+            let handle = std::thread::spawn(move || {
+                v.write_sensitive_record_unchecked_with_injector(&id2, &pc, b"v2 plaintext secret", Version(1), op2, &p, &injector)
+            });
+
+            paused_rx.recv().unwrap();
+            let before_image_path = root.join(".before-images").join(format!("note-before-image-pause-{op2}.record"));
+            let bytes = std::fs::read(&before_image_path).expect("the before-image must exist while paused");
+            let as_text = String::from_utf8_lossy(&bytes);
+            assert!(!as_text.contains("v1 plaintext secret"), "the before-image must hold the pointer, not v1's plaintext, got {as_text:?}");
+            assert!(!as_text.contains("v2 plaintext secret"), "nor the new write's plaintext, got {as_text:?}");
+            assert!(as_text.contains("pii://note-before-image-pause"), "got {as_text:?}");
+
+            resume_tx.send(()).unwrap();
+            handle.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn reconcile_itself_can_be_interrupted_mid_fixup_of_a_sensitive_rows_pii_content_hash_check() {
+            // Uses `open_with_pii_store_and_injector` to interrupt
+            // `recovery::reconcile` itself (not the original write) right
+            // after it marks a stalled sensitive row `Recovering`, mirroring
+            // `recovery.rs`'s own `reconcile_marks_a_row_recovering_...`
+            // test but with a `PiiStore` threaded through. Proves the PII
+            // verification branch is reached via the SAME generic
+            // `Recovering`-marking step every other row goes through, not a
+            // special-cased shortcut, and that a second, uninterrupted pass
+            // still resolves it afterward.
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-reconcile-pause").unwrap();
+            let pointer_content = pointer_content_for("note-reconcile-pause");
+            let op = Uuid::new_v4();
+
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterPiiStagedBeforeCommit);
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id, &pointer_content, b"secret", Version(0), op, &pii_store, &injector,
+                );
+                assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterPiiStagedBeforeCommit))));
+            }
+
+            let interrupt_recovery = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
+            let interrupted = Vault::open_with_pii_store_and_injector(root.clone(), &journal_path, &pii_store, &interrupt_recovery);
+            assert!(matches!(interrupted, Err(StorageError::Interrupted(FaultPoint::AfterMarkedRecoveringBeforeFixup))));
+
+            // A second, uninterrupted pass (ordinary open) must still resolve
+            // the row deterministically.
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            let after = reopened.read_note(&id);
+            match after {
+                Ok(record) => {
+                    assert!(record.content.contains("pii://note-reconcile-pause"));
+                    assert_eq!(pii_store.get("note-reconcile-pause").unwrap(), b"secret");
+                }
+                Err(StorageError::NotFound { .. }) => {
+                    assert!(!pii_store.has_live("note-reconcile-pause"));
+                }
+                other => panic!("must resolve deterministically, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn crash_after_pii_committed_before_pointer_rename_rolls_back_cleanly_on_a_first_write() {
+            // The second new FaultPoint, on a first write: the live `.pii`
+            // file exists, but the pointer rename never ran. Recovery must
+            // never leave a `.pii` file with no corresponding pointer at
+            // all for a note that never had one before this operation.
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-commit-crash").unwrap();
+            let op = Uuid::new_v4();
+            let pointer_content = pointer_content_for("note-commit-crash");
+
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterPiiCommittedBeforePointerRename);
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id,
+                    &pointer_content,
+                    b"secret content",
+                    Version(0),
+                    op,
+                    &pii_store,
+                    &injector,
+                );
+                assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterPiiCommittedBeforePointerRename))));
+                // The live ciphertext IS committed at this exact point.
+                assert!(pii_store.has_live("note-commit-crash"));
+                assert!(matches!(vault.read_note(&id), Err(StorageError::NotFound { .. })), "no pointer exists yet");
+            }
+
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            let after = reopened.read_note(&id);
+            match after {
+                Ok(record) => {
+                    assert!(record.content.contains("pii://note-commit-crash"));
+                    assert_eq!(pii_store.get("note-commit-crash").unwrap(), b"secret content");
+                }
+                Err(StorageError::NotFound { .. }) => {
+                    assert!(!pii_store.has_live("note-commit-crash"), "rolled back: the orphaned live ciphertext must be removed too");
+                }
+                other => panic!("must resolve deterministically, got {other:?}"),
+            }
+        }
+    }
 }

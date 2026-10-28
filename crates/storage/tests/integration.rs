@@ -50,6 +50,16 @@ fn open_vault(root: PathBuf) -> Vault {
     Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap()
 }
 
+/// A fresh, unique `PiiStore` for a test that doesn't care about sensitive
+/// content specifically — `propose_and_commit`'s signature (Task 6) always
+/// requires one, even for an `Internal`/`Public` note, since the caller is
+/// responsible for having one open before calling in (see that function's
+/// doc comment).
+fn test_pii_store() -> vault_security::PiiStore {
+    let dir = unique_test_dir();
+    vault_security::PiiStore::open(dir.join(".pii-store"), &dir.join(".pii-store").join("master.key")).unwrap()
+}
+
 fn valid_yaml(id: &str) -> String {
     format!(
         r#"
@@ -188,6 +198,7 @@ fn storage_exposes_exactly_one_public_write_function() {
 fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-e2e");
     let v = storage::propose_and_commit(
         &vault,
@@ -197,6 +208,7 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap();
     assert_eq!(
@@ -209,6 +221,7 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
 fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_is_never_created() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = secret_classified_yaml("note-secret");
     let err = storage::propose_and_commit(
         &vault,
@@ -218,6 +231,7 @@ fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     assert!(matches!(
@@ -236,6 +250,7 @@ fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_
 fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_is_never_created() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = yaml_with_broken_link("note-broken-link");
     let err = storage::propose_and_commit(
         &vault,
@@ -245,6 +260,7 @@ fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_i
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     assert!(matches!(err, ProposeError::Link(domain::LinkError::BrokenLink { .. })));
@@ -259,6 +275,7 @@ fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_i
 fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-e2e-conflict");
     storage::propose_and_commit(
         &vault,
@@ -268,6 +285,7 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap();
     let err = storage::propose_and_commit(
@@ -278,6 +296,7 @@ fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     assert!(matches!(err, ProposeError::Storage(StorageError::Conflict { .. })));
@@ -292,6 +311,7 @@ fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_creat
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-typo").replace("supports: []", "supprots: [\"missing-id\"]");
     let err = storage::propose_and_commit(
         &vault,
@@ -301,6 +321,7 @@ fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_creat
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     match err {
@@ -317,6 +338,7 @@ fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = format!("{}totally_unknown: 1\n", valid_yaml("note-extra"));
     let err = storage::propose_and_commit(
         &vault,
@@ -326,6 +348,7 @@ fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     assert!(
@@ -366,6 +389,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let original_yaml = valid_yaml("note-a");
     storage::propose_and_commit(
         &vault,
@@ -375,6 +399,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap();
     let id = NoteId::parse("note-a").unwrap();
@@ -391,6 +416,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
             &HashSet::new(),
             &HashSet::new(),
             &gate,
+            &pii_store,
         )
         .unwrap_err();
         match err {
@@ -421,6 +447,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
     let yaml = valid_yaml("note-c").replace("supports: []", "supports: [\"NOTE-B\"]");
@@ -432,6 +459,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
         &known,
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     match err {
@@ -449,6 +477,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
 fn canonical_relation_target_resolves_against_known_note_ids() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
     let yaml = valid_yaml("note-c").replace("supports: []", "supports: [\"note-b\"]");
@@ -460,6 +489,7 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
         &known,
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .unwrap();
     assert_eq!(
@@ -481,6 +511,7 @@ fn pending(refs: &[&str]) -> HashSet<String> {
 fn assert_pending_ref_commits(relation: &str, target: &str) {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-p").replace(&format!("{relation}: []"), &format!("{relation}: [\"{target}\"]"));
     assert!(yaml.contains(target), "fixture must actually contain the target");
     let v = storage::propose_and_commit(
@@ -491,6 +522,7 @@ fn assert_pending_ref_commits(relation: &str, target: &str) {
         &HashSet::new(),
         &pending(&[target]),
         &gate,
+        &pii_store,
     )
     .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
     assert_eq!(
@@ -520,6 +552,7 @@ fn pending_unresolved_code_symbol_in_applies_to_is_accepted() {
 fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
     let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
     let pending_refs = pending(&["https://fastapi.tiangolo.com/tutorial/cors/"]);
@@ -537,6 +570,7 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
         &known,
         &pending_refs,
         &gate,
+        &pii_store,
     )
     .unwrap();
     // Spec C6: a pending reference is "accettato e segnalato". The commit
@@ -555,6 +589,7 @@ fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id(
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-q").replace("derived_from: []", "derived_from: [\"https://example.com/x\"]");
     let err = storage::propose_and_commit(
         &vault,
@@ -564,6 +599,7 @@ fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id(
         &HashSet::new(),
         &pending(&["https://example.com/other"]),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     match err {
@@ -581,6 +617,7 @@ fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
     let root = unique_test_dir();
     let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let yaml = valid_yaml("note-r").replace("supports: []", "supports: [\"missing-id\"]");
     let err = storage::propose_and_commit(
         &vault,
@@ -590,6 +627,7 @@ fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
         &HashSet::new(),
         &pending(&["https://example.com/unrelated"]),
         &gate,
+        &pii_store,
     )
     .unwrap_err();
     assert!(
@@ -615,6 +653,7 @@ fn full_note(id: &str, body: &str) -> String {
 /// irrelevant case.
 fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome, ProposeError> {
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     storage::propose_and_commit(
         vault,
         text,
@@ -623,6 +662,7 @@ fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome,
         &HashSet::new(),
         &HashSet::new(),
         &gate,
+        &pii_store,
     )
     .map(|result| match result {
         CommitResult::Committed(outcome) => outcome,
@@ -757,17 +797,18 @@ fn valid_note_yaml(id: &str) -> String {
 /// for the one test in this file that exercises the `GitPending` response
 /// code rather than the ordinary git-backed success path every other test
 /// here uses via `open_vault`.
-fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet<String>) {
+fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet<String>, vault_security::PiiStore) {
     let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
-    (vault, gate, HashSet::new(), HashSet::new())
+    let pii_store = test_pii_store();
+    (vault, gate, HashSet::new(), HashSet::new(), pii_store)
 }
 
 #[test]
 fn propose_and_commit_surfaces_git_pending_as_ok_not_err() {
-    let (vault, gate, known, pending) = test_fixtures_no_git_repo();
+    let (vault, gate, known, pending, pii_store) = test_fixtures_no_git_repo();
     let note_text = valid_note_yaml("note-a");
-    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate);
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate, &pii_store);
     assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "git unavailability is a non-error outcome, got {result:?}");
 }
 
@@ -781,8 +822,9 @@ fn propose_and_commit_on_a_git_repo_with_no_commits_yet_is_git_pending_not_an_er
     git2::Repository::init(&root).unwrap(); // no initial commit
     let vault = Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap();
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let pii_store = test_pii_store();
     let note_text = valid_note_yaml("note-a");
-    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate);
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, &pii_store);
     assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "got {result:?}");
     let note_id = NoteId::parse("note-a").unwrap();
     assert_eq!(vault.read_note(&note_id).unwrap().content, note_text, "the write durably happened");

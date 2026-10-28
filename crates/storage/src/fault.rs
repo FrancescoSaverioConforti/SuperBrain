@@ -57,6 +57,28 @@ pub enum FaultPoint {
     /// `Recovering`, as a crash mid-recovery would. Only ever armed by tests
     /// (`trigger_at` is `#[cfg(test)]`).
     AfterMarkedRecoveringBeforeFixup,
+    /// `Vault::write_sensitive_record_unchecked` (Task 6): the ciphertext for
+    /// a `Sensitive` note has been durably staged via `PiiStore::stage`
+    /// (fsynced to `<pii root>/.staging/<note_id>-<operation_id>.pii`) and
+    /// the journal row's `pii_content_hash` has been recorded on the same
+    /// write as this operation's still-`IntentRecorded` row (mirroring how
+    /// `content_hash` is recorded before the Markdown rename). The live
+    /// `<note_id>.pii` file has NOT yet been updated, and the Markdown
+    /// pointer rename has NOT yet run. This is the sensitive-write analogue
+    /// of `AfterRenameBeforeContentPersisted`, inserted immediately before
+    /// it in the same pipeline: for a sensitive note, "persist content"
+    /// means staging+committing `PiiStore` THEN doing the Markdown rename
+    /// with the pointer bytes.
+    AfterPiiStagedBeforeCommit,
+    /// `Vault::write_sensitive_record_unchecked`: `PiiStore::commit_staged`
+    /// has renamed the staged ciphertext onto the live `<note_id>.pii` path.
+    /// The Markdown pointer rename has NOT yet run. A crash here leaves a
+    /// committed ciphertext with no corresponding (or a stale) Markdown
+    /// pointer; recovery resolves this exactly as it resolves the ordinary
+    /// rename-vs-journal-advance window, by rolling forward (committing the
+    /// pointer rename) or rolling back (removing the live `.pii` file and
+    /// restoring the previous pointer) based on what the journal row says.
+    AfterPiiCommittedBeforePointerRename,
 }
 
 /// Returned when an armed injector interrupts a pipeline at `point`.

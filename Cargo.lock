@@ -735,6 +735,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "uuid",
+ "vault-security",
 ]
 
 [[package]]

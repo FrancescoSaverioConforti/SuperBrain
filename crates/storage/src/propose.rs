@@ -1,9 +1,29 @@
 use std::collections::HashSet;
 
+use domain::Classification;
 use uuid::Uuid;
+use vault_security::{PiiPointer, PiiStore};
 
 use crate::note_id::{NoteId, NoteIdError};
 use crate::vault::{StorageError, Vault, Version};
+
+/// A reserved body marker that signals "this `Sensitive`-note write is a
+/// DELETION, not a content update" to `propose_and_commit`'s sensitive
+/// branch. Deliberately not a new enum parameter on `propose_and_commit`'s
+/// public signature (which remains the one and only public write entry
+/// point in the whole workspace, per the Global Constraints): a caller
+/// requests deletion of a sensitive note by calling `propose_and_commit`
+/// with a note whose BODY is exactly this sentinel. The gate still scans the
+/// whole note text (the sentinel contains no secret-shaped content, so it
+/// always passes the secret scanner), and `propose_and_commit`'s own check
+/// for this exact body happens only AFTER the gate has passed, so a
+/// malformed or rejected note can never be mistaken for a tombstone.
+///
+/// Chosen to be exceedingly unlikely to collide with real note content
+/// (an HTML-comment-shaped marker, which `domain::parse_frontmatter` never
+/// treats specially and which a human would never type as the entire body
+/// of a real note by accident).
+pub const SENSITIVE_TOMBSTONE_BODY: &str = "<!-- SUPERBRAIN:TOMBSTONE -->";
 
 /// Every way `propose_and_commit` can fail to commit a note, in the exact
 /// short-circuit order the function evaluates them: schema parse (surfaced
@@ -28,6 +48,14 @@ pub enum ProposeError {
     Link(domain::LinkError),
     Rejected(policy::GateRejection),
     Storage(StorageError),
+    /// A failure inside `vault-security`'s `DeletionLog` while recording a
+    /// sensitive-note deletion (see `SENSITIVE_TOMBSTONE_BODY`). Folded to a
+    /// rendered message for the same crate-boundary-visibility reason
+    /// `StorageError::Journal`/`StorageError::PiiStore` are: `DeletionLog`'s
+    /// own `DeletionLogError` carries no plaintext (deletion log rows are
+    /// note ids, generations and hashes only), so this capture cannot leak
+    /// sensitive content either.
+    DeletionLog(String),
 }
 
 /// What a successful [`propose_and_commit`] reports back to the caller.
@@ -138,6 +166,16 @@ pub enum CommitResult {
 /// `Ok(CommitResult::GitPending { .. })`, not an error — git unavailability
 /// is an expected, non-error outcome per spec, not a failure of the
 /// proposal itself.
+///
+/// `pii_store` is the `PiiStore` this call uses to answer the gate's
+/// `EncryptedStoreAvailability` question and, for a `Sensitive` note, to
+/// actually stage and commit its ciphertext (Task 6). It is the caller's
+/// job to open it once (typically at `<vault_root>/.pii-store`, mirroring
+/// how `vault.rs`'s `BEFORE_IMAGE_DIR` is a fixed, documented sibling of the
+/// vault root) and pass the SAME `PiiStore` across calls, so repeated calls
+/// share one master key and one on-disk store rather than re-deriving a
+/// fingerprint and potentially re-keying on every call.
+#[allow(clippy::too_many_arguments)]
 pub fn propose_and_commit(
     vault: &Vault,
     note_text: &str,
@@ -146,6 +184,7 @@ pub fn propose_and_commit(
     known_ids: &HashSet<NoteId>,
     pending_ids: &HashSet<String>,
     gate: &policy::Gate,
+    pii_store: &PiiStore,
 ) -> Result<CommitResult, ProposeError> {
     let note = match domain::parse_frontmatter(frontmatter_of(note_text)) {
         Ok(note) => note,
@@ -195,20 +234,138 @@ pub fn propose_and_commit(
         Err(link_err) => return Err(ProposeError::Link(link_err)),
     };
 
+    // Task 6: whether the encrypted store is available for THIS call. A
+    // `PiiStore` value already in hand (the caller opened it successfully)
+    // is always `Available` — there is nothing left to try. `open`'s own
+    // error mapping (`vault_security::unavailable_reason_for`) is for a
+    // caller that has NOT yet managed to open one at all; since
+    // `propose_and_commit` requires an already-open `&PiiStore`, that
+    // mapping is exercised by whatever constructs the `PiiStore` before
+    // calling in, not here.
+    let availability = vault_security::EncryptedStoreAvailability::Available;
+
     // The gate scans the WHOLE note text, body included, so a secret that
     // appears only in the body is still caught before the vault is touched.
-    match gate.evaluate(&note, note_text, Ok(link_state)) {
+    match gate.evaluate(&note, note_text, Ok(link_state), availability) {
         policy::GateDecision::Reject(rejection) => Err(ProposeError::Rejected(rejection)),
         policy::GateDecision::Pass => {
-            match vault.write_record_unchecked(&note_id, note_text, expected_version, operation_id) {
-                Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
-                Err(StorageError::GitPending { note_id }) => {
-                    Ok(CommitResult::GitPending { note_id, operation_id })
+            if matches!(note.classification, Classification::Sensitive) {
+                commit_sensitive(vault, &note_id, note_text, expected_version, operation_id, pii_store, link_state)
+            } else {
+                match vault.write_record_unchecked(&note_id, note_text, expected_version, operation_id) {
+                    Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
+                    Err(StorageError::GitPending { note_id }) => {
+                        Ok(CommitResult::GitPending { note_id, operation_id })
+                    }
+                    Err(other) => Err(ProposeError::Storage(other)),
                 }
-                Err(other) => Err(ProposeError::Storage(other)),
             }
         }
     }
+}
+
+/// The `Sensitive`-note branch of `propose_and_commit` (Task 6). `note_text`
+/// is the gate-accepted full note (frontmatter plus body); its body decides
+/// whether this write is an ordinary content update or a deletion
+/// ([`SENSITIVE_TOMBSTONE_BODY`]):
+///
+/// - Ordinary update: the real body is staged into `pii_store` as
+///   ciphertext, and the Markdown record that actually lands is the
+///   frontmatter (verbatim, so relations/classification/metadata stay
+///   queryable) plus a `pii://<note_id>` pointer body — see
+///   [`pointer_record`].
+/// - Deletion (the body is exactly the tombstone marker): `DeletionLog::
+///   record_deletion` runs FIRST, inside the surrounding journal operation
+///   boundary that `write_sensitive_record_unchecked` establishes for this
+///   `operation_id` (the deletion log's own three-step protocol is a
+///   SEPARATE, independently-authenticated mechanism per spec contract C5 —
+///   it is not folded into the A2 journal's `WriteState` machine — but it
+///   is still run to completion before the tombstone pointer is committed,
+///   so a reader can never observe a committed tombstone pointer whose
+///   deletion was never logged). The tombstone's "plaintext" staged into
+///   `PiiStore` is empty: a deleted note has no more sensitive content to
+///   protect, and `PiiStore::get` on it is never a meaningful operation
+///   again once the deletion log also marks it deleted.
+fn commit_sensitive(
+    vault: &Vault,
+    note_id: &NoteId,
+    note_text: &str,
+    expected_version: Version,
+    operation_id: Uuid,
+    pii_store: &PiiStore,
+    link_state: domain::LinkState,
+) -> Result<CommitResult, ProposeError> {
+    let body = body_of(note_text);
+    let is_deletion = body.trim() == SENSITIVE_TOMBSTONE_BODY;
+
+    if is_deletion {
+        let deletion_log = vault_security::DeletionLog::open(&deletion_log_db_path(pii_store))
+            .map_err(|e| ProposeError::DeletionLog(e.to_string()))?;
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(deletion_log_reference_path(pii_store));
+        deletion_log
+            .record_deletion(note_id.as_str(), &trusted_ref)
+            .map_err(|e| ProposeError::DeletionLog(e.to_string()))?;
+    }
+
+    let frontmatter = frontmatter_of(note_text);
+    let pointer_content = pointer_record(frontmatter, note_id);
+    let plaintext: &[u8] = if is_deletion { b"" } else { body.as_bytes() };
+
+    match vault.write_sensitive_record_unchecked(note_id, &pointer_content, plaintext, expected_version, operation_id, pii_store) {
+        Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
+        Err(StorageError::GitPending { note_id }) => Ok(CommitResult::GitPending { note_id, operation_id }),
+        Err(other) => Err(ProposeError::Storage(other)),
+    }
+}
+
+/// Builds the Markdown record that actually lands for a `Sensitive` note:
+/// the original frontmatter, delimited exactly as a full note's frontmatter
+/// always is, followed by the `pii://<note_id>` pointer as the body. This
+/// keeps every frontmatter-driven feature (relations, classification,
+/// status, link classification on a later read) working unchanged, while
+/// ensuring the real content never reaches the Markdown vault, git history,
+/// the A2 journal, or any before-image — only the pointer URI does.
+fn pointer_record(frontmatter: &str, note_id: &NoteId) -> String {
+    let pointer = PiiPointer::for_note(note_id.as_str());
+    format!("---\n{frontmatter}---\n{}", pointer.uri)
+}
+
+/// `<pii_store_root>/deletion-log.sqlite` — a fixed, documented sibling of
+/// the PII store root, mirroring how `vault.rs`'s before-image directory is
+/// a fixed sibling of the vault root.
+fn deletion_log_db_path(pii_store: &PiiStore) -> std::path::PathBuf {
+    pii_store.root().join("deletion-log.sqlite")
+}
+
+/// `<pii_store_root>/deletion-log-reference.dpapi` — the deletion log's
+/// authenticated trusted reference (Task 5), a sibling of its own SQLite
+/// file.
+fn deletion_log_reference_path(pii_store: &PiiStore) -> std::path::PathBuf {
+    pii_store.root().join("deletion-log-reference.dpapi")
+}
+
+/// Returns the body portion of `note_text` — everything after the closing
+/// frontmatter delimiter line, or the empty string if there is none (bare
+/// YAML with no body). Mirrors `frontmatter_of`'s own delimiter-finding
+/// logic exactly, so the two always agree on where the frontmatter ends.
+fn body_of(note_text: &str) -> &str {
+    let Some(after_open) = strip_delimiter_line(note_text) else {
+        return "";
+    };
+    let mut offset = 0;
+    for line in after_open.split_inclusive('\n') {
+        if let Some(after_close) = strip_delimiter_line(line) {
+            // `after_close` is the remainder of THIS line after the closing
+            // `---`; the body starts at the NEXT line, i.e. right after the
+            // full line `line` (which already includes its own trailing
+            // newline from split_inclusive, or is the last, newline-less
+            // line of the text).
+            let _ = after_close;
+            return &after_open[offset + line.len()..];
+        }
+        offset += line.len();
+    }
+    ""
 }
 
 /// Returns the YAML frontmatter portion of `note_text`, which is what gets

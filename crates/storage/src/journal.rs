@@ -22,13 +22,20 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS operations (
     before_image_path TEXT,
     git_commit_oid TEXT,
     previous_state TEXT,
+    pii_content_hash TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )";
 
+// Additive migration (Task 6): a journal file created before this column
+// existed has no `pii_content_hash` column yet. `ALTER TABLE ... ADD COLUMN`
+// is a no-op (ignored error) when the column is already present, so this is
+// safe to run unconditionally on every open.
+const MIGRATE_ADD_PII_CONTENT_HASH: &str = "ALTER TABLE operations ADD COLUMN pii_content_hash TEXT";
+
 // Columns in the order `row_from_sql` reads them.
 const SELECT_ROWS: &str = "SELECT operation_id, note_id, state, expected_version, new_version, \
-    content_hash, before_image_hash, before_image_path, git_commit_oid, previous_state FROM operations";
+    content_hash, before_image_hash, before_image_path, git_commit_oid, previous_state, pii_content_hash FROM operations";
 
 // SQLite-side UTC timestamp with millisecond precision; keeps the journal free of a clock dependency.
 const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -60,6 +67,13 @@ pub(crate) struct OperationRow {
     /// from. Not cleared once the row resolves — it stays as an audit trail.
     /// `None` for a row that was never marked `Recovering`.
     pub(crate) previous_state: Option<WriteState>,
+    /// The hash of the PLAINTEXT staged into `PiiStore` for this operation
+    /// (Task 6), written on the same journal write that records
+    /// `FaultPoint::AfterPiiStagedBeforeCommit`'s advance — mirroring
+    /// exactly how `content_hash` itself is recorded before the Markdown
+    /// rename. `None` for every non-sensitive operation; this column is
+    /// purely additive and leaves every A1/A2 write path untouched.
+    pub(crate) pii_content_hash: Option<String>,
 }
 
 /// Optional columns that `Journal::advance` may set alongside a state change.
@@ -72,6 +86,7 @@ pub(crate) struct AdvanceFields {
     before_image_path: Option<String>,
     git_commit_oid: Option<String>,
     previous_state: Option<WriteState>,
+    pii_content_hash: Option<String>,
 }
 
 impl AdvanceFields {
@@ -119,6 +134,16 @@ impl AdvanceFields {
             ..Self::default()
         }
     }
+
+    /// Layers a `pii_content_hash` onto an existing `AdvanceFields` builder
+    /// (typically the result of `content` or `content_with_before_image`),
+    /// so the sensitive write path can record the pointer's own
+    /// `content_hash`/`before_image_hash` and the staged plaintext's
+    /// `pii_content_hash` on the exact same journal write.
+    pub(crate) fn merge_pii_content_hash(mut self, pii_content_hash: impl Into<String>) -> Self {
+        self.pii_content_hash = Some(pii_content_hash.into());
+        self
+    }
 }
 
 pub(crate) struct Journal {
@@ -137,6 +162,13 @@ impl Journal {
 
     fn from_connection(conn: Connection) -> Result<Self, JournalError> {
         conn.execute_batch(SCHEMA)?;
+        // Additive migration for a journal file created before this column
+        // existed. Ignore the error unconditionally: the only failure mode
+        // for `ADD COLUMN` here is "duplicate column name" (already
+        // migrated, or created fresh by SCHEMA above, which already
+        // includes it), and SQLite gives no portable "already exists" guard
+        // for ALTER TABLE ADD COLUMN the way CREATE TABLE IF NOT EXISTS does.
+        let _ = conn.execute_batch(MIGRATE_ADD_PII_CONTENT_HASH);
         Ok(Self { conn })
     }
 
@@ -232,6 +264,7 @@ impl Journal {
                     before_image_path = COALESCE(?6, before_image_path), \
                     git_commit_oid = COALESCE(?7, git_commit_oid), \
                     previous_state = COALESCE(?9, previous_state), \
+                    pii_content_hash = COALESCE(?10, pii_content_hash), \
                     updated_at = {NOW_SQL} \
                  WHERE operation_id = ?1 AND state = ?8"
             ),
@@ -245,6 +278,7 @@ impl Journal {
                 fields.git_commit_oid,
                 state_to_sql(from),
                 fields.previous_state.map(state_to_sql),
+                fields.pii_content_hash,
             ],
         )?;
         if updated != 1 {
@@ -482,6 +516,7 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
             .get::<_, Option<String>>(9)?
             .map(|s| state_from_sql(&s).map_err(|e| conversion_error(9, e)))
             .transpose()?,
+        pii_content_hash: row.get(10)?,
     })
 }
 
