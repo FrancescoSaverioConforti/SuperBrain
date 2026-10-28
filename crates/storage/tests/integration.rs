@@ -3,19 +3,51 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use storage::{CommitOutcome, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
+use storage::{CommitOutcome, CommitResult, NoteId, NoteIdError, ProposeError, StorageError, Vault, Version};
 
 fn unique_test_dir() -> PathBuf {
+    // A per-process counter on top of the timestamp: parallel tests can read
+    // the same clock value, which made two tests share one directory.
+    static UNIQUE_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "superbrain-propose-test-{}-{}",
+        "superbrain-propose-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        UNIQUE_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// `Vault::open` with `root` and a fresh, unique journal path alongside it —
+/// the mechanical A2 replacement for A1's `Vault::new(root)` at every call
+/// site in this file. This integration test continues to exercise only
+/// `propose_and_commit`'s genuinely public surface; this is its only change.
+///
+/// Task 5 note: `root` is ALSO git-initialized (with an initial empty
+/// commit), so a successful `propose_and_commit` call reaches the new
+/// terminus, `WriteState::GitCommitted`, and reports
+/// `Ok(CommitResult::Committed(_))` rather than `Ok(CommitResult::GitPending { .. })`.
+/// Every call site in this file exercises the ordinary, git-backed success
+/// path; `propose_and_commit_surfaces_git_pending_as_ok_not_err` below is
+/// the one test that deliberately builds its own non-git vault instead.
+fn open_vault(root: PathBuf) -> Vault {
+    git2::Repository::init(&root).unwrap();
+    {
+        let repo = git2::Repository::open(&root).unwrap();
+        let signature = git2::Signature::now("SuperBrain Test", "test@localhost").unwrap();
+        let tree_oid = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial empty commit", &tree, &[])
+            .unwrap();
+    }
+    Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap()
 }
 
 fn valid_yaml(id: &str) -> String {
@@ -154,7 +186,7 @@ fn storage_exposes_exactly_one_public_write_function() {
 
 #[test]
 fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-e2e");
     let v = storage::propose_and_commit(
@@ -167,12 +199,15 @@ fn valid_note_passes_gate_and_is_committed_through_the_controlled_entry_point() 
         &gate,
     )
     .unwrap();
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Unlinked });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Unlinked })
+    );
 }
 
 #[test]
 fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_is_never_created() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = secret_classified_yaml("note-secret");
     let err = storage::propose_and_commit(
@@ -199,7 +234,7 @@ fn secret_classified_note_is_rejected_by_propose_and_commit_and_the_record_file_
 
 #[test]
 fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_is_never_created() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = yaml_with_broken_link("note-broken-link");
     let err = storage::propose_and_commit(
@@ -222,7 +257,7 @@ fn note_with_broken_link_is_rejected_by_propose_and_commit_and_the_record_file_i
 
 #[test]
 fn version_conflict_surfaces_end_to_end_through_propose_and_commit() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-e2e-conflict");
     storage::propose_and_commit(
@@ -255,7 +290,7 @@ fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_creat
     // Reviewer's reproduction: `supprots: ["missing-id"]` used to parse and
     // COMMIT, the broken link silently vanishing with the ignored key.
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-typo").replace("supports: []", "supprots: [\"missing-id\"]");
     let err = storage::propose_and_commit(
@@ -280,7 +315,7 @@ fn typoed_relation_key_is_rejected_end_to_end_and_the_record_file_is_never_creat
 #[test]
 fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = format!("{}totally_unknown: 1\n", valid_yaml("note-extra"));
     let err = storage::propose_and_commit(
@@ -306,10 +341,15 @@ fn unknown_top_level_frontmatter_key_is_rejected_end_to_end() {
 
 // --- A1 final review, Finding C2: case-insensitive filesystem collision ---
 
+/// Entries directly inside `dir`, excluding `.git` (Task 5: `open_vault`
+/// now git-initializes its root as a side effect of making the vault
+/// git-backed, so `.git` is a vault-setup artifact, not note content — the
+/// "nothing may be written" assertions in this file are about note content).
 fn files_in(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".git")
         .collect();
     names.sort();
     names
@@ -324,7 +364,7 @@ fn case_variant_of_an_existing_note_id_is_rejected_before_the_vault_and_original
     // overwrote note-a. It must now be a validation error naming the id
     // field, raised before the vault is touched.
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let original_yaml = valid_yaml("note-a");
     storage::propose_and_commit(
@@ -379,7 +419,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
     // target must not be silently treated as a different (broken or
     // resolved) id than its lowercase form.
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
@@ -407,7 +447,7 @@ fn relation_target_that_is_not_a_canonical_note_id_is_rejected_as_invalid_note_i
 
 #[test]
 fn canonical_relation_target_resolves_against_known_note_ids() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
@@ -422,7 +462,10 @@ fn canonical_relation_target_resolves_against_known_note_ids() {
         &gate,
     )
     .unwrap();
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Resolved });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Resolved })
+    );
 }
 
 // --- A1 second whole-branch review, Finding I-A: pending references are opaque ---
@@ -436,7 +479,7 @@ fn pending(refs: &[&str]) -> HashSet<String> {
 }
 
 fn assert_pending_ref_commits(relation: &str, target: &str) {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-p").replace(&format!("{relation}: []"), &format!("{relation}: [\"{target}\"]"));
     assert!(yaml.contains(target), "fixture must actually contain the target");
@@ -450,7 +493,10 @@ fn assert_pending_ref_commits(relation: &str, target: &str) {
         &gate,
     )
     .unwrap_or_else(|e| panic!("pending {relation} target {target:?} must commit, got {e:?}"));
-    assert_eq!(v, CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending });
+    assert_eq!(
+        v,
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending })
+    );
     let id = NoteId::parse("note-p").unwrap();
     assert_eq!(vault.read_note(&id).unwrap().content, yaml);
 }
@@ -472,7 +518,7 @@ fn pending_unresolved_code_symbol_in_applies_to_is_accepted() {
 
 #[test]
 fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let mut known = HashSet::new();
     known.insert(NoteId::parse("note-b").unwrap());
@@ -497,7 +543,7 @@ fn mixed_resolved_and_opaque_pending_targets_commit_and_classify_as_pending() {
     // result itself flags it; the caller does not have to re-classify.
     assert_eq!(
         outcome,
-        CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending }
+        CommitResult::Committed(CommitOutcome { version: Version(1), link_state: domain::LinkState::Pending })
     );
 }
 
@@ -507,7 +553,7 @@ fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id(
     // URL that is NOT in pending_ids is malformed input, reported precisely
     // as InvalidNoteId (not confused with a BrokenLink to a missing note).
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-q").replace("derived_from: []", "derived_from: [\"https://example.com/x\"]");
     let err = storage::propose_and_commit(
@@ -533,7 +579,7 @@ fn non_note_id_target_not_declared_pending_is_still_rejected_as_invalid_note_id(
 #[test]
 fn valid_note_id_target_neither_known_nor_pending_is_still_a_broken_link() {
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     let yaml = valid_yaml("note-r").replace("supports: []", "supports: [\"missing-id\"]");
     let err = storage::propose_and_commit(
@@ -560,6 +606,13 @@ fn full_note(id: &str, body: &str) -> String {
     format!("---\n{}---\n{body}", valid_yaml(id).trim_start())
 }
 
+/// Thin wrapper over `propose_and_commit` for this section's tests, which
+/// only care about the ordinary `CommitOutcome` (every call site here uses
+/// `open_vault`, which is git-backed, so a successful commit always reaches
+/// `CommitResult::Committed`). `GitPending` has its own dedicated test
+/// (`propose_and_commit_surfaces_git_pending_as_ok_not_err`), so unwrapping
+/// it away here would hide a real regression rather than paper over an
+/// irrelevant case.
 fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome, ProposeError> {
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
     storage::propose_and_commit(
@@ -571,11 +624,17 @@ fn commit(vault: &Vault, text: &str, expected: Version) -> Result<CommitOutcome,
         &HashSet::new(),
         &gate,
     )
+    .map(|result| match result {
+        CommitResult::Committed(outcome) => outcome,
+        CommitResult::GitPending { note_id, operation_id } => panic!(
+            "commit() test helper expects a git-backed vault to reach CommitResult::Committed, got GitPending for note {note_id:?} operation {operation_id}"
+        ),
+    })
 }
 
 #[test]
 fn note_with_frontmatter_and_body_round_trips_byte_for_byte() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let text = full_note(
         "note-body",
         "# CORS bug\n\nSome prose.\n\n---\n\nA thematic break above, and a fake key below:\nid: not-the-real-id\n",
@@ -588,7 +647,7 @@ fn note_with_frontmatter_and_body_round_trips_byte_for_byte() {
 
 #[test]
 fn updating_a_note_replaces_its_body_atomically() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let id = NoteId::parse("note-upd").unwrap();
     let v1 = full_note("note-upd", "old body: first draft\n");
     let v2 = full_note("note-upd", "new body: rewritten\n");
@@ -602,7 +661,7 @@ fn updating_a_note_replaces_its_body_atomically() {
 
 #[test]
 fn version_conflict_on_a_note_with_a_body_is_the_ordinary_storage_conflict() {
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let id = NoteId::parse("note-conf").unwrap();
     let original = full_note("note-conf", "body A\n");
     commit(&vault, &original, Version(0)).unwrap();
@@ -621,7 +680,7 @@ fn version_conflict_on_a_note_with_a_body_is_the_ordinary_storage_conflict() {
 #[test]
 fn secret_only_in_the_body_is_rejected_by_the_gate_and_the_record_file_is_never_created() {
     let root = unique_test_dir();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
     let text = full_note("note-leak", "Debug notes.\naws_key = AKIAABCDEFGHIJKLMNOP\n");
     let frontmatter_end = text.find("---\nDebug").unwrap();
     assert!(!text[..frontmatter_end].contains("AKIA"), "secret must be in the body only");
@@ -659,7 +718,7 @@ fn propose_and_commit_rejects_a_record_path_symlinked_outside_the_vault_root() {
     std::os::unix::fs::symlink(&outside_file, &link).unwrap();
     #[cfg(windows)]
     std::os::windows::fs::symlink_file(&outside_file, &link).unwrap();
-    let vault = Vault::new(root.clone());
+    let vault = open_vault(root.clone());
 
     for expected in [Version(7), Version(0)] {
         let err = commit(&vault, &valid_yaml("note-a"), expected).unwrap_err();
@@ -679,9 +738,52 @@ fn propose_and_commit_rejects_a_record_path_symlinked_outside_the_vault_root() {
 fn frontmatter_only_note_without_delimiters_still_commits_unchanged() {
     // Backward compatibility: bare YAML (no `---` delimiters, no body) is
     // still accepted and stored exactly as given.
-    let vault = Vault::new(unique_test_dir());
+    let vault = open_vault(unique_test_dir());
     let yaml = valid_yaml("note-legacy");
     assert!(!yaml.contains("---"));
     assert_eq!(commit(&vault, &yaml, Version(0)).unwrap().version, Version(1));
     assert_eq!(vault.read_note(&NoteId::parse("note-legacy").unwrap()).unwrap().content, yaml);
+}
+
+// --- Task 5: git_pending as a non-error CommitResult ---
+
+/// Alias for `valid_yaml`, under the name the Task 5 brief's own test uses.
+fn valid_note_yaml(id: &str) -> String {
+    valid_yaml(id)
+}
+
+/// A vault whose root is deliberately NOT a git repository, plus the other
+/// fixtures `propose_and_commit` needs (a gate, empty known/pending sets),
+/// for the one test in this file that exercises the `GitPending` response
+/// code rather than the ordinary git-backed success path every other test
+/// here uses via `open_vault`.
+fn test_fixtures_no_git_repo() -> (Vault, policy::Gate, HashSet<NoteId>, HashSet<String>) {
+    let vault = Vault::open_with_default_indexer(unique_test_dir(), &unique_test_dir().join("journal.sqlite")).unwrap();
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    (vault, gate, HashSet::new(), HashSet::new())
+}
+
+#[test]
+fn propose_and_commit_surfaces_git_pending_as_ok_not_err() {
+    let (vault, gate, known, pending) = test_fixtures_no_git_repo();
+    let note_text = valid_note_yaml("note-a");
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &known, &pending, &gate);
+    assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "git unavailability is a non-error outcome, got {result:?}");
+}
+
+#[test]
+fn propose_and_commit_on_a_git_repo_with_no_commits_yet_is_git_pending_not_an_error() {
+    // Final whole-branch review, finding I2: `git init` with zero commits
+    // (an unborn HEAD) used to make a durably-persisted write come back as a
+    // hard `Err(Storage(Git(..)))`, while recovery treated the same condition
+    // as git_pending. The write has happened, so it must not be an error.
+    let root = unique_test_dir();
+    git2::Repository::init(&root).unwrap(); // no initial commit
+    let vault = Vault::open_with_default_indexer(root, &unique_test_dir().join("journal.sqlite")).unwrap();
+    let gate = policy::Gate::new(policy::SecretPolicy::new(1));
+    let note_text = valid_note_yaml("note-a");
+    let result = storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate);
+    assert!(matches!(result, Ok(CommitResult::GitPending { .. })), "got {result:?}");
+    let note_id = NoteId::parse("note-a").unwrap();
+    assert_eq!(vault.read_note(&note_id).unwrap().content, note_text, "the write durably happened");
 }
