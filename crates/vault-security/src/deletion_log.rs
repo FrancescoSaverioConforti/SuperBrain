@@ -754,16 +754,11 @@ mod tests {
         );
 
         // Another unexplained mismatch: log two generations ahead (not the
-        // specific "exactly one ahead, Pending" pattern).
-        reference.write(&GenerationRef { generation: 0, chain_hash: "0".repeat(64) }).unwrap();
-        // Force the log to generation 3 by recording two more deletions with
-        // the reference re-pointed back to 1 after each, simulating "log
-        // raced ahead of reference by more than one step" — here we assert
-        // directly against a synthetic two-ahead reference instead, which is
-        // simpler and equally valid as "any other unexplained mismatch."
-        log.record_deletion("note-b", &reference_for_test_only(&log, dir.path())).unwrap();
-        // reference is now at generation 2 (completed normally above). Make
-        // it stale by rewinding it to generation 0 == "log two ahead."
+        // specific "exactly one ahead, Pending" pattern). Record a second
+        // deletion normally (reference tracks it, landing at generation 2),
+        // then rewind the reference to generation 0 so the log sits two
+        // generations ahead of it.
+        log.record_deletion("note-b", &file_ref(dir.path())).unwrap();
         let stale_reference = file_ref(dir.path());
         stale_reference.write(&GenerationRef { generation: 0, chain_hash: "0".repeat(64) }).unwrap();
         let result2 = log.reconcile(&stale_reference);
@@ -771,13 +766,6 @@ mod tests {
             matches!(result2, Err(DeletionLogError::Inconsistent)),
             "log two generations ahead of the reference is not the specific one-ahead roll-forward case and must fail closed, got {result2:?}"
         );
-    }
-
-    /// Helper used only by the test above: the real trusted reference for
-    /// `log`'s own directory (keeps that test self-contained without
-    /// introducing a second log instance).
-    fn reference_for_test_only(_log: &DeletionLog, dir: &Path) -> FileTrustedReferenceStore {
-        file_ref(dir)
     }
 
     #[test]
@@ -909,6 +897,64 @@ mod tests {
         assert_eq!(row2.state, DeletionLogState::Completed);
     }
 
+    /// A second (not first) deletion crashes before the reference is
+    /// touched at all: the reference already exists at generation 1 from a
+    /// prior, fully-completed deletion, the log advances to generation 2,
+    /// and the crash happens at `AfterGenerationWrittenPending` — i.e.
+    /// before step 2 runs for THIS deletion. This exercises the
+    /// `row.generation == r.generation + 1 && Pending` branch of
+    /// `reconcile`, distinct from the equal-generation branch covered by
+    /// `two_consecutive_deletions_with_a_crash_between_them_converge_correctly_on_reconcile`
+    /// (which crashes later, at `BeforeMarkedCompleted`, after the
+    /// reference has already been bumped).
+    #[test]
+    fn a_second_deletion_crashing_before_the_reference_is_touched_rolls_forward_past_a_stale_reference(
+    ) {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+
+        // First deletion completes fully: reference ends up at generation 1.
+        let first = log.record_deletion("note-a", &reference).unwrap();
+        assert_eq!(first.generation, 1);
+        let ref_after_first = reference.read().unwrap().unwrap();
+        assert_eq!(ref_after_first.generation, 1);
+
+        // Second deletion crashes immediately after step 1 (generation 2
+        // written, Pending) and before step 2 (reference untouched).
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending);
+        let second = log
+            .record_deletion_with_injector("note-b", &reference, &injector)
+            .expect("record_deletion must return the half-finished receipt, not an error");
+        assert_eq!(second.generation, 2);
+
+        // The log has advanced to generation 2, Pending, but the reference
+        // is still at generation 1 — untouched by this second deletion.
+        let row2_before = DeletionLog::row_for_generation(&log.conn.lock().unwrap(), 2).unwrap().unwrap();
+        assert_eq!(row2_before.state, DeletionLogState::Pending);
+        let ref_before_reconcile = reference.read().unwrap().unwrap();
+        assert_eq!(
+            ref_before_reconcile.generation, 1,
+            "reference must still be at generation 1, unlike the BeforeMarkedCompleted crash case"
+        );
+
+        // Even in this half-crashed state, note-b must already read deleted.
+        assert!(log.is_deleted("note-b").unwrap(), "note-b must be non-consultable even mid-crash");
+
+        // Restart and reconcile.
+        let restarted = DeletionLog::open(log.db_path()).unwrap();
+        let outcome = restarted.reconcile(&reference).expect("reconcile must roll forward, not fail");
+        assert_eq!(outcome, ReconcileOutcome::RolledForward { generation: 2 });
+
+        // Reference is now updated to generation 2, and the row is Completed.
+        let ref_after_reconcile = reference.read().unwrap().unwrap();
+        assert_eq!(ref_after_reconcile.generation, 2);
+        assert_eq!(ref_after_reconcile.chain_hash, second.chain_hash);
+
+        let row2_after = DeletionLog::row_for_generation(&restarted.conn.lock().unwrap(), 2).unwrap().unwrap();
+        assert_eq!(row2_after.state, DeletionLogState::Completed);
+    }
+
     /// lettura concorrente durante una cancellazione: a concurrent read
     /// during `record_deletion` must see `is_deleted() == true` throughout,
     /// since the note becomes non-consultable at step 1, before the
@@ -927,7 +973,6 @@ mod tests {
         // recorded.
         log.record_deletion("note-existing", &reference).unwrap();
 
-        let saw_false_before_recorded = Arc::new(AtomicBool::new(false));
         let keep_reading = Arc::new(AtomicBool::new(true));
 
         let reader_log = Arc::clone(&log);
@@ -952,7 +997,6 @@ mod tests {
         keep_reading.store(false, Ordering::SeqCst);
         let observed_true = reader.join().unwrap();
         assert!(observed_true, "the concurrent reader must have observed is_deleted(note-concurrent) == true");
-        let _ = saw_false_before_recorded; // retained for documentation symmetry
 
         // Final state, read after the writer returns: must still be true.
         assert!(log.is_deleted("note-concurrent").unwrap());
