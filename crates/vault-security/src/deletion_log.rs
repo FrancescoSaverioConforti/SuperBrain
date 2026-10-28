@@ -557,6 +557,20 @@ impl DeletionLog {
         Ok(DeletionReceipt { generation: next_generation, chain_hash })
     }
 
+    /// Returns `true` if this log has never recorded a single row — i.e. no
+    /// deletion, in any state, has ever been written to this log. Used by
+    /// [`crate::backup`]'s "no deletions ever" sentinel exception, which
+    /// must check the log's own row history, not merely the absence of the
+    /// trusted reference (an absent reference can ALSO mean "the reference
+    /// was lost while the log itself has real history," a state
+    /// [`DeletionLog::reconcile`] itself fails closed on via
+    /// [`DeletionLogError::ReferenceMissing`] rather than treating as
+    /// harmless).
+    pub(crate) fn is_empty(&self) -> Result<bool, DeletionLogError> {
+        let conn = self.conn.lock().expect("deletion log mutex poisoned");
+        Ok(Self::latest_row(&conn)?.is_none())
+    }
+
     /// Returns `true` if `note_id` has a deletion entry in ANY state
     /// (`Pending` or `Completed`). Per C5, the note becomes non-consultable
     /// starting at step 1 — a `Pending` entry must already read as deleted.

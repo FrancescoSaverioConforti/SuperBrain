@@ -322,6 +322,22 @@ fn a_completed_sensitive_write_leaves_no_recoverable_plaintext_in_any_temp_file_
 /// bytes `BackupTarget::write_blob` received directly off disk (never going
 /// back through `restore()`, which would decrypt them) and asserts the
 /// plaintext does not appear as a substring anywhere in that blob.
+///
+/// IMPORTANT (A3 Task 7 review round 1, item 2): asserting only that
+/// `SENSITIVE_PLAINTEXT` is absent from the raw blob is too weak to tell
+/// "backup is properly encrypted" apart from "backup's own AEAD layer was
+/// silently removed or broken." The Markdown pointer record only ever holds
+/// `pii://<id>` (never the plaintext), and the `.pii` file is ALREADY
+/// independently AEAD-encrypted before it ever reaches the backup snapshot
+/// — so `SENSITIVE_PLAINTEXT` can never appear in the PLAINTEXT snapshot
+/// either, regardless of whether `backup()`'s own outer encryption actually
+/// runs. This test therefore also asserts that something the plaintext
+/// snapshot genuinely DOES contain — the literal `pii://<note_id>` pointer
+/// string, which lives in the Markdown vault_files portion of the plaintext
+/// snapshot — is ALSO absent from the raw encrypted blob bytes. Only this
+/// second assertion can actually fail if the backup's AEAD layer were
+/// removed or broken (in which case the blob would just be the plaintext
+/// snapshot, including the pointer string, verbatim).
 #[test]
 fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_content_outside_its_aead_envelope() {
     let root = unique_test_dir();
@@ -353,12 +369,27 @@ fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_conte
         "the backup blob written to BackupTarget::write_blob must never contain the sensitive plaintext outside its AEAD envelope"
     );
 
+    // The strengthened assertion: the `pii://<note_id>` pointer string is a
+    // genuine, known substring of the PLAINTEXT snapshot (it lives inside
+    // the Markdown record bytes `backup()` collects into `vault_files`,
+    // unencrypted at the plaintext-snapshot stage). If the backup's AEAD
+    // layer were removed or broken, the raw blob would just BE that
+    // plaintext snapshot, and this pointer string would appear in it
+    // verbatim. Its absence here is therefore actual evidence the AEAD
+    // layer ran, not merely evidence that plaintext content was never
+    // collected in the first place.
+    let pointer_needle = "pii://note-backup-audit".as_bytes();
+    assert!(
+        !raw_blob_bytes.windows(pointer_needle.len()).any(|w| w == pointer_needle),
+        "the raw backup blob must not contain the literal pii:// pointer string in the clear; its presence would mean the backup's AEAD encryption layer did not actually run"
+    );
+
     // Sanity: a different-but-also-sensitive-looking correct decrypt DOES
     // produce the pointer (proving the backup path actually ran, not that
     // it silently skipped the note).
     let destination = unique_test_dir().join("restored-for-audit");
     let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.root().join("deletion-log-reference.dpapi"));
-    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref).unwrap();
+    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref, &pii_store).unwrap();
     assert!(outcome.restored_note_ids.contains(&"note-backup-audit".to_string()));
     let restored_record = std::fs::read_to_string(destination.join("note-backup-audit.record")).unwrap();
     assert!(restored_record.contains("pii://note-backup-audit"), "the pointer itself is allowed and expected in the restored Markdown record");
