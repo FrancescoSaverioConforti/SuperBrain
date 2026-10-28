@@ -3404,4 +3404,21 @@ mod tests {
             "SEC-003 finding (this sub-case is CLOSED): once a note has its own committed journal row, read_note's unconditional hash check rejects a later hard-link swap to different content as Inconsistent — got {result2:?}. If this assertion fails, that hash check stopped catching this swap and the verdict must be re-evaluated toward OPEN."
         );
     }
+
+    #[test]
+    fn a3_sec_00x_status_is_unchanged_from_a2_or_this_test_must_be_updated_deliberately() {
+        // Status oracle, not a vulnerability requirement. It does not assert
+        // that any SEC-00x behavior must occur; it asserts that today's
+        // observed behavior matches the status Continuity records:
+        // [d5b9] SEC-001 open, [c16c6] SEC-002 narrowed, [c17e8] SEC-003
+        // narrowed. The observations live in the existing tests below, which
+        // are called directly so no fixture or assertion is duplicated here.
+        // If a change fixes or alters one of these defects, the matching
+        // test fails. The fix author then updates that test and the
+        // Continuity record in the same change, as a visible decision.
+        sec_001_toctou_window_between_path_check_and_write_still_exists();
+        sec_001_toctou_read_side_leaks_an_outside_records_version_and_bytes_into_the_before_image();
+        sec_002_read_path_rejects_both_aliasing_shapes_but_write_path_pre_read_does_not();
+        sec_003_hard_link_aliasing_is_invisible_to_canonicalization_after_a2();
+    }
 }
