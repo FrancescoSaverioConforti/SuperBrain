@@ -50,7 +50,12 @@
 //!   committed the note at or past this row's `new_version` (this row
 //!   stalled live and a later write committed on top of it), nothing is
 //!   restored: the before-image is deleted and the row becomes `Failed`,
-//!   leaving the later operation's record untouched (evidence item 26). A
+//!   leaving the later operation's record untouched (evidence item 26). The
+//!   same happens if the before-image is the never-committed content of a
+//!   stalled sibling (no committed row carries its hash, a non-committed one
+//!   does): two writes stalled in a row, and restoring the second one's
+//!   before-image would put the first one's never-committed bytes back on
+//!   disk (evidence item 26, second variant). A
 //!   recorded before-image that cannot be
 //!   restored or does not verify gives `Inconsistent`. A pass interrupted
 //!   after the restore (`FaultPoint::DuringBeforeImageRestore`) is resumed
@@ -377,6 +382,22 @@ fn fix_content_persisted(
         }
     }
 
+    // The before-image is the never-committed content of a stalled sibling
+    // (evidence item 26, second variant): an earlier operation on this note
+    // renamed those bytes into place and never committed them, and this row
+    // was accepted against them. No committed row carries that hash, while
+    // a non-committed one does. Restoring it would put content nobody
+    // committed back on disk, where the raw-version check would build on it.
+    // Skip the restore, as above: the earlier sibling's own rollback (it is
+    // resolved first, in version order) already put the last committed
+    // content back. Decided from the journal alone, so a pass that already
+    // deleted the before-image resolves the same way.
+    if before_image_is_uncommitted_sibling_content(journal, &note_id, op, before_hash)? {
+        delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+        journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
+        return Ok(WriteState::Failed);
+    }
+
     // If the record already holds the before-image, an earlier pass restored
     // it and crashed before advancing the row. The restore is idempotent, so
     // skip straight to completing it.
@@ -409,6 +430,35 @@ fn fix_content_persisted(
     delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
     journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
     Ok(WriteState::Failed)
+}
+
+/// Row 2's second guard. `true` when `before_hash` is the content of some
+/// other operation on `note_id` that never committed (any state before
+/// `JournalCommitted`, or `Failed`), and of no operation that did. A hash
+/// that some committed row carries is legitimate content even if a failed
+/// row also carries it (same bytes, same version). A hash that no row
+/// carries at all (not written by any journaled operation) is not treated
+/// as a sibling: the existing restore path, and its `Inconsistent` on a
+/// missing or unverifiable before-image, are unchanged for it.
+fn before_image_is_uncommitted_sibling_content(
+    journal: &Journal,
+    note_id: &NoteId,
+    op: Uuid,
+    before_hash: &str,
+) -> Result<bool, ReconcileError> {
+    let rows = journal.operations_with_content_hash(note_id.as_str(), before_hash)?;
+    let committed = |state: Option<WriteState>| {
+        matches!(state, Some(WriteState::JournalCommitted | WriteState::GitCommitted | WriteState::IndexCurrent))
+    };
+    // A row mid-recovery counts by the state it is being recovered from. Rows
+    // are resolved in version order, so a sibling below this row's version
+    // is normally resolved already; this only keeps the check conservative.
+    if rows.iter().any(|r| {
+        committed(Some(r.state)) || (r.state == WriteState::Recovering && committed(r.previous_state))
+    }) {
+        return Ok(false);
+    }
+    Ok(rows.iter().any(|r| r.operation_id != op))
 }
 
 /// Row 3. Returns `GitStep::Committed` once the row records its commit
@@ -1073,6 +1123,13 @@ mod tests {
     /// rename and the ContentPersisted advance (the same `Vault` keeps being
     /// used, nothing is reopened); then op_b (v2 -> v3), accepted because the
     /// raw file says v2, commits all the way to IndexCurrent.
+    ///
+    /// Since the live write guard (`Journal::unresolved_operation_on_note`,
+    /// evidence item 26 second variant) the write path refuses op_b, so this
+    /// state can now only come from a journal written before that guard.
+    /// The helper checks the refusal, then builds op_b's committed row and
+    /// record by hand exactly as the write path used to leave them, so row
+    /// 2's later-commit guard (commit 88b20f6) stays covered.
     fn stalled_a_then_committed_b(root: &std::path::Path, journal_path: &std::path::Path, op_a: Uuid, op_b: Uuid) {
         let id = NoteId::parse("note-a").unwrap();
         let vault = Vault::open_with_default_indexer(root.to_path_buf(), journal_path).unwrap();
@@ -1081,41 +1138,25 @@ mod tests {
         let stalled = vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector);
         assert!(matches!(stalled, Err(StorageError::Interrupted(_))));
         assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::ContentPersisted);
-        assert_eq!(vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b).unwrap(), Version(3));
-        assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::IndexCurrent);
-        assert_eq!(vault.read_note(&id).unwrap().content, "v3 from B", "live, B is readable before any reopen");
-    }
+        let refused = vault.write_record_unchecked(&id, "v3 from B", Version(2), Uuid::new_v4());
+        assert!(matches!(refused, Err(StorageError::UnresolvedOperation { operation_id, .. }) if operation_id == op_a), "got {refused:?}");
 
-    #[test]
-    fn live_writes_after_a_stall_and_a_later_commit_stay_on_the_journal_and_survive_reopen() {
-        // The live, pre-reopen window. While A is stalled at
-        // ContentPersisted, a write at the journal's version is refused
-        // (Conflict) and read_note fails closed (Inconsistent). Once B
-        // commits, the journal and the record agree again, so every further
-        // live write is checked against B's version and stays consistent,
-        // and reopening keeps it.
-        let root = crate::git::test_support::init_test_repo();
-        let journal_path = unique_test_dir().join("journal.sqlite");
-        let id = NoteId::parse("note-a").unwrap();
-        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let a_bytes = std::fs::read(root.join("note-a.record")).unwrap();
+        let b_bytes = serialize_record_for_test("v3 from B", Version(3));
         {
-            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
-            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
-            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
-            assert!(vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector).is_err());
-            assert!(matches!(vault.read_note(&id), Err(StorageError::Inconsistent { .. })));
-            let err = vault.write_record_unchecked(&id, "x", Version(1), Uuid::new_v4()).unwrap_err();
-            assert!(matches!(err, StorageError::Conflict { actual: Version(2), .. }), "got {err:?}");
-            vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b).unwrap();
-            let err = vault.write_record_unchecked(&id, "x", Version(1), Uuid::new_v4()).unwrap_err();
-            assert!(matches!(err, StorageError::Conflict { actual: Version(3), .. }), "got {err:?}");
-            assert_eq!(vault.write_record_unchecked(&id, "v4 from C", Version(3), Uuid::new_v4()).unwrap(), Version(4));
-            assert_eq!(vault.read_note(&id).unwrap().content, "v4 from C");
+            let journal = vault.journal_for_test();
+            journal.insert_intent(op_b, id.as_str(), 2).unwrap();
+            let before_b = persist_before_image(root, &id, op_b, &a_bytes).unwrap();
+            let fields = AdvanceFields::content_with_before_image(3, content_hash(&b_bytes), before_b);
+            journal.record_fields(op_b, WriteState::IntentRecorded, fields.clone()).unwrap();
+            std::fs::write(root.join("note-a.record"), &b_bytes).unwrap();
+            journal.advance(op_b, WriteState::ContentPersisted, fields).unwrap();
+            journal.advance(op_b, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+            journal.advance(op_b, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
+            delete_before_image(root, &id, op_b).unwrap();
+            journal.advance(op_b, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
         }
-        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
-        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
-        let record = vault.read_note(&id).unwrap();
-        assert_eq!((record.content.as_str(), record.version), ("v4 from C", Version(4)));
+        assert_eq!(vault.read_note(&id).unwrap().content, "v3 from B", "live, B is readable before any reopen");
     }
 
     #[test]
@@ -1194,5 +1235,200 @@ mod tests {
         assert!(matches!(err, StorageError::Conflict { actual: Version(3), .. }), "got {err:?}");
         // The legitimate next write still works.
         assert_eq!(vault.write_record_unchecked(&id, "v4", Version(3), Uuid::new_v4()).unwrap(), Version(4));
+    }
+
+    // --- Evidence item 26, second variant: two stalled siblings, nothing committed past them ---
+
+    /// Seeds, in the journal at `journal_path` and on disk at `root`, the
+    /// second-variant state: `op_1` committed v1 (all the way to
+    /// IndexCurrent); `op_a` (v1 -> v2) renamed its bytes into place and
+    /// stalled at ContentPersisted; `op_b` (v2 -> v3), accepted against the
+    /// raw file's v2, did the same. B's before-image is therefore A's v2
+    /// bytes, which no operation ever committed. Nothing committed past A or
+    /// B. Returns the serialized v1, v2 (A) and v3 (B) records.
+    fn seed_two_stalled_siblings(root: &std::path::Path, journal: &Journal, op_1: Uuid, op_a: Uuid, op_b: Uuid) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let id = NoteId::parse("note-a").unwrap();
+        let v1 = serialize_record_for_test("v1", Version(1));
+        let a = serialize_record_for_test("v2 from A", Version(2));
+        let b = serialize_record_for_test("v3 from B", Version(3));
+        journal.insert_intent(op_1, id.as_str(), 0).unwrap();
+        journal.advance(op_1, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&v1))).unwrap();
+        journal.advance(op_1, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op_1, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op_1, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
+        let before_a = persist_before_image(root, &id, op_a, &v1).unwrap();
+        journal.insert_intent(op_a, id.as_str(), 1).unwrap();
+        journal.advance(op_a, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(2, content_hash(&a), before_a)).unwrap();
+        let before_b = persist_before_image(root, &id, op_b, &a).unwrap();
+        journal.insert_intent(op_b, id.as_str(), 2).unwrap();
+        journal.advance(op_b, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(3, content_hash(&b), before_b)).unwrap();
+        std::fs::write(root.join("note-a.record"), &b).unwrap();
+        (v1, a, b)
+    }
+
+    #[test]
+    fn row_2_never_restores_a_stalled_siblings_never_committed_content_as_a_before_image() {
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_1, op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (v1, _a, _b) = seed_two_stalled_siblings(&root, &Journal::open(&journal_path).unwrap(), op_1, op_a, op_b);
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::Failed);
+        assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::Failed);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), v1, "the record holds the last committed content (v1), never A's never-committed v2");
+        assert!(read_before_image(&root, &id, op_a).is_err() && read_before_image(&root, &id, op_b).is_err(), "no before-image is orphaned");
+        assert_eq!(vault.journal_for_test().last_committed_for_note("note-a").unwrap().unwrap().operation_id, op_1);
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!((record.content.as_str(), record.version), ("v1", Version(1)), "readable, not Inconsistent");
+        // A write at A's never-committed version must not be accepted on top of it.
+        let err = vault.write_record_unchecked(&id, "diverging", Version(2), Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StorageError::Conflict { actual: Version(1), .. }), "got {err:?}");
+        assert_eq!(vault.write_record_unchecked(&id, "v2 for real", Version(1), Uuid::new_v4()).unwrap(), Version(2));
+    }
+
+    #[test]
+    fn sibling_before_image_guard_is_idempotent_across_an_interrupted_and_a_repeated_pass() {
+        // A pass that already resolved A, marked B Recovering and deleted B's
+        // before-image, then stopped before B's Failed advance. The guard is
+        // decided from the journal alone, so it does not need the file.
+        let (root, journal) = fresh_root_and_journal();
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_1, op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (v1, _a, _b) = seed_two_stalled_siblings(&root, &journal, op_1, op_a, op_b);
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
+        assert!(matches!(reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &injector), Err(ReconcileError::Interrupted(_))));
+        // The interrupted pass left A at Recovering (first in version order).
+        // Also put B where a later crash would leave it: Recovering, with its
+        // before-image already deleted.
+        journal.advance(op_b, WriteState::Recovering, AdvanceFields::previous_state(WriteState::ContentPersisted)).unwrap();
+        delete_before_image(&root, &id, op_b).unwrap();
+
+        let first = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(first.failed, vec![op_a, op_b], "B resolves to Failed, not Inconsistent over its missing before-image");
+        let second = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(second, ReconcileReport::default(), "a second pass finds nothing left to do");
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), v1);
+        assert_eq!(journal.get(op_b).unwrap().unwrap().state, WriteState::Failed);
+    }
+
+    #[test]
+    fn a_before_image_matching_committed_content_is_still_restored_even_if_a_failed_row_has_the_same_hash() {
+        // The guard only fires when the before-image is NOT committed content.
+        // Identical bytes at the same version can belong both to a Failed row
+        // and to a later committed one (A failed with "x" at v2, then C
+        // committed "x" at v2): the committed row wins and the restore runs.
+        let (root, journal) = fresh_root_and_journal();
+        let id = NoteId::parse("note-a").unwrap();
+        let x = serialize_record_for_test("x", Version(2));
+        let (op_a, op_c, op_d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        journal.insert_intent(op_a, id.as_str(), 1).unwrap();
+        journal.advance(op_a, WriteState::ContentPersisted, AdvanceFields::content(2, content_hash(&x))).unwrap();
+        journal.advance(op_a, WriteState::Recovering, AdvanceFields::previous_state(WriteState::ContentPersisted)).unwrap();
+        journal.advance(op_a, WriteState::Failed, AdvanceFields::none()).unwrap();
+        journal.insert_intent(op_c, id.as_str(), 1).unwrap();
+        journal.advance(op_c, WriteState::ContentPersisted, AdvanceFields::content(2, content_hash(&x))).unwrap();
+        journal.advance(op_c, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op_c, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op_c, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
+        let before_d = persist_before_image(&root, &id, op_d, &x).unwrap();
+        std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
+        journal.insert_intent(op_d, id.as_str(), 2).unwrap();
+        journal.advance(op_d, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(3, "will-not-match", before_d)).unwrap();
+
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        assert_eq!(report.failed, vec![op_d]);
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), x, "C's committed content is restored");
+    }
+
+    #[test]
+    fn a_live_write_is_refused_before_any_filesystem_effect_while_a_stalled_content_persisted_row_exists() {
+        // Protection 1, live window of the second variant: A stalls at
+        // ContentPersisted (rename landed, the journal stopped). B, at the
+        // raw file's version, and C, at the journal's version, are both
+        // refused under the per-note lock before touching the record or
+        // persisting a before-image. Reopening resolves A (its bytes are on
+        // disk and verify, so C1 rolls it forward), after which the note
+        // writes normally again.
+        //
+        // Supersedes 88b20f6's
+        // `live_writes_after_a_stall_and_a_later_commit_stay_on_the_journal_and_survive_reopen`,
+        // which pinned the old live behaviour this guard removes: a write at
+        // the journal's version got Conflict(actual = raw v2) and B, at the
+        // raw version, was accepted on top of A's never-committed bytes.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b, op_c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+            assert!(vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector).is_err());
+            assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::ContentPersisted);
+            assert!(matches!(vault.read_note(&id), Err(StorageError::Inconsistent { .. })), "reads still fail closed");
+            let on_disk = std::fs::read(root.join("note-a.record")).unwrap();
+
+            let b = vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b);
+            assert!(matches!(&b, Err(StorageError::UnresolvedOperation { note_id, operation_id }) if note_id == "note-a" && *operation_id == op_a), "a write at the raw file's version is refused, got {b:?}");
+            let c = vault.write_record_unchecked(&id, "v2 from C", Version(1), op_c);
+            assert!(matches!(&c, Err(StorageError::UnresolvedOperation { operation_id, .. }) if *operation_id == op_a), "a write at the journal's version is refused too, got {c:?}");
+            // A retry of A itself still goes through the retry path, unchanged.
+            let retry = vault.write_record_unchecked(&id, "v2 from A", Version(1), op_a);
+            assert!(matches!(retry, Err(StorageError::OperationInProgress { operation_id }) if operation_id == op_a), "got {retry:?}");
+            assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), on_disk, "no filesystem effect on the record");
+            assert!(read_before_image(&root, &id, op_b).is_err() && read_before_image(&root, &id, op_c).is_err(), "no before-image persisted");
+            assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::Failed, "the refused attempt is terminal");
+            assert_eq!(vault.journal_row_for_test(op_c).unwrap().state, WriteState::Failed);
+            // Other notes are unaffected.
+            let other = NoteId::parse("note-b").unwrap();
+            assert_eq!(vault.write_record_unchecked(&other, "b1", Version(0), Uuid::new_v4()).unwrap(), Version(1));
+        }
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::IndexCurrent, "A's verified bytes roll forward (C1)");
+        let record = vault.read_note(&id).unwrap();
+        assert_eq!((record.content.as_str(), record.version), ("v2 from A", Version(2)));
+        assert_eq!(vault.write_record_unchecked(&id, "v3", Version(2), Uuid::new_v4()).unwrap(), Version(3));
+    }
+
+    #[test]
+    fn a_live_write_is_refused_while_an_intent_recorded_row_whose_rename_may_have_landed_exists() {
+        // The same stall one step earlier: the rename landed but the
+        // ContentPersisted advance did not, so the row is IntentRecorded and
+        // carries its intended hash (C1). Under the per-note lock such a row
+        // can only be a stalled write, never one in flight.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let (op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+        vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+        let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeContentPersisted);
+        assert!(vault.write_record_unchecked_with_injector(&id, "v2 from A", Version(1), op_a, &injector).is_err());
+        assert_eq!(vault.journal_row_for_test(op_a).unwrap().state, WriteState::IntentRecorded);
+        let on_disk = std::fs::read(root.join("note-a.record")).unwrap();
+        let b = vault.write_record_unchecked(&id, "v3 from B", Version(2), op_b);
+        assert!(matches!(&b, Err(StorageError::UnresolvedOperation { operation_id, .. }) if *operation_id == op_a), "got {b:?}");
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), on_disk);
+        assert!(read_before_image(&root, &id, op_b).is_err());
+        assert_eq!(vault.journal_row_for_test(op_b).unwrap().state, WriteState::Failed);
+    }
+
+    #[test]
+    fn a_git_pending_operation_does_not_block_later_writes_to_the_note() {
+        // JournalCommitted is committed, readable state: only the git step is
+        // pending. The live guard must not treat it as unresolved.
+        let root = unique_test_dir(); // not a git repository: every write is git_pending
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let id = NoteId::parse("note-a").unwrap();
+        let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+        assert!(matches!(vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()), Err(StorageError::GitPending { .. })));
+        assert!(matches!(vault.write_record_unchecked(&id, "v2", Version(1), Uuid::new_v4()), Err(StorageError::GitPending { .. })));
+        assert_eq!(vault.read_note(&id).unwrap().content, "v2");
+        // The ordinary stale-version case is still Conflict.
+        let err = vault.write_record_unchecked(&id, "stale", Version(1), Uuid::new_v4()).unwrap_err();
+        assert!(matches!(err, StorageError::Conflict { expected: Version(1), actual: Version(2), .. }), "got {err:?}");
     }
 }

@@ -322,6 +322,66 @@ impl Journal {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every operation on `note_id` whose recorded `content_hash` equals
+    /// `content_hash`, in any state, in ascending `new_version` order. Used by
+    /// recovery's row 2 to tell whether a before-image is content some
+    /// operation actually committed, or the never-committed bytes of a
+    /// stalled sibling (evidence item 26, second variant). The hash covers
+    /// the record's version header, so a match is the same bytes at the same
+    /// version.
+    pub(crate) fn operations_with_content_hash(
+        &self,
+        note_id: &str,
+        content_hash: &str,
+    ) -> Result<Vec<OperationRow>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_ROWS} WHERE note_id = ?1 AND content_hash = ?2 ORDER BY new_version ASC, rowid ASC"
+        ))?;
+        let rows = stmt.query_map(params![note_id, content_hash], row_from_sql)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The lowest-version operation on `note_id`, other than `excluding`,
+    /// that may already have changed the note's record without the journal
+    /// committing it: a row at `ContentPersisted` or `Recovering`, or at
+    /// `IntentRecorded` with its intended `content_hash` already recorded
+    /// (the write path records it just before the rename). `None` if there
+    /// is no such row.
+    ///
+    /// The write path calls this while holding the note's per-note lock.
+    /// Only the lock holder can be between recording its hash and reaching
+    /// `JournalCommitted` (or `Failed`), so any row this returns is a write
+    /// that stopped partway (evidence item 26, second variant), never one
+    /// still in flight. An `IntentRecorded` row without a hash has not
+    /// touched the record and is not returned (it may be a concurrent writer
+    /// waiting for the lock). `JournalCommitted` rows are committed, readable
+    /// state (git pending at most) and are never returned.
+    pub(crate) fn unresolved_operation_on_note(
+        &self,
+        note_id: &str,
+        excluding: Uuid,
+    ) -> Result<Option<OperationRow>, JournalError> {
+        let row = self
+            .conn
+            .query_row(
+                &format!(
+                    "{SELECT_ROWS} WHERE note_id = ?1 AND operation_id != ?2 \
+                     AND (state IN (?3, ?4) OR (state = ?5 AND content_hash IS NOT NULL)) \
+                     ORDER BY new_version ASC, rowid ASC LIMIT 1"
+                ),
+                params![
+                    note_id,
+                    excluding.to_string(),
+                    state_to_sql(WriteState::ContentPersisted),
+                    state_to_sql(WriteState::Recovering),
+                    state_to_sql(WriteState::IntentRecorded),
+                ],
+                row_from_sql,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Every operation that is neither `IndexCurrent` nor `Failed`, in
     /// ascending `new_version` order (rows with no `new_version` yet first,
     /// then `rowid` as the tie-break). Consumed by `recovery::reconcile` on
@@ -534,6 +594,49 @@ mod tests {
         let row = journal.last_committed_for_note("note-a").unwrap().unwrap();
         assert_eq!(row.operation_id, op_b, "must resolve to the row with the highest new_version, not the highest rowid");
         assert_eq!(row.new_version, Some(3));
+    }
+
+    #[test]
+    fn unresolved_operation_on_note_finds_only_rows_that_may_have_touched_the_record() {
+        let journal = Journal::open_in_memory().unwrap();
+        let me = Uuid::new_v4();
+        journal.insert_intent(me, "note-a", 1).unwrap();
+        // A bare intent (no hash yet) and a git-pending committed row do not count.
+        let waiting = Uuid::new_v4();
+        journal.insert_intent(waiting, "note-a", 1).unwrap();
+        let pending = Uuid::new_v4();
+        journal.insert_intent(pending, "note-a", 0).unwrap();
+        journal.advance(pending, WriteState::ContentPersisted, AdvanceFields::content(1, "h1")).unwrap();
+        journal.advance(pending, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        assert!(journal.unresolved_operation_on_note("note-a", me).unwrap().is_none());
+        // An intent with its hash recorded counts; so does the excluded id only when not excluded.
+        let stalled = Uuid::new_v4();
+        journal.insert_intent(stalled, "note-a", 1).unwrap();
+        journal.record_fields(stalled, WriteState::IntentRecorded, AdvanceFields::content(2, "h2")).unwrap();
+        assert_eq!(journal.unresolved_operation_on_note("note-a", me).unwrap().unwrap().operation_id, stalled);
+        assert!(journal.unresolved_operation_on_note("note-a", stalled).unwrap().is_none());
+        assert!(journal.unresolved_operation_on_note("note-b", me).unwrap().is_none(), "scoped to the note");
+        journal.advance(stalled, WriteState::ContentPersisted, AdvanceFields::none()).unwrap();
+        assert_eq!(journal.unresolved_operation_on_note("note-a", me).unwrap().unwrap().operation_id, stalled);
+        journal.advance(stalled, WriteState::Recovering, AdvanceFields::previous_state(WriteState::ContentPersisted)).unwrap();
+        assert_eq!(journal.unresolved_operation_on_note("note-a", me).unwrap().unwrap().operation_id, stalled);
+        journal.advance(stalled, WriteState::Failed, AdvanceFields::none()).unwrap();
+        assert!(journal.unresolved_operation_on_note("note-a", me).unwrap().is_none(), "terminal rows never count");
+    }
+
+    #[test]
+    fn operations_with_content_hash_matches_any_state_on_the_note() {
+        let journal = Journal::open_in_memory().unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        journal.insert_intent(a, "note-a", 0).unwrap();
+        journal.advance(a, WriteState::ContentPersisted, AdvanceFields::content(1, "h")).unwrap();
+        journal.advance(a, WriteState::Recovering, AdvanceFields::previous_state(WriteState::ContentPersisted)).unwrap();
+        journal.advance(a, WriteState::Failed, AdvanceFields::none()).unwrap();
+        journal.insert_intent(b, "note-b", 0).unwrap();
+        journal.advance(b, WriteState::ContentPersisted, AdvanceFields::content(1, "h")).unwrap();
+        let rows = journal.operations_with_content_hash("note-a", "h").unwrap();
+        assert_eq!(rows.iter().map(|r| r.operation_id).collect::<Vec<_>>(), vec![a]);
+        assert!(journal.operations_with_content_hash("note-a", "other").unwrap().is_empty());
     }
 
     #[test]

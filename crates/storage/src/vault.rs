@@ -163,6 +163,18 @@ pub enum StorageError {
     /// caller must use a new `operation_id`.
     #[error("operation {operation_id} already names a different request (note, expected version or content differ)")]
     OperationIdReused { operation_id: Uuid },
+    /// A new write to `note_id` was refused because an earlier operation on
+    /// the same note, `operation_id`, stopped partway after it may already
+    /// have changed the record (its row is at `ContentPersisted`, or at
+    /// `IntentRecorded` with its intended hash recorded) and was never
+    /// committed or failed. Accepting a write now would build on content no
+    /// operation committed (evidence item 26, second variant). Nothing was
+    /// applied: the refusal happens before the record or any before-image is
+    /// touched, and this call's own journal row is `Failed`. The next
+    /// `Vault::open` recovery pass resolves `operation_id`; the caller then
+    /// retries with a new `operation_id`.
+    #[error("note {note_id} has an unresolved earlier operation {operation_id}; nothing was applied, reopen the vault to recover it")]
+    UnresolvedOperation { note_id: String, operation_id: Uuid },
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -562,7 +574,11 @@ impl Vault {
     ///    lock below because it touches only the journal, never the
     ///    filesystem: nothing a concurrent reader could observe on disk
     ///    changes as a result of this row existing.
-    /// 2. Acquire the per-note lock (now also shared with `read_note`) and
+    /// 2. Acquire the per-note lock (now also shared with `read_note`). If
+    ///    another operation on this note stopped partway after it may have
+    ///    changed the record (`Journal::unresolved_operation_on_note`), advance
+    ///    this row to `Failed` and return `UnresolvedOperation` without touching
+    ///    the filesystem (evidence item 26, second variant). Otherwise
     ///    read the actual current version exactly as A1 did. On a version
     ///    mismatch, advance the journal row to `Failed` (a rejected
     ///    attempt is terminal) and return `Conflict`.
@@ -677,6 +693,29 @@ impl Vault {
         // filesystem mid-write (Task 4 architectural-review correction).
         let note_lock = self.note_lock(note_id);
         let _guard = note_lock.lock().unwrap();
+
+        // Step 2a (evidence item 26, second variant): refuse the write if an
+        // earlier operation on this note stopped partway after it may have
+        // changed the record. The raw file may then hold bytes no operation
+        // committed, and the version check below would accept a write built
+        // on them. Checked under the per-note lock, where such a row can only
+        // be stalled, never in flight (see `unresolved_operation_on_note`),
+        // and before the record is read, the before-image is persisted or
+        // anything is renamed. This call's own intent row becomes Failed, as
+        // for a Conflict.
+        let unresolved = self
+            .journal
+            .lock()
+            .unwrap()
+            .unresolved_operation_on_note(note_id.as_str(), operation_id)
+            .map_err(journal_err)?;
+        if let Some(blocking) = unresolved {
+            self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+            return Err(StorageError::UnresolvedOperation {
+                note_id: note_id.as_str().to_string(),
+                operation_id: blocking.operation_id,
+            });
+        }
 
         let current_bytes = match std::fs::read(&record_path) {
             Ok(bytes) => Some(bytes),
