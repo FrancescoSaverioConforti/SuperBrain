@@ -614,7 +614,7 @@ mod tests {
         let bytes = serialize_record_for_test("content", Version(1));
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted);
         assert_eq!(report.recovered, vec![op]);
@@ -635,7 +635,7 @@ mod tests {
         let op_prev = Uuid::new_v4();
         journal.insert_intent(op_prev, id.as_str(), 0).unwrap();
         let before_bytes = serialize_record_for_test("old content", Version(1));
-        journal.advance(op_prev, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&before_bytes))).unwrap();
+        journal.advance(op_prev, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&before_bytes))).unwrap();
         journal.advance(op_prev, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         journal.advance(op_prev, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
         journal.advance(op_prev, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
@@ -648,7 +648,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
         journal.insert_intent(op, id.as_str(), 1).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(
-            2, "expected-hash-that-will-not-match", &content_hash(&before_bytes),
+            2, "expected-hash-that-will-not-match", content_hash(&before_bytes),
         )).unwrap();
 
         let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
@@ -678,7 +678,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
         journal.insert_intent(op, id.as_str(), 1).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(
-            2, "expected-hash-that-will-not-match", &content_hash(&before_bytes),
+            2, "expected-hash-that-will-not-match", content_hash(&before_bytes),
         )).unwrap();
 
         let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
@@ -717,7 +717,7 @@ mod tests {
         let bytes = serialize_record_for_test("content", Version(1));
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
         // Deviation from the brief's literal text, which asserted the row
@@ -750,7 +750,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         let existing_oid = commit_operation(&repo_dir, op, "note-a", &root.join("note-a.record")).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
         // After reconcile, Tier 1 must now be authoritative: the row itself carries the Oid.
@@ -766,7 +766,7 @@ mod tests {
         let bytes = serialize_record_for_test("content", Version(1));
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         let report = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted, "stays pending, not blocked");
@@ -781,7 +781,7 @@ mod tests {
         let bytes = serialize_record_for_test("content", Version(1));
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         journal.advance(op, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
         let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
@@ -804,7 +804,7 @@ mod tests {
         let bytes = serialize_record_for_test("content", Version(1));
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
-        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, &content_hash(&bytes))).unwrap();
+        journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         journal.advance(op, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
 
