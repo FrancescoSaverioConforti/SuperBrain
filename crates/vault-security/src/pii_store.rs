@@ -418,6 +418,18 @@ impl PiiStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(PiiStoreError::Io(e)),
         };
+        // A3 review round 3: never overwrite an existing before-image for
+        // this operation. If one is already there, the live file may by now
+        // be this operation's OWN ciphertext, and re-copying it would
+        // replace the only copy of the prior content with a copy of the new
+        // one. No legitimate caller commits the same operation twice, so
+        // this is refused rather than guessed at.
+        if self.before_image_exists(note_id, operation_id)? {
+            return Err(PiiStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a PII before-image already exists for this operation; refusing to overwrite it",
+            )));
+        }
         if let Some(prior_bytes) = prior_bytes {
             let before_image_dir = self.root.join(BEFORE_IMAGE_DIR);
             std::fs::create_dir_all(&before_image_dir)?;
@@ -488,9 +500,44 @@ impl PiiStore {
         }
     }
 
-    /// Whether a before-image exists for `(note_id, operation_id)`.
+    /// Whether a before-image exists for `(note_id, operation_id)`, as a
+    /// plain `bool` for tests and diagnostics ONLY: any error checking for
+    /// it reads as `false`. Code that decides whether to delete, restore or
+    /// overwrite anything must use [`PiiStore::before_image_exists`] or
+    /// [`PiiStore::get_before_image`], which report errors instead of
+    /// collapsing them into "absent" (A3 review round 3).
     pub fn has_before_image(&self, note_id: &str, operation_id: Uuid) -> bool {
-        self.before_image_path(note_id, operation_id).is_file()
+        matches!(self.before_image_exists(note_id, operation_id), Ok(true))
+    }
+
+    /// Whether a before-image exists for `(note_id, operation_id)`. Only a
+    /// `NotFound` means "absent"; any other I/O error, or a path that exists
+    /// but is not a regular file, is an error, never `Ok(false)`.
+    pub fn before_image_exists(&self, note_id: &str, operation_id: Uuid) -> Result<bool, PiiStoreError> {
+        match std::fs::metadata(self.before_image_path(note_id, operation_id)) {
+            Ok(meta) if meta.is_file() => Ok(true),
+            Ok(_) => Err(PiiStoreError::Io(std::io::Error::other("PII before-image path exists but is not a regular file"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(PiiStoreError::Io(e)),
+        }
+    }
+
+    /// Reads back and decrypts this operation's before-image, exactly as
+    /// [`PiiStore::get_staged`] does for a staged file:
+    /// [`PiiStoreError::NotFound`] if there is none,
+    /// [`PiiStoreError::Inconsistent`] if it does not decrypt,
+    /// [`PiiStoreError::Io`] on any other read failure. Used by `storage`'s
+    /// recovery to POSITIVELY verify that a before-image is redundant (its
+    /// content is identical to what is live) before deleting it.
+    pub fn get_before_image(&self, note_id: &str, operation_id: Uuid) -> Result<Vec<u8>, PiiStoreError> {
+        let bytes = match std::fs::read(self.before_image_path(note_id, operation_id)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PiiStoreError::NotFound { note_id: note_id.to_string() })
+            }
+            Err(e) => return Err(PiiStoreError::Io(e)),
+        };
+        self.decrypt_buffer(note_id, &bytes)
     }
 
     /// Unwraps the data key, decrypts, and returns the plaintext for
@@ -553,9 +600,9 @@ impl PiiStore {
     }
 
     /// Removes the live `.pii` file for `note_id` if one exists. Idempotent.
-    /// Used by `storage`'s crash-recovery rollback path to undo a committed
-    /// ciphertext when the pointer rename never happened (the sensitive
-    /// analogue of restoring a before-image).
+    /// UNVERIFIED: it removes whatever is there. Rollback code must use
+    /// [`PiiStore::remove_live_verified`] instead, which first proves the
+    /// live file is the content the caller means to remove.
     pub fn remove_live(&self, note_id: &str) -> Result<(), PiiStoreError> {
         let path = self.live_path(note_id);
         match std::fs::remove_file(&path) {
@@ -563,6 +610,27 @@ impl PiiStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(PiiStoreError::Io(e)),
         }
+    }
+
+    /// Removes the live `.pii` file for `note_id` ONLY after re-reading it
+    /// and verifying that it decrypts to plaintext hashing to
+    /// `expected_plaintext_hash` (A3 review round 3: the verification sits
+    /// next to the destructive act instead of being left to every caller).
+    /// `Ok(false)` if there is no live file; [`PiiStoreError::Inconsistent`]
+    /// if the live file is someone else's content or does not decrypt;
+    /// [`PiiStoreError::Io`] on any read failure. In every error case the
+    /// live file is left untouched.
+    pub fn remove_live_verified(&self, note_id: &str, expected_plaintext_hash: &str) -> Result<bool, PiiStoreError> {
+        let plaintext = match self.get(note_id) {
+            Ok(plaintext) => plaintext,
+            Err(PiiStoreError::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if content_hash(&plaintext) != expected_plaintext_hash {
+            return Err(PiiStoreError::Inconsistent { note_id: note_id.to_string() });
+        }
+        self.remove_live(note_id)?;
+        Ok(true)
     }
 
     /// Whether a live `.pii` file exists for `note_id`.
@@ -760,16 +828,15 @@ mod tests {
 
     #[test]
     fn commit_staged_fails_closed_on_a_non_notfound_io_error_reading_the_live_file_instead_of_silently_overwriting() {
-        // A3 review round 2, item #3: `commit_staged` must propagate any
-        // I/O error OTHER than NotFound when reading the current live file
-        // — never silently treat it as "nothing to preserve" (a first
-        // write) and proceed to overwrite. Simulated here by making the
-        // live path a DIRECTORY instead of a file: `std::fs::read` on a
-        // directory fails with `PermissionDenied` on this platform, not
-        // `NotFound`, so a pre-fix `if let Ok(..) = std::fs::read(...)`
-        // would silently skip the before-image and still attempt the
-        // rename — which itself would then fail for an unrelated reason
-        // (renaming onto an existing directory), masking the real bug.
+        // A3 review round 2, item #3: a live path that is a DIRECTORY must
+        // not produce a before-image or a successful commit. NOTE (round
+        // 3): this is NOT a regression test for the swallowed-read-error
+        // fix. With the old swallowing code the read error is ignored, but
+        // the following `rename(staged, <directory>)` fails too, so the
+        // assertions below pass with or without the fix (verified by
+        // reverting it). The genuine regression tests are the
+        // `commit_staged_fails_closed_when_the_live_file_*` tests below,
+        // where the live file is unreadable but still renamable-over.
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let note_id = "note-live-is-a-directory";
@@ -788,6 +855,124 @@ mod tests {
         // No before-image must have been fabricated from a read that never
         // actually succeeded.
         assert!(!store.has_before_image(note_id, op), "no before-image must exist when the live-file read never succeeded");
+    }
+
+    /// Shared body of the item-3 regression tests (A3 review round 3). The
+    /// directory-as-live-path test above is a FALSE GREEN: with the old,
+    /// swallowing `if let Ok(..) = std::fs::read(..)`, the subsequent
+    /// `rename(staged, <directory>)` ALSO fails, so `commit_staged` still
+    /// returns `Err(Io)` and still leaves no before-image — the assertions
+    /// pass whether or not the fix is present. A genuine regression test
+    /// needs a live file that exists, holds real committed ciphertext,
+    /// CANNOT be read, and CAN still be renamed over — so the old code
+    /// visibly destroys it (returns `Ok`, live is now v2, no before-image),
+    /// while the fixed code refuses before touching anything.
+    fn assert_commit_staged_never_overwrites_a_live_file_it_could_not_read(
+        obstruct: impl FnOnce(&Path) -> Box<dyn FnOnce()>,
+    ) {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op1 = Uuid::new_v4();
+        store.stage("note-a", b"v1 committed", op1).unwrap();
+        store.commit_staged("note-a", op1).unwrap();
+
+        let op2 = Uuid::new_v4();
+        store.stage("note-a", b"v2 attempt", op2).unwrap();
+        let release = obstruct(&store.live_path("note-a"));
+        let result = store.commit_staged("note-a", op2);
+        release();
+
+        assert!(
+            matches!(result, Err(PiiStoreError::Io(_))),
+            "an unreadable live file must make commit_staged fail closed with Io, got {result:?}"
+        );
+        assert_eq!(
+            store.get("note-a").unwrap(),
+            b"v1 committed",
+            "the live file must be untouched: overwriting it without a before-image would destroy the only copy of v1"
+        );
+        assert!(!store.has_before_image("note-a", op2), "no before-image fabricated from a read that never succeeded");
+        assert!(store.get_staged("note-a", op2).is_ok(), "the staged file is left in place for the caller's rollback");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_staged_fails_closed_when_the_live_file_is_held_without_read_sharing() {
+        // FILE_SHARE_DELETE only: every other READ open fails with a
+        // sharing violation, but a replacing rename (which needs only
+        // DELETE access on the target) still succeeds — exactly the
+        // combination under which the old code silently overwrote v1.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        assert_commit_staged_never_overwrites_a_live_file_it_could_not_read(|live| {
+            let handle = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_DELETE).open(live).unwrap();
+            assert!(std::fs::read(live).is_err(), "precondition: the live file must be unreadable while held");
+            Box::new(move || drop(handle))
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_fails_closed_when_the_live_file_is_not_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let probe_dir = tempdir().unwrap();
+        let probe = probe_dir.path().join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&probe).is_ok() {
+            // Running as root: permission bits do not block reads, so this
+            // environment cannot produce the error this test needs.
+            return;
+        }
+        assert_commit_staged_never_overwrites_a_live_file_it_could_not_read(|live| {
+            let live = live.to_path_buf();
+            std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Box::new(move || std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap())
+        });
+    }
+
+    #[test]
+    fn commit_staged_never_overwrites_an_existing_before_image_for_the_same_operation() {
+        // A3 review round 3 self-audit: committing the same operation twice
+        // would re-copy the live file (by then this operation's OWN
+        // ciphertext) over its before-image, replacing the only copy of the
+        // prior content.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op1 = Uuid::new_v4();
+        store.stage("note-a", b"v1", op1).unwrap();
+        store.commit_staged("note-a", op1).unwrap();
+        let op2 = Uuid::new_v4();
+        store.stage("note-a", b"v2", op2).unwrap();
+        store.commit_staged("note-a", op2).unwrap();
+        store.stage("note-a", b"v2 again", op2).unwrap();
+        assert!(store.commit_staged("note-a", op2).is_err());
+        assert_eq!(store.get_before_image("note-a", op2).unwrap(), b"v1", "op2's before-image must still hold v1");
+        assert_eq!(store.get("note-a").unwrap(), b"v2", "and the live file is untouched");
+    }
+
+    #[test]
+    fn before_image_exists_reports_an_unreadable_path_as_an_error_not_as_absent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op = Uuid::new_v4();
+        assert!(!store.before_image_exists("note-a", op).unwrap());
+        std::fs::create_dir_all(store.before_image_path("note-a", op)).unwrap();
+        assert!(store.before_image_exists("note-a", op).is_err());
+    }
+
+    #[test]
+    fn remove_live_verified_never_removes_content_that_does_not_match() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op = Uuid::new_v4();
+        store.stage("note-a", b"v1", op).unwrap();
+        store.commit_staged("note-a", op).unwrap();
+        assert!(matches!(store.remove_live_verified("note-a", &content_hash(b"other")), Err(PiiStoreError::Inconsistent { .. })));
+        assert_eq!(store.get("note-a").unwrap(), b"v1");
+        assert!(store.remove_live_verified("note-a", &content_hash(b"v1")).unwrap());
+        assert!(!store.has_live("note-a"));
+        assert!(!store.remove_live_verified("note-a", &content_hash(b"v1")).unwrap(), "absent is Ok(false)");
     }
 
     #[test]

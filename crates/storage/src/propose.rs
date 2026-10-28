@@ -262,7 +262,10 @@ pub fn propose_and_commit(
                 let pii_store = pii_store.expect("gate passed a Sensitive note without an available PiiStore");
                 commit_sensitive(vault, &note_id, note_text, expected_version, operation_id, pii_store, link_state)
             } else {
-                match vault.write_record_unchecked(&note_id, note_text, expected_version, operation_id) {
+                // `pii_store` is threaded through so a catch-up of an
+                // earlier git-pending SENSITIVE write on this note can clean
+                // up its PII before-image (A3 review round 3, item 1(b)).
+                match vault.write_record_unchecked_with_pii_store(&note_id, note_text, expected_version, operation_id, pii_store) {
                     Ok(version) => Ok(CommitResult::Committed(CommitOutcome { version, link_state })),
                     Err(StorageError::GitPending { note_id }) => {
                         Ok(CommitResult::GitPending { note_id, operation_id })

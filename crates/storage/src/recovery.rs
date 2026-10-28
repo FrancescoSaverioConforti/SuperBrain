@@ -75,8 +75,16 @@
 //!   `Vault::open`. As `ScanDepth` documents, an unbounded miss proves absence
 //!   only among commits reachable from `HEAD`; rewriting history out of band
 //!   is an accepted residual risk.
-//! - `GitCommitted`: `Indexer::mark_current`, then `IndexCurrent`. This marks
-//!   pipeline completion only, not index freshness.
+//! - `GitCommitted`: delete the row's Markdown and PII before-images (again,
+//!   idempotently, in case a crash landed between the `GitCommitted` advance
+//!   and those deletes), then `Indexer::mark_current`, then `IndexCurrent`.
+//!   This marks pipeline completion only, not index freshness.
+//!
+//! Every PII step fails closed (A3 review round 3): a row carrying a
+//! `pii_content_hash` is never advanced, rolled back or cleaned up without a
+//! `PiiStore` to verify against, and any read error or unexpected PII state
+//! leaves the row and every before-image as they are for the next pass. See
+//! `roll_back_pii` for the decision table.
 //! - `Recovering`: re-dispatch from the stored `previous_state` (step 1 above).
 //!
 //! # Concurrency
@@ -96,7 +104,7 @@ use std::path::Path;
 
 use domain::WriteState;
 use uuid::Uuid;
-use vault_security::PiiStore;
+use vault_security::{PiiStore, PiiStoreError};
 
 use crate::atomic::atomic_write;
 use crate::fault::{FaultInjector, FaultPoint, Interrupted};
@@ -250,6 +258,11 @@ fn resolve(
                 let version = row
                     .new_version
                     .ok_or_else(|| inconsistent(op, "GitCommitted row has no new_version"))?;
+                // Item 1(c): a row resumed from GitCommitted (a crash after
+                // the advance, before the before-image deletes) gets the
+                // same cleanup as one that just arrived from row 3. A no-op
+                // repeat for the latter.
+                delete_before_images_at_git_committed(root, pii_store, &parse_note_id(row)?, row)?;
                 indexer.mark_current(&row.note_id, version);
                 journal.advance(op, WriteState::IndexCurrent, AdvanceFields::none())?;
                 return Ok(Outcome::Completed);
@@ -322,7 +335,7 @@ fn fix_intent_recorded(
             // violated upstream; checked here anyway, defensively, since
             // this is the one place recovery is authoritative over the
             // pairing.
-            if pii_is_consistent(pii_store, &note_id, op, row) {
+            if pii_is_consistent(pii_store, &note_id, op, row)? {
                 return Ok(WriteState::ContentPersisted);
             }
             // A3 review round 2, item #4: the pointer that just landed is
@@ -386,145 +399,228 @@ fn fix_intent_recorded(
     Ok(WriteState::Failed)
 }
 
-/// Task 6: `true` iff `row` has no `pii_content_hash` (an ordinary,
-/// non-sensitive write — always consistent from this check's point of view)
-/// OR `pii_store` has a staged-or-committed ciphertext for `note_id` whose
-/// decrypted plaintext hashes to `row.pii_content_hash`. Checks the LIVE
-/// `.pii` file first (the common case once `PiiStore::commit_staged` has
-/// already run), then the staging file for this exact `operation_id` (the
-/// crash-between-stage-and-commit window `AfterPiiStagedBeforeCommit`
-/// characterizes). `pii_store: None` with a row that DOES carry a
-/// `pii_content_hash` is never consistent — there is no way to verify it
-/// without a store to check against, so it fails closed rather than
-/// silently rolling forward unverified.
-fn pii_is_consistent(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> bool {
+/// Task 6: whether this row's pointer may roll forward as far as its PII
+/// half is concerned. `Ok(true)` iff `row` has no `pii_content_hash` (an
+/// ordinary, non-sensitive write) OR the LIVE `.pii` file for `note_id`
+/// decrypts to plaintext hashing to `row.pii_content_hash`.
+///
+/// Only called once the pointer rename has landed, and the write path runs
+/// `PiiStore::commit_staged` strictly before that rename, so the live file is
+/// the only place this row's ciphertext can legitimately be. A matching
+/// STAGED file is deliberately not accepted (A3 review round 3): rolling the
+/// pointer forward while the live file still holds other content would pair
+/// the new pointer with the wrong ciphertext.
+///
+/// `Ok(false)` only on a POSITIVE determination that the live file is not
+/// this row's content: it is absent, decrypts to different content, or fails
+/// AEAD verification. Anything ambiguous is an error and changes nothing
+/// (A3 review round 3, the fail-closed rule): no `PiiStore` to check against
+/// (`Inconsistent`), or the live file cannot be read at all (`Io`). The
+/// caller then never reaches its rollback path, which restores and deletes
+/// things.
+fn pii_is_consistent(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> Result<bool, ReconcileError> {
     let Some(expected) = row.pii_content_hash.as_deref() else {
-        return true;
+        return Ok(true);
     };
-    let Some(store) = pii_store else {
-        return false;
-    };
-    if let Ok(plaintext) = store.get(note_id.as_str()) {
-        if content_hash(&plaintext) == expected {
-            return true;
-        }
+    let store = require_pii_store(pii_store, op)?;
+    match classify_live_pii(store, note_id, op, expected)? {
+        LivePii::Ours => Ok(true),
+        LivePii::Absent | LivePii::Other(_) | LivePii::Undecryptable => Ok(false),
     }
-    if let Ok(plaintext) = store.get_staged(note_id.as_str(), op) {
-        if content_hash(&plaintext) == expected {
-            return true;
-        }
-    }
-    false
 }
 
-/// Task 6: discards whatever this operation left STAGED (never committed,
-/// or committed but this row is being rolled back anyway) in `PiiStore`, as
-/// part of rolling this operation back to `Failed`. Never touches the LIVE
-/// `.pii` file — see [`roll_back_pii`] for that, which must also decide
-/// between restoring a before-image and removing the live file outright,
-/// never just discarding. A no-op when `pii_store` is `None`.
-fn discard_pii(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid) {
-    let Some(store) = pii_store else { return };
-    let _ = store.discard_staged(note_id.as_str(), op);
+/// The fail-closed rule for a row that carries a `pii_content_hash` when no
+/// `PiiStore` was supplied: nothing about its PII state can be verified,
+/// restored or cleaned up, so recovery refuses (`Inconsistent`, blocking
+/// `Vault::open`) rather than resolving the row without it.
+fn require_pii_store(pii_store: Option<&PiiStore>, op: Uuid) -> Result<&PiiStore, ReconcileError> {
+    pii_store.ok_or_else(|| {
+        inconsistent(
+            op,
+            "this operation's journal row carries a pii_content_hash but no PiiStore was supplied to reconcile; \
+             cannot verify, roll back or clean up its PII state — open the vault with Vault::open_with_pii_store instead",
+        )
+    })
+}
+
+/// What the live `.pii` file for a note is, relative to one operation's own
+/// expected plaintext hash. Every variant is a POSITIVE observation: a read
+/// that fails for any reason other than `NotFound` is not a variant at all,
+/// it is an error from [`classify_live_pii`].
+enum LivePii {
+    /// No live file exists.
+    Absent,
+    /// The live file decrypts to this operation's own content.
+    Ours,
+    /// The live file decrypts to other content, whose plaintext hash this is.
+    Other(String),
+    /// The live file exists and was read, but does not decrypt/verify.
+    Undecryptable,
+}
+
+fn classify_live_pii(store: &PiiStore, note_id: &NoteId, op: Uuid, expected: &str) -> Result<LivePii, ReconcileError> {
+    match store.get(note_id.as_str()) {
+        Ok(plaintext) => {
+            let hash = content_hash(&plaintext);
+            Ok(if hash == expected { LivePii::Ours } else { LivePii::Other(hash) })
+        }
+        Err(PiiStoreError::NotFound { .. }) => Ok(LivePii::Absent),
+        Err(PiiStoreError::Inconsistent { .. }) => Ok(LivePii::Undecryptable),
+        Err(e) => Err(pii_err(op, "cannot read the live PII file", e)),
+    }
+}
+
+/// A `PiiStoreError` raised while recovering `op`. An I/O error stays `Io`
+/// (the row is left as it is and re-examined on the next pass); anything
+/// else is `Inconsistent`.
+fn pii_err(op: Uuid, context: &str, e: PiiStoreError) -> ReconcileError {
+    match e {
+        PiiStoreError::Io(io) => ReconcileError::Io(std::io::Error::new(io.kind(), format!("{context}: {io}"))),
+        other => inconsistent(op, format!("{context}: {other}")),
+    }
 }
 
 /// Task 6 (A3 review round, CRITICAL fix): rolls back `PiiStore`'s state for
-/// `operation_id` as part of failing this row, exactly mirroring
-/// `storage::vault::roll_back_pii`'s logic (recovery cannot call that
-/// function directly — it has no `&Vault` — so this is recovery's own copy
-/// of the same decision):
+/// `operation_id` as part of failing this row.
 ///
-/// - Always discards this operation's staged (never-promoted, or
-///   promoted-then-rolled-back) file first.
-/// - If this operation's own content is currently the live `.pii` file
-///   (verified by hash against `row.pii_content_hash`, never assumed):
-///   - If a PII before-image exists for `(note_id, operation_id)` (an
-///     UPDATE — `PiiStore::commit_staged` preserved the prior,
-///     already-committed operation's ciphertext before overwriting the
-///     live file), RESTORE it — verified against the PRIOR operation's OWN
-///     recorded `pii_content_hash` (looked up via
-///     `Journal::last_committed_for_note`, exactly the hash the before-image
-///     must decrypt to, since it IS that prior operation's committed
-///     ciphertext — never this failing operation's own hash, which
-///     describes different content), so the live file goes back to the
-///     PRIOR operation's ciphertext rather than being left empty or
-///     verified against the wrong expectation. The before-image is then
-///     deleted (it has been consumed). If no prior committed row can be
-///     found (should not happen once a before-image exists, since the
-///     before-image is only ever created by overwriting a prior live file —
-///     treated as `Inconsistent`, never silently guessed).
-///   - If no before-image exists (a FIRST write — there was nothing to
-///     restore the live file TO), remove the live file outright.
-/// - If this operation's own content is NOT the live file (the live file,
-///   if any, belongs to an earlier, already-resolved operation — this row
-///   never got as far as `commit_staged`, or a later legitimate operation's
-///   content is already there), nothing about the live file is touched.
+/// - Always discards this operation's own staged file first.
+/// - If this operation's own content is the live `.pii` file (verified by
+///   hash against `row.pii_content_hash`, never assumed) and a PII
+///   before-image exists (an UPDATE: `PiiStore::commit_staged` preserved the
+///   prior committed ciphertext before overwriting the live file), the
+///   before-image is RESTORED, verified against the PRIOR operation's own
+///   recorded `pii_content_hash` (via `Journal::last_committed_for_note`;
+///   never this failing operation's hash, which describes different
+///   content), and only then deleted.
+/// - If it is the live file and there is no before-image (a FIRST write),
+///   the live file is removed, re-verified at the point of removal.
+/// - If the live file is another operation's content, the live file is
+///   never touched.
 ///
 /// A row with no `pii_content_hash` at all (an ordinary, non-sensitive
-/// write) is a complete no-op beyond the staged-file discard, which is
-/// itself already a no-op for such a row (nothing was ever staged for it).
-fn roll_back_pii(
+/// write) is a no-op beyond the staged-file discard.
+///
+/// # Fail-closed rule (A3 review round 3)
+///
+/// Every destructive step (restoring over the live file, removing it,
+/// deleting the before-image) runs only on a POSITIVE, verified observation.
+/// Rounds 1 and 2 each treated a failure as permission to proceed: round 2's
+/// "not ours" branch read ANY error on the live file (a sharing violation,
+/// say) as "this is not my content" and deleted the before-image, which was
+/// then the only copy of committed v1 content. Here an unreadable live file,
+/// an unreadable or undecryptable before-image, or an observation that fits
+/// no legitimate crash window returns an error. Nothing is changed, the row
+/// is not advanced (every caller advances to `Failed` only after this
+/// returns `Ok`), and the next recovery pass examines it again. The decision
+/// table, where "BI" is this operation's own PII before-image:
+///
+/// | live file            | BI absent              | BI present and decrypts            | BI unreadable |
+/// |----------------------|------------------------|------------------------------------|---------------|
+/// | ours                 | verified remove (first write), unless the last committed row has this same hash | restore, verified against the prior committed hash, then delete BI | error |
+/// | other content `h`    | nothing to do          | delete BI only if it decrypts to `h` (an identical copy of what is live), else error | error |
+/// | absent               | nothing to do          | error (the BI may be the only copy) | error |
+/// | undecryptable        | error                  | error                              | error |
+/// | read error           | error                  | error                              | error |
+///
+/// This is also the live write path's rollback (`vault::roll_back_pii`
+/// calls it), so the two paths cannot drift apart again as they did in
+/// round 1.
+pub(crate) fn roll_back_pii(
     journal: &Journal,
     pii_store: Option<&PiiStore>,
     note_id: &NoteId,
     op: Uuid,
     row: &OperationRow,
 ) -> Result<(), ReconcileError> {
-    // A3 review round, IMPORTANT finding #5: a sensitive row with no
-    // `PiiStore` configured for this reconcile pass must fail CLOSED
-    // (`Inconsistent`, blocking `Vault::open` itself), never silently roll
-    // back without ever touching `.pii` — the live ciphertext this row's
-    // pointer may still legitimately describe (or may need cleaning up)
-    // cannot be reasoned about at all without a store to check it against.
-    if pii_store.is_none() && row.pii_content_hash.is_some() {
-        return Err(inconsistent(
-            op,
-            "this operation's journal row carries a pii_content_hash but no PiiStore was supplied to reconcile; \
-             cannot verify or roll back its PII state — open the vault with Vault::open_with_pii_store instead",
-        ));
+    // A staged file is never committed content, so discarding this
+    // operation's own one is always safe. Done whenever a store is at hand,
+    // even for a row with no pii_content_hash. A failure to discard is
+    // reported, never swallowed, so the row is re-examined rather than
+    // failed with an orphaned ciphertext left behind.
+    if let Some(store) = pii_store {
+        store
+            .discard_staged(note_id.as_str(), op)
+            .map_err(|e| pii_err(op, "cannot discard this operation's staged PII file", e))?;
     }
-    discard_pii(pii_store, note_id, op);
-    let (Some(store), Some(expected)) = (pii_store, row.pii_content_hash.as_deref()) else {
+    let Some(expected) = row.pii_content_hash.as_deref() else {
         return Ok(());
     };
-    let live_is_ours = matches!(store.get(note_id.as_str()), Ok(live_plaintext) if content_hash(&live_plaintext) == expected);
-    if !live_is_ours {
-        // A3 review round 2, NEW finding #1 ("not ours" branch): the live
-        // file belongs to a different, already-resolved operation (an
-        // earlier one this row never got to overwrite, or a LATER
-        // legitimate operation that has since overwritten it again), so
-        // the live file itself is correctly left untouched. But if THIS
-        // failing operation's OWN `commit_staged` call ran before it was
-        // superseded, it left its OWN before-image on disk
-        // (`<note_id>-{op}.pii`, keyed by this op's own operation_id) —
-        // an orphan now that this row is being failed, never reachable
-        // through the live file again. Delete it unconditionally; it is
-        // never legitimate content for ANY other operation (a
-        // before-image is created only under the operation_id of the
-        // write that is about to overwrite the live file, so no other
-        // row's recovery could ever need THIS op's before-image).
-        store
-            .delete_before_image(note_id.as_str(), op)
-            .map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
-        return Ok(());
+    // A3 review round, IMPORTANT finding #5: no store, no verdict.
+    let store = require_pii_store(pii_store, op)?;
+    let live = classify_live_pii(store, note_id, op, expected)?;
+    let before_image = match store.get_before_image(note_id.as_str(), op) {
+        Ok(plaintext) => Some(content_hash(&plaintext)),
+        Err(PiiStoreError::NotFound { .. }) => None,
+        Err(e) => return Err(pii_err(op, "cannot read this operation's PII before-image; leaving it in place", e)),
+    };
+    match (live, before_image) {
+        // Live content hashes to this operation's own, and there is no
+        // before-image. Normally a first write whose ciphertext went live:
+        // nothing to restore it to, so it is removed (verified again at the
+        // point of removal). But "hashes to ours" is not "is only ours": an
+        // update that writes the SAME plaintext as the committed version and
+        // stops before commit_staged leaves the committed ciphertext live,
+        // and it hashes identically. If the last committed operation's
+        // pii_content_hash is this same hash, the live file is (also)
+        // committed content and is left alone.
+        (LivePii::Ours, None) => {
+            let committed_has_same_content = journal
+                .last_committed_for_note(note_id.as_str())?
+                .is_some_and(|prior| prior.pii_content_hash.as_deref() == Some(expected));
+            if !committed_has_same_content {
+                store
+                    .remove_live_verified(note_id.as_str(), expected)
+                    .map_err(|e| pii_err(op, "cannot remove this operation's own live PII file", e))?;
+            }
+        }
+        // An update whose own ciphertext is live: put the prior committed
+        // content back, verified, and only then consume the before-image.
+        (LivePii::Ours, Some(_)) => {
+            let prior_hash = journal
+                .last_committed_for_note(note_id.as_str())?
+                .and_then(|prior| prior.pii_content_hash)
+                .ok_or_else(|| inconsistent(op, "a PII before-image exists but no prior committed operation's pii_content_hash could be found to verify it against"))?;
+            let restored = store
+                .restore_before_image(note_id.as_str(), op, &prior_hash)
+                .map_err(|e| pii_err(op, "PII before-image restore failed", e))?;
+            if !restored {
+                return Err(inconsistent(op, "PII before-image disappeared between reading it and restoring it"));
+            }
+            store
+                .delete_before_image(note_id.as_str(), op)
+                .map_err(|e| pii_err(op, "cannot delete the consumed PII before-image", e))?;
+        }
+        // Someone else's content is live and this operation left no
+        // before-image (it never reached commit_staged): nothing to undo.
+        (LivePii::Other(_), None) | (LivePii::Absent, None) => {}
+        // Someone else's content is live and this operation left a
+        // before-image: commit_staged copied the live file and then never
+        // renamed over it. The before-image is deleted only when it is
+        // POSITIVELY an identical copy of what is live, so deleting it
+        // loses nothing.
+        (LivePii::Other(live_hash), Some(before_hash)) if live_hash == before_hash => {
+            store
+                .delete_before_image(note_id.as_str(), op)
+                .map_err(|e| pii_err(op, "cannot delete a redundant PII before-image", e))?;
+        }
+        (LivePii::Other(_), Some(_)) => {
+            return Err(inconsistent(
+                op,
+                "the live PII file holds neither this operation's content nor the content of its before-image; \
+                 the before-image may be the only copy of committed content, so it is left in place",
+            ));
+        }
+        (LivePii::Absent, Some(_)) => {
+            return Err(inconsistent(
+                op,
+                "no live PII file exists but this operation's before-image does; it may be the only copy of \
+                 committed content, so it is left in place",
+            ));
+        }
+        (LivePii::Undecryptable, _) => {
+            return Err(inconsistent(op, "the live PII file does not decrypt; refusing to roll back over it"));
+        }
     }
-    if !store.has_before_image(note_id.as_str(), op) {
-        remove_live_pii(pii_store, note_id);
-        return Ok(());
-    }
-    let prior_hash = journal
-        .last_committed_for_note(note_id.as_str())?
-        .and_then(|prior| prior.pii_content_hash)
-        .ok_or_else(|| inconsistent(op, "a PII before-image exists but no prior committed operation's pii_content_hash could be found to verify it against"))?;
-    let restored = store
-        .restore_before_image(note_id.as_str(), op, &prior_hash)
-        .map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
-    if !restored {
-        return Err(inconsistent(op, "PII before-image disappeared between the existence check and the restore attempt"));
-    }
-    store
-        .delete_before_image(note_id.as_str(), op)
-        .map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
     Ok(())
 }
 
@@ -568,7 +664,7 @@ fn fix_content_persisted(
         // from this row's point of view, "my ciphertext is missing or
         // wrong" is handled identically to "my pointer bytes are missing or
         // wrong" — both mean this operation never validly completed.
-        if pii_is_consistent(pii_store, &note_id, op, row) {
+        if pii_is_consistent(pii_store, &note_id, op, row)? {
             journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
             return Ok(WriteState::JournalCommitted);
         }
@@ -681,15 +777,6 @@ fn fix_content_persisted(
     Ok(WriteState::Failed)
 }
 
-/// Task 6: removes the live `.pii` file for `note_id`, if `pii_store` is
-/// configured. Used by the rollback paths above where this operation's own
-/// ciphertext — committed or not — must not survive as an orphan once its
-/// pointer has been rolled back.
-fn remove_live_pii(pii_store: Option<&PiiStore>, note_id: &NoteId) {
-    let Some(store) = pii_store else { return };
-    let _ = store.remove_live(note_id.as_str());
-}
-
 /// Row 2's second guard. `true` when `before_hash` is the content of some
 /// other operation on `note_id` that never committed (any state before
 /// `JournalCommitted`, or `Failed`), and of no operation that did. A hash
@@ -737,6 +824,14 @@ fn fix_journal_committed(
 ) -> Result<GitStep, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
+    // A3 review round 3, item 1(a): a sensitive row reaching GitCommitted
+    // must have its PII before-image deleted (see
+    // `delete_before_images_at_git_committed`). Without a store that cannot
+    // happen, so the row is refused HERE, before git is touched or the row
+    // advanced, never committed with its cleanup silently skipped.
+    if row.pii_content_hash.is_some() {
+        require_pii_store(pii_store, op)?;
+    }
     // Always Unbounded on the recovery path. See the module docs.
     let found = match find_commit_for_operation(journal, repo_path, op, ScanDepth::Unbounded) {
         Ok(found) => found,
@@ -765,23 +860,42 @@ fn fix_journal_committed(
     // The Oid is recorded on the same write that advances the state, so Tier 1
     // is authoritative from here on. This includes repairing a Tier 2 find.
     journal.advance(op, WriteState::GitCommitted, AdvanceFields::git_oid(oid))?;
-    // Per spec, the before-image is deleted only once GitCommitted is reached.
-    delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
-    // A3 review round 2, NEW finding #1: the PII before-image must be
-    // deleted on the EXACT SAME schedule as the Markdown one — once
-    // GitCommitted is reached — never left behind. This is the only place
-    // in `recovery.rs` a row resumed directly from `JournalCommitted` (a
-    // crash after the linearization point but before the git commit)
-    // reaches its point of no return; the live-write path's equivalent
-    // moment is `Vault::commit_to_git`, which already does this. Before
-    // this fix, a tombstone/deletion write's PII before-image (the REAL,
-    // now-deleted content) could survive a successful roll-forward
-    // recovery indefinitely, still decryptable by the live master key —
-    // directly undermining spec contract C5.
-    if let Some(store) = pii_store {
-        store.delete_before_image(note_id.as_str(), op).map_err(|e| from_storage(op, StorageError::PiiStore(e.to_string())))?;
-    }
+    delete_before_images_at_git_committed(root, pii_store, &note_id, row)?;
     Ok(GitStep::Committed)
+}
+
+/// Deletes `row`'s Markdown and PII before-images, once the row has reached
+/// `GitCommitted` (per spec, "La before-image si elimina solo dopo
+/// git_committed"). Idempotent: both deletes treat a missing file as done.
+///
+/// Called from row 3 right after its advance to `GitCommitted`, AND from row
+/// 4 for every row resumed directly from `GitCommitted` (A3 review round 3,
+/// item 1(c)): a crash between the `GitCommitted` advance and these deletes
+/// resumes the row from row 4, never through row 3, and before this fix it
+/// went to `IndexCurrent` with its PII before-image orphaned. That
+/// before-image is the prior version's real content (for a tombstone, the
+/// "deleted" content itself), still decryptable by the live master key
+/// (A3 review round 2, NEW finding #1; spec contract C5).
+///
+/// A sensitive row with no `PiiStore` to delete with fails closed
+/// (`Inconsistent`) and is not advanced (A3 review round 3, item 1(a)).
+fn delete_before_images_at_git_committed(
+    root: &Path,
+    pii_store: Option<&PiiStore>,
+    note_id: &NoteId,
+    row: &OperationRow,
+) -> Result<(), ReconcileError> {
+    let op = row.operation_id;
+    if row.pii_content_hash.is_some() {
+        require_pii_store(pii_store, op)?;
+    }
+    delete_before_image(root, note_id, op).map_err(|e| from_storage(op, e))?;
+    if let Some(store) = pii_store {
+        store
+            .delete_before_image(note_id.as_str(), op)
+            .map_err(|e| pii_err(op, "cannot delete the PII before-image at GitCommitted", e))?;
+    }
+    Ok(())
 }
 
 /// Row 3's result: committed (the row is now `GitCommitted`) or pending, with
