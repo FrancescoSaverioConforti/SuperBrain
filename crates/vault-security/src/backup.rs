@@ -19,12 +19,18 @@
 //!    check, reused verbatim).
 //! 2. A per-note cross-check: every note id the backup would restore is
 //!    checked against `live_deletion_log.is_deleted(note_id)`. This catches
-//!    the case check 1 CANNOT: a note deleted strictly after this backup
-//!    was taken. The backup's own embedded snapshot has no way to know
-//!    about a deletion that happened after it was created; only the LIVE
-//!    log can.
+//!    what check 1 cannot see: which specific notes the live log reports
+//!    deleted. Every such note is EXCLUDED from the restore (neither its
+//!    record nor its ciphertext is written) and named in
+//!    [`RestoreOutcome::excluded_deleted_note_ids`], rather than aborting
+//!    the whole restore (final whole-branch review, CRITICAL C1: a deletion
+//!    is a tombstone write, so every backup taken after a deletion names
+//!    the deleted note, and the old "reject if any note is deleted" rule
+//!    made such a vault permanently unrestorable). If check 1 fails while
+//!    the snapshot names a deleted note, the refusal is reported as
+//!    [`BackupError::DeletedSinceBackup`], naming those notes.
 //!
-//! Both checks must pass before ANY byte is written to `destination_root`.
+//! Both checks run before ANY byte is written to `destination_root`.
 //! On any ambiguity — an I/O error reading either reference, a corrupt or
 //! tampered reference, a missing live reference — this fails closed
 //! ([`BackupError::DeletionLogRejected`]) and extracts nothing, per the same
@@ -140,12 +146,15 @@ pub enum BackupError {
     #[error("deletion log rejected this restore: {0}")]
     DeletionLogRejected(DeletionLogError),
 
-    /// Check 2 (see module docs): at least one note the backup would have
-    /// restored has since been deleted in the LIVE deletion log, after this
-    /// backup was taken. Named explicitly and distinctly from
+    /// Check 1 (see module docs) refused this backup — its embedded
+    /// reference is older than the live one, or the live reference cannot
+    /// be verified — AND at least one note in it is deleted in the LIVE
+    /// deletion log, typically because it was deleted after this backup was
+    /// taken. Named explicitly and distinctly from
     /// [`BackupError::DeletionLogRejected`] so a caller can tell "the
     /// reference itself is unusable" apart from "specific notes must not be
-    /// exposed."
+    /// exposed." When check 1 passes, deleted notes are instead excluded and
+    /// reported in [`RestoreOutcome::excluded_deleted_note_ids`].
     #[error("note(s) deleted since this backup was taken must not be exposed by restore: {note_ids:?}")]
     DeletedSinceBackup { note_ids: Vec<String> },
 
@@ -284,6 +293,12 @@ pub struct RestoreOutcome {
     /// Note ids (vault notes, i.e. Markdown record files minus their
     /// extension) that were actually written to `destination_root`.
     pub restored_note_ids: Vec<String>,
+    /// Note ids present in the backup (as a Markdown record, a `.pii` file,
+    /// or both) that the LIVE deletion log reports deleted, and that were
+    /// therefore NOT written anywhere: neither their record nor their
+    /// ciphertext. Reported explicitly so a deleted note never just
+    /// silently vanishes from the caller's point of view.
+    pub excluded_deleted_note_ids: Vec<String>,
 }
 
 /// Derives the HKDF-SHA256 backup subkey from `master_key`. See module docs
@@ -667,27 +682,43 @@ pub(crate) fn restore_with_pii_root(
 
     let snapshot = deserialize_snapshot(&plaintext_snapshot).ok_or(BackupError::HashMismatch)?;
 
-    // Both checks (module docs) must pass before anything is written. They
-    // run in this order — check 2 (the specific per-note cross-check)
-    // BEFORE check 1 (the backup's own embedded reference snapshot vs the
-    // live reference) — so that whenever a restorable note was actually
-    // deleted after this backup was taken, the caller gets the precise,
-    // actionable `DeletedSinceBackup { note_ids }` naming it, rather than
-    // the generic `ReferenceStale` that a live-reference generation bump
-    // for ANY reason would also produce. This does not weaken check 1: it
-    // still runs (below) and still fails closed on its own terms (a stale
-    // generation with no specific deleted note identifiable, a corrupt or
-    // tampered reference, or a missing reference that isn't the legitimate
-    // "no deletion has ever happened" case) — it only yields precedence to
-    // the more specific error when both would otherwise fire.
+    // Both checks (module docs) run before anything is written.
+    //
+    // Check 2 (the per-note cross-check against the LIVE log) no longer
+    // rejects the whole restore on its own (final whole-branch review,
+    // CRITICAL C1). It used to: any note id in the snapshot that the live
+    // log reports deleted aborted everything. But a deletion is a tombstone
+    // WRITE, so every backup taken AFTER a deletion still names the deleted
+    // note (its tombstone record and tombstone ciphertext), and every such
+    // backup was refused. A vault that had ever deleted one sensitive note
+    // could never be restored again, not even its other notes.
+    //
+    // Now a deleted note is EXCLUDED: neither its record nor its ciphertext
+    // is written, and its id is reported in
+    // `RestoreOutcome::excluded_deleted_note_ids` ("un restore applica prima
+    // le cancellazioni più recenti e solo dopo diventa consultabile", spec
+    // Fase A item 5). Exclusion is unconditional for a deleted id: it does
+    // NOT try to tell a backed-up tombstone apart from backed-up real
+    // content. That distinction is not safely decidable here. The tombstone
+    // record is the same `pii://<id>` pointer shape as a live one; only its
+    // decrypted plaintext (empty) differs, and this function never decrypts
+    // `.pii` contents. And `record_deletion` runs BEFORE the tombstone
+    // ciphertext replaces the real one, so a backup taken in between has a
+    // current reference but still holds the real content. Dropping every
+    // deleted id is correct in both cases: a deleted note has nothing left
+    // that a restore should expose.
+    //
+    // Check 1 (the backup's embedded reference vs the live reference) is
+    // unchanged and still fails closed on a stale, corrupt, tampered or
+    // missing reference. When it fails AND the snapshot names a deleted
+    // note, the more specific `DeletedSinceBackup { note_ids }` is returned
+    // (unchanged precedence from before this fix); exclusion only applies
+    // once check 1 has passed.
 
-    // Check 2: cross-check every note id the backup would restore against
-    // the LIVE deletion log's is_deleted. This is the check the backup's
-    // own embedded snapshot cannot perform, because it predates deletions
-    // recorded after the backup was taken. A note is named here if EITHER
-    // its Markdown record (vault_files, keyed by relative path ending in
-    // ".record") OR its PII ciphertext (pii_files, keyed by bare note id)
-    // is present in the snapshot.
+    // Check 2: which note ids in the snapshot the LIVE log reports deleted.
+    // A note is named here if EITHER its Markdown record (vault_files,
+    // keyed by relative path ending in ".record") OR its PII ciphertext
+    // (pii_files, keyed by bare note id) is present in the snapshot.
     let mut candidate_note_ids: Vec<String> = Vec::new();
     for name in snapshot.vault_files.keys() {
         if let Some(stem) = name.strip_suffix(".record") {
@@ -707,9 +738,6 @@ pub(crate) fn restore_with_pii_root(
         if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
             deleted_since_backup.push(note_id.clone());
         }
-    }
-    if !deleted_since_backup.is_empty() {
-        return Err(BackupError::DeletedSinceBackup { note_ids: deleted_since_backup });
     }
 
     // Check 1: the backup's OWN embedded reference snapshot against the
@@ -738,15 +766,30 @@ pub(crate) fn restore_with_pii_root(
     // bypass that same fail-closed judgment merely because the reference
     // happens to be unreadable; only a genuinely empty log justifies the
     // exception.
-    let live_reference_for_check1 = live_trusted_ref.read().map_err(BackupError::DeletionLogRejected)?;
-    let live_log_is_empty = live_deletion_log.is_empty().map_err(BackupError::DeletionLogRejected)?;
-    let both_sides_have_never_seen_a_deletion =
-        snapshot.reference == no_deletions_ever_reference() && live_reference_for_check1.is_none() && live_log_is_empty;
-    if !both_sides_have_never_seen_a_deletion {
-        live_deletion_log
-            .verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
-            .map_err(BackupError::DeletionLogRejected)?;
+    let check_1 = (|| -> Result<(), DeletionLogError> {
+        let live_reference_for_check1 = live_trusted_ref.read()?;
+        let live_log_is_empty = live_deletion_log.is_empty()?;
+        let both_sides_have_never_seen_a_deletion =
+            snapshot.reference == no_deletions_ever_reference() && live_reference_for_check1.is_none() && live_log_is_empty;
+        if both_sides_have_never_seen_a_deletion {
+            return Ok(());
+        }
+        live_deletion_log.verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
+    })();
+    if let Err(e) = check_1 {
+        if !deleted_since_backup.is_empty() {
+            return Err(BackupError::DeletedSinceBackup { note_ids: deleted_since_backup });
+        }
+        return Err(BackupError::DeletionLogRejected(e));
     }
+
+    // Both checks passed: drop every deleted note from what gets written.
+    let excluded: std::collections::BTreeSet<&str> = deleted_since_backup.iter().map(String::as_str).collect();
+    let is_excluded_record = |name: &str| name.strip_suffix(".record").is_some_and(|stem| excluded.contains(stem));
+    let vault_files_to_write: Vec<(&String, &Vec<u8>)> =
+        snapshot.vault_files.iter().filter(|(name, _)| !is_excluded_record(name)).collect();
+    let pii_files_to_write: Vec<(&String, &Vec<u8>)> =
+        snapshot.pii_files.iter().filter(|(note_id, _)| !excluded.contains(note_id.as_str())).collect();
 
     // Guard (Task 7 round 2 review finding), checked BEFORE any byte of
     // EITHER the vault files or the `.pii` files is written: the earlier
@@ -764,10 +807,10 @@ pub(crate) fn restore_with_pii_root(
     // possibly-newer PII content can never happen.
     std::fs::create_dir_all(pii_root)?;
     let mut already_live: Vec<String> = Vec::new();
-    for note_id in snapshot.pii_files.keys() {
+    for (note_id, _) in &pii_files_to_write {
         let dest_path = pii_root.join(format!("{note_id}.pii"));
         match std::fs::metadata(&dest_path) {
-            Ok(_) => already_live.push(note_id.clone()),
+            Ok(_) => already_live.push((*note_id).clone()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(BackupError::Io(e.to_string())),
         }
@@ -780,7 +823,7 @@ pub(crate) fn restore_with_pii_root(
     // Both deletion-log checks AND the PII existence guard passed: NOW, and
     // only now, extract.
     std::fs::create_dir_all(destination_root)?;
-    for (name, content) in &snapshot.vault_files {
+    for (name, content) in &vault_files_to_write {
         let dest_path = destination_root.join(name);
         if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -798,18 +841,22 @@ pub(crate) fn restore_with_pii_root(
     // `std::fs::write`, so a crash mid-loop can never leave a truncated
     // `.pii` file over previously-valid ciphertext: the rename is the only
     // operation that ever touches the final path.
-    for (note_id, content) in &snapshot.pii_files {
+    for (note_id, content) in &pii_files_to_write {
         let dest_path = pii_root.join(format!("{note_id}.pii"));
         atomic_write_pii(&dest_path, content)?;
     }
 
-    let restored_note_ids: Vec<String> = snapshot
-        .vault_files
-        .keys()
-        .filter_map(|name| name.strip_suffix(".record").map(|s| s.to_string()))
+    let restored_note_ids: Vec<String> = vault_files_to_write
+        .iter()
+        .filter_map(|(name, _)| name.strip_suffix(".record").map(|s| s.to_string()))
         .collect();
 
-    Ok(RestoreOutcome { hash: recomputed_hash, generation: snapshot.reference.generation, restored_note_ids })
+    Ok(RestoreOutcome {
+        hash: recomputed_hash,
+        generation: snapshot.reference.generation,
+        restored_note_ids,
+        excluded_deleted_note_ids: deleted_since_backup,
+    })
 }
 
 #[cfg(test)]
@@ -1321,6 +1368,83 @@ mod tests {
             let receipt = handle.join().unwrap();
             assert_eq!(receipt.generation, 1);
         });
+    }
+
+    /// Final whole-branch review, CRITICAL C1: a backup taken AFTER a
+    /// deletion (its own embedded reference already reflects it) must be
+    /// restorable. Before the fix, check 2 rejected the WHOLE restore as
+    /// `DeletedSinceBackup` because the deleted note's id appears anywhere in
+    /// the snapshot, so a vault that had ever deleted one sensitive note
+    /// could never be restored again, not even its other notes.
+    #[test]
+    fn a_backup_taken_after_a_deletion_restores_its_other_notes_and_excludes_the_deleted_one() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"2\n---\npii://note-a");
+        write_file(&vault_root.join("note-b.record"), b"1\n---\nplain note b");
+
+        let pii_store = open_pii_store(dir.path());
+        let op1 = Uuid::new_v4();
+        pii_store.stage("note-a", b"REAL SENSITIVE CONTENT", op1).unwrap();
+        pii_store.commit_staged("note-a", op1).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        // Delete note-a exactly as the storage pipeline does: log first,
+        // then the tombstone (empty plaintext) replaces the live ciphertext.
+        log.record_deletion("note-a", &reference).unwrap();
+        let op2 = Uuid::new_v4();
+        pii_store.stage("note-a", b"", op2).unwrap();
+        pii_store.commit_staged("note-a", op2).unwrap();
+        pii_store.delete_before_image("note-a", op2).unwrap();
+
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(manifest.generation, 1, "the backup postdates the deletion");
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+            .expect("a backup taken after the deletion must restore, not be rejected wholesale");
+        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()], "the excluded note must be reported, never silently dropped");
+        assert_eq!(std::fs::read(destination.join("note-b.record")).unwrap(), b"1\n---\nplain note b");
+        assert!(!destination.join("note-a.record").exists(), "the deleted note's record must not be restored");
+        assert!(!restored_pii_root.join("note-a.pii").exists(), "the deleted note's ciphertext must not be restored");
+    }
+
+    /// C1, the reason exclusion is unconditional rather than "only if the
+    /// backed-up copy is a tombstone": `record_deletion` runs BEFORE the
+    /// tombstone ciphertext replaces the live one, so a backup taken in that
+    /// window has a current reference but still holds the REAL content.
+    /// Restore must still drop it.
+    #[test]
+    fn a_deleted_note_whose_backed_up_ciphertext_is_still_the_real_content_is_excluded_too() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"1\n---\npii://note-a");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"REAL SENSITIVE CONTENT", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        log.record_deletion("note-a", &reference).unwrap();
+
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        assert!(outcome.restored_note_ids.is_empty());
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
+        assert!(all_files_under(&destination).is_empty() || !destination.exists());
+        assert!(!restored_pii_root.join("note-a.pii").exists());
     }
 
     #[test]
