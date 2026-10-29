@@ -699,6 +699,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_nonce_never_repeats_across_many_draws() {
+        // AES-256-GCM nonce reuse under the same key is catastrophic (it
+        // breaks both confidentiality and authentication). This asserts
+        // fresh_nonce() genuinely draws fresh randomness each call rather
+        // than e.g. returning a fixed/cached value: a mutant that replaced
+        // the body with `[0; NONCE_LEN]` would pass every other test in
+        // this suite (each of which only encrypts once per key) but fails
+        // here. A collision among 50 draws from a 12-byte CSPRNG is
+        // astronomically unlikely (~2^-96 per pair), so this is not flaky.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let nonce = fresh_nonce();
+            assert!(seen.insert(nonce), "fresh_nonce() produced a duplicate nonce: {nonce:?}");
+        }
+    }
+
+    #[test]
     fn stage_then_commit_then_get_round_trips_plaintext() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());

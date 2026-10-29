@@ -187,6 +187,20 @@ mod tests {
     /// anywhere in it, reconstructs byte-identical key material from
     /// kit_text + passphrase).
     #[test]
+    fn argon2id_params_match_the_documented_owasp_floor_values() {
+        // Every other test here only checks that key derivation round-trips
+        // correctly, which would pass identically even if this function
+        // silently regressed to argon2::Params::default() (much weaker than
+        // the documented OWASP-floor values). Pin the exact parameters so a
+        // future weakening of the KDF strength fails a test instead of
+        // passing silently.
+        let params = argon2id_params();
+        assert_eq!(params.m_cost(), 65536, "memory cost must be 65536 KiB (64 MiB)");
+        assert_eq!(params.t_cost(), 3, "time cost (iterations) must be 3");
+        assert_eq!(params.p_cost(), 1, "parallelism must be 1 for cross-machine reproducibility");
+    }
+
+    #[test]
     fn recovery_kit_generated_from_a_live_master_key_recovers_that_exact_key_independent_of_dpapi() {
         let live_key = MasterKey::generate();
         let live_bytes = *live_key.expose_secret();
