@@ -583,8 +583,64 @@ impl DeletionLog {
         Ok(rows.next().map_err(|e| DeletionLogError::Io(e.to_string()))?.is_some())
     }
 
-    /// Run at startup. Compares the log's latest generation against the
-    /// trusted reference:
+    /// Walks the WHOLE chain from genesis and verifies every link (final
+    /// whole-branch review, I5). Before this, only the latest row was ever
+    /// compared against the trusted reference, so a corrupted or rewritten
+    /// MIDDLE row went undetected, and rewriting a middle row's `note_id`
+    /// silently "un-deletes" that note (`is_deleted` stops seeing it).
+    ///
+    /// Rows are read in generation order and must be exactly generations
+    /// `1, 2, ..., n` with no gap; each row's `prev_chain_hash` must equal
+    /// its predecessor's `chain_hash` ([`GENESIS_PREV_CHAIN_HASH`] for
+    /// generation 1); each row's `chain_hash` must equal
+    /// `sha256(prev_chain_hash || generation || note_id)` recomputed from the
+    /// row itself; and each `state` must be a known one. Any failure is
+    /// [`DeletionLogError::ChainBroken`]. Run by [`DeletionLog::reconcile`]
+    /// (so on every production startup) and by
+    /// [`DeletionLog::verify_safe_to_expose_after_restore`] (so on every
+    /// restore). The latest row's link to the trusted reference is
+    /// `reconcile`'s own, separate check.
+    pub fn verify_chain(&self) -> Result<(), DeletionLogError> {
+        let conn = self.conn.lock().expect("deletion log mutex poisoned");
+        Self::verify_chain_on(&conn)
+    }
+
+    fn verify_chain_on(conn: &Connection) -> Result<(), DeletionLogError> {
+        let io = |e: rusqlite::Error| DeletionLogError::Io(e.to_string());
+        let mut stmt = conn
+            .prepare("SELECT generation, note_id, prev_chain_hash, chain_hash, state FROM deletions ORDER BY generation ASC")
+            .map_err(io)?;
+        let mut rows = stmt.query([]).map_err(io)?;
+        let mut expected_generation: u64 = 1;
+        let mut expected_prev = GENESIS_PREV_CHAIN_HASH.to_string();
+        while let Some(row) = rows.next().map_err(io)? {
+            let generation: i64 = row.get(0).map_err(io)?;
+            let note_id: String = row.get(1).map_err(io)?;
+            let prev_chain_hash: String = row.get(2).map_err(io)?;
+            let chain_hash: String = row.get(3).map_err(io)?;
+            let state: String = row.get(4).map_err(io)?;
+            if generation < 0 || generation as u64 != expected_generation {
+                return Err(DeletionLogError::ChainBroken);
+            }
+            if prev_chain_hash != expected_prev {
+                return Err(DeletionLogError::ChainBroken);
+            }
+            if chain_hash != Self::compute_chain_hash(&prev_chain_hash, expected_generation, &note_id) {
+                return Err(DeletionLogError::ChainBroken);
+            }
+            if DeletionLogState::from_sql(&state).is_none() {
+                return Err(DeletionLogError::ChainBroken);
+            }
+            expected_generation += 1;
+            expected_prev = chain_hash;
+        }
+        Ok(())
+    }
+
+    /// Run at startup (`storage::Vault::open_with_pii_store`). First walks
+    /// the whole chain ([`DeletionLog::verify_chain`]; a broken link is
+    /// [`DeletionLogError::ChainBroken`]), then compares the log's latest
+    /// generation against the trusted reference:
     ///
     /// - Equal generation and matching hash, with the log's row already
     ///   `Completed`: [`ReconcileOutcome::AlreadyConsistent`].
@@ -598,6 +654,9 @@ impl DeletionLog {
     ///   failed closed: never guessed.
     pub fn reconcile(&self, trusted_ref: &dyn TrustedReferenceStore) -> Result<ReconcileOutcome, DeletionLogError> {
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
+        // I5: the whole chain must verify before anything is rolled forward
+        // or declared consistent.
+        Self::verify_chain_on(&conn)?;
         let latest = Self::latest_row(&conn)?;
         let reference = trusted_ref.read()?;
 
@@ -706,6 +765,9 @@ impl DeletionLog {
         restored_reference_snapshot: &GenerationRef,
         live_trusted_ref: &dyn TrustedReferenceStore,
     ) -> Result<(), DeletionLogError> {
+        // I5: a live log whose chain does not verify cannot vouch for which
+        // notes are deleted.
+        self.verify_chain()?;
         let live = live_trusted_ref.read()?.ok_or(DeletionLogError::ReferenceMissing)?;
         if restored_reference_snapshot.generation < live.generation {
             return Err(DeletionLogError::ReferenceStale {
@@ -1060,6 +1122,108 @@ mod tests {
 
         // Final state, read after the writer returns: must still be true.
         assert!(log.is_deleted("note-concurrent").unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // Final whole-branch review, I4 #3 and I5: the hash chain itself
+    // -----------------------------------------------------------------
+
+    /// I4 #3: `compute_chain_hash` collapsed to a fixed string survived,
+    /// because nothing checked the hash depends on its inputs. Pins the
+    /// documented formula `sha256(prev || generation || note_id)` to a
+    /// vector computed independently with Python's `hashlib`, determinism,
+    /// and that changing ANY one input changes the output.
+    #[test]
+    fn compute_chain_hash_matches_a_known_answer_and_depends_on_every_input() {
+        let genesis = GENESIS_PREV_CHAIN_HASH;
+        let h = DeletionLog::compute_chain_hash(genesis, 1, "note-a");
+        assert_eq!(h, "7fa99c98997e4901987dacbec69c62e0af0b052230298c82c714521a06fdee14");
+        assert_eq!(DeletionLog::compute_chain_hash(genesis, 1, "note-a"), h, "deterministic");
+        assert_ne!(DeletionLog::compute_chain_hash(&"1".repeat(64), 1, "note-a"), h, "depends on prev_chain_hash");
+        assert_ne!(DeletionLog::compute_chain_hash(genesis, 2, "note-a"), h, "depends on generation");
+        assert_ne!(DeletionLog::compute_chain_hash(genesis, 1, "note-b"), h, "depends on note_id");
+    }
+
+    fn corrupt(log: &DeletionLog, sql: &str) {
+        log.conn.lock().unwrap().execute(sql, []).unwrap();
+    }
+
+    fn three_deletions(dir: &Path) -> (DeletionLog, FileTrustedReferenceStore) {
+        let log = open_log(dir);
+        let reference = file_ref(dir);
+        for id in ["note-a", "note-b", "note-c"] {
+            log.record_deletion(id, &reference).unwrap();
+        }
+        (log, reference)
+    }
+
+    /// I5: before the fix only the LATEST row was compared against the
+    /// trusted reference, so rewriting a MIDDLE row's `note_id` (which
+    /// silently "un-deletes" that note: `is_deleted` stops seeing it) went
+    /// undetected and reconcile reported `AlreadyConsistent`. The full walk
+    /// must catch it, both in `verify_chain` and on the startup path.
+    #[test]
+    fn a_corrupted_middle_row_note_id_is_detected_as_chain_broken() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = three_deletions(dir.path());
+        corrupt(&log, "UPDATE deletions SET note_id = 'note-x' WHERE generation = 2");
+        assert!(!log.is_deleted("note-b").unwrap(), "precondition: the corruption un-deletes note-b");
+
+        assert_eq!(log.reconcile(&reference), Err(DeletionLogError::ChainBroken), "the startup path must walk the whole chain");
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
+    }
+
+    /// I5: a middle row's own `chain_hash` rewritten (which also breaks the
+    /// next row's `prev_chain_hash` link).
+    #[test]
+    fn a_corrupted_middle_row_chain_hash_is_detected_as_chain_broken() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = three_deletions(dir.path());
+        corrupt(&log, &format!("UPDATE deletions SET chain_hash = '{}' WHERE generation = 2", "e".repeat(64)));
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
+        assert_eq!(log.reconcile(&reference), Err(DeletionLogError::ChainBroken));
+    }
+
+    /// I5: a row whose `prev_chain_hash` no longer names its predecessor,
+    /// even though its own `chain_hash` was recomputed to match it (an
+    /// attacker re-hashing one row cannot splice it into the chain).
+    #[test]
+    fn a_middle_row_relinked_to_the_wrong_predecessor_is_detected_as_chain_broken() {
+        let dir = tempdir().unwrap();
+        let (log, _reference) = three_deletions(dir.path());
+        let forged_prev = "d".repeat(64);
+        let forged_hash = DeletionLog::compute_chain_hash(&forged_prev, 2, "note-b");
+        corrupt(&log, &format!("UPDATE deletions SET prev_chain_hash = '{forged_prev}', chain_hash = '{forged_hash}' WHERE generation = 2"));
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
+    }
+
+    /// I5: a deleted (missing) middle generation is a gap in the chain.
+    #[test]
+    fn a_missing_middle_generation_is_detected_as_chain_broken() {
+        let dir = tempdir().unwrap();
+        let (log, _reference) = three_deletions(dir.path());
+        corrupt(&log, "DELETE FROM deletions WHERE generation = 2");
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
+    }
+
+    /// I5: an intact chain (and an empty log) verifies.
+    #[test]
+    fn an_intact_chain_and_an_empty_log_verify() {
+        let dir = tempdir().unwrap();
+        assert_eq!(open_log(&dir.path().join("empty")).verify_chain(), Ok(()));
+        let (log, reference) = three_deletions(dir.path());
+        assert_eq!(log.verify_chain(), Ok(()));
+        assert_eq!(log.reconcile(&reference), Ok(ReconcileOutcome::AlreadyConsistent));
+    }
+
+    /// I5: the restore-time gate walks the live chain too.
+    #[test]
+    fn verify_safe_to_expose_after_restore_rejects_a_live_log_with_a_broken_chain() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = three_deletions(dir.path());
+        let live = reference.read().unwrap().unwrap();
+        corrupt(&log, "UPDATE deletions SET note_id = 'note-x' WHERE generation = 1");
+        assert_eq!(log.verify_safe_to_expose_after_restore(&live, &reference), Err(DeletionLogError::ChainBroken));
     }
 
     // -----------------------------------------------------------------

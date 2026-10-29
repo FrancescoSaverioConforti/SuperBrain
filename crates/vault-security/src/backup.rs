@@ -1454,6 +1454,56 @@ mod tests {
         assert_ne!(&subkey, master_key.expose_secret(), "the backup subkey must be cryptographically distinct from the raw master key");
     }
 
+    /// Final whole-branch review, I4 #1: the only prior subkey test asserted
+    /// "subkey != master key", which a constant `[0; 32]` also satisfies, so
+    /// that mutant survived. Pins a known-answer vector (HKDF-SHA256 per RFC
+    /// 5869, salt absent = 32 zero bytes, ikm = bytes 0..32, info =
+    /// "superbrain-backup-v1", computed independently with Python's `hmac`),
+    /// determinism, and that different master keys give different subkeys.
+    #[test]
+    fn derive_backup_subkey_matches_a_known_answer_and_depends_on_the_master_key() {
+        let ikm: [u8; MASTER_KEY_LEN] = std::array::from_fn(|i| i as u8);
+        let key = MasterKey::from_bytes(ikm, crate::keys::KeySource::Fresh);
+        let subkey = derive_backup_subkey(&key);
+        let hex: String = subkey.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "17d5fd5e35ab48a7eb46511f0635ffe33a96b75214607f2f11db1ae36955c4e7");
+
+        assert_eq!(derive_backup_subkey(&key), subkey, "deterministic for the same master key");
+        let mut other_bytes = ikm;
+        other_bytes[0] ^= 0x01;
+        let other = MasterKey::from_bytes(other_bytes, crate::keys::KeySource::Fresh);
+        assert_ne!(derive_backup_subkey(&other), subkey, "a different master key must give a different subkey");
+    }
+
+    /// I4 #2: `backup.rs`'s own `fresh_nonce` (a separate function from
+    /// `pii_store.rs`'s) collapsed to a constant survived, i.e. nonce reuse
+    /// across backups under one subkey went undetected. Same check Task 8
+    /// added for `pii_store::fresh_nonce`, plus the observable consequence:
+    /// two backups of identical content produce different blobs.
+    #[test]
+    fn backup_fresh_nonce_never_repeats_and_two_identical_backups_use_different_nonces() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let nonce = fresh_nonce();
+            assert!(seen.insert(nonce), "backup fresh_nonce() produced a duplicate nonce: {nonce:?}");
+        }
+
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        write_file(&vault_root.join("note-a.record"), b"1\n---\nsame content");
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target_1 = FilesystemBackupTarget::new(dir.path().join("t1"));
+        let target_2 = FilesystemBackupTarget::new(dir.path().join("t2"));
+        let m1 = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target_1, &reference).unwrap();
+        let m2 = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target_2, &reference).unwrap();
+        assert_eq!(m1.hash, m2.hash, "precondition: identical plaintext snapshots");
+        let blob_1 = target_1.read_blob(BLOB_NAME).unwrap();
+        let blob_2 = target_2.read_blob(BLOB_NAME).unwrap();
+        assert_ne!(blob_1[..NONCE_LEN], blob_2[..NONCE_LEN], "two backups under one subkey must never share a nonce");
+    }
+
     #[test]
     fn restore_must_not_silently_roll_back_live_pii_ciphertext_that_was_committed_after_the_backup_was_taken() {
         // Reviewer's exact repro (Task 7 round 2 finding): back up note-a
