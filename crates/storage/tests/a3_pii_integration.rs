@@ -278,6 +278,107 @@ fn a_properly_deleted_sensitive_note_goes_through_the_deletion_log_and_is_not_fl
     assert!(!orphans.contains(&"note-proper-delete".to_string()), "a deletion-logged note must not be an unexplained orphan");
 }
 
+/// Final whole-branch review, I2 (Option A: a deleted note id is retired).
+/// Before the fix, new content could be written under a deleted id and
+/// `get` returned it while `is_deleted` still said `true`.
+#[test]
+fn writing_new_sensitive_content_to_a_previously_deleted_note_id_is_rejected_as_note_deleted() {
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let id = NoteId::parse("note-retired").unwrap();
+
+    storage::propose_and_commit(&vault, &sensitive_note("note-retired", "original secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let v1 = vault.current_version(&id).unwrap();
+    storage::propose_and_commit(&vault, &sensitive_tombstone("note-retired"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let tombstone_record = vault.read_note(&id).unwrap();
+
+    let result = storage::propose_and_commit(
+        &vault,
+        &sensitive_note("note-retired", "resurrected content"),
+        tombstone_record.version,
+        Uuid::new_v4(),
+        &known,
+        &pending,
+        &gate,
+        Some(&pii_store),
+    );
+    assert!(
+        matches!(&result, Err(ProposeError::Storage(StorageError::NoteDeleted { note_id })) if note_id == "note-retired"),
+        "a write of new content to a deleted note id must be refused with NoteDeleted, got {result:?}"
+    );
+    assert_eq!(vault.read_note(&id).unwrap(), tombstone_record, "the tombstone record is untouched");
+    assert_eq!(pii_store.get("note-retired").unwrap(), b"", "the live ciphertext is still the empty tombstone");
+}
+
+/// I2: the same retirement holds across a reclassification. A deleted
+/// sensitive id cannot come back as an `Internal` note either.
+#[test]
+fn writing_internal_content_to_a_previously_deleted_sensitive_note_id_is_rejected_too() {
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let id = NoteId::parse("note-retired-internal").unwrap();
+
+    storage::propose_and_commit(&vault, &sensitive_note("note-retired-internal", "original secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let v1 = vault.current_version(&id).unwrap();
+    storage::propose_and_commit(&vault, &sensitive_tombstone("note-retired-internal"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let tombstone_record = vault.read_note(&id).unwrap();
+
+    let internal = sensitive_note("note-retired-internal", "now internal").replace("classification: sensitive", "classification: internal");
+    let result = storage::propose_and_commit(&vault, &internal, tombstone_record.version, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
+    assert!(
+        matches!(&result, Err(ProposeError::Storage(StorageError::NoteDeleted { .. }))),
+        "got {result:?}"
+    );
+    assert_eq!(vault.read_note(&id).unwrap(), tombstone_record);
+}
+
+/// I2: re-issuing the tombstone for an already-deleted id is accepted (it
+/// is how an operator finishes a deletion whose tombstone step failed) and
+/// does not append a second deletion-log entry.
+#[test]
+#[cfg(windows)]
+fn a_repeated_tombstone_write_to_an_already_deleted_note_is_accepted_without_a_second_log_entry() {
+    use vault_security::TrustedReferenceStore;
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let id = NoteId::parse("note-twice").unwrap();
+
+    storage::propose_and_commit(&vault, &sensitive_note("note-twice", "secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let v1 = vault.current_version(&id).unwrap();
+    storage::propose_and_commit(&vault, &sensitive_tombstone("note-twice"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    let v2 = vault.current_version(&id).unwrap();
+    let result = storage::propose_and_commit(&vault, &sensitive_tombstone("note-twice"), v2, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
+    assert!(matches!(result, Ok(CommitResult::Committed(_))), "got {result:?}");
+
+    let reference = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()).read().unwrap().unwrap();
+    assert_eq!(reference.generation, 1, "the second tombstone must not record a second deletion");
+}
+
+/// I2, read side: the consumer-facing read refuses a deleted note.
+#[test]
+fn get_unless_deleted_refuses_a_deleted_note_and_serves_a_live_one() {
+    let root = unique_test_dir();
+    let (vault, pii_store) = open_vault_and_pii_store(root);
+    let (known, pending) = empty();
+    let gate = gate();
+    let id = NoteId::parse("note-read-del").unwrap();
+
+    storage::propose_and_commit(&vault, &sensitive_note("note-read-del", "secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    assert_eq!(pii_store.get_unless_deleted("note-read-del").unwrap(), b"secret");
+    let v1 = vault.current_version(&id).unwrap();
+    storage::propose_and_commit(&vault, &sensitive_tombstone("note-read-del"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
+    assert!(
+        matches!(pii_store.get_unless_deleted("note-read-del"), Err(vault_security::PiiStoreError::Deleted { .. })),
+        "a deleted note must read as Deleted"
+    );
+}
+
 #[test]
 fn a_tombstone_write_with_a_stale_expected_version_is_rejected_and_never_recorded_in_the_deletion_log() {
     // A3 review round, IMPORTANT finding #1 regression test: the deletion

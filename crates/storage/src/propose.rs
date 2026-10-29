@@ -323,9 +323,9 @@ fn commit_sensitive(
     let deletion_log;
     let trusted_ref;
     let deletion = if is_deletion {
-        deletion_log = vault_security::DeletionLog::open(&deletion_log_db_path(pii_store))
+        deletion_log = vault_security::DeletionLog::open(&pii_store.deletion_log_path())
             .map_err(|e| ProposeError::Storage(StorageError::DeletionLog(e.to_string())))?;
-        trusted_ref = vault_security::DpapiTrustedReferenceStore::new(deletion_log_reference_path(pii_store));
+        trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
         Some(PendingDeletion { log: &deletion_log, trusted_ref: &trusted_ref })
     } else {
         None
@@ -348,20 +348,6 @@ fn commit_sensitive(
 fn pointer_record(frontmatter: &str, note_id: &NoteId) -> String {
     let pointer = PiiPointer::for_note(note_id.as_str());
     format!("---\n{frontmatter}---\n{}", pointer.uri)
-}
-
-/// `<pii_store_root>/deletion-log.sqlite` — a fixed, documented sibling of
-/// the PII store root, mirroring how `vault.rs`'s before-image directory is
-/// a fixed sibling of the vault root.
-fn deletion_log_db_path(pii_store: &PiiStore) -> std::path::PathBuf {
-    pii_store.root().join("deletion-log.sqlite")
-}
-
-/// `<pii_store_root>/deletion-log-reference.dpapi` — the deletion log's
-/// authenticated trusted reference (Task 5), a sibling of its own SQLite
-/// file.
-fn deletion_log_reference_path(pii_store: &PiiStore) -> std::path::PathBuf {
-    pii_store.root().join("deletion-log-reference.dpapi")
 }
 
 /// Returns the body portion of `note_text` — everything after the closing

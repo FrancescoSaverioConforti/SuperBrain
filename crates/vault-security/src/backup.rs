@@ -553,9 +553,7 @@ pub fn backup(
     master_key: &MasterKey,
     target: &dyn BackupTarget,
 ) -> Result<BackupManifest, BackupError> {
-    let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(
-        pii_store.root().join("deletion-log-reference.dpapi"),
-    );
+    let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
     backup_with_reference(vault_root, pii_store, deletion_log, master_key, target, &trusted_ref)
 }
 

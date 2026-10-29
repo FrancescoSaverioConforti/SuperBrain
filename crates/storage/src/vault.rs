@@ -196,6 +196,18 @@ pub enum StorageError {
     /// note ids, generations and hashes only).
     #[error("deletion log error: {0}")]
     DeletionLog(String),
+    /// A non-tombstone write targeted a note id the deletion log records as
+    /// deleted (final whole-branch review, I2). A deleted note id is retired
+    /// permanently, consistent with the deletion log's own monotonic,
+    /// append-only model: accepting new content under it would leave a note
+    /// that is live and "deleted" at once, which every later restore would
+    /// then drop. Nothing was applied: the refusal happens under the
+    /// per-note lock, before the record, any before-image or the PII store
+    /// is touched, and this call's own journal row is `Failed`. A tombstone
+    /// write to an already-deleted id is still accepted (it re-applies the
+    /// deletion, e.g. to finish one whose tombstone step failed).
+    #[error("note {note_id} has been deleted; a deleted note id is retired and cannot receive new content")]
+    NoteDeleted { note_id: String },
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -934,6 +946,16 @@ impl Vault {
             });
         }
 
+        // Step 2b (final whole-branch review, I2): a note id the deletion
+        // log records as deleted is retired, whatever classification this
+        // new write carries (a deleted sensitive note must not come back as
+        // an Internal one either). Only checkable when a `PiiStore` is at
+        // hand, since the deletion log lives beside it;
+        // `propose_and_commit` passes one whenever the caller configured it.
+        if let Some(store) = pii_store {
+            self.refuse_if_deleted(store, note_id, operation_id)?;
+        }
+
         // Step 3: preserve what this write is about to overwrite, if
         // anything, keyed by THIS operation's own operation_id.
         let before_image_hash = match &current_bytes {
@@ -1182,11 +1204,27 @@ impl Vault {
         // two consistent in practice: a deletion is logged if and only if
         // the tombstone pointer this same call is about to commit is also
         // about to be accepted.
-        if let Some(deletion) = &deletion {
-            deletion
-                .log
-                .record_deletion(note_id.as_str(), deletion.trusted_ref)
-                .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+        //
+        // Final whole-branch review, I2: a deleted note id is retired. A
+        // NON-tombstone write to it is refused here (`refuse_if_deleted`,
+        // same lock, same point). A tombstone write to an id that is
+        // already deleted re-applies the tombstone but does not append a
+        // second log entry: the log already says "deleted", and a second
+        // generation for the same id would add nothing but chain length.
+        match &deletion {
+            Some(deletion) => {
+                let already_deleted = deletion
+                    .log
+                    .is_deleted(note_id.as_str())
+                    .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+                if !already_deleted {
+                    deletion
+                        .log
+                        .record_deletion(note_id.as_str(), deletion.trusted_ref)
+                        .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+                }
+            }
+            None => self.refuse_if_deleted(pii_store, note_id, operation_id)?,
         }
 
         // Step 3: before-image of the POINTER record (never the plaintext —
@@ -1539,6 +1577,29 @@ impl Vault {
             .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
             .map_err(journal_err)?;
         Ok(true)
+    }
+
+    /// Final whole-branch review, I2: refuses a non-tombstone write to a note
+    /// id the deletion log (at `pii_store.deletion_log_path()`) records as
+    /// deleted, in any state. Must be called under `note_id`'s per-note lock,
+    /// after the version check and before anything is touched, so it cannot
+    /// race a concurrent tombstone on the same note: that tombstone either
+    /// committed first (and this call's version check already failed) or has
+    /// already logged its deletion (and this check sees it). On refusal, or
+    /// if the log cannot be consulted (fail closed, never "not deleted"),
+    /// this call's own journal row is advanced to `Failed`, as for a
+    /// `Conflict`.
+    fn refuse_if_deleted(&self, pii_store: &PiiStore, note_id: &NoteId, operation_id: Uuid) -> Result<(), StorageError> {
+        let deleted = DeletionLog::open(&pii_store.deletion_log_path())
+            .and_then(|log| log.is_deleted(note_id.as_str()))
+            .map_err(|e| StorageError::DeletionLog(e.to_string()));
+        let refusal = match deleted {
+            Ok(false) => return Ok(()),
+            Ok(true) => StorageError::NoteDeleted { note_id: note_id.as_str().to_string() },
+            Err(e) => e,
+        };
+        self.journal.lock().unwrap().advance(operation_id, WriteState::Failed, AdvanceFields::none()).map_err(journal_err)?;
+        Err(refusal)
     }
 
     /// The index step, GitCommitted -> IndexCurrent (Task 6). `mark_current`

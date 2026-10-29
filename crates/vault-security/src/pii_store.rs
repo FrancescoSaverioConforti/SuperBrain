@@ -109,7 +109,26 @@ pub enum PiiStoreError {
     NotFound { note_id: String },
     #[error(transparent)]
     Key(#[from] KeyError),
+    /// [`PiiStore::get_unless_deleted`]: the deletion log records `note_id`
+    /// as deleted (in any state, `Pending` included, per C5's "non
+    /// consultabile dal passo 1"), so its content is not returned, whatever
+    /// ciphertext may still be on disk.
+    #[error("PII record {note_id} has been deleted and is not consultable")]
+    Deleted { note_id: String },
+    /// [`PiiStore::get_unless_deleted`] could not consult the deletion log.
+    /// Fails closed: "could not check" is never read as "not deleted".
+    #[error("cannot consult the deletion log for {note_id}: {reason}")]
+    DeletionLogUnavailable { note_id: String, reason: String },
 }
+
+/// File name, inside a [`PiiStore`]'s root, of the deletion log's SQLite
+/// database. See [`PiiStore::deletion_log_path`].
+const DELETION_LOG_FILE: &str = "deletion-log.sqlite";
+
+/// File name, inside a [`PiiStore`]'s root, of the deletion log's
+/// DPAPI-authenticated trusted reference. See
+/// [`PiiStore::deletion_log_reference_path`].
+const DELETION_LOG_REFERENCE_FILE: &str = "deletion-log-reference.dpapi";
 
 /// The result of a successful [`PiiStore::stage`] call: the hash of the
 /// PLAINTEXT that was staged (never the ciphertext), for `storage`'s journal
@@ -187,9 +206,10 @@ pub fn unavailable_reason_for(err: &PiiStoreError) -> StoreUnavailableReason {
             StoreUnavailableReason::NotYetConfigured
         }
         PiiStoreError::Io(_) => StoreUnavailableReason::NotYetConfigured,
-        PiiStoreError::Inconsistent { .. } | PiiStoreError::NotFound { .. } => {
-            StoreUnavailableReason::StoreInconsistent
-        }
+        PiiStoreError::Inconsistent { .. }
+        | PiiStoreError::NotFound { .. }
+        | PiiStoreError::Deleted { .. }
+        | PiiStoreError::DeletionLogUnavailable { .. } => StoreUnavailableReason::StoreInconsistent,
     }
 }
 
@@ -306,6 +326,22 @@ impl PiiStore {
     /// independently-configured root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `<root>/deletion-log.sqlite`: the single, documented location of the
+    /// deletion log that governs this store's notes. `storage`'s write
+    /// pipeline, its startup reconciliation, [`crate::backup::backup`] and
+    /// [`PiiStore::get_unless_deleted`] all derive it from here, so there is
+    /// one source of truth for where it lives.
+    pub fn deletion_log_path(&self) -> PathBuf {
+        self.root.join(DELETION_LOG_FILE)
+    }
+
+    /// `<root>/deletion-log-reference.dpapi`: the deletion log's
+    /// DPAPI-authenticated trusted reference, a sibling of
+    /// [`PiiStore::deletion_log_path`].
+    pub fn deletion_log_reference_path(&self) -> PathBuf {
+        self.root.join(DELETION_LOG_REFERENCE_FILE)
     }
 
     /// `<root>/<note_id>.pii`.
@@ -540,10 +576,38 @@ impl PiiStore {
         self.decrypt_buffer(note_id, &bytes)
     }
 
+    /// The consumer-facing read of a sensitive note's content: [`PiiStore::get`],
+    /// but only after the deletion log at [`PiiStore::deletion_log_path`]
+    /// confirms `note_id` is NOT deleted (final whole-branch review, I2).
+    /// A note with a deletion entry in any state is
+    /// [`PiiStoreError::Deleted`], whatever ciphertext is still on disk: if
+    /// `record_deletion` succeeded but a later step of the tombstone write
+    /// failed or crashed, the old ciphertext can still be live, and per C5
+    /// it must be non-consultable from the moment the deletion is logged.
+    /// A deletion log that cannot be opened or queried is
+    /// [`PiiStoreError::DeletionLogUnavailable`], never "not deleted".
+    pub fn get_unless_deleted(&self, note_id: &str) -> Result<Vec<u8>, PiiStoreError> {
+        let unavailable = |e: crate::deletion_log::DeletionLogError| PiiStoreError::DeletionLogUnavailable {
+            note_id: note_id.to_string(),
+            reason: e.to_string(),
+        };
+        let log = crate::deletion_log::DeletionLog::open(&self.deletion_log_path()).map_err(unavailable)?;
+        if log.is_deleted(note_id).map_err(unavailable)? {
+            return Err(PiiStoreError::Deleted { note_id: note_id.to_string() });
+        }
+        self.get(note_id)
+    }
+
     /// Unwraps the data key, decrypts, and returns the plaintext for
     /// `note_id`'s live ciphertext. An AEAD tag mismatch on either layer is
     /// [`PiiStoreError::Inconsistent`] — never a silent fallback to some
     /// other content.
+    ///
+    /// Low-level primitive: it does NOT consult the deletion log. It is what
+    /// crash recovery, rollback verification and the restore round-trip use,
+    /// where the question is "what bytes are on disk", not "may a reader see
+    /// this note". Code that serves a note's content to a reader must use
+    /// [`PiiStore::get_unless_deleted`].
     pub fn get(&self, note_id: &str) -> Result<Vec<u8>, PiiStoreError> {
         let path = self.live_path(note_id);
         let bytes = match std::fs::read(&path) {
@@ -713,6 +777,80 @@ mod tests {
             let nonce = fresh_nonce();
             assert!(seen.insert(nonce), "fresh_nonce() produced a duplicate nonce: {nonce:?}");
         }
+    }
+
+    /// Final whole-branch review, I2 (read side): `record_deletion` runs
+    /// BEFORE the tombstone ciphertext replaces the live one, so if a later
+    /// step of the tombstone write fails or crashes, the REAL ciphertext is
+    /// still live. It must already be non-consultable through the
+    /// consumer-facing read, while the low-level `get` still sees the bytes.
+    #[test]
+    fn get_unless_deleted_refuses_a_note_whose_deletion_is_logged_even_while_its_real_ciphertext_is_still_live() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op = Uuid::new_v4();
+        store.stage("note-a", b"REAL CONTENT", op).unwrap();
+        store.commit_staged("note-a", op).unwrap();
+        store.stage("note-b", b"untouched", op).unwrap();
+        store.commit_staged("note-b", op).unwrap();
+        assert_eq!(store.get_unless_deleted("note-a").unwrap(), b"REAL CONTENT", "not deleted yet: served normally");
+
+        let log = crate::deletion_log::DeletionLog::open(&store.deletion_log_path()).unwrap();
+        let reference = crate::deletion_log::FileTrustedReferenceStore::new(dir.path().join("trusted-reference.bin"));
+        log.record_deletion("note-a", &reference).unwrap();
+
+        assert!(
+            matches!(store.get_unless_deleted("note-a"), Err(PiiStoreError::Deleted { note_id }) if note_id == "note-a"),
+            "a logged deletion makes the note non-consultable immediately"
+        );
+        assert_eq!(store.get("note-a").unwrap(), b"REAL CONTENT", "precondition: the real ciphertext is still on disk");
+        assert_eq!(store.get_unless_deleted("note-b").unwrap(), b"untouched", "other notes are unaffected");
+    }
+
+    /// I2: a deletion log that cannot be opened fails closed.
+    #[test]
+    fn get_unless_deleted_fails_closed_when_the_deletion_log_cannot_be_opened() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let op = Uuid::new_v4();
+        store.stage("note-a", b"REAL CONTENT", op).unwrap();
+        store.commit_staged("note-a", op).unwrap();
+        // A directory where the SQLite file should be: it cannot be opened.
+        std::fs::create_dir_all(store.deletion_log_path()).unwrap();
+        assert!(
+            matches!(store.get_unless_deleted("note-a"), Err(PiiStoreError::DeletionLogUnavailable { .. })),
+            "an unreadable deletion log must never read as 'not deleted'"
+        );
+    }
+
+    /// Final whole-branch review, I4 #4: the fingerprint's `.pii` extension
+    /// check is the guard against minting a fresh master key over an
+    /// existing encrypted store (the plan's top Review Focus item). A root
+    /// holding only non-`.pii` files (stray temp files, the deletion log,
+    /// a staged file inside `.staging/`) must read as "no existing
+    /// ciphertext"; adding one live `.pii` file must flip it. The `==`->`!=`
+    /// mutant survived before this test because no test fingerprinted a root
+    /// whose ONLY contents were non-`.pii` files.
+    #[test]
+    fn fingerprint_ignores_non_pii_files_and_detects_a_real_pii_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join(STAGING_DIR)).unwrap();
+        std::fs::write(root.join("note-a.pii.tmp-1-2"), b"stray temp file").unwrap();
+        std::fs::write(root.join("deletion-log.sqlite"), b"not ciphertext").unwrap();
+        std::fs::write(root.join("readme.txt"), b"unrelated").unwrap();
+        std::fs::write(root.join(STAGING_DIR).join("note-a-00000000-0000-0000-0000-000000000000.pii"), b"staged").unwrap();
+
+        assert!(
+            !PiiStore::fingerprint(&root).unwrap().indicates_existing_ciphertext(),
+            "only non-.pii files at the root: no existing ciphertext"
+        );
+
+        std::fs::write(root.join("note-a.pii"), b"live ciphertext").unwrap();
+        assert!(
+            PiiStore::fingerprint(&root).unwrap().indicates_existing_ciphertext(),
+            "one live .pii file: existing ciphertext"
+        );
     }
 
     #[test]
