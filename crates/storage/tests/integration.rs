@@ -192,6 +192,19 @@ fn storage_exposes_exactly_one_public_write_function() {
         "propose.rs must expose exactly one public function, found: {pub_write_fns_in_propose:?}"
     );
     assert!(pub_write_fns_in_propose[0].contains("propose_and_commit"));
+
+    // A3 final review, I1: restore.rs's one public function bootstraps a
+    // BRAND-NEW vault from an authenticated backup (it refuses an existing
+    // journal and a non-empty destination); it cannot write into an existing
+    // vault. Pinned here so any further public function there is a
+    // conscious decision too.
+    let restore_source = include_str!("../src/restore.rs");
+    let pub_fns_in_restore: Vec<&str> = restore_source
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pub fn"))
+        .collect();
+    assert_eq!(pub_fns_in_restore.len(), 1, "restore.rs must expose exactly one public function, found: {pub_fns_in_restore:?}");
+    assert!(pub_fns_in_restore[0].contains("restore_vault_from_backup"));
 }
 
 #[test]

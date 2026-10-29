@@ -354,7 +354,7 @@ fn pointer_record(frontmatter: &str, note_id: &NoteId) -> String {
 /// frontmatter delimiter line, or the empty string if there is none (bare
 /// YAML with no body). Mirrors `frontmatter_of`'s own delimiter-finding
 /// logic exactly, so the two always agree on where the frontmatter ends.
-fn body_of(note_text: &str) -> &str {
+pub(crate) fn body_of(note_text: &str) -> &str {
     let Some(after_open) = strip_delimiter_line(note_text) else {
         return "";
     };
@@ -391,7 +391,7 @@ fn body_of(note_text: &str) -> &str {
 /// field value (a `---` inside a block scalar is indented, so it is not
 /// exactly `---`). Hence the first such line always closes the frontmatter,
 /// and any later `---` line (e.g. a Markdown thematic break) is body.
-fn frontmatter_of(note_text: &str) -> &str {
+pub(crate) fn frontmatter_of(note_text: &str) -> &str {
     let Some(after_open) = strip_delimiter_line(note_text) else {
         return note_text;
     };

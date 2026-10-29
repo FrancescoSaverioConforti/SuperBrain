@@ -8,6 +8,13 @@
 //! calls the crate-private write primitive under the per-note
 //! optimistic-concurrency check.
 //!
+//! [`restore_vault_from_backup`] (A3) is not a second way to write into a
+//! vault: it only bootstraps a BRAND-NEW vault from an authenticated backup
+//! blob (it refuses an existing journal path and a non-empty destination),
+//! every note in which passed the gate when it was first written. It seeds
+//! the journal so the restored notes are readable through
+//! [`Vault::read_note`]; see its module docs.
+//!
 //! The raw primitives behind it — `atomic_write` (pure filesystem mechanics:
 //! no id validation, no gate, no version check) and
 //! `Vault::write_record_unchecked` (no gate) — are `pub(crate)` and are not
@@ -85,6 +92,7 @@ mod journal;
 mod note_id;
 mod propose;
 mod recovery;
+mod restore;
 mod vault;
 
 // `atomic` is deliberately NOT re-exported: `atomic_write` is a raw,
@@ -92,6 +100,7 @@ mod vault;
 // the crate docs above and Finding C1 of the A1 final review).
 pub use note_id::{NoteId, NoteIdError};
 pub use propose::{propose_and_commit, CommitOutcome, CommitResult, ProposeError, SENSITIVE_TOMBSTONE_BODY};
+pub use restore::{restore_vault_from_backup, RestoreError};
 pub use vault::{StorageError, Vault, VaultRecord, Version};
 
 #[test]

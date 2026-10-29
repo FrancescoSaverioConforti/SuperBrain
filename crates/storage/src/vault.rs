@@ -35,7 +35,7 @@ fn serialize_record(content: &str, version: Version) -> Vec<u8> {
 
 /// Parses the single-buffer on-disk record format back into a
 /// [`VaultRecord`]. `note_id` is used only to label errors.
-fn parse_record(bytes: &[u8], note_id: &NoteId) -> Result<VaultRecord, StorageError> {
+pub(crate) fn parse_record(bytes: &[u8], note_id: &NoteId) -> Result<VaultRecord, StorageError> {
     let text = String::from_utf8(bytes.to_vec()).map_err(|_| StorageError::Io(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "record is not valid utf-8"),
     ))?;

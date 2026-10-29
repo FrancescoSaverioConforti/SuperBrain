@@ -151,3 +151,79 @@ fn a_vault_that_has_deleted_a_sensitive_note_can_still_back_up_and_restore_from_
         }
     }
 }
+
+/// Final whole-branch review, I1: a restored vault must be usable through
+/// the normal storage API, not just byte-identical on disk. Restores a plain
+/// and a sensitive note (plus an update, so versions above 1 are covered),
+/// then drops the returned `Vault` and reopens the restored root with the
+/// ordinary `Vault::open_with_pii_store` and the restored journal, and reads
+/// both notes back through `read_note` (and the sensitive one's content
+/// through `get_unless_deleted`).
+#[test]
+#[cfg(windows)]
+fn a_restored_vault_is_readable_through_vault_open_and_read_note_for_plain_and_sensitive_notes() {
+    let root = unique_test_dir();
+    init_git_repo(&root);
+    let pii_store = open_pii_store(&root);
+    let vault = Vault::open_with_pii_store(root.clone(), &unique_test_dir().join("journal.sqlite"), &pii_store).unwrap();
+    let plain_text = note("note-plain", "internal", "plain body v1\n");
+    write(&vault, &pii_store, &plain_text, Version(0));
+    let plain_v2 = note("note-plain", "internal", "plain body v2\n");
+    write(&vault, &pii_store, &plain_v2, Version(1));
+    write(&vault, &pii_store, &note("note-secret", "sensitive", "restored sensitive content"), Version(0));
+    let plain_id = NoteId::parse("note-plain").unwrap();
+    let secret_id = NoteId::parse("note-secret").unwrap();
+    let original_plain = vault.read_note(&plain_id).unwrap();
+    let original_secret = vault.read_note(&secret_id).unwrap();
+
+    let (log, reference) = live_log_and_ref(&pii_store);
+    let master_key = MasterKey::load_or_create(&unique_test_dir().join("backup-master.key"), None).unwrap();
+    let target = FilesystemBackupTarget::new(unique_test_dir().join("target"));
+    vault_security::backup(&root, &pii_store, &log, &master_key, &target).unwrap();
+
+    let destination = unique_test_dir().join("restored");
+    let journal_path = unique_test_dir().join("restored-journal.sqlite");
+    let restored_pii_store = PiiStore::open(unique_test_dir().join("restored-pii"), &pii_key_path(&root)).unwrap();
+    let (restored_vault, outcome) =
+        storage::restore_vault_from_backup(&target, &master_key, &destination, &journal_path, &log, &reference, &restored_pii_store)
+            .expect("restore into a usable vault");
+    let mut ids = outcome.restored_note_ids.clone();
+    ids.sort();
+    assert_eq!(ids, vec!["note-plain".to_string(), "note-secret".to_string()]);
+    assert_eq!(restored_vault.read_note(&plain_id).unwrap(), original_plain);
+    drop(restored_vault);
+
+    // The ordinary constructor, on the restored root and restored journal.
+    let reopened = Vault::open_with_pii_store(destination.clone(), &journal_path, &restored_pii_store).expect("reopen the restored vault");
+    let plain = reopened.read_note(&plain_id).expect("plain note readable after restore");
+    assert_eq!(plain, original_plain);
+    assert_eq!(plain.version, Version(2));
+    assert_eq!(plain.content, plain_v2);
+    let secret = reopened.read_note(&secret_id).expect("sensitive note's pointer record readable after restore");
+    assert_eq!(secret, original_secret);
+    assert!(secret.content.ends_with("pii://note-secret"));
+    assert_eq!(restored_pii_store.get_unless_deleted("note-secret").unwrap(), b"restored sensitive content");
+
+    // And it is a working vault: an ordinary update on top of the restore.
+    let plain_v3 = note("note-plain", "internal", "plain body v3\n");
+    write(&reopened, &restored_pii_store, &plain_v3, Version(2));
+    assert_eq!(reopened.read_note(&plain_id).unwrap().content, plain_v3);
+}
+
+/// I1: restore only bootstraps a brand-new vault; it never seeds rows into
+/// an existing journal.
+#[test]
+fn restore_vault_from_backup_refuses_an_existing_journal_path() {
+    let root = unique_test_dir();
+    let pii_store = open_pii_store(&root);
+    let log = DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+    let reference = DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+    let master_key = MasterKey::load_or_create(&unique_test_dir().join("backup-master.key"), None).unwrap();
+    let target = FilesystemBackupTarget::new(unique_test_dir().join("target"));
+    let journal_path = unique_test_dir().join("existing-journal.sqlite");
+    std::fs::write(&journal_path, b"").unwrap();
+    let destination = unique_test_dir().join("restored");
+    let result = storage::restore_vault_from_backup(&target, &master_key, &destination, &journal_path, &log, &reference, &pii_store);
+    assert!(matches!(result, Err(storage::RestoreError::JournalAlreadyExists)), "got {:?}", result.err());
+    assert!(!destination.exists(), "nothing restored");
+}
