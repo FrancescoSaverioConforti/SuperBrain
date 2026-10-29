@@ -379,6 +379,74 @@ fn get_unless_deleted_refuses_a_deleted_note_and_serves_a_live_one() {
     );
 }
 
+/// Writes the deletion-log row that a crash right after C5 step 1 leaves
+/// behind (generation `generation`, `Pending`, chain-hashed exactly as
+/// `DeletionLog::record_deletion` does), without steps 2 and 3. Goes
+/// straight at the SQLite file: `vault-security`'s own fault injector is
+/// crate-private, and this is the on-disk state such a crash produces.
+fn write_pending_deletion_row(db_path: &std::path::Path, generation: u64, prev_chain_hash: &str, note_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prev_chain_hash.as_bytes());
+    hasher.update(generation.to_string().as_bytes());
+    hasher.update(note_id.as_bytes());
+    let chain_hash: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    drop(vault_security::DeletionLog::open(db_path).unwrap()); // creates the schema
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO deletions (generation, note_id, prev_chain_hash, chain_hash, state) VALUES (?1, ?2, ?3, ?4, 'pending')",
+        rusqlite::params![generation as i64, note_id, prev_chain_hash, chain_hash],
+    )
+    .unwrap();
+    chain_hash
+}
+
+fn deletion_row_state(db_path: &std::path::Path, generation: u64) -> String {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.query_row("SELECT state FROM deletions WHERE generation = ?1", [generation as i64], |r| r.get(0)).unwrap()
+}
+
+/// Final whole-branch review, I3: `DeletionLog::reconcile` must run on the
+/// production startup path. A crash between C5 step 1 (row written,
+/// `Pending`) and step 2 (trusted reference updated) must be rolled forward
+/// by the next `Vault::open_with_pii_store`, not left `Pending` forever.
+#[test]
+#[cfg(windows)]
+fn open_with_pii_store_rolls_a_crashed_pending_deletion_forward() {
+    use vault_security::TrustedReferenceStore;
+    let root = unique_test_dir();
+    let pii_store = open_pii_store(&root);
+    let db_path = pii_store.deletion_log_path();
+    let chain_hash = write_pending_deletion_row(&db_path, 1, &"0".repeat(64), "note-crashed");
+    let reference = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+    assert!(reference.read().unwrap().is_none(), "precondition: step 2 never ran");
+
+    let _vault = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store)
+        .expect("a single pending first deletion is the one roll-forward case and must not block opening");
+
+    assert_eq!(deletion_row_state(&db_path, 1), "completed", "reconcile completed the pending row");
+    let rolled = reference.read().unwrap().expect("reconcile wrote the trusted reference");
+    assert_eq!((rolled.generation, rolled.chain_hash), (1, chain_hash));
+    assert!(matches!(pii_store.get_unless_deleted("note-crashed"), Err(vault_security::PiiStoreError::Deleted { .. })));
+}
+
+/// I3: any deletion-log/reference disagreement reconcile cannot explain
+/// fails `Vault::open_with_pii_store` closed, like the A2 journal's own
+/// reconcile does (here: a trusted reference claiming a generation the log
+/// has never reached).
+#[test]
+#[cfg(windows)]
+fn open_with_pii_store_fails_closed_on_an_unexplained_deletion_log_mismatch() {
+    use vault_security::TrustedReferenceStore;
+    let root = unique_test_dir();
+    let pii_store = open_pii_store(&root);
+    vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path())
+        .write(&vault_security::GenerationRef { generation: 5, chain_hash: "f".repeat(64) })
+        .unwrap();
+    let result = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store);
+    assert!(matches!(result, Err(StorageError::DeletionLog(_))), "got {:?}", result.err());
+}
+
 #[test]
 fn a_tombstone_write_with_a_stale_expected_version_is_rejected_and_never_recorded_in_the_deletion_log() {
     // A3 review round, IMPORTANT finding #1 regression test: the deletion

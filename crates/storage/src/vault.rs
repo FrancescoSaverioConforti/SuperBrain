@@ -546,6 +546,12 @@ impl Vault {
     /// its staged-or-committed ciphertext and rolled forward or back
     /// accordingly. This is the constructor a production caller that writes
     /// `Sensitive` notes must use.
+    ///
+    /// It also runs `DeletionLog::reconcile` against the deletion log at
+    /// `pii_store.deletion_log_path()` and its DPAPI trusted reference
+    /// first: a crash mid-deletion is rolled forward, and any other
+    /// log/reference disagreement fails this call with
+    /// `StorageError::DeletionLog` (final whole-branch review, I3).
     pub fn open_with_pii_store(root: PathBuf, journal_path: &Path, pii_store: &PiiStore) -> Result<Self, StorageError> {
         Self::open_reconciled(root, journal_path, Box::new(NullIndexer), Some(pii_store), &FaultInjector::none())
     }
@@ -581,6 +587,21 @@ impl Vault {
         pii_store: Option<&PiiStore>,
         injector: &FaultInjector,
     ) -> Result<Self, StorageError> {
+        // Final whole-branch review, I3: the deletion log's own C5
+        // reconciliation runs on the same startup path as the journal's,
+        // before any `Vault` exists, whenever a `PiiStore` (and so a
+        // deletion log beside it) is in play. It rolls forward the one
+        // explainable crash pattern (a `Pending` entry one generation ahead
+        // of the trusted reference) and fails `open` closed on any other
+        // disagreement ("modalità di riconciliazione"), exactly as the
+        // journal's reconcile does for an unrecoverable operation. Runs first
+        // so a half-finished deletion is completed before anything else.
+        if let Some(store) = pii_store {
+            let log = DeletionLog::open(&store.deletion_log_path()).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+            let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(store.deletion_log_reference_path());
+            log.reconcile(&trusted_ref).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+        }
+
         let journal = Journal::open(journal_path).map_err(journal_err)?;
         // No Vault lock is taken here: this runs before the Vault exists, so
         // nothing else can be writing or committing through it. See
