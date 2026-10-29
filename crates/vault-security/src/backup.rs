@@ -153,6 +153,18 @@ pub enum BackupError {
     /// Fails closed rather than silently merging or overwriting.
     #[error("destination already contains files; refusing to restore into a non-empty directory")]
     AlreadyExists,
+
+    /// [`restore`] would have to overwrite at least one `.pii` file that
+    /// already exists at `pii_root` (typically the LIVE `PiiStore`'s own
+    /// root). Fails closed rather than silently clobbering live,
+    /// potentially newer ciphertext with whatever the backup happened to
+    /// hold — mirrors [`BackupError::AlreadyExists`]'s discipline on the
+    /// Markdown vault side, applied to the PII side. Named distinctly so a
+    /// caller can tell "the Markdown destination already has files" apart
+    /// from "the PII root already has at least one of these specific
+    /// files."
+    #[error("refusing to restore: {note_ids:?} already have a live .pii file at the destination; restoring would silently overwrite live PII ciphertext")]
+    PiiAlreadyExists { note_ids: Vec<String> },
 }
 
 impl From<io::Error> for BackupError {
@@ -331,6 +343,36 @@ fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a
     let slice = bytes.get(*offset..*offset + len)?;
     *offset += len;
     Some(slice)
+}
+
+/// Writes `contents` to `path` atomically: a sibling temp file in the same
+/// directory, fsynced, then renamed over `path`. A minimal, crate-local copy
+/// of the same stage-then-rename primitive `pii_store.rs` uses for its own
+/// `atomic_write` (same family — create, write, fsync, rename) and
+/// `storage::atomic::atomic_write` uses elsewhere in this plan: `storage` is
+/// not a dependency of `vault-security`, and `pii_store.rs`'s own copy is
+/// module-private, so this is a third, deliberately small copy rather than a
+/// new cross-crate dependency. A crash between the temp file's rename and
+/// the next loop iteration can never leave a half-written `.pii` file
+/// visible under its final name — the rename is the only operation that
+/// touches the final path at all.
+fn atomic_write_pii(path: &Path, contents: &[u8]) -> Result<(), BackupError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_name = format!(
+        "{}.tmp-{}-{}",
+        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+    );
+    let tmp_path = dir.join(tmp_name);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 /// Every regular file under `root`, recursively, excluding `.git` and
@@ -706,7 +748,37 @@ pub(crate) fn restore_with_pii_root(
             .map_err(BackupError::DeletionLogRejected)?;
     }
 
-    // Both checks passed: NOW, and only now, extract.
+    // Guard (Task 7 round 2 review finding), checked BEFORE any byte of
+    // EITHER the vault files or the `.pii` files is written: the earlier
+    // "`destination_root` must be empty" check says nothing about
+    // `pii_root`, which in production IS the LIVE `PiiStore`'s root — a
+    // directory that can perfectly well already hold `.pii` files newer
+    // than this backup (the reviewer's repro: back up a note, commit newer
+    // content to the SAME live store, then restore into a brand-new empty
+    // Markdown destination — `destination_root` being empty says nothing
+    // about whether `pii_root` already has files). Mirror `AlreadyExists`'s
+    // discipline on the vault side exactly: check the WHOLE set of target
+    // `.pii` paths for existing files before writing any of them (of either
+    // kind), and refuse the entire restore if even one already exists,
+    // naming every offending note id, so a silent rollback of live,
+    // possibly-newer PII content can never happen.
+    std::fs::create_dir_all(pii_root)?;
+    let mut already_live: Vec<String> = Vec::new();
+    for note_id in snapshot.pii_files.keys() {
+        let dest_path = pii_root.join(format!("{note_id}.pii"));
+        match std::fs::metadata(&dest_path) {
+            Ok(_) => already_live.push(note_id.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BackupError::Io(e.to_string())),
+        }
+    }
+    if !already_live.is_empty() {
+        already_live.sort();
+        return Err(BackupError::PiiAlreadyExists { note_ids: already_live });
+    }
+
+    // Both deletion-log checks AND the PII existence guard passed: NOW, and
+    // only now, extract.
     std::fs::create_dir_all(destination_root)?;
     for (name, content) in &snapshot.vault_files {
         let dest_path = destination_root.join(name);
@@ -721,11 +793,14 @@ pub(crate) fn restore_with_pii_root(
     // `PiiStore::live_path` uses) — never only the Markdown pointer. See
     // this function's doc comment: a restore that wrote the pointer but not
     // the ciphertext behind it would leave a sensitive note as a dangling
-    // `pii://` reference while still reporting success.
-    std::fs::create_dir_all(pii_root)?;
+    // `pii://` reference while still reporting success. Each write is
+    // staged-then-renamed ([`atomic_write_pii`]) rather than a plain
+    // `std::fs::write`, so a crash mid-loop can never leave a truncated
+    // `.pii` file over previously-valid ciphertext: the rename is the only
+    // operation that ever touches the final path.
     for (note_id, content) in &snapshot.pii_files {
         let dest_path = pii_root.join(format!("{note_id}.pii"));
-        std::fs::write(&dest_path, content)?;
+        atomic_write_pii(&dest_path, content)?;
     }
 
     let restored_note_ids: Vec<String> = snapshot
@@ -1255,5 +1330,138 @@ mod tests {
         let master_key = fresh_master_key(dir.path());
         let subkey = derive_backup_subkey(&master_key);
         assert_ne!(&subkey, master_key.expose_secret(), "the backup subkey must be cryptographically distinct from the raw master key");
+    }
+
+    #[test]
+    fn restore_must_not_silently_roll_back_live_pii_ciphertext_that_was_committed_after_the_backup_was_taken() {
+        // Reviewer's exact repro (Task 7 round 2 finding): back up note-a
+        // with content "OLD". Commit NEWER content to the SAME live store
+        // afterward (a completely ordinary, independent write — no
+        // deletion involved, so neither deletion-log check fires). Restore
+        // to a brand-new, EMPTY vault destination (not even restoring the
+        // vault's Markdown records matters here — the point is that
+        // `destination_root` being empty says nothing about whether the
+        // LIVE `pii_root` already has files). Before the fix, restore
+        // silently overwrote the LIVE note-a.pii back to "OLD" ciphertext,
+        // with no before-image kept: a silent rollback of current, valid
+        // sensitive content. After the fix, restore must FAIL and the live
+        // content must remain "NEWER", untouched, byte for byte.
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+
+        // The LIVE pii store — restore in this test targets THIS SAME
+        // store's root, exactly like production's `restore` (not
+        // `restore_with_pii_root` pointed at an isolated root), because the
+        // whole point of the finding is restoring into a live, in-use
+        // PiiStore.
+        let pii_store = open_pii_store(dir.path());
+        let op1 = Uuid::new_v4();
+        pii_store.stage("note-a", b"OLD", op1).unwrap();
+        pii_store.commit_staged("note-a", op1).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Back up note-a while it still holds "OLD".
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // Commit NEWER content to the SAME live store, after the backup was
+        // taken. No deletion is involved anywhere in this sequence.
+        let op2 = Uuid::new_v4();
+        pii_store.stage("note-a", b"NEWER", op2).unwrap();
+        pii_store.commit_staged("note-a", op2).unwrap();
+        let live_pii_path = pii_store.root().join("note-a.pii");
+        let live_bytes_before_restore = std::fs::read(&live_pii_path).unwrap();
+        assert_eq!(pii_store.get("note-a").unwrap(), b"NEWER", "precondition: the live store now holds NEWER");
+
+        // Attempt to restore into a brand-new, EMPTY vault destination,
+        // targeting the SAME live `pii_store` the backup read from.
+        let destination = dir.path().join("restored");
+        assert!(!destination.exists(), "precondition: destination does not exist yet");
+        let result = restore(&target, &master_key, &destination, &log, &reference, &pii_store);
+
+        assert!(
+            matches!(&result, Err(BackupError::PiiAlreadyExists { note_ids }) if note_ids == &["note-a".to_string()]),
+            "restore must fail closed naming note-a, not silently succeed, got {result:?}"
+        );
+
+        // The live content must remain NEWER, untouched, byte for byte —
+        // no silent rollback to OLD, and no before-image side effect either
+        // (this path never touches PiiStore's own stage/commit machinery at
+        // all).
+        assert_eq!(std::fs::read(&live_pii_path).unwrap(), live_bytes_before_restore, "the live .pii file on disk must be byte-identical to before the restore attempt");
+        assert_eq!(pii_store.get("note-a").unwrap(), b"NEWER", "the live content must remain NEWER, not rolled back to OLD");
+    }
+
+    #[test]
+    fn restore_into_a_pii_root_with_no_existing_pii_files_still_succeeds_normally() {
+        // Happy-path regression guard: the new existence guard must not
+        // block the ordinary case where the target pii_root has nothing
+        // live yet (a fresh isolated root, or a live store that has never
+        // held this note).
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"sensitive content", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        assert!(!restored_pii_root.exists(), "precondition: no pii root exists yet at the restore target");
+
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
+        assert!(restored_pii_root.join("note-a.pii").exists());
+        let restored_store = PiiStore::open(restored_pii_root.clone(), &dir.path().join("pii-master.key")).unwrap();
+        assert_eq!(restored_store.get("note-a").unwrap(), b"sensitive content");
+    }
+
+    #[test]
+    fn pii_writes_during_restore_go_through_a_sibling_temp_file_and_rename_never_a_direct_write() {
+        // Required test 3 (atomicity, by code inspection + an observable
+        // proxy): atomic_write_pii must never leave a stray temp file
+        // behind on success, and the final file must be reachable only via
+        // rename, never via a partially-written direct `std::fs::write`.
+        // This exercises atomic_write_pii directly (the same function
+        // restore()'s loop calls for every `.pii` file) and confirms: (a)
+        // the final file's content is exactly what was requested, (b) no
+        // `.tmp-` sibling is left behind, and (c) by inspection of
+        // `atomic_write_pii` itself (see the function above in this same
+        // module) the only call that ever touches the FINAL path is
+        // `std::fs::rename` — there is no code path in which the final
+        // path receives partial bytes directly.
+        let dir = tempdir().unwrap();
+        let pii_root = dir.path().join("pii-root");
+        std::fs::create_dir_all(&pii_root).unwrap();
+        let final_path = pii_root.join("note-a.pii");
+
+        atomic_write_pii(&final_path, b"full content, never partial").unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"full content, never partial");
+        let leftover_tmp: Vec<_> = std::fs::read_dir(&pii_root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftover_tmp.is_empty(), "atomic_write_pii must leave no temp file behind on success: {leftover_tmp:?}");
+
+        // Overwriting again (simulating a second restore of the same note
+        // into an otherwise-cleared root) must also go cleanly through the
+        // same rename, never corrupting the destination with a partial
+        // write even though content differs in length.
+        atomic_write_pii(&final_path, b"short").unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"short", "rename must fully replace prior content, never append or truncate in place");
     }
 }

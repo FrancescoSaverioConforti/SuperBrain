@@ -386,10 +386,18 @@ fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_conte
 
     // Sanity: a different-but-also-sensitive-looking correct decrypt DOES
     // produce the pointer (proving the backup path actually ran, not that
-    // it silently skipped the note).
+    // it silently skipped the note). Restored into a FRESH, isolated
+    // `PiiStore` rather than the original live `pii_store` the backup was
+    // taken from: `restore` now (A3 Task 7 round 2 fix) refuses to write a
+    // `.pii` file over one that already exists at the destination, and
+    // `note-backup-audit.pii` already lives in the original `pii_store` —
+    // restoring there again would be exactly the live-clobber case that
+    // guard exists to reject, not a legitimate round-trip to audit.
     let destination = unique_test_dir().join("restored-for-audit");
     let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.root().join("deletion-log-reference.dpapi"));
-    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref, &pii_store).unwrap();
+    let isolated_pii_root = unique_test_dir().join("restored-pii-store-for-audit");
+    let isolated_pii_store = PiiStore::open(isolated_pii_root.clone(), &isolated_pii_root.join("master.key")).unwrap();
+    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref, &isolated_pii_store).unwrap();
     assert!(outcome.restored_note_ids.contains(&"note-backup-audit".to_string()));
     let restored_record = std::fs::read_to_string(destination.join("note-backup-audit.record")).unwrap();
     assert!(restored_record.contains("pii://note-backup-audit"), "the pointer itself is allowed and expected in the restored Markdown record");
