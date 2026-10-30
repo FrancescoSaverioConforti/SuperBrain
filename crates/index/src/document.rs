@@ -25,23 +25,32 @@
 //! # Crate-boundary decision: how `Document` receives the body
 //!
 //! A `storage::VaultRecord`'s `content` is the raw record text (frontmatter
-//! delimiters included). Splitting it into frontmatter/body is already
-//! implemented once, as `storage::propose::body_of` — but that function is
-//! `pub(crate)` to `storage`, not reachable from `index` (a different crate).
-//! Re-implementing delimiter-splitting here would duplicate logic that must
-//! stay byte-for-byte in sync with `storage`'s own notion of where a body
-//! starts (`body_of`'s doc comment is explicit that it "mirrors
-//! `frontmatter_of`'s own delimiter-finding logic exactly").
+//! delimiters included). Splitting it into frontmatter/body was originally
+//! implemented only as `storage::propose::body_of` / `frontmatter_of`, both
+//! `pub(crate)` to `storage` and therefore unreachable from `index` (a
+//! different crate). Rather than have `index` (or Task 3's real indexer
+//! wiring, which receives raw `record_bytes: &[u8]` straight from
+//! `storage::Indexer::mark_current` — see `indexer_impl.rs`'s doc comment)
+//! reimplement that delimiter-finding logic — which would have to stay
+//! byte-for-byte in sync with `storage`'s own notion of where a body starts,
+//! including CRLF and YAML block-scalar-dash edge cases, with no
+//! compiler-enforced guarantee of doing so — `storage` now exposes a small,
+//! additive public function doing the same split: `storage::split_record`.
+//! It takes raw record bytes and returns `(domain::NoteMetadata,
+//! Option<String>)` by calling the EXISTING `frontmatter_of` / `body_of`
+//! helpers and `domain::parse_frontmatter` internally, so this crate never
+//! duplicates that logic.
 //!
-//! Rather than duplicate that logic, `Document::new` takes an already-split
-//! `(metadata: domain::NoteMetadata, body: Option<&str>)` pair. The caller
-//! that has both a raw record and access to do the splitting (Task 3's real
-//! indexer wiring, which parses `record_bytes` via `domain::parse_frontmatter`
-//! — see `indexer_impl.rs`'s `mark_current` doc comment, which already
-//! anticipates this) is responsible for extracting the body before calling
-//! `Document::new`. `body: None` covers the bare-frontmatter case (no body
-//! at all) the same way `body_of` returns `""` for it; `Document` treats
-//! both `None` and `Some("")` identically (nothing to append).
+//! `Document::new` still takes an already-split `(metadata, body)` pair —
+//! the lower-level constructor, useful when a caller already has both
+//! pieces (e.g. from its own parsing, or in tests). `Document::from_record_bytes`
+//! is the convenience constructor that goes straight from raw bytes (calling
+//! `storage::split_record` first) to a `Document`, demonstrating that `index`
+//! can do this without reimplementing any frontmatter-splitting logic
+//! itself. `body: None` and `body: Some("")` are treated identically by
+//! `Document::new` (nothing to append) — matching `body_of`'s own behavior
+//! of returning `""` for a bare-frontmatter note with no body at all, and
+//! matching `split_record`'s own `None`-for-empty-body convention.
 
 use domain::{Classification, NoteMetadata, NoteStatus, NoteType, TrustLevel};
 
@@ -90,6 +99,17 @@ impl Document {
             classification: metadata.classification,
             text_searchable,
         }
+    }
+
+    /// Builds a `Document` straight from raw record bytes — the same shape
+    /// `storage::Indexer::mark_current`'s `record_bytes: &[u8]` receives —
+    /// by calling `storage::split_record` first and then [`Document::new`].
+    /// This is the demonstration that `index` never has to reimplement any
+    /// frontmatter/body-splitting logic itself: `storage` owns that logic in
+    /// exactly one place.
+    pub fn from_record_bytes(record_bytes: &[u8]) -> Result<Self, storage::SplitRecordError> {
+        let (metadata, body) = storage::split_record(record_bytes)?;
+        Ok(Self::new(metadata, body.as_deref()))
     }
 }
 
@@ -271,5 +291,27 @@ mod tests {
         let doc_b = Document::new(metadata_b, Some(""));
 
         assert_eq!(doc_a.text_searchable, doc_b.text_searchable);
+    }
+
+    // --- `from_record_bytes`: raw bytes -> Document without `index` ever
+    // reimplementing storage's frontmatter/body-splitting logic itself. ---
+
+    #[test]
+    fn from_record_bytes_builds_a_document_matching_the_already_split_constructor() {
+        let record_bytes: &[u8] = b"---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---\nbody text with get_user_by_id in it\n";
+
+        let doc = Document::from_record_bytes(record_bytes).expect("valid record must parse");
+
+        assert_eq!(doc.id, "bug-2026-10-30-example");
+        assert_eq!(doc.project, "project-x");
+        assert!(doc.text_searchable.contains("get_user_by_id"));
+        assert!(doc.text_searchable.contains("agent:coder@prompt-v3"));
+    }
+
+    #[test]
+    fn from_record_bytes_surfaces_split_record_errors() {
+        let result = Document::from_record_bytes(b"not: frontmatter");
+
+        assert!(result.is_err());
     }
 }

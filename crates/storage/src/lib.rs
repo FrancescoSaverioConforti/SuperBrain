@@ -102,7 +102,7 @@ mod vault;
 // ungated, unvalidated filesystem primitive and must stay crate-private (see
 // the crate docs above and Finding C1 of the A1 final review).
 pub use note_id::{NoteId, NoteIdError};
-pub use propose::{propose_and_commit, CommitOutcome, CommitResult, ProposeError, SENSITIVE_TOMBSTONE_BODY};
+pub use propose::{propose_and_commit, split_record, CommitOutcome, CommitResult, ProposeError, SENSITIVE_TOMBSTONE_BODY, SplitRecordError};
 pub use restore::{restore_vault_from_backup, RestoreError};
 pub use vault::{Indexer, StorageError, Vault, VaultRecord, Version};
 

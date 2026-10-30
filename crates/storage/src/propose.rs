@@ -415,6 +415,51 @@ fn strip_delimiter_line(text: &str) -> Option<&str> {
     rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))
 }
 
+/// Every way [`split_record`] can fail to turn raw record bytes into parsed
+/// metadata plus body.
+#[derive(Debug, thiserror::Error)]
+pub enum SplitRecordError {
+    /// `record_bytes` is not valid UTF-8, so it cannot even be split into
+    /// frontmatter/body text. Mirrors `vault::parse_record`'s own UTF-8
+    /// check on the same raw-bytes-from-disk shape.
+    #[error("record is not valid utf-8")]
+    InvalidUtf8,
+    /// The frontmatter half failed `domain::parse_frontmatter`.
+    #[error("invalid frontmatter: {0}")]
+    Schema(#[from] domain::ValidationError),
+}
+
+/// Splits raw record bytes — the same shape `Vault::read_note`'s
+/// `VaultRecord::content` holds, and the same shape a `storage::Indexer`'s
+/// `mark_current(note_id, version, record_bytes: &[u8])` callback receives —
+/// into already-parsed [`domain::NoteMetadata`] plus the extracted body.
+///
+/// This is an additive, read-side parsing helper: it calls the existing
+/// private `frontmatter_of` / `body_of` splitters and `domain::parse_frontmatter`
+/// internally rather than duplicating their delimiter-finding logic, so a
+/// caller outside this crate (e.g. `index`'s real indexer wiring) never has
+/// to reimplement CRLF handling or YAML block-scalar-dash edge cases to go
+/// from raw bytes to a `(NoteMetadata, body)` pair — it stays in sync with
+/// `storage`'s own notion of where a body starts by construction, not by
+/// convention.
+///
+/// `body` is `None` for a bare-frontmatter record with no body at all (the
+/// same case `body_of` reports as `""`); `Some(body)` otherwise, including
+/// `Some(String::new())` if a closing delimiter is immediately followed by
+/// nothing. Callers that treat `None` and `Some("")` identically (as
+/// `index::Document::new` does) do not need to special-case which one they
+/// get.
+pub fn split_record(record_bytes: &[u8]) -> Result<(domain::NoteMetadata, Option<String>), SplitRecordError> {
+    let text = std::str::from_utf8(record_bytes).map_err(|_| SplitRecordError::InvalidUtf8)?;
+
+    let metadata = domain::parse_frontmatter(frontmatter_of(text))?;
+
+    let body = body_of(text);
+    let body = if body.is_empty() { None } else { Some(body.to_string()) };
+
+    Ok((metadata, body))
+}
+
 fn parse_note_id(field: &str, raw: &str) -> Result<NoteId, ProposeError> {
     NoteId::parse(raw).map_err(|error| ProposeError::InvalidNoteId {
         field: field.to_string(),
@@ -425,7 +470,51 @@ fn parse_note_id(field: &str, raw: &str) -> Result<NoteId, ProposeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::frontmatter_of;
+    use super::{body_of, frontmatter_of, split_record};
+
+    const FULL_NOTE: &str = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---\n# Body\nsome prose here\n";
+
+    #[test]
+    fn split_record_round_trips_a_full_notes_raw_bytes() {
+        let (metadata, body) = split_record(FULL_NOTE.as_bytes()).expect("valid frontmatter must parse");
+
+        // Matches what frontmatter_of + domain::parse_frontmatter would have
+        // produced separately.
+        let expected_metadata = domain::parse_frontmatter(frontmatter_of(FULL_NOTE)).expect("same parse");
+        assert_eq!(metadata.id, expected_metadata.id);
+        assert_eq!(metadata.schema_version, expected_metadata.schema_version);
+        assert_eq!(metadata.project, expected_metadata.project);
+
+        // Matches what body_of would have produced separately.
+        let expected_body = body_of(FULL_NOTE);
+        assert_eq!(body.as_deref(), Some(expected_body));
+        assert_eq!(body, Some("# Body\nsome prose here\n".to_string()));
+    }
+
+    #[test]
+    fn split_record_reports_none_body_for_bare_frontmatter_with_no_body() {
+        let note = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---";
+
+        let (_, body) = split_record(note.as_bytes()).expect("valid frontmatter must parse");
+
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn split_record_rejects_invalid_utf8() {
+        let invalid = [0xFF, 0xFE, 0xFD];
+
+        let result = split_record(&invalid);
+
+        assert!(matches!(result, Err(super::SplitRecordError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn split_record_surfaces_schema_errors() {
+        let result = split_record(b"not: frontmatter");
+
+        assert!(matches!(result, Err(super::SplitRecordError::Schema(_))));
+    }
 
     #[test]
     fn bare_yaml_without_delimiters_is_entirely_frontmatter() {
