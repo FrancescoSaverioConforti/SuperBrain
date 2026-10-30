@@ -281,3 +281,55 @@ fn operational_gate_failures_are_errors_in_both_wrappers() {
         ))
     );
 }
+
+#[test]
+fn held_out_labels() {
+    let f = Fixture::new();
+    let fixture = include_str!("../../../eval/rag/test/notes/isolation-smoke.md");
+    let labels = include_str!("../../../eval/rag/test/labels.jsonl");
+    let outcome = storage::propose_and_commit(
+        &f.vault,
+        fixture,
+        Version(0),
+        Uuid::new_v4(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &policy::Gate::new(policy::SecretPolicy::new(1)),
+        Some(&f.pii),
+    )
+    .unwrap();
+    assert!(matches!(outcome, storage::CommitResult::Committed(_)));
+    // Deliberately place a label copy under the vault to challenge accidental
+    // recursive walks; ordinary runner operation rejects this layout.
+    let adversarial = f.root.join("eval/rag/test");
+    std::fs::create_dir_all(&adversarial).unwrap();
+    std::fs::write(adversarial.join("labels.jsonl"), labels).unwrap();
+    std::fs::write(adversarial.join("labels.record"), labels).unwrap();
+    for _ in 0..2 {
+        let fresh = RealIndexer::new();
+        rebuild_index(&f.vault, &fresh).unwrap();
+        let idx = Index::new(
+            &f.vault,
+            &fresh,
+            "project-x",
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+        );
+        for marker in ["HELDOUT_QUESTION_CANARY_901", "HELDOUT_ANSWER_CANARY_902"] {
+            assert!(labels.contains(marker));
+            assert_eq!(
+                search(&idx, &allow(), context(), query(marker))
+                    .result
+                    .unwrap()
+                    .outcome,
+                SearchOutcome::NotPresent
+            );
+        }
+        assert!(matches!(
+            search(&idx, &allow(), context(), query("rag-visible-needle"))
+                .result
+                .unwrap()
+                .outcome,
+            SearchOutcome::Matches { .. }
+        ));
+    }
+}
