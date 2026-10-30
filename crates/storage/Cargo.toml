@@ -10,6 +10,7 @@ description = "SuperBrain storage layer (placeholder)."
 [dependencies]
 domain = { path = "../domain" }
 policy = { path = "../policy" }
+vault-security = { path = "../vault-security" }
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

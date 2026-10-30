@@ -57,6 +57,38 @@ pub enum FaultPoint {
     /// `Recovering`, as a crash mid-recovery would. Only ever armed by tests
     /// (`trigger_at` is `#[cfg(test)]`).
     AfterMarkedRecoveringBeforeFixup,
+    /// `Vault::write_sensitive_record_unchecked` (Task 6): the ciphertext for
+    /// a `Sensitive` note has been durably staged via `PiiStore::stage`
+    /// (fsynced to `<pii root>/.staging/<note_id>-<operation_id>.pii`) and
+    /// the journal row's `pii_content_hash` has been recorded on the same
+    /// write as this operation's still-`IntentRecorded` row (mirroring how
+    /// `content_hash` is recorded before the Markdown rename). The live
+    /// `<note_id>.pii` file has NOT yet been updated, and the Markdown
+    /// pointer rename has NOT yet run. This is the sensitive-write analogue
+    /// of `AfterRenameBeforeContentPersisted`, inserted immediately before
+    /// it in the same pipeline: for a sensitive note, "persist content"
+    /// means staging+committing `PiiStore` THEN doing the Markdown rename
+    /// with the pointer bytes.
+    AfterPiiStagedBeforeCommit,
+    /// `Vault::write_sensitive_record_unchecked`: `PiiStore::commit_staged`
+    /// has renamed the staged ciphertext onto the live `<note_id>.pii` path.
+    /// The Markdown pointer rename has NOT yet run. A crash here leaves a
+    /// committed ciphertext with no corresponding (or a stale) Markdown
+    /// pointer; recovery resolves this exactly as it resolves the ordinary
+    /// rename-vs-journal-advance window, by rolling forward (committing the
+    /// pointer rename) or rolling back (removing the live `.pii` file and
+    /// restoring the previous pointer) based on what the journal row says.
+    AfterPiiCommittedBeforePointerRename,
+    /// `restore::promote_note` (restore-promotion TOCTOU fix): the note's
+    /// content (and, if sensitive, its committed ciphertext) is in place
+    /// except for the pointer rename, and the deletion-log write lock has
+    /// NOT yet been acquired for its final re-check.
+    RestoreBeforeDeletionRecheck,
+    /// `restore::promote_note`: the deletion-log write lock is HELD for this
+    /// note, before its final `is_deleted` re-check and pointer rename. A
+    /// concurrent `record_deletion` is blocked for as long as a test pauses
+    /// here.
+    RestoreWriteLockHeld,
 }
 
 /// Returned when an armed injector interrupts a pipeline at `point`.
@@ -72,8 +104,24 @@ pub(crate) enum Interrupted {
 #[derive(Debug)]
 pub(crate) struct FaultInjector {
     trigger: Option<FaultPoint>,
+    /// Test-only: how many hits of `trigger` to let through before
+    /// interrupting (0 = interrupt on the first hit). Lets a test crash a
+    /// multi-note restore on, say, its third note.
+    #[cfg(test)]
+    trigger_skip: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pause: Option<Pause>,
+    #[cfg(test)]
+    multi_pause: Option<MultiPause>,
+}
+
+/// Test-only: pause at ANY of several points, reporting which one was hit.
+#[cfg(test)]
+#[derive(Debug)]
+struct MultiPause {
+    points: Vec<FaultPoint>,
+    paused: std::sync::mpsc::Sender<FaultPoint>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 /// Test-only: where to pause, and the two channel ends used to tell the test
@@ -92,14 +140,38 @@ impl FaultInjector {
         Self {
             trigger: None,
             #[cfg(test)]
+            trigger_skip: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             pause: None,
+            #[cfg(test)]
+            multi_pause: None,
         }
     }
 
     /// An injector that interrupts when the pipeline reaches `point`.
     #[cfg(test)]
     pub(crate) fn trigger_at(point: FaultPoint) -> Self {
-        Self { trigger: Some(point), pause: None }
+        Self { trigger: Some(point), ..Self::none() }
+    }
+
+    /// An injector that lets `point` pass `n - 1` times and interrupts on its
+    /// `n`-th hit (`n >= 1`).
+    #[cfg(test)]
+    pub(crate) fn trigger_at_nth(point: FaultPoint, n: usize) -> Self {
+        assert!(n >= 1);
+        Self { trigger: Some(point), trigger_skip: std::sync::atomic::AtomicUsize::new(n - 1), ..Self::none() }
+    }
+
+    /// An injector that pauses at EVERY hit of ANY point in `points`: sends
+    /// the point hit on `paused`, then blocks until `()` arrives on `resume`
+    /// (or the resume sender is dropped). Never returns `Interrupted`.
+    #[cfg(test)]
+    pub(crate) fn pause_at_each(
+        points: Vec<FaultPoint>,
+        paused: std::sync::mpsc::Sender<FaultPoint>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self { multi_pause: Some(MultiPause { points, paused, resume }), ..Self::none() }
     }
 
     /// An injector that, when the pipeline reaches `point`, sends `()` on
@@ -114,7 +186,7 @@ impl FaultInjector {
         paused: std::sync::mpsc::Sender<()>,
         resume: std::sync::mpsc::Receiver<()>,
     ) -> Self {
-        Self { trigger: None, pause: Some(Pause { point, paused, resume }) }
+        Self { pause: Some(Pause { point, paused, resume }), ..Self::none() }
     }
 
     /// Called by a pipeline immediately after `point`'s effect has happened.
@@ -128,7 +200,22 @@ impl FaultInjector {
                 let _ = pause.resume.recv();
             }
         }
+        #[cfg(test)]
+        if let Some(pause) = &self.multi_pause {
+            if pause.points.contains(&point) {
+                let _ = pause.paused.send(point);
+                let _ = pause.resume.recv();
+            }
+        }
         if self.trigger == Some(point) {
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                if self.trigger_skip.load(Ordering::SeqCst) > 0 {
+                    self.trigger_skip.fetch_sub(1, Ordering::SeqCst);
+                    return Ok(());
+                }
+            }
             Err(Interrupted::At(point))
         } else {
             Ok(())

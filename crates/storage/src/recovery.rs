@@ -38,7 +38,10 @@
 //!   deleted and the row advanced to `Failed`. The caller must retry with a
 //!   new `operation_id` (final whole-branch review, finding C1).
 //! - `ContentPersisted`: if the record on disk hashes to the row's
-//!   `content_hash`, roll forward to `JournalCommitted`. Otherwise restore this
+//!   `content_hash` (and, for a sensitive row, its live ciphertext verifies),
+//!   AND the deletion log does not record its note as deleted, whatever its
+//!   classification — see `note_is_deleted`; a tombstone row is exempt,
+//!   being the deletion itself — roll forward to `JournalCommitted`. Otherwise restore this
 //!   operation's before-image, verify it, delete the before-image and advance
 //!   the row to `Failed`. Its `new_version` stays as the version it failed to
 //!   commit. No git commit is made: the restored content was already
@@ -75,8 +78,16 @@
 //!   `Vault::open`. As `ScanDepth` documents, an unbounded miss proves absence
 //!   only among commits reachable from `HEAD`; rewriting history out of band
 //!   is an accepted residual risk.
-//! - `GitCommitted`: `Indexer::mark_current`, then `IndexCurrent`. This marks
-//!   pipeline completion only, not index freshness.
+//! - `GitCommitted`: delete the row's Markdown and PII before-images (again,
+//!   idempotently, in case a crash landed between the `GitCommitted` advance
+//!   and those deletes), then `Indexer::mark_current`, then `IndexCurrent`.
+//!   This marks pipeline completion only, not index freshness.
+//!
+//! Every PII step fails closed (A3 review round 3): a row carrying a
+//! `pii_content_hash` is never advanced, rolled back or cleaned up without a
+//! `PiiStore` to verify against, and any read error or unexpected PII state
+//! leaves the row and every before-image as they are for the next pass. See
+//! `roll_back_pii` for the decision table.
 //! - `Recovering`: re-dispatch from the stored `previous_state` (step 1 above).
 //!
 //! # Concurrency
@@ -96,6 +107,7 @@ use std::path::Path;
 
 use domain::WriteState;
 use uuid::Uuid;
+use vault_security::{PiiStore, PiiStoreError};
 
 use crate::atomic::atomic_write;
 use crate::fault::{FaultInjector, FaultPoint, Interrupted};
@@ -160,6 +172,7 @@ pub(crate) fn reconcile(
     journal: &Journal,
     repo_path: &Path,
     indexer: &dyn Indexer,
+    pii_store: Option<&PiiStore>,
     injector: &FaultInjector,
 ) -> Result<ReconcileReport, ReconcileError> {
     let mut report = ReconcileReport::default();
@@ -169,7 +182,7 @@ pub(crate) fn reconcile(
         injector
             .check(FaultPoint::AfterMarkedRecoveringBeforeFixup)
             .map_err(|Interrupted::At(point)| ReconcileError::Interrupted(point))?;
-        match resolve(root, journal, repo_path, indexer, &row, origin, injector)? {
+        match resolve(root, journal, repo_path, indexer, pii_store, &row, origin, injector)? {
             Outcome::Completed => report.recovered.push(op),
             Outcome::Failed => report.failed.push(op),
             Outcome::GitPending(reason) => {
@@ -204,11 +217,13 @@ fn mark_recovering(journal: &Journal, row: &OperationRow) -> Result<WriteState, 
 
 /// Step 3 for one row: applies the fault-matrix row for `origin`, then for
 /// each state it advances to, until the row is terminal or resting.
+#[allow(clippy::too_many_arguments)]
 fn resolve(
     root: &Path,
     journal: &Journal,
     repo_path: &Path,
     indexer: &dyn Indexer,
+    pii_store: Option<&PiiStore>,
     row: &OperationRow,
     origin: WriteState,
     injector: &FaultInjector,
@@ -219,17 +234,17 @@ fn resolve(
         at = match at {
             // Row 1: the write never got past its intent, unless its rename
             // already landed (then it is row 2's roll-forward case).
-            WriteState::IntentRecorded => match fix_intent_recorded(root, journal, row)? {
+            WriteState::IntentRecorded => match fix_intent_recorded(root, journal, pii_store, row)? {
                 WriteState::Failed => return Ok(Outcome::Failed),
                 next => next,
             },
             // Row 2: roll forward on a verified hash, else roll back to Failed.
-            WriteState::ContentPersisted => match fix_content_persisted(root, journal, row, injector)? {
+            WriteState::ContentPersisted => match fix_content_persisted(root, journal, pii_store, row, injector)? {
                 WriteState::Failed => return Ok(Outcome::Failed),
                 next => next,
             },
             // Row 3: idempotent git commit, or rest as git_pending.
-            WriteState::JournalCommitted => match fix_journal_committed(root, journal, repo_path, row)? {
+            WriteState::JournalCommitted => match fix_journal_committed(root, journal, repo_path, pii_store, row)? {
                 GitStep::Committed => WriteState::GitCommitted,
                 GitStep::Pending(reason) => {
                     // Only a row resumed directly from JournalCommitted is still
@@ -246,6 +261,11 @@ fn resolve(
                 let version = row
                     .new_version
                     .ok_or_else(|| inconsistent(op, "GitCommitted row has no new_version"))?;
+                // Item 1(c): a row resumed from GitCommitted (a crash after
+                // the advance, before the before-image deletes) gets the
+                // same cleanup as one that just arrived from row 3. A no-op
+                // repeat for the latter.
+                delete_before_images_at_git_committed(root, pii_store, &parse_note_id(row)?, row)?;
                 indexer.mark_current(&row.note_id, version);
                 journal.advance(op, WriteState::IndexCurrent, AdvanceFields::none())?;
                 return Ok(Outcome::Completed);
@@ -291,7 +311,12 @@ fn resolve(
 /// before-image this operation persisted is deleted (it is no longer needed
 /// and would otherwise be orphaned under a terminal row), and the row
 /// becomes `Failed`.
-fn fix_intent_recorded(root: &Path, journal: &Journal, row: &OperationRow) -> Result<WriteState, ReconcileError> {
+fn fix_intent_recorded(
+    root: &Path,
+    journal: &Journal,
+    pii_store: Option<&PiiStore>,
+    row: &OperationRow,
+) -> Result<WriteState, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
     if let Some(intended) = row.content_hash.as_deref() {
@@ -302,14 +327,378 @@ fn fix_intent_recorded(root: &Path, journal: &Journal, row: &OperationRow) -> Re
             Err(e) => return Err(ReconcileError::Io(e)),
         };
         if on_disk_hash.as_deref() == Some(intended) {
-            return Ok(WriteState::ContentPersisted);
+            // Task 6: a sensitive write's pointer rename landed, but the
+            // ContentPersisted advance did not. Before handing this row to
+            // row 2's roll-forward path, verify the staged-or-committed
+            // ciphertext this row's `pii_content_hash` names. A mismatch or
+            // absence here means the pointer rename landed WITHOUT its
+            // ciphertext having been staged/committed consistently — never
+            // roll a pointer forward over that. This can only happen if
+            // `AfterPiiCommittedBeforePointerRename`'s invariant were
+            // violated upstream; checked here anyway, defensively, since
+            // this is the one place recovery is authoritative over the
+            // pairing.
+            if pii_is_consistent(pii_store, &note_id, op, row)? {
+                return Ok(WriteState::ContentPersisted);
+            }
+            // A3 review round 2, item #4: the pointer that just landed is
+            // the NEW version (whose PII pairing is inconsistent), so it
+            // must be rolled BACK to the PRIOR version — restored from the
+            // Markdown before-image, exactly as `fix_content_persisted`
+            // restores its own before-image on a mismatch — never just
+            // deleted out from under a pointer that is left stuck at the
+            // bad new version. Only reachable via `.pii` corruption or
+            // tampering upstream (never a live-traffic path, since
+            // `AfterPiiCommittedBeforePointerRename`'s own invariant
+            // guarantees consistency when nothing else interferes), but a
+            // row still needs a safe, non-`Inconsistent` resolution here.
+            if let Some(before_hash) = row.before_image_hash.as_deref() {
+                let before_bytes = read_before_image(root, &note_id, op)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot read before-image: {e}")))?;
+                if content_hash(&before_bytes) != before_hash {
+                    return Err(inconsistent(op, "before-image restore failed: before-image does not match its recorded hash"));
+                }
+                atomic_write(&record_path, &before_bytes)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: write failed: {e}")))?;
+                let restored = std::fs::read(&record_path)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot re-read record: {e}")))?;
+                if content_hash(&restored) != before_hash {
+                    return Err(inconsistent(op, "before-image restore failed: restored record does not verify"));
+                }
+            } else if journal.last_committed_for_note(note_id.as_str())?.is_none() {
+                // No before-image means this was a first write with no
+                // prior pointer; nothing to restore to, so the record (if
+                // any landed) is removed, mirroring `fix_content_persisted`'s
+                // own first-write rollback.
+                match std::fs::remove_file(&record_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(ReconcileError::Io(e)),
+                }
+            }
+            roll_back_pii(journal, pii_store, &note_id, op, row)?;
+            delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+            journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
+            return Ok(WriteState::Failed);
         }
     }
     // Deleted BEFORE the terminal advance, as in row 2, so a crash in
     // between cannot orphan it under a row that is never revisited.
     delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+    // Task 6: the pointer rename never landed (this row's intended bytes
+    // are not on disk, or there was no intended hash at all). This pipeline
+    // commits the ciphertext (stage + commit_staged) strictly BEFORE the
+    // pointer rename, so a row with a `pii_content_hash` can legitimately
+    // have already made ITS OWN bytes the live `.pii` file at this point,
+    // even though its pointer never landed — the
+    // `AfterPiiCommittedBeforePointerRename` window. `roll_back_pii`
+    // decides, from a verified hash, whether the live file is this
+    // operation's own (restore its before-image, or remove it outright on
+    // a first write with nothing to restore to) or belongs to an earlier,
+    // already-resolved operation (left untouched) — this is the exact
+    // multi-store consistency guard the crash-on-update test targets.
+    roll_back_pii(journal, pii_store, &note_id, op, row)?;
     journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
     Ok(WriteState::Failed)
+}
+
+/// Task 6: whether this row's pointer may roll forward as far as its PII
+/// half is concerned. `Ok(true)` iff `row` has no `pii_content_hash` (an
+/// ordinary, non-sensitive write) OR the LIVE `.pii` file for `note_id`
+/// decrypts to plaintext hashing to `row.pii_content_hash`.
+///
+/// Only called once the pointer rename has landed, and the write path runs
+/// `PiiStore::commit_staged` strictly before that rename, so the live file is
+/// the only place this row's ciphertext can legitimately be. A matching
+/// STAGED file is deliberately not accepted (A3 review round 3): rolling the
+/// pointer forward while the live file still holds other content would pair
+/// the new pointer with the wrong ciphertext.
+///
+/// `Ok(false)` only on a POSITIVE determination that the live file is not
+/// this row's content: it is absent, decrypts to different content, or fails
+/// AEAD verification. Anything ambiguous is an error and changes nothing
+/// (A3 review round 3, the fail-closed rule): no `PiiStore` to check against
+/// (`Inconsistent`), or the live file cannot be read at all (`Io`). The
+/// caller then never reaches its rollback path, which restores and deletes
+/// things.
+fn pii_is_consistent(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> Result<bool, ReconcileError> {
+    let Some(expected) = row.pii_content_hash.as_deref() else {
+        return Ok(true);
+    };
+    let store = require_pii_store(pii_store, op)?;
+    match classify_live_pii(store, note_id, op, expected)? {
+        LivePii::Ours => Ok(true),
+        LivePii::Absent | LivePii::Other(_) | LivePii::Undecryptable => Ok(false),
+    }
+}
+
+/// Whether `row` must not be forwarded because the deletion log beside
+/// `pii_store` records its note as deleted, in any state. Applies to EVERY
+/// row, whatever its note's classification (independent review of 41005c6,
+/// F1: this used to return `Ok(false)` for any row without a
+/// `pii_content_hash`, so an interrupted `Internal`/`Public` write — live, or
+/// a restore promotion of a backup's older non-sensitive version — whose note
+/// was deleted before recovery was forwarded and readable again; a deleted id
+/// is retired for every classification, I2).
+///
+/// Fail closed: a row carrying a `pii_content_hash` with no store
+/// (`require_pii_store`), or a log that cannot be opened or queried, is an
+/// error, never "not deleted", and leaves the row as it is for the next pass.
+/// A row WITHOUT a `pii_content_hash` when no store was supplied
+/// (`Vault::open_with_default_indexer`) is `Ok(false)`: such a vault has no
+/// deletion log to consult at all, is never given one to record deletions
+/// in, and refusing would make every ordinary non-sensitive crash recovery
+/// impossible without an encrypted store (the same reason `Vault::read_note`
+/// only fails closed on a `Sensitive` record there).
+///
+/// No false positives for a non-tombstone row: a write to an id the log
+/// already records as deleted is refused before it touches anything (I2,
+/// `Vault::refuse_if_deleted`), so a deleted note's non-tombstone row can
+/// only be one that passed that check and was then overtaken by the
+/// deletion — content that must stay discarded.
+///
+/// One exception: a TOMBSTONE row is never "deleted content". It IS the
+/// deletion: `record_deletion` runs before it, so its note always reads as
+/// deleted, and discarding it would roll the live `.pii` file BACK to the
+/// real, deleted ciphertext from its before-image, undoing the purge C5
+/// requires. Forwarding it exposes nothing (its plaintext is empty) and
+/// completes that purge. See [`is_tombstone_row`] for how one is recognised.
+fn note_is_deleted(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> Result<bool, ReconcileError> {
+    if is_tombstone_row(row) {
+        return Ok(false);
+    }
+    let store = match (row.pii_content_hash.as_deref(), pii_store) {
+        (_, Some(store)) => store,
+        (None, None) => return Ok(false),
+        (Some(_), None) => require_pii_store(pii_store, op)?,
+    };
+    vault_security::DeletionLog::open(&store.deletion_log_path())
+        .and_then(|log| log.is_deleted(note_id.as_str()))
+        .map_err(|e| inconsistent(op, format!("cannot consult the deletion log before forwarding a row: {e}")))
+}
+
+/// Whether `row` gets the tombstone exemption from [`note_is_deleted`].
+/// Decided from what the journal row already records, with no new column
+/// (F3), by the two conditions under which discarding a row of a deleted
+/// note would UNDO its purge:
+///
+/// - its staged plaintext is the EMPTY tombstone (`pii_content_hash` is
+///   `content_hash(b"")`, what `propose::commit_sensitive` stages for a
+///   deletion); a row with no `pii_content_hash` is never a tombstone, since
+///   deletions are only ever written through the sensitive path; and
+/// - it overwrote earlier content (`before_image_hash` is set). Only then
+///   does the rollback restore anything: the prior pointer record and, from
+///   the PII before-image, the real ciphertext the deletion is purging. A row
+///   with nothing before it is discarded harmlessly (its own empty
+///   ciphertext and pointer are removed), so it gets no exemption. This is
+///   what keeps an empty-bodied `Sensitive` note in a restored backup from
+///   being mistaken for its own deletion: a restore promotion always writes
+///   into a fresh vault, so its rows never carry a before-image.
+///
+/// Residual ambiguity (not closable without a schema change, since the
+/// journal records no "this is a deletion" flag): a LIVE update of a
+/// `Sensitive` note to a genuinely empty body stages the same empty plaintext
+/// over a before-image, exactly like a tombstone. Forwarding such a row when
+/// its note was deleted meanwhile exposes no content (its plaintext is
+/// empty), purges the prior ciphertext's before-image at `GitCommitted`, and
+/// `Vault::read_note` still withholds its pointer record as deleted.
+fn is_tombstone_row(row: &OperationRow) -> bool {
+    row.pii_content_hash.as_deref() == Some(content_hash(b"").as_str()) && row.before_image_hash.is_some()
+}
+
+/// The fail-closed rule for a row that carries a `pii_content_hash` when no
+/// `PiiStore` was supplied: nothing about its PII state can be verified,
+/// restored or cleaned up, so recovery refuses (`Inconsistent`, blocking
+/// `Vault::open`) rather than resolving the row without it.
+fn require_pii_store(pii_store: Option<&PiiStore>, op: Uuid) -> Result<&PiiStore, ReconcileError> {
+    pii_store.ok_or_else(|| {
+        inconsistent(
+            op,
+            "this operation's journal row carries a pii_content_hash but no PiiStore was supplied to reconcile; \
+             cannot verify, roll back or clean up its PII state — open the vault with Vault::open_with_pii_store instead",
+        )
+    })
+}
+
+/// What the live `.pii` file for a note is, relative to one operation's own
+/// expected plaintext hash. Every variant is a POSITIVE observation: a read
+/// that fails for any reason other than `NotFound` is not a variant at all,
+/// it is an error from [`classify_live_pii`].
+enum LivePii {
+    /// No live file exists.
+    Absent,
+    /// The live file decrypts to this operation's own content.
+    Ours,
+    /// The live file decrypts to other content, whose plaintext hash this is.
+    Other(String),
+    /// The live file exists and was read, but does not decrypt/verify.
+    Undecryptable,
+}
+
+fn classify_live_pii(store: &PiiStore, note_id: &NoteId, op: Uuid, expected: &str) -> Result<LivePii, ReconcileError> {
+    match store.get(note_id.as_str()) {
+        Ok(plaintext) => {
+            let hash = content_hash(&plaintext);
+            Ok(if hash == expected { LivePii::Ours } else { LivePii::Other(hash) })
+        }
+        Err(PiiStoreError::NotFound { .. }) => Ok(LivePii::Absent),
+        Err(PiiStoreError::Inconsistent { .. }) => Ok(LivePii::Undecryptable),
+        Err(e) => Err(pii_err(op, "cannot read the live PII file", e)),
+    }
+}
+
+/// A `PiiStoreError` raised while recovering `op`. An I/O error stays `Io`
+/// (the row is left as it is and re-examined on the next pass); anything
+/// else is `Inconsistent`.
+fn pii_err(op: Uuid, context: &str, e: PiiStoreError) -> ReconcileError {
+    match e {
+        PiiStoreError::Io(io) => ReconcileError::Io(std::io::Error::new(io.kind(), format!("{context}: {io}"))),
+        other => inconsistent(op, format!("{context}: {other}")),
+    }
+}
+
+/// Task 6 (A3 review round, CRITICAL fix): rolls back `PiiStore`'s state for
+/// `operation_id` as part of failing this row.
+///
+/// - Always discards this operation's own staged file first.
+/// - If this operation's own content is the live `.pii` file (verified by
+///   hash against `row.pii_content_hash`, never assumed) and a PII
+///   before-image exists (an UPDATE: `PiiStore::commit_staged` preserved the
+///   prior committed ciphertext before overwriting the live file), the
+///   before-image is RESTORED, verified against the PRIOR operation's own
+///   recorded `pii_content_hash` (via `Journal::last_committed_for_note`;
+///   never this failing operation's hash, which describes different
+///   content), and only then deleted.
+/// - If it is the live file and there is no before-image (a FIRST write),
+///   the live file is removed, re-verified at the point of removal.
+/// - If the live file is another operation's content, the live file is
+///   never touched.
+///
+/// A row with no `pii_content_hash` at all (an ordinary, non-sensitive
+/// write) is a no-op beyond the staged-file discard.
+///
+/// # Fail-closed rule (A3 review round 3)
+///
+/// Every destructive step (restoring over the live file, removing it,
+/// deleting the before-image) runs only on a POSITIVE, verified observation.
+/// Rounds 1 and 2 each treated a failure as permission to proceed: round 2's
+/// "not ours" branch read ANY error on the live file (a sharing violation,
+/// say) as "this is not my content" and deleted the before-image, which was
+/// then the only copy of committed v1 content. Here an unreadable live file,
+/// an unreadable or undecryptable before-image, or an observation that fits
+/// no legitimate crash window returns an error. Nothing is changed, the row
+/// is not advanced (every caller advances to `Failed` only after this
+/// returns `Ok`), and the next recovery pass examines it again. The decision
+/// table, where "BI" is this operation's own PII before-image:
+///
+/// | live file            | BI absent              | BI present and decrypts            | BI unreadable |
+/// |----------------------|------------------------|------------------------------------|---------------|
+/// | ours                 | verified remove (first write), unless the last committed row has this same hash | restore, verified against the prior committed hash, then delete BI | error |
+/// | other content `h`    | nothing to do          | delete BI only if it decrypts to `h` (an identical copy of what is live), else error | error |
+/// | absent               | nothing to do          | error (the BI may be the only copy) | error |
+/// | undecryptable        | error                  | error                              | error |
+/// | read error           | error                  | error                              | error |
+///
+/// This is also the live write path's rollback (`vault::roll_back_pii`
+/// calls it), so the two paths cannot drift apart again as they did in
+/// round 1.
+pub(crate) fn roll_back_pii(
+    journal: &Journal,
+    pii_store: Option<&PiiStore>,
+    note_id: &NoteId,
+    op: Uuid,
+    row: &OperationRow,
+) -> Result<(), ReconcileError> {
+    // A staged file is never committed content, so discarding this
+    // operation's own one is always safe. Done whenever a store is at hand,
+    // even for a row with no pii_content_hash. A failure to discard is
+    // reported, never swallowed, so the row is re-examined rather than
+    // failed with an orphaned ciphertext left behind.
+    if let Some(store) = pii_store {
+        store
+            .discard_staged(note_id.as_str(), op)
+            .map_err(|e| pii_err(op, "cannot discard this operation's staged PII file", e))?;
+    }
+    let Some(expected) = row.pii_content_hash.as_deref() else {
+        return Ok(());
+    };
+    // A3 review round, IMPORTANT finding #5: no store, no verdict.
+    let store = require_pii_store(pii_store, op)?;
+    let live = classify_live_pii(store, note_id, op, expected)?;
+    let before_image = match store.get_before_image(note_id.as_str(), op) {
+        Ok(plaintext) => Some(content_hash(&plaintext)),
+        Err(PiiStoreError::NotFound { .. }) => None,
+        Err(e) => return Err(pii_err(op, "cannot read this operation's PII before-image; leaving it in place", e)),
+    };
+    match (live, before_image) {
+        // Live content hashes to this operation's own, and there is no
+        // before-image. Normally a first write whose ciphertext went live:
+        // nothing to restore it to, so it is removed (verified again at the
+        // point of removal). But "hashes to ours" is not "is only ours": an
+        // update that writes the SAME plaintext as the committed version and
+        // stops before commit_staged leaves the committed ciphertext live,
+        // and it hashes identically. If the last committed operation's
+        // pii_content_hash is this same hash, the live file is (also)
+        // committed content and is left alone.
+        (LivePii::Ours, None) => {
+            let committed_has_same_content = journal
+                .last_committed_for_note(note_id.as_str())?
+                .is_some_and(|prior| prior.pii_content_hash.as_deref() == Some(expected));
+            if !committed_has_same_content {
+                store
+                    .remove_live_verified(note_id.as_str(), expected)
+                    .map_err(|e| pii_err(op, "cannot remove this operation's own live PII file", e))?;
+            }
+        }
+        // An update whose own ciphertext is live: put the prior committed
+        // content back, verified, and only then consume the before-image.
+        (LivePii::Ours, Some(_)) => {
+            let prior_hash = journal
+                .last_committed_for_note(note_id.as_str())?
+                .and_then(|prior| prior.pii_content_hash)
+                .ok_or_else(|| inconsistent(op, "a PII before-image exists but no prior committed operation's pii_content_hash could be found to verify it against"))?;
+            let restored = store
+                .restore_before_image(note_id.as_str(), op, &prior_hash)
+                .map_err(|e| pii_err(op, "PII before-image restore failed", e))?;
+            if !restored {
+                return Err(inconsistent(op, "PII before-image disappeared between reading it and restoring it"));
+            }
+            store
+                .delete_before_image(note_id.as_str(), op)
+                .map_err(|e| pii_err(op, "cannot delete the consumed PII before-image", e))?;
+        }
+        // Someone else's content is live and this operation left no
+        // before-image (it never reached commit_staged): nothing to undo.
+        (LivePii::Other(_), None) | (LivePii::Absent, None) => {}
+        // Someone else's content is live and this operation left a
+        // before-image: commit_staged copied the live file and then never
+        // renamed over it. The before-image is deleted only when it is
+        // POSITIVELY an identical copy of what is live, so deleting it
+        // loses nothing.
+        (LivePii::Other(live_hash), Some(before_hash)) if live_hash == before_hash => {
+            store
+                .delete_before_image(note_id.as_str(), op)
+                .map_err(|e| pii_err(op, "cannot delete a redundant PII before-image", e))?;
+        }
+        (LivePii::Other(_), Some(_)) => {
+            return Err(inconsistent(
+                op,
+                "the live PII file holds neither this operation's content nor the content of its before-image; \
+                 the before-image may be the only copy of committed content, so it is left in place",
+            ));
+        }
+        (LivePii::Absent, Some(_)) => {
+            return Err(inconsistent(
+                op,
+                "no live PII file exists but this operation's before-image does; it may be the only copy of \
+                 committed content, so it is left in place",
+            ));
+        }
+        (LivePii::Undecryptable, _) => {
+            return Err(inconsistent(op, "the live PII file does not decrypt; refusing to roll back over it"));
+        }
+    }
+    Ok(())
 }
 
 /// Row 2. Returns `JournalCommitted` (rolled forward) or `Failed` (rolled back).
@@ -322,6 +711,7 @@ fn fix_intent_recorded(root: &Path, journal: &Journal, row: &OperationRow) -> Re
 fn fix_content_persisted(
     root: &Path,
     journal: &Journal,
+    pii_store: Option<&PiiStore>,
     row: &OperationRow,
     injector: &FaultInjector,
 ) -> Result<WriteState, ReconcileError> {
@@ -342,8 +732,31 @@ fn fix_content_persisted(
     };
 
     if on_disk_hash.as_deref() == Some(expected_hash) {
-        journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
-        return Ok(WriteState::JournalCommitted);
+        // Task 6: the pointer's own bytes verify, but for a sensitive write
+        // that is only half the pairing — the staged-or-committed
+        // ciphertext this row names must ALSO verify before rolling
+        // forward. Falling through to the rollback below (rather than
+        // returning early here) reuses the exact same before-image-restore
+        // machinery that already exists for an ordinary content mismatch:
+        // from this row's point of view, "my ciphertext is missing or
+        // wrong" is handled identically to "my pointer bytes are missing or
+        // wrong" — both mean this operation never validly completed.
+        //
+        // Restore-promotion TOCTOU fix, generalized by F1: no row, of any
+        // classification, is forwarded to JournalCommitted if the deletion
+        // log now records its note as deleted (tombstones excepted, see
+        // `note_is_deleted`). A deletion can land after a crash in the
+        // ContentPersisted -> JournalCommitted window (the writer's own
+        // locked re-check, if any, ran before it), and forwarding the row
+        // would make deleted content readable. It is treated exactly like a
+        // ciphertext mismatch: the rollback below. Applied to every row
+        // alike, from the live write path or from a restore's promotion; a
+        // row resumed from IntentRecorded whose rename landed reaches it
+        // too, through `fix_intent_recorded`'s hand-over.
+        if pii_is_consistent(pii_store, &note_id, op, row)? && !note_is_deleted(pii_store, &note_id, op, row)? {
+            journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
+            return Ok(WriteState::JournalCommitted);
+        }
     }
 
     // No before_image_hash means the record did not exist when this
@@ -362,6 +775,11 @@ fn fix_content_persisted(
                 Err(e) => return Err(ReconcileError::Io(e)),
             }
         }
+        // Task 6: no Markdown before-image means a first write — `roll_back_pii`
+        // correctly removes this operation's own live `.pii` file outright
+        // (nothing to restore to) when it is this operation's own content,
+        // and never touches it otherwise.
+        roll_back_pii(journal, pii_store, &note_id, op, row)?;
         journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
         return Ok(WriteState::Failed);
     };
@@ -377,6 +795,7 @@ fn fix_content_persisted(
     if let Some(later) = journal.last_committed_for_note(note_id.as_str())? {
         if matches!((later.new_version, row.new_version), (Some(l), Some(mine)) if l >= mine) {
             delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+            roll_back_pii(journal, pii_store, &note_id, op, row)?;
             journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
             return Ok(WriteState::Failed);
         }
@@ -396,6 +815,7 @@ fn fix_content_persisted(
     // pass that already deleted the before-image resolves the same way.
     if before_image_is_uncommitted_sibling_content(journal, &note_id, op, before_hash)? {
         delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+        roll_back_pii(journal, pii_store, &note_id, op, row)?;
         journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
         return Ok(WriteState::Failed);
     }
@@ -430,6 +850,18 @@ fn fix_content_persisted(
     // The opposite order would orphan the before-image of a row that is
     // already terminal and never revisited.
     delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+    // Task 6 (A3 review round, CRITICAL fix): this is the rollback branch
+    // the crash-on-update design targets — the pointer has just been
+    // restored to its PREVIOUS version. `roll_back_pii` RESTORES the live
+    // `.pii` file from this operation's own PII before-image (if this
+    // operation's own content is currently live AND a before-image exists
+    // — the UPDATE case: the live file goes back to the PRIOR operation's
+    // ciphertext, never left empty) rather than merely removing it; it
+    // removes outright only on a FIRST write (nothing to restore to), and
+    // leaves the live file alone entirely if it belongs to a different
+    // operation. Never unconditional, never a bare discard of the only
+    // surviving copy of committed content.
+    roll_back_pii(journal, pii_store, &note_id, op, row)?;
     journal.advance(op, WriteState::Failed, AdvanceFields::none())?;
     Ok(WriteState::Failed)
 }
@@ -476,10 +908,19 @@ fn fix_journal_committed(
     root: &Path,
     journal: &Journal,
     repo_path: &Path,
+    pii_store: Option<&PiiStore>,
     row: &OperationRow,
 ) -> Result<GitStep, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
+    // A3 review round 3, item 1(a): a sensitive row reaching GitCommitted
+    // must have its PII before-image deleted (see
+    // `delete_before_images_at_git_committed`). Without a store that cannot
+    // happen, so the row is refused HERE, before git is touched or the row
+    // advanced, never committed with its cleanup silently skipped.
+    if row.pii_content_hash.is_some() {
+        require_pii_store(pii_store, op)?;
+    }
     // Always Unbounded on the recovery path. See the module docs.
     let found = match find_commit_for_operation(journal, repo_path, op, ScanDepth::Unbounded) {
         Ok(found) => found,
@@ -508,9 +949,42 @@ fn fix_journal_committed(
     // The Oid is recorded on the same write that advances the state, so Tier 1
     // is authoritative from here on. This includes repairing a Tier 2 find.
     journal.advance(op, WriteState::GitCommitted, AdvanceFields::git_oid(oid))?;
-    // Per spec, the before-image is deleted only once GitCommitted is reached.
-    delete_before_image(root, &note_id, op).map_err(|e| from_storage(op, e))?;
+    delete_before_images_at_git_committed(root, pii_store, &note_id, row)?;
     Ok(GitStep::Committed)
+}
+
+/// Deletes `row`'s Markdown and PII before-images, once the row has reached
+/// `GitCommitted` (per spec, "La before-image si elimina solo dopo
+/// git_committed"). Idempotent: both deletes treat a missing file as done.
+///
+/// Called from row 3 right after its advance to `GitCommitted`, AND from row
+/// 4 for every row resumed directly from `GitCommitted` (A3 review round 3,
+/// item 1(c)): a crash between the `GitCommitted` advance and these deletes
+/// resumes the row from row 4, never through row 3, and before this fix it
+/// went to `IndexCurrent` with its PII before-image orphaned. That
+/// before-image is the prior version's real content (for a tombstone, the
+/// "deleted" content itself), still decryptable by the live master key
+/// (A3 review round 2, NEW finding #1; spec contract C5).
+///
+/// A sensitive row with no `PiiStore` to delete with fails closed
+/// (`Inconsistent`) and is not advanced (A3 review round 3, item 1(a)).
+fn delete_before_images_at_git_committed(
+    root: &Path,
+    pii_store: Option<&PiiStore>,
+    note_id: &NoteId,
+    row: &OperationRow,
+) -> Result<(), ReconcileError> {
+    let op = row.operation_id;
+    if row.pii_content_hash.is_some() {
+        require_pii_store(pii_store, op)?;
+    }
+    delete_before_image(root, note_id, op).map_err(|e| from_storage(op, e))?;
+    if let Some(store) = pii_store {
+        store
+            .delete_before_image(note_id.as_str(), op)
+            .map_err(|e| pii_err(op, "cannot delete the PII before-image at GitCommitted", e))?;
+    }
+    Ok(())
 }
 
 /// Row 3's result: committed (the row is now `GitCommitted`) or pending, with
@@ -629,7 +1103,7 @@ mod tests {
         let (root, journal) = fresh_root_and_journal();
         let op = Uuid::new_v4();
         journal.insert_intent(op, "note-a", 0).unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
         assert_eq!(report.failed, vec![op]);
     }
@@ -651,7 +1125,7 @@ mod tests {
         journal
             .record_fields(op, WriteState::IntentRecorded, AdvanceFields::content_with_before_image(2, content_hash(&intended), before_hash))
             .unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
         assert_eq!(report.failed, vec![op]);
         assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), old, "the prior version is left exactly as it was");
@@ -668,7 +1142,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, "note-a", 0).unwrap();
         journal.record_fields(op, WriteState::IntentRecorded, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         let row = journal.get(op).unwrap().unwrap();
         assert_eq!(row.state, WriteState::JournalCommitted, "rolled forward (no git repo here, so it rests as git_pending)");
         assert_eq!(row.previous_state, Some(WriteState::IntentRecorded));
@@ -688,7 +1162,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), &bytes).unwrap();
         journal.insert_intent(op, id.as_str(), 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted);
         assert_eq!(report.recovered, vec![op]);
     }
@@ -724,7 +1198,7 @@ mod tests {
             2, "expected-hash-that-will-not-match", content_hash(&before_bytes),
         )).unwrap();
 
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
 
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed, "the rolled-back operation itself is Failed, not JournalCommitted");
         assert_eq!(journal.get(op).unwrap().unwrap().new_version, Some(2), "the row still truthfully records the version it FAILED to commit, for audit purposes — it is not reinterpreted as success");
@@ -755,14 +1229,14 @@ mod tests {
         )).unwrap();
 
         let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
-        let interrupted = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &injector);
+        let interrupted = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &injector);
         assert!(matches!(interrupted, Err(ReconcileError::Interrupted(_))), "row 2 must go through the same generic Recovering-marking step as every other row, not a special-cased shortcut");
         let mid_recovery_row = journal.get(op).unwrap().unwrap();
         assert_eq!(mid_recovery_row.state, WriteState::Recovering, "genuinely at Recovering, not fast-forwarded past it");
         assert_eq!(mid_recovery_row.previous_state, Some(WriteState::ContentPersisted));
 
         // A second, uninterrupted pass must still resolve to Failed, per the test above.
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
         assert_eq!(report.failed, vec![op]);
     }
@@ -777,7 +1251,7 @@ mod tests {
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(
             2, "expected-hash-that-will-not-match", "before-image-hash-but-no-file-exists",
         )).unwrap();
-        let err = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap_err();
+        let err = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap_err();
         assert!(matches!(err, ReconcileError::Inconsistent { operation_id, .. } if operation_id == op));
     }
 
@@ -792,7 +1266,7 @@ mod tests {
         journal.insert_intent(op, id.as_str(), 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
-        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, None, &FaultInjector::none()).unwrap();
         // Deviation from the brief's literal text, which asserted the row
         // stops at GitCommitted. That predates the second independent-review
         // cascade correction: reconcile marks this row Recovering with
@@ -825,7 +1299,7 @@ mod tests {
         journal.insert_intent(op, id.as_str(), 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
-        reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        reconcile(&root, &journal, &repo_dir, &NullIndexer, None, &FaultInjector::none()).unwrap();
         // After reconcile, Tier 1 must now be authoritative: the row itself carries the Oid.
         assert_eq!(journal.get(op).unwrap().unwrap().git_commit_oid, Some(existing_oid.to_string()), "reconcile must repair the journal row with the Tier-2-found Oid");
         assert_eq!(find_commit_for_operation(&journal, &repo_dir, op, ScanDepth::Unbounded).unwrap(), Some(existing_oid));
@@ -841,7 +1315,7 @@ mod tests {
         journal.insert_intent(op, id.as_str(), 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
-        let report = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &root, &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted, "stays pending, not blocked");
         assert_eq!(report.git_pending, vec![op]);
     }
@@ -857,7 +1331,7 @@ mod tests {
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&bytes))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
         journal.advance(op, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::IndexCurrent);
         assert_eq!(report.recovered, vec![op]);
     }
@@ -882,7 +1356,7 @@ mod tests {
         journal.advance(op, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
 
         let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
-        let interrupted = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &injector);
+        let interrupted = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &injector);
         assert!(matches!(interrupted, Err(ReconcileError::Interrupted(_))), "reconcile itself must be interruptible mid-fixup, not only the original write");
         let mid_recovery_row = journal.get(op).unwrap().unwrap();
         assert_eq!(mid_recovery_row.state, WriteState::Recovering, "genuinely left at Recovering by the interrupted reconcile, not inserted artificially by the test");
@@ -890,7 +1364,7 @@ mod tests {
 
         // A second, uninterrupted reconcile pass must re-dispatch from previous_state
         // and still reach IndexCurrent — proving the re-dispatch-from-Recovering path.
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::IndexCurrent);
         assert_eq!(report.recovered, vec![op]);
     }
@@ -1018,7 +1492,7 @@ mod tests {
         std::fs::write(root.join("note-a.record"), b"CORRUPTED").unwrap();
         journal.insert_intent(op, "note-a", 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, "hash-that-wont-match")).unwrap();
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::Failed);
         assert_eq!(report.failed, vec![op]);
         assert!(!root.join("note-a.record").exists(), "no committed version exists, so the unverified record is removed (pre-operation state)");
@@ -1091,7 +1565,7 @@ mod tests {
         journal.advance(op_b, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(2, content_hash(&b_bytes), before_b)).unwrap();
         journal.advance(op_b, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
 
-        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(report.recovered, vec![op_a, op_b], "resolved in version order");
         assert!(report.git_pending.is_empty(), "nothing stranded: {:?}", report.git_pending_reasons);
         assert_eq!(journal.get(op_a).unwrap().unwrap().state, WriteState::IndexCurrent);
@@ -1111,7 +1585,7 @@ mod tests {
         journal.insert_intent(op, "note-a", 0).unwrap();
         journal.advance(op, WriteState::ContentPersisted, AdvanceFields::content(1, content_hash(&own))).unwrap();
         journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
-        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &repo_dir, &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(journal.get(op).unwrap().unwrap().state, WriteState::JournalCommitted);
         assert_eq!(report.git_pending, vec![op]);
         assert!(report.git_pending_reasons[0].1.contains("own content"));
@@ -1179,9 +1653,9 @@ mod tests {
         // advance: the guard does not depend on the before-image existing.
         delete_before_image(&root, &id, op_a).unwrap();
         let journal = Journal::open(&journal_path).unwrap();
-        let first = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
+        let first = reconcile(&root, &journal, &root, &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(first.failed, vec![op_a]);
-        let second = reconcile(&root, &journal, &root, &NullIndexer, &FaultInjector::none()).unwrap();
+        let second = reconcile(&root, &journal, &root, &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(second, ReconcileReport::default(), "a second pass finds nothing left to do");
         drop(journal);
 
@@ -1301,16 +1775,16 @@ mod tests {
         let (op_1, op_a, op_b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let (v1, _a, _b) = seed_two_stalled_siblings(&root, &journal, op_1, op_a, op_b);
         let injector = FaultInjector::trigger_at(FaultPoint::AfterMarkedRecoveringBeforeFixup);
-        assert!(matches!(reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &injector), Err(ReconcileError::Interrupted(_))));
+        assert!(matches!(reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &injector), Err(ReconcileError::Interrupted(_))));
         // The interrupted pass left A at Recovering (first in version order).
         // Also put B where a later crash would leave it: Recovering, with its
         // before-image already deleted.
         journal.advance(op_b, WriteState::Recovering, AdvanceFields::previous_state(WriteState::ContentPersisted)).unwrap();
         delete_before_image(&root, &id, op_b).unwrap();
 
-        let first = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let first = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(first.failed, vec![op_a, op_b], "B resolves to Failed, not Inconsistent over its missing before-image");
-        let second = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let second = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(second, ReconcileReport::default(), "a second pass finds nothing left to do");
         assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), v1);
         assert_eq!(journal.get(op_b).unwrap().unwrap().state, WriteState::Failed);
@@ -1340,7 +1814,7 @@ mod tests {
         journal.insert_intent(op_d, id.as_str(), 2).unwrap();
         journal.advance(op_d, WriteState::ContentPersisted, AdvanceFields::content_with_before_image(3, "will-not-match", before_d)).unwrap();
 
-        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, &FaultInjector::none()).unwrap();
+        let report = reconcile(&root, &journal, &no_git_repo(), &NullIndexer, None, &FaultInjector::none()).unwrap();
         assert_eq!(report.failed, vec![op_d]);
         assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), x, "C's committed content is restored");
     }
@@ -1432,5 +1906,66 @@ mod tests {
         // The ordinary stale-version case is still Conflict.
         let err = vault.write_record_unchecked(&id, "stale", Version(1), Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, StorageError::Conflict { expected: Version(1), actual: Version(2), .. }), "got {err:?}");
+    }
+
+    // --- A3 review round 2, item #4: fix_intent_recorded restores the
+    // Markdown pointer from its before-image on a PII-inconsistent rollback ---
+
+    #[test]
+    fn fix_intent_recorded_restores_the_markdown_pointer_from_its_before_image_on_a_pii_inconsistent_rollback() {
+        // Simulates the defensive, upstream-invariant-violation window
+        // `fix_intent_recorded`'s pointer-landed branch guards: the v2
+        // pointer rename landed and its content_hash matches, but
+        // pii_content_hash names ciphertext that does not exist anywhere
+        // (neither live nor staged) — never reachable via live traffic
+        // (AfterPiiCommittedBeforePointerRename's own invariant prevents
+        // it), but recovery must still resolve the row safely rather than
+        // leaving the pointer stuck at the bad v2 version. Before the fix,
+        // this branch called delete_before_image without ever restoring
+        // the pointer from it, leaving the Markdown record directly at v2
+        // although the row resolves to Failed.
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let pii_root = unique_test_dir();
+        let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+
+        // v1 fully committed: a real pointer record plus real PiiStore ciphertext.
+        let op1 = Uuid::new_v4();
+        let v1_plaintext = b"v1 secret";
+        let v1_pointer = serialize_record_for_test("pii://note-a", Version(1));
+        pii_store.stage("note-a", v1_plaintext, op1).unwrap();
+        pii_store.commit_staged("note-a", op1).unwrap();
+        std::fs::write(root.join("note-a.record"), &v1_pointer).unwrap();
+        let journal = Journal::open(&journal_path).unwrap();
+        journal.insert_intent(op1, id.as_str(), 0).unwrap();
+        let v1_fields = AdvanceFields::content(1, content_hash(&v1_pointer)).merge_pii_content_hash(content_hash(v1_plaintext));
+        journal.advance(op1, WriteState::ContentPersisted, v1_fields).unwrap();
+        journal.advance(op1, WriteState::JournalCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op1, WriteState::GitCommitted, AdvanceFields::none()).unwrap();
+        journal.advance(op1, WriteState::IndexCurrent, AdvanceFields::none()).unwrap();
+
+        // v2's pointer rename landed (bytes on disk match its intended
+        // content_hash), its Markdown before-image (v1's pointer) was
+        // persisted under op2, but its pii_content_hash names ciphertext
+        // that was never staged or committed anywhere.
+        let op2 = Uuid::new_v4();
+        let v2_pointer = serialize_record_for_test("pii://note-a", Version(2));
+        let before_hash = persist_before_image(&root, &id, op2, &v1_pointer).unwrap();
+        std::fs::write(root.join("note-a.record"), &v2_pointer).unwrap();
+        journal.insert_intent(op2, id.as_str(), 1).unwrap();
+        let v2_fields = AdvanceFields::content_with_before_image(2, content_hash(&v2_pointer), before_hash)
+            .merge_pii_content_hash(content_hash(b"never actually staged or committed"));
+        journal.record_fields(op2, WriteState::IntentRecorded, v2_fields).unwrap();
+
+        let report = reconcile(&root, &journal, &root, &NullIndexer, Some(&pii_store), &FaultInjector::none()).unwrap();
+        assert_eq!(report.failed, vec![op2]);
+        assert_eq!(journal.get(op2).unwrap().unwrap().state, WriteState::Failed);
+
+        // THE ASSERTION THAT MATTERS: the Markdown pointer must have been
+        // restored to v1's, not left stuck at v2's bad pointer.
+        assert_eq!(std::fs::read(root.join("note-a.record")).unwrap(), v1_pointer, "the pointer must be restored to v1's, not left at v2's inconsistent pointer");
+        assert!(read_before_image(&root, &id, op2).is_err(), "the consumed before-image must be deleted, not orphaned");
+        assert_eq!(pii_store.get("note-a").unwrap(), v1_plaintext, "v1's ciphertext, never touched by this rollback, must remain readable");
     }
 }
