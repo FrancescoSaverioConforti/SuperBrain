@@ -17,6 +17,8 @@
 //!   governed by their own tests in `vault.rs`, not by anything in this crate.
 //! - **[n2io] is not closed by this crate existing.** [n2io] is the deferred
 //!   confidentiality audit (carried over from A3) covering the index,
-//!   embedding and cache surfaces. Its index-surface portion is being closed
-//!   specifically by Task 4 of the B1 deterministic-search plan. Until that
-//!   task lands, the index surface must not be treated as audited.
+//!   embedding, summary, attachment and cache surfaces. Its index-surface
+//!   portion is being closed specifically by Task 4 of the B1
+//!   deterministic-search plan. Until that task lands, the index surface
+//!   must not be treated as audited; the other four surfaces remain open
+//!   for B2/C2/future phases.
