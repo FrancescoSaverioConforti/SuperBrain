@@ -15,13 +15,11 @@
 //!   only calls `Vault::read_note` and `Vault::current_version`, which already
 //!   perform those checks internally. Any change to those checks is still
 //!   governed by their own tests in `vault.rs`, not by anything in this crate.
-//! - **[n2io] is not closed by this crate existing.** [n2io] is the deferred
-//!   confidentiality audit (carried over from A3) covering the index,
-//!   embedding, summary, attachment and cache surfaces. Its index-surface
-//!   portion is being closed specifically by Task 4 of the B1
-//!   deterministic-search plan. Until that task lands, the index surface
-//!   must not be treated as audited; the other four surfaces remain open
-//!   for B2/C2/future phases.
+//! - **[n2io] remains partially open.** Task 4 audited the in-memory
+//!   trigram/BM25 postings and indexing log/error-output paths. The search
+//!   response surface remains open for Task 6's dedicated body/source/relations
+//!   tests. Embedding, summary, attachment and cache surfaces remain open for
+//!   their future phases. See `.continuity/claims/n2io.md` and the B1 handoff.
 //!
 //! # B1 Task 1
 //!
@@ -58,4 +56,5 @@
 pub mod bm25;
 pub mod document;
 pub mod indexer_impl;
+pub mod time_range;
 pub mod trigram;

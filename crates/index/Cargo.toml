@@ -8,6 +8,8 @@ publish = false
 description = "SuperBrain deterministic search index (scaffold)."
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 domain = { path = "../domain" }
 storage = { path = "../storage" }
 
