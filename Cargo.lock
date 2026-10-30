@@ -59,6 +59,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "domain",
+ "git2",
+ "index",
+ "policy",
+ "storage",
+ "uuid",
+ "vault-security",
+]
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
