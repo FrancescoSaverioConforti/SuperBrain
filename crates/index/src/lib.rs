@@ -31,5 +31,17 @@
 //! from outside `storage`. See that module's doc comment for the full
 //! design note, including the Step 5 scalability-benchmark protocol Task 9
 //! will execute once real indexes exist.
+//!
+//! # B1 Task 2
+//!
+//! [`document`] defines `Document`, the shared shape built from a parsed
+//! note's metadata (plus its already-split body) that both `TrigramIndex`
+//! (this task) and `Bm25Index` (Task 3) consume. [`trigram`] defines
+//! `TrigramIndex` itself: a standalone insert/remove/exact-query postings
+//! structure over `Document::text_searchable`, with no knowledge of
+//! structured metadata, classification, or filters. Neither module wires
+//! into `SkeletonIndexer` yet — that real-indexer wiring is Task 3's job.
 
+pub mod document;
 pub mod indexer_impl;
+pub mod trigram;
