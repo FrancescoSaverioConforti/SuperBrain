@@ -1355,16 +1355,20 @@ mod tests {
             let destination = dir.path().join("restored");
             let restored_pii_root = dir.path().join("restored-pii-store");
             let result = restore_with_pii_root(&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
+            let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
+
+            // Resume BEFORE asserting: a failed assertion here must fail the
+            // test, not leave the deleter thread parked forever and hang the
+            // scope (which `cargo mutants` reports as a timeout, not a kill).
+            resume_tx.send(()).unwrap();
+            let receipt = handle.join().unwrap();
+            assert_eq!(receipt.generation, 1);
+
             assert!(
                 matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &["note-a".to_string()]),
                 "restoring while the deletion is still pending must be rejected as DeletedSinceBackup naming note-a, not silently succeed, got {result:?}"
             );
-            assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty");
-
-            // Clean up: resume and let record_deletion complete normally.
-            resume_tx.send(()).unwrap();
-            let receipt = handle.join().unwrap();
-            assert_eq!(receipt.generation, 1);
+            assert!(destination_untouched, "destination must remain completely empty");
         });
     }
 

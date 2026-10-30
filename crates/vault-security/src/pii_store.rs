@@ -807,6 +807,19 @@ mod tests {
         assert_eq!(store.get_unless_deleted("note-b").unwrap(), b"untouched", "other notes are unaffected");
     }
 
+    /// The deletion-log locations are a contract shared by `storage`'s write
+    /// pipeline and startup reconcile, `backup()`, and existing vaults on
+    /// disk: they must stay exactly these sibling files of the root (the
+    /// mutation re-run showed `deletion_log_reference_path -> Default`
+    /// surviving, since every caller agreed with the mutated value).
+    #[test]
+    fn deletion_log_paths_are_the_documented_siblings_of_the_root() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        assert_eq!(store.deletion_log_path(), dir.path().join("pii-store").join("deletion-log.sqlite"));
+        assert_eq!(store.deletion_log_reference_path(), dir.path().join("pii-store").join("deletion-log-reference.dpapi"));
+    }
+
     /// I2: a deletion log that cannot be opened fails closed.
     #[test]
     fn get_unless_deleted_fails_closed_when_the_deletion_log_cannot_be_opened() {

@@ -1206,6 +1206,18 @@ mod tests {
         assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
     }
 
+    /// I5: renumbering the LAST row keeps every hash link intact (each hash
+    /// is recomputed from the expected generation), so only the contiguity
+    /// check catches it (the mutation re-run showed `||`->`&&` on that check
+    /// surviving).
+    #[test]
+    fn a_renumbered_last_generation_is_detected_as_chain_broken() {
+        let dir = tempdir().unwrap();
+        let (log, _reference) = three_deletions(dir.path());
+        corrupt(&log, "UPDATE deletions SET generation = 5 WHERE generation = 3");
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken));
+    }
+
     /// I5: an intact chain (and an empty log) verifies.
     #[test]
     fn an_intact_chain_and_an_empty_log_verify() {
