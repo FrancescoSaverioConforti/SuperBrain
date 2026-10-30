@@ -760,14 +760,29 @@ impl DeletionLog {
     /// snapshot, per C5/the plan's restore rule). Equal or ahead of the
     /// live reference is fine; strictly behind is
     /// [`DeletionLogError::ReferenceStale`].
+    ///
+    /// Final-review re-review, N1: this used to compare
+    /// `restored_reference_snapshot` only against whatever
+    /// `live_trusted_ref.read()` returned, without ever confirming that
+    /// value is itself the LIVE LOG's own head — `verify_chain` proves the
+    /// log's chain is internally consistent, not that it agrees with the
+    /// reference. A log that is missing, rolled back, or stuck mid-protocol
+    /// could still pass that narrower check while disagreeing with what the
+    /// log itself has actually recorded, exposing a deleted note's content.
+    /// `reconcile` is the one function that already proves the live log's
+    /// head agrees with the live reference (completing a single safe
+    /// roll-forward if the log crashed mid-protocol, failing closed on any
+    /// other disagreement) — called here first, so this gate's exposure
+    /// decision is always made against a log state `reconcile` itself has
+    /// just vouched for, never a merely self-consistent one.
     pub fn verify_safe_to_expose_after_restore(
         &self,
         restored_reference_snapshot: &GenerationRef,
         live_trusted_ref: &dyn TrustedReferenceStore,
     ) -> Result<(), DeletionLogError> {
-        // I5: a live log whose chain does not verify cannot vouch for which
-        // notes are deleted.
-        self.verify_chain()?;
+        // The live log's own head must agree with the live reference before
+        // this gate trusts either of them for the comparison below.
+        self.reconcile(live_trusted_ref)?;
         let live = live_trusted_ref.read()?.ok_or(DeletionLogError::ReferenceMissing)?;
         if restored_reference_snapshot.generation < live.generation {
             return Err(DeletionLogError::ReferenceStale {

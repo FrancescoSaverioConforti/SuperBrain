@@ -1372,6 +1372,81 @@ mod tests {
         });
     }
 
+    /// Final-review re-review, N1: `verify_safe_to_expose_after_restore`
+    /// used to check only that the backup's own embedded reference was not
+    /// behind whatever `live_trusted_ref.read()` returned, plus that the
+    /// LIVE LOG's chain was internally self-consistent (`verify_chain`) — it
+    /// never confirmed the live log's own head actually agrees with that
+    /// live reference. A deletion whose `record_deletion` call logs the
+    /// generation but whose tombstone write never lands (a crash, or any
+    /// later pipeline failure) leaves the real ciphertext live; if the live
+    /// deletion-log FILE is then lost (deleted, rolled back to an earlier
+    /// backup of just that file) while the separate, DPAPI-protected
+    /// trusted-reference file survives untouched, the old check still
+    /// passed — a fresh, empty log is a trivially "valid" chain — and
+    /// `restore()` exposed the deleted note's real content. Reusing
+    /// `reconcile` (which already proves the live log's head agrees with
+    /// the live reference, not merely that the log is self-consistent)
+    /// closes this: an empty log against a reference claiming generation 1
+    /// is exactly the `(None, Some(r))` case `reconcile` already fails
+    /// closed on as `ReferenceMissing`.
+    #[test]
+    fn restore_fails_closed_when_the_live_deletion_log_itself_is_lost_even_though_its_chain_is_trivially_valid() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+        write_file(&vault_root.join("note-b.record"), b"0\n---\nordinary note");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"REAL SECRET", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // record_deletion runs to completion (generation 1, reference
+        // updated) — but note-a's tombstone write is never performed here
+        // (this unit test operates below storage's write pipeline, so
+        // there is no tombstone to send; this directly models the
+        // crashed/failed-tombstone state the review's repro constructs via
+        // storage's own pipeline). The real ciphertext stays live under
+        // note-a's pointer, exactly as it would after a crash between
+        // DeletionLog::record_deletion completing and the tombstone commit.
+        log.record_deletion("note-a", &reference).unwrap();
+        assert!(reference.read().unwrap().is_some(), "the reference survives — this is the part that must NOT be lost for the bug to be absent");
+        assert_eq!(pii_store.get("note-a").unwrap(), b"REAL SECRET", "the real ciphertext is still live — the tombstone never landed");
+
+        let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(manifest.generation, 1, "the backup's own snapshot correctly reflects the completed deletion");
+
+        // Lose the live deletion-log FILE (not the reference) — e.g. the
+        // SQLite file is deleted, or a stale copy from before the deletion
+        // was ever recorded is restored in its place. A fresh DeletionLog
+        // opened at the same path is an empty, trivially self-consistent
+        // chain. `log`'s own connection must be dropped first: on Windows,
+        // SQLite's open file handle would otherwise block the removal.
+        let db_path = log.db_path().to_path_buf();
+        drop(log);
+        std::fs::remove_file(&db_path).unwrap();
+        let log_after_loss = DeletionLog::open(&db_path).unwrap();
+        assert!(log_after_loss.is_empty().unwrap(), "the live log is now empty — lost, not merely stale");
+        assert!(reference.read().unwrap().is_some(), "the reference itself was never touched by this loss");
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let result = restore_with_pii_root(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
+
+        assert!(
+            result.is_err(),
+            "restore must fail closed when the live log cannot vouch for the reference it is being compared against, got {result:?}"
+        );
+        let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
+        assert!(destination_untouched, "nothing must be written, including note-a's real content, when the live log itself cannot be trusted");
+    }
+
     /// Final whole-branch review, CRITICAL C1: a backup taken AFTER a
     /// deletion (its own embedded reference already reflects it) must be
     /// restorable. Before the fix, check 2 rejected the WHOLE restore as
