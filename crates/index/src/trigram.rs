@@ -49,17 +49,24 @@ use std::collections::{HashMap, HashSet};
 use storage::NoteId;
 
 /// A trigram postings index: trigram -> set of note ids whose indexed text
-/// contains that trigram, plus the reverse mapping (note id -> trigrams it
-/// contributed) so `remove` can clean up exactly what `insert` added.
+/// contains that trigram, the reverse mapping (note id -> trigrams it
+/// contributed) so `remove` can clean up exactly what `insert` added, and
+/// the original (case-folded) indexed text per note id so `query_exact` can
+/// confirm a real substring match on top of the trigram pre-filter.
 #[derive(Debug, Default)]
 pub struct TrigramIndex {
     postings: HashMap<[char; 3], HashSet<NoteId>>,
     by_note: HashMap<NoteId, HashSet<[char; 3]>>,
+    /// Case-folded indexed text per note id, used only by `query_exact` to
+    /// verify a candidate actually contains the query term as a literal
+    /// substring (see `contains_term`). Kept in sync with `by_note`: every
+    /// `insert` populates both, every `remove` clears both.
+    texts: HashMap<NoteId, String>,
 }
 
 impl TrigramIndex {
     pub fn new() -> Self {
-        Self { postings: HashMap::new(), by_note: HashMap::new() }
+        Self { postings: HashMap::new(), by_note: HashMap::new(), texts: HashMap::new() }
     }
 
     /// Indexes `text` under `note_id`. If `note_id` was already indexed,
@@ -78,13 +85,16 @@ impl TrigramIndex {
         for trigram in &trigrams {
             self.postings.entry(*trigram).or_default().insert(note_id.clone());
         }
+        self.texts.insert(note_id.clone(), text.to_lowercase());
         self.by_note.insert(note_id, trigrams);
     }
 
-    /// Removes every trigram posting previously added for `note_id`. A
-    /// subsequent `query_exact` for any of its terms returns no hit for
-    /// this note id. Removing a note id that was never inserted is a no-op.
+    /// Removes every trigram posting previously added for `note_id`, along
+    /// with its stored text. A subsequent `query_exact` for any of its terms
+    /// returns no hit for this note id. Removing a note id that was never
+    /// inserted is a no-op.
     pub fn remove(&mut self, note_id: &NoteId) {
+        self.texts.remove(note_id);
         let Some(trigrams) = self.by_note.remove(note_id) else {
             return;
         };
@@ -99,11 +109,14 @@ impl TrigramIndex {
     }
 
     /// Returns every note id whose indexed text contains `term` as an exact
-    /// (case-insensitive) substring, found by intersecting the postings
-    /// lists of all of `term`'s trigrams and then confirming the substring
-    /// actually occurs (the trigram intersection alone only proves all of
-    /// term's trigrams are present somewhere in the text, not that they
-    /// occur contiguously in `term`'s exact order — see `contains_term`).
+    /// (case-insensitive) substring. Implementation: intersects the postings
+    /// lists of all of `term`'s trigrams to get a cheap CANDIDATE set (every
+    /// one of `term`'s trigrams occurs somewhere in the note's text, but not
+    /// necessarily contiguously or in `term`'s exact order), then confirms
+    /// each candidate with `contains_term`, which checks the literal
+    /// substring against the note's stored text. The trigram intersection is
+    /// a fast pre-filter; `contains_term` is what makes the result actually
+    /// correct as an exact-match primitive.
     ///
     /// A `term` shorter than 3 characters has no trigrams and always
     /// returns an empty result (see the module doc comment).
@@ -129,7 +142,21 @@ impl TrigramIndex {
             }
         }
 
-        candidates.unwrap_or_default().into_iter().collect()
+        candidates
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|note_id| self.contains_term(note_id, term))
+            .collect()
+    }
+
+    /// Confirms that `note_id`'s indexed text actually contains `term` as a
+    /// literal (case-insensitive) substring. This is the verification step
+    /// `query_exact` runs over each trigram-intersection candidate, since
+    /// the intersection alone only proves all of `term`'s trigrams are
+    /// present somewhere in the text, not that they occur contiguously in
+    /// `term`'s exact order.
+    fn contains_term(&self, note_id: &NoteId, term: &str) -> bool {
+        self.texts.get(note_id).is_some_and(|text| text.contains(&term.to_lowercase()))
     }
 }
 
@@ -288,6 +315,25 @@ mod tests {
         index.insert(id("note-a"), "completely unrelated content");
 
         assert!(index.query_exact("zzzzz-not-present").is_empty());
+    }
+
+    // --- Reviewer finding: trigram-intersection alone produces false
+    // positives. All four of "catdog"'s trigrams (cat, atd, tdo, dog) can
+    // each appear somewhere in a text that never contains "catdog" as a
+    // literal substring. query_exact must verify the actual substring, not
+    // just that all its trigrams are individually present.
+
+    #[test]
+    fn query_exact_rejects_a_trigram_intersection_false_positive() {
+        let mut index = TrigramIndex::new();
+        // "cat" (cat is nice), "atd" (nice, atd), "tdo" (atd is a typo, tdo),
+        // "dog" (the dog barks) each occur somewhere in this text, but the
+        // literal substring "catdog" never occurs anywhere in it.
+        index.insert(id("note-a"), "cat is nice, atd is a typo, tdo what, the dog barks");
+
+        let hits = index.query_exact("catdog");
+
+        assert!(hits.is_empty(), "catdog never occurs literally, so it must not be a hit");
     }
 
     #[test]
