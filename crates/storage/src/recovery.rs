@@ -38,7 +38,10 @@
 //!   deleted and the row advanced to `Failed`. The caller must retry with a
 //!   new `operation_id` (final whole-branch review, finding C1).
 //! - `ContentPersisted`: if the record on disk hashes to the row's
-//!   `content_hash`, roll forward to `JournalCommitted`. Otherwise restore this
+//!   `content_hash` (and, for a sensitive row, its live ciphertext verifies
+//!   AND the deletion log does not record its note as deleted — see
+//!   `sensitive_note_is_deleted`; a tombstone row is exempt, being the
+//!   deletion itself), roll forward to `JournalCommitted`. Otherwise restore this
 //!   operation's before-image, verify it, delete the before-image and advance
 //!   the row to `Failed`. Its `new_version` stays as the version it failed to
 //!   commit. No git commit is made: the restored content was already
@@ -429,6 +432,34 @@ fn pii_is_consistent(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, r
     }
 }
 
+/// Restore-promotion TOCTOU fix: whether `row` is a sensitive row (it
+/// carries a `pii_content_hash`) whose note the deletion log beside
+/// `pii_store` records as deleted, in any state. `Ok(false)` for a
+/// non-sensitive row. Fail closed: a missing store (`require_pii_store`) or a
+/// log that cannot be opened or queried is an error, never "not deleted",
+/// and leaves the row as it is for the next pass.
+///
+/// One exception, by content rather than by origin: a row whose staged
+/// plaintext is the EMPTY tombstone (`content_hash(b"")`, what
+/// `propose::commit_sensitive` stages for a deletion) is never "deleted
+/// content". It IS the deletion: `record_deletion` runs before it, so its
+/// note always reads as deleted, and discarding it would roll the live
+/// `.pii` file BACK to the real, deleted ciphertext from its before-image —
+/// undoing the purge C5 requires. Forwarding it exposes nothing (its
+/// plaintext is empty) and completes that purge.
+fn sensitive_note_is_deleted(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> Result<bool, ReconcileError> {
+    let Some(pii_hash) = row.pii_content_hash.as_deref() else {
+        return Ok(false);
+    };
+    if pii_hash == content_hash(b"") {
+        return Ok(false);
+    }
+    let store = require_pii_store(pii_store, op)?;
+    vault_security::DeletionLog::open(&store.deletion_log_path())
+        .and_then(|log| log.is_deleted(note_id.as_str()))
+        .map_err(|e| inconsistent(op, format!("cannot consult the deletion log before forwarding a sensitive row: {e}")))
+}
+
 /// The fail-closed rule for a row that carries a `pii_content_hash` when no
 /// `PiiStore` was supplied: nothing about its PII state can be verified,
 /// restored or cleaned up, so recovery refuses (`Inconsistent`, blocking
@@ -664,7 +695,16 @@ fn fix_content_persisted(
         // from this row's point of view, "my ciphertext is missing or
         // wrong" is handled identically to "my pointer bytes are missing or
         // wrong" — both mean this operation never validly completed.
-        if pii_is_consistent(pii_store, &note_id, op, row)? {
+        //
+        // Restore-promotion TOCTOU fix: a sensitive row is also never
+        // forwarded to JournalCommitted if the deletion log now records its
+        // note as deleted. A deletion can land after a crash in the
+        // ContentPersisted -> JournalCommitted window (the writer's own
+        // locked re-check, if any, ran before it), and forwarding the row
+        // would make deleted content readable. It is treated exactly like a
+        // ciphertext mismatch: the rollback below. Applied to every row
+        // alike, from the live write path or from a restore's promotion.
+        if pii_is_consistent(pii_store, &note_id, op, row)? && !sensitive_note_is_deleted(pii_store, &note_id, op, row)? {
             journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
             return Ok(WriteState::JournalCommitted);
         }

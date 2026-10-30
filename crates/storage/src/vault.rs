@@ -208,6 +208,14 @@ pub enum StorageError {
     /// deletion, e.g. to finish one whose tombstone step failed).
     #[error("note {note_id} has been deleted; a deleted note id is retired and cannot receive new content")]
     NoteDeleted { note_id: String },
+    /// [`Vault::read_note`] (restore-promotion TOCTOU fix, raw API boundary):
+    /// the record is a `Sensitive` note's pointer record and the deletion log
+    /// beside this vault's `PiiStore` records the note as deleted (any
+    /// state). The pointer record itself is withheld, not just its PII
+    /// content: a tombstoned note must not be consultable through the
+    /// ordinary read API at all. The read side of [`StorageError::NoteDeleted`].
+    #[error("note {note_id} has been deleted and is not consultable")]
+    Deleted { note_id: String },
 }
 
 /// Folds a crate-private `journal::JournalError` into `StorageError::Journal`
@@ -321,7 +329,7 @@ fn git_err(note_id: &NoteId, e: GitError) -> StorageError {
 
 /// Folds a crate-private `recovery::ReconcileError`, from the shared
 /// `recovery::own_content` helper used by the retry path, into `StorageError`.
-fn reconcile_err(note_id: &NoteId, e: ReconcileError) -> StorageError {
+pub(crate) fn reconcile_err(note_id: &NoteId, e: ReconcileError) -> StorageError {
     match e {
         ReconcileError::Io(e) => StorageError::Io(e),
         ReconcileError::Journal(e) => journal_err(e),
@@ -503,6 +511,10 @@ pub struct Vault {
     /// The index step of the write pipeline (Task 6). Its `mark_current` runs
     /// after `GitCommitted`, and its `state_for` backs `index_state_for`.
     indexer: Box<dyn Indexer>,
+    /// The deletion log beside the `PiiStore` this vault was opened with
+    /// (`PiiStore::deletion_log_path`), if any. `read_note` consults it
+    /// before returning a `Sensitive` record; see [`StorageError::Deleted`].
+    deletion_log_path: Option<PathBuf>,
 }
 
 impl Vault {
@@ -535,7 +547,9 @@ impl Vault {
     /// ciphertext here; see [`Vault::open_with_pii_store`] for a vault whose
     /// recovery pass CAN resolve those rows. A caller that never writes
     /// `Sensitive` notes (or that always pairs this constructor with its own
-    /// separate reconciliation of the PII store) is unaffected.
+    /// separate reconciliation of the PII store) is unaffected. Such a vault
+    /// also has no deletion log to consult, so `read_note` refuses any
+    /// `Sensitive` record it finds (fail closed, `StorageError::DeletionLog`).
     pub fn open_with_default_indexer(root: PathBuf, journal_path: &Path) -> Result<Self, StorageError> {
         Self::open(root, journal_path, Box::new(NullIndexer))
     }
@@ -626,6 +640,7 @@ impl Vault {
             journal: Mutex::new(journal),
             git_lock: Mutex::new(()),
             indexer,
+            deletion_log_path: pii_store.map(PiiStore::deletion_log_path),
         })
     }
 
@@ -640,8 +655,16 @@ impl Vault {
         self.indexer.state_for(note_id.as_str())
     }
 
+    /// The committed version of `note_id`. Unlike [`Vault::read_note`], it
+    /// does not withhold a deleted `Sensitive` note: a version number is
+    /// what a writer needs for its optimistic-concurrency check (re-issuing
+    /// a tombstone for an already-deleted note, I2, needs it), it carries no
+    /// note content, and every write to a deleted id other than a tombstone
+    /// is refused anyway (`StorageError::NoteDeleted`).
     pub fn current_version(&self, note_id: &NoteId) -> Result<Version, StorageError> {
-        self.read_note(note_id).map(|record| record.version)
+        let note_lock = self.note_lock(note_id);
+        let _guard = note_lock.lock().unwrap();
+        self.read_note_locked(note_id).map(|record| record.version)
     }
 
     /// Reads the current record for `note_id` by resolving it through the
@@ -667,10 +690,20 @@ impl Vault {
     /// operation's before-image at read time would pair that operation's
     /// overwritten content with THIS row's version number — exactly the
     /// cross-operation mislabeling the second architectural review forbids.
+    ///
+    /// A `Sensitive` record (restore-promotion TOCTOU fix, raw API boundary)
+    /// is returned only after the deletion log beside the vault's encrypted
+    /// store confirms its note is not deleted: a deleted note is
+    /// [`StorageError::Deleted`], and a log that cannot be consulted (or a
+    /// vault opened without one) is an error, never "not deleted". This
+    /// never decrypts anything; it withholds the pointer record itself, so a
+    /// tombstoned note's metadata is not consultable either.
     pub fn read_note(&self, note_id: &NoteId) -> Result<VaultRecord, StorageError> {
         let note_lock = self.note_lock(note_id);
         let _guard = note_lock.lock().unwrap();
-        self.read_note_locked(note_id)
+        let record = self.read_note_locked(note_id)?;
+        refuse_read_if_deleted(self.deletion_log_path.as_deref(), note_id, &record)?;
+        Ok(record)
     }
 
     /// The body of `read_note`, run while the caller already holds the
@@ -1636,6 +1669,18 @@ impl Vault {
             .map_err(journal_err)
     }
 
+    /// This vault's root directory (crate-private: `restore`'s promotion
+    /// writes restored records under it).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// This vault's journal (crate-private: `restore`'s promotion drives its
+    /// rows through the same A2 transitions the write path uses).
+    pub(crate) fn journal(&self) -> &Mutex<Journal> {
+        &self.journal
+    }
+
     /// Test-only introspection: the journal row for `operation_id`, or
     /// `None` if no such row exists. Lets tests assert on journal state
     /// (e.g. `WriteState`, `new_version`) without widening any production
@@ -1695,6 +1740,35 @@ impl Vault {
     /// `eval/results/A1/evidence.md`, "Known limitations").
     fn record_path_checked(&self, note_id: &NoteId) -> Result<PathBuf, StorageError> {
         record_path_checked(&self.root, note_id)
+    }
+}
+
+/// `Vault::read_note`'s deletion gate. Applies to a record that is a
+/// `Sensitive` note's pointer record: its frontmatter says `Sensitive`, or
+/// its body (or, whatever its shape, its last line) is this note's own
+/// `pii://` pointer. Any one is enough, so a record whose frontmatter does
+/// not parse is still gated if it points at encrypted content. Every other record passes unchecked: deletions are
+/// only ever recorded through a `Sensitive` tombstone, and a deleted id can
+/// never receive non-tombstone content again (I2).
+fn refuse_read_if_deleted(deletion_log_path: Option<&Path>, note_id: &NoteId, record: &VaultRecord) -> Result<(), StorageError> {
+    let sensitive_by_frontmatter = domain::parse_frontmatter(crate::propose::frontmatter_of(&record.content))
+        .is_ok_and(|note| matches!(note.classification, domain::Classification::Sensitive));
+    let pointer = vault_security::PiiPointer::for_note(note_id.as_str()).uri;
+    let points_at_pii = crate::propose::body_of(&record.content).trim() == pointer
+        || record.content.lines().last().map(str::trim) == Some(pointer.as_str());
+    if !sensitive_by_frontmatter && !points_at_pii {
+        return Ok(());
+    }
+    let Some(path) = deletion_log_path else {
+        return Err(StorageError::DeletionLog(format!(
+            "note {} is sensitive, but this vault was opened without an encrypted store, so its deletion log cannot be consulted",
+            note_id.as_str()
+        )));
+    };
+    match DeletionLog::open(path).and_then(|log| log.is_deleted(note_id.as_str())) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(StorageError::Deleted { note_id: note_id.as_str().to_string() }),
+        Err(e) => Err(StorageError::DeletionLog(e.to_string())),
     }
 }
 
@@ -4601,8 +4675,12 @@ mod tests {
             }
 
             let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
-            let after = reopened.read_note(&id).unwrap();
-            assert!(after.content.contains("pii://note-tombstone-cleanup"));
+            // Rolled forward: the tombstone is the committed version. Read
+            // through `current_version`, since `read_note` withholds a
+            // deleted sensitive note's pointer record (restore-promotion
+            // TOCTOU fix).
+            assert_eq!(reopened.current_version(&id).unwrap(), Version(v1_version.0 + 1));
+            assert!(matches!(reopened.read_note(&id), Err(StorageError::Deleted { .. })));
             assert_eq!(pii_store.get("note-tombstone-cleanup").unwrap(), b"", "the live ciphertext is now the empty tombstone");
 
             // THE ASSERTION THAT ACTUALLY MATTERS FOR C5: the before-image
@@ -4614,6 +4692,86 @@ mod tests {
                 "the PII before-image holding the REAL, now-deleted content must be purged once the tombstone write successfully completes — \
                  deleted sensitive content must never survive its own deletion as a recoverable before-image"
             );
+        }
+
+        #[test]
+        fn a_live_sensitive_write_crashed_before_journal_committed_is_discarded_by_reconcile_if_its_note_is_deleted_meanwhile() {
+            // Restore-promotion TOCTOU fix, point 4: the new reconcile
+            // condition is not restore-specific. A LIVE sensitive write that
+            // crashed between ContentPersisted and JournalCommitted, whose
+            // note is then deleted (say by another process) before the next
+            // recovery pass, must be discarded, never forwarded.
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-live-gap").unwrap();
+            let op = Uuid::new_v4();
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id,
+                    &pointer_content_for("note-live-gap"),
+                    b"LIVE SECRET",
+                    Version(0),
+                    op,
+                    &pii_store,
+                    None,
+                    &injector,
+                );
+                assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
+            }
+            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            log.record_deletion("note-live-gap", &vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()))
+                .unwrap();
+
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            assert_eq!(reopened.journal_row_for_test(op).unwrap().state, WriteState::Failed);
+            assert!(matches!(reopened.read_note(&id), Err(StorageError::NotFound { .. })));
+            assert!(!pii_store.has_live("note-live-gap"), "the deleted note's ciphertext must not be left live");
+        }
+
+        #[test]
+        fn a_tombstone_write_crashed_before_journal_committed_still_rolls_forward_and_purges_the_real_content() {
+            // The one content-based exception to the condition above: a
+            // tombstone row (empty plaintext) is the deletion itself, and its
+            // note always reads as deleted. Discarding it would put the
+            // REAL ciphertext back from its before-image; forwarding it
+            // completes the purge.
+            let root = crate::git::test_support::init_test_repo();
+            let journal_path = unique_dir().join("journal.sqlite");
+            let pii_store = open_pii_store(&root);
+            let id = NoteId::parse("note-tomb-gap").unwrap();
+            let pointer_content = pointer_content_for("note-tomb-gap");
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                vault
+                    .write_sensitive_record_unchecked(&id, &pointer_content, b"REAL SECRET", Version(0), Uuid::new_v4(), &pii_store, None)
+                    .unwrap();
+            }
+            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+            let op = Uuid::new_v4();
+            {
+                let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+                let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
+                let deletion = PendingDeletion { log: &log, trusted_ref: &trusted_ref };
+                let result = vault.write_sensitive_record_unchecked_with_injector(
+                    &id,
+                    &pointer_content,
+                    b"",
+                    Version(1),
+                    op,
+                    &pii_store,
+                    Some(deletion),
+                    &injector,
+                );
+                assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
+            }
+            let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
+            assert_eq!(reopened.journal_row_for_test(op).unwrap().state, WriteState::IndexCurrent, "the tombstone is forwarded");
+            assert_eq!(pii_store.get("note-tomb-gap").unwrap(), b"", "the live ciphertext is the empty tombstone, not the real content");
+            assert!(!pii_store.has_before_image("note-tomb-gap", op), "the real content's before-image is purged");
         }
 
         #[test]
@@ -4892,6 +5050,7 @@ mod tests {
                 journal: Mutex::new(Journal::open(&journal_path).unwrap()),
                 git_lock: Mutex::new(()),
                 indexer: Box::new(NullIndexer),
+                deletion_log_path: Some(pii_store.deletion_log_path()),
             };
             let version = vault
                 .write_sensitive_record_unchecked(&id, &pointer_content, b"v2 secret", Version(1), op2, &pii_store, None)

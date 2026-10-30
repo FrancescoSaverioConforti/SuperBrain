@@ -603,11 +603,21 @@ impl PiiStore {
     /// [`PiiStoreError::Inconsistent`] — never a silent fallback to some
     /// other content.
     ///
-    /// Low-level primitive: it does NOT consult the deletion log. It is what
-    /// crash recovery, rollback verification and the restore round-trip use,
-    /// where the question is "what bytes are on disk", not "may a reader see
-    /// this note". Code that serves a note's content to a reader must use
-    /// [`PiiStore::get_unless_deleted`].
+    /// RAW, UNGATED primitive: it does NOT consult the deletion log, so it
+    /// will happily decrypt a deleted note's ciphertext if any is still on
+    /// disk. It exists for crash recovery and rollback verification, where
+    /// the question is "what bytes are on disk", not "may a reader see this
+    /// note".
+    ///
+    /// It must NEVER be called on any path reachable by an external caller
+    /// (a read API, a restore, a consumer of note content) unless a
+    /// deletion-log check has already gated that exact note on that path.
+    /// Code that serves a note's content to a reader must use
+    /// [`PiiStore::get_unless_deleted`], which re-checks the log at read
+    /// time. Neither `storage::Vault::read_note` nor
+    /// `storage::restore_vault_from_backup` calls this (the restore stages
+    /// plaintext from the backup itself, after its own deletion checks,
+    /// never from a live `.pii` file).
     pub fn get(&self, note_id: &str) -> Result<Vec<u8>, PiiStoreError> {
         let path = self.live_path(note_id);
         let bytes = match std::fs::read(&path) {
@@ -634,6 +644,14 @@ impl PiiStore {
             Err(e) => return Err(PiiStoreError::Io(e)),
         };
         self.decrypt_buffer(note_id, &bytes)
+    }
+
+    /// Decrypts a `.pii` buffer taken from a backup snapshot (bytes that
+    /// were a live `.pii` file when the backup ran) under this store's
+    /// master key. Crate-private: only [`crate::backup::restore`] calls it,
+    /// and only for notes its deletion-log checks have just cleared.
+    pub(crate) fn decrypt_backed_up_buffer(&self, note_id: &str, bytes: &[u8]) -> Result<Vec<u8>, PiiStoreError> {
+        self.decrypt_buffer(note_id, bytes)
     }
 
     fn decrypt_buffer(&self, note_id: &str, bytes: &[u8]) -> Result<Vec<u8>, PiiStoreError> {

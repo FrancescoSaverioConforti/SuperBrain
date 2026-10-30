@@ -445,6 +445,16 @@ impl Journal {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every row in the journal, in insertion order. Used only by
+    /// `restore::restore_vault_from_backup` to decide whether an existing
+    /// journal is an interrupted restore of the same backup (every row one of
+    /// that restore's own operation ids) before resuming into it.
+    pub(crate) fn all_operations(&self) -> Result<Vec<OperationRow>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!("{SELECT_ROWS} ORDER BY rowid ASC"))?;
+        let rows = stmt.query_map([], row_from_sql)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Every operation on `note_id` resting at `JournalCommitted` (git
     /// pending) with a `new_version` below `below_version`, in ascending
     /// `new_version` order. The git step commits these before an operation

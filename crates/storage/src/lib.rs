@@ -10,10 +10,13 @@
 //!
 //! [`restore_vault_from_backup`] (A3) is not a second way to write into a
 //! vault: it only bootstraps a BRAND-NEW vault from an authenticated backup
-//! blob (it refuses an existing journal path and a non-empty destination),
-//! every note in which passed the gate when it was first written. It seeds
-//! the journal so the restored notes are readable through
-//! [`Vault::read_note`]; see its module docs.
+//! blob (it refuses a non-empty destination and any existing journal other
+//! than its own interrupted restore of the same backup, which it resumes),
+//! every note in which passed the gate when it was first written. It
+//! promotes each note through the journal, under a final deletion-log
+//! re-check made while holding the deletion log's write lock, so the
+//! restored notes are readable through [`Vault::read_note`]; see its module
+//! docs.
 //!
 //! The raw primitives behind it — `atomic_write` (pure filesystem mechanics:
 //! no id validation, no gate, no version check) and

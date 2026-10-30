@@ -10,7 +10,8 @@
 //! which is trivially always satisfied, or against the live reference,
 //! which catches a STALE backup but not a note deleted strictly AFTER the
 //! backup was taken but BEFORE the restore runs. [`restore`] therefore runs
-//! two independent checks before writing anything to `destination_root`:
+//! two independent checks before staging anything (it never writes; see
+//! "Who writes" below):
 //!
 //! 1. [`DeletionLog::verify_safe_to_expose_after_restore`] — the backup's
 //!    own embedded reference snapshot against the LIVE trusted reference.
@@ -44,7 +45,7 @@
 //!    [`BackupError::DeletionLogRejected`] — a label choice only, made
 //!    before anything is written either way.
 //!
-//! Both checks run before ANY byte is written to `destination_root`.
+//! Both checks run before anything is staged for the caller.
 //! On any ambiguity — an I/O error reading either reference, a corrupt or
 //! tampered reference, a missing live reference, or the live log itself
 //! disagreeing with its own reference — this fails closed
@@ -57,6 +58,20 @@
 //! differently, and only because the second, post-check-1 note-level
 //! cross-check is what actually decides exposure in that case, not check 1
 //! itself.
+//!
+//! # Who writes (restore-promotion TOCTOU fix)
+//!
+//! [`restore`] decrypts, runs checks 1 and 2, and returns the surviving
+//! notes as a [`StagedRestore`] — record bytes and PII plaintext, in memory,
+//! unpersisted. It used to write the `.record`/`.pii` files itself right
+//! after check 2, with no lock and no further check, so a deletion
+//! completing in between was written out anyway and reported as restored.
+//! Persisting is now `storage`'s job (`storage::restore_vault_from_backup`):
+//! each note is promoted through the A2 journal, and its pointer rename (the
+//! point after which it is readable) happens only after one more
+//! `is_deleted` re-check made under [`DeletionLog::acquire_write_lock`], the
+//! same cross-process lock [`DeletionLog::record_deletion`] holds for its
+//! whole span, so the two can never interleave.
 //!
 //! # Key separation
 //!
@@ -184,22 +199,31 @@ pub enum BackupError {
     #[error("note(s) deleted since this backup was taken must not be exposed by restore: {note_ids:?}")]
     DeletedSinceBackup { note_ids: Vec<String> },
 
-    /// [`restore`] was asked to write into a non-empty `destination_root`.
-    /// Fails closed rather than silently merging or overwriting.
+    /// The restore's promotion step (`storage::restore_vault_from_backup`,
+    /// which owns every write since the restore-promotion TOCTOU fix) was
+    /// asked to write into a non-empty destination. Fails closed rather than
+    /// silently merging or overwriting.
     #[error("destination already contains files; refusing to restore into a non-empty directory")]
     AlreadyExists,
 
-    /// [`restore`] would have to overwrite at least one `.pii` file that
-    /// already exists at `pii_root` (typically the LIVE `PiiStore`'s own
-    /// root). Fails closed rather than silently clobbering live,
-    /// potentially newer ciphertext with whatever the backup happened to
-    /// hold — mirrors [`BackupError::AlreadyExists`]'s discipline on the
-    /// Markdown vault side, applied to the PII side. Named distinctly so a
-    /// caller can tell "the Markdown destination already has files" apart
-    /// from "the PII root already has at least one of these specific
-    /// files."
+    /// The restore's promotion step would have to overwrite at least one
+    /// `.pii` file that already exists in the destination `PiiStore`
+    /// (typically the LIVE store). Fails closed rather than silently
+    /// clobbering live, potentially newer ciphertext with whatever the
+    /// backup happened to hold — mirrors [`BackupError::AlreadyExists`]'s
+    /// discipline on the Markdown vault side, applied to the PII side. Named
+    /// distinctly so a caller can tell "the Markdown destination already has
+    /// files" apart from "the PII store already has at least one of these
+    /// specific files."
     #[error("refusing to restore: {note_ids:?} already have a live .pii file at the destination; restoring would silently overwrite live PII ciphertext")]
     PiiAlreadyExists { note_ids: Vec<String> },
+
+    /// A backed-up `.pii` ciphertext (inside an otherwise authenticated
+    /// backup) does not decrypt under the `PiiStore` [`restore`] was given —
+    /// typically a store whose master key is not the one the backed-up
+    /// ciphertext was written under. Fails closed: nothing is staged.
+    #[error("backed-up PII ciphertext for note {note_id} does not decrypt under the given PII store's key")]
+    PiiUndecryptable { note_id: String },
 }
 
 impl From<io::Error> for BackupError {
@@ -307,7 +331,8 @@ pub struct BackupManifest {
     pub created_at: SystemTime,
 }
 
-/// What [`restore`] reports on success.
+/// What a completed restore reports, built by the caller that actually
+/// promotes [`restore`]'s staged notes (`storage::restore_vault_from_backup`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreOutcome {
     /// Recomputed hash of the restored plaintext snapshot, for the caller to
@@ -316,14 +341,83 @@ pub struct RestoreOutcome {
     /// The generation embedded in the restored backup's own `GenerationRef`
     /// snapshot.
     pub generation: u64,
-    /// Note ids (vault notes, i.e. Markdown record files minus their
-    /// extension) that were actually written to `destination_root`.
+    /// Note ids that were actually promoted all the way to a committed,
+    /// readable state — never a pre-promotion list.
     pub restored_note_ids: Vec<String>,
     /// Note ids present in the backup (as a Markdown record, a `.pii` file,
-    /// or both) that the LIVE deletion log reports deleted, and that were
-    /// therefore NOT written anywhere: neither their record nor their
-    /// ciphertext. Reported explicitly so a deleted note never just
+    /// or both) that the LIVE deletion log reports deleted — whether caught
+    /// by [`restore`]'s own checks or by the promotion's final re-check —
+    /// and that were therefore NOT made readable: neither their record nor
+    /// their ciphertext. Reported explicitly so a deleted note never just
     /// silently vanishes from the caller's point of view.
+    pub excluded_deleted_note_ids: Vec<String>,
+}
+
+/// One note [`restore`] has decrypted and cleared through both deletion-log
+/// checks, NOT yet persisted anywhere. The caller promotes it (or excludes
+/// it, if its own final re-check finds it deleted after all).
+///
+/// Holds plaintext PII in memory: its `Debug` output never shows the record
+/// or plaintext bytes, and the plaintext is zeroized on drop.
+pub struct StagedNote {
+    note_id: String,
+    record: Vec<u8>,
+    pii_plaintext: Option<Vec<u8>>,
+}
+
+impl StagedNote {
+    /// The note id (the backed-up record file's name minus `.record`).
+    pub fn note_id(&self) -> &str {
+        &self.note_id
+    }
+
+    /// The backed-up Markdown record file's exact bytes (version header,
+    /// separator, content), as `storage` writes them.
+    pub fn record_bytes(&self) -> &[u8] {
+        &self.record
+    }
+
+    /// The decrypted plaintext of this note's backed-up `.pii` ciphertext,
+    /// if the backup held one for it.
+    pub fn pii_plaintext(&self) -> Option<&[u8]> {
+        self.pii_plaintext.as_deref()
+    }
+}
+
+impl std::fmt::Debug for StagedNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedNote")
+            .field("note_id", &self.note_id)
+            .field("record_len", &self.record.len())
+            .field("has_pii_plaintext", &self.pii_plaintext.is_some())
+            .finish()
+    }
+}
+
+impl Drop for StagedNote {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(plaintext) = self.pii_plaintext.as_mut() {
+            plaintext.zeroize();
+        }
+    }
+}
+
+/// What [`restore`] returns: everything a caller needs to promote the
+/// backup's surviving notes, with nothing written to disk yet.
+#[derive(Debug)]
+pub struct StagedRestore {
+    /// Recomputed hash of the restored plaintext snapshot.
+    pub hash: String,
+    /// The generation embedded in the backup's own `GenerationRef` snapshot.
+    pub generation: u64,
+    /// Notes that passed both checks, sorted by note id.
+    pub notes: Vec<StagedNote>,
+    /// Backed-up vault files that are not note records (no `.record`
+    /// suffix), as `(relative path, bytes)`, sorted by path. Not subject to
+    /// the deletion log (they are not notes).
+    pub other_files: Vec<(String, Vec<u8>)>,
+    /// Notes [`restore`]'s own checks excluded as deleted, sorted.
     pub excluded_deleted_note_ids: Vec<String>,
 }
 
@@ -384,36 +478,6 @@ fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a
     let slice = bytes.get(*offset..*offset + len)?;
     *offset += len;
     Some(slice)
-}
-
-/// Writes `contents` to `path` atomically: a sibling temp file in the same
-/// directory, fsynced, then renamed over `path`. A minimal, crate-local copy
-/// of the same stage-then-rename primitive `pii_store.rs` uses for its own
-/// `atomic_write` (same family — create, write, fsync, rename) and
-/// `storage::atomic::atomic_write` uses elsewhere in this plan: `storage` is
-/// not a dependency of `vault-security`, and `pii_store.rs`'s own copy is
-/// module-private, so this is a third, deliberately small copy rather than a
-/// new cross-crate dependency. A crash between the temp file's rename and
-/// the next loop iteration can never leave a half-written `.pii` file
-/// visible under its final name — the rename is the only operation that
-/// touches the final path at all.
-fn atomic_write_pii(path: &Path, contents: &[u8]) -> Result<(), BackupError> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp_name = format!(
-        "{}.tmp-{}-{}",
-        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
-    );
-    let tmp_path = dir.join(tmp_name);
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
 }
 
 /// Every regular file under `root`, recursively, excluding `.git` and
@@ -629,67 +693,42 @@ pub(crate) fn backup_with_reference(
 }
 
 /// Reads the single blob from `target`, decrypts it under `master_key`'s
-/// HKDF subkey, verifies its hash, then runs BOTH deletion-log checks
-/// described in the module docs before writing anything to
-/// `destination_root` or to `pii_store`'s live ciphertext location. Only if
-/// both checks pass does extraction proceed.
+/// HKDF subkey, verifies its hash, runs BOTH deletion-log checks described
+/// in the module docs, and returns the surviving notes STAGED: their record
+/// bytes and their PII plaintext (decrypted with `pii_store`'s key), in
+/// memory only. This function writes NOTHING to disk.
 ///
-/// `destination_root` must not already exist, or must exist and be empty —
-/// restoring into a non-empty directory is refused
-/// ([`BackupError::AlreadyExists`]) rather than silently merging or
-/// overwriting whatever is already there.
+/// # Why it no longer writes (restore-promotion TOCTOU fix)
 ///
-/// Every live `.pii` file the backup held is written back to
-/// `pii_store.root()`, under the exact same `<note_id>.pii` convention
-/// [`PiiStore`]'s own live-file storage uses (see `pii_store.rs`'s
-/// `live_path`) — never only the Markdown pointer records. A restore that
-/// wrote the pointer but not the ciphertext behind it would leave a
-/// sensitive note as a dangling `pii://` pointer with nothing to resolve
-/// it, while still reporting success: exactly the durability failure this
-/// phase exists to prevent.
+/// Until this fix, this function wrote every surviving `.record` and `.pii`
+/// file itself, right after check 2's last `is_deleted` read, with no lock
+/// and no further check. A deletion completing in that window was never
+/// seen: the deleted note's ciphertext and record were written anyway, and
+/// the restore reported it as successfully restored (reproduced
+/// deterministically by an independent security review). Checks 1 and 2
+/// still run here, unchanged, but they are no longer the last word: the
+/// caller (`storage::restore_vault_from_backup`) promotes each staged note
+/// through the A2 journal and, under [`DeletionLog::acquire_write_lock`],
+/// re-checks `is_deleted` for that note immediately before the rename that
+/// makes it readable. A note found deleted there is excluded, not written.
+///
+/// Every staged note whose backup also held a `.pii` file carries its
+/// decrypted plaintext ([`StagedNote::pii_plaintext`]) — never only the
+/// Markdown pointer record — so the caller can re-stage it into its own
+/// `PiiStore` alongside the pointer. A `.pii` file in the backup with no
+/// `.record` file for the same note id is not a restorable note and is not
+/// staged (it is never exposed either). Plaintext is returned only for notes
+/// check 2 has just cleared as not deleted; any decryption failure fails the
+/// whole call closed ([`BackupError::PiiUndecryptable`]).
 pub fn restore(
     target: &dyn BackupTarget,
     master_key: &MasterKey,
-    destination_root: &Path,
     live_deletion_log: &DeletionLog,
     live_trusted_ref: &dyn TrustedReferenceStore,
     pii_store: &PiiStore,
-) -> Result<RestoreOutcome, BackupError> {
-    restore_with_pii_root(target, master_key, destination_root, live_deletion_log, live_trusted_ref, pii_store.root())
-}
-
-/// [`restore`], but lets a caller/test supply the exact PII live-file root
-/// directory directly, rather than requiring a full [`PiiStore`] (whose
-/// `root()` this function's `pii_root` parameter mirrors exactly — see
-/// [`PiiStore::root`]). Exists for the same reason [`backup_with_reference`]
-/// exists alongside [`backup`]: production code always goes through
-/// [`restore`], which always passes `pii_store.root()`; this lets tests
-/// restore into an ISOLATED pii root distinct from the live store being
-/// backed up, so a round-trip test can assert on the restored bytes without
-/// clobbering the original live file.
-pub(crate) fn restore_with_pii_root(
-    target: &dyn BackupTarget,
-    master_key: &MasterKey,
-    destination_root: &Path,
-    live_deletion_log: &DeletionLog,
-    live_trusted_ref: &dyn TrustedReferenceStore,
-    pii_root: &Path,
-) -> Result<RestoreOutcome, BackupError> {
+) -> Result<StagedRestore, BackupError> {
     if target.is_empty()? {
         return Err(BackupError::TargetEmpty);
-    }
-
-    // Refuse to write into a non-empty destination BEFORE touching the
-    // blob at all: an empty destination is the only state this function
-    // ever writes into.
-    match std::fs::read_dir(destination_root) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                return Err(BackupError::AlreadyExists);
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(BackupError::Io(e.to_string())),
     }
 
     let blob = target.read_blob(BLOB_NAME)?;
@@ -861,8 +900,12 @@ pub(crate) fn restore_with_pii_root(
     // and the live log/reference pair is known trustworthy, or the
     // sentinel exception applied), compute the REAL exclusion list. This
     // closes the race above: a deletion that landed anywhere up to and
-    // including check 1 itself is reflected here, because this is the
-    // very last read of the live log before anything is written.
+    // including check 1 itself is reflected here. It is the last read of the
+    // live log in THIS function, but no longer the last one before a note
+    // becomes readable: the caller's promotion re-checks each note under the
+    // deletion-log write lock right before its pointer rename (see this
+    // function's doc comment), which is what closes the window between here
+    // and the write.
     let mut deleted_since_backup = Vec::new();
     for note_id in &candidate_note_ids {
         // Any error here (I/O failure reading the log) must fail closed:
@@ -872,78 +915,36 @@ pub(crate) fn restore_with_pii_root(
         }
     }
 
-    // Both checks passed: drop every deleted note from what gets written.
+    // Both checks passed: stage every surviving note, dropping every
+    // deleted one. Nothing is written here; see the doc comment.
     let excluded: std::collections::BTreeSet<&str> = deleted_since_backup.iter().map(String::as_str).collect();
-    let is_excluded_record = |name: &str| name.strip_suffix(".record").is_some_and(|stem| excluded.contains(stem));
-    let vault_files_to_write: Vec<(&String, &Vec<u8>)> =
-        snapshot.vault_files.iter().filter(|(name, _)| !is_excluded_record(name)).collect();
-    let pii_files_to_write: Vec<(&String, &Vec<u8>)> =
-        snapshot.pii_files.iter().filter(|(note_id, _)| !excluded.contains(note_id.as_str())).collect();
-
-    // Guard (Task 7 round 2 review finding), checked BEFORE any byte of
-    // EITHER the vault files or the `.pii` files is written: the earlier
-    // "`destination_root` must be empty" check says nothing about
-    // `pii_root`, which in production IS the LIVE `PiiStore`'s root — a
-    // directory that can perfectly well already hold `.pii` files newer
-    // than this backup (the reviewer's repro: back up a note, commit newer
-    // content to the SAME live store, then restore into a brand-new empty
-    // Markdown destination — `destination_root` being empty says nothing
-    // about whether `pii_root` already has files). Mirror `AlreadyExists`'s
-    // discipline on the vault side exactly: check the WHOLE set of target
-    // `.pii` paths for existing files before writing any of them (of either
-    // kind), and refuse the entire restore if even one already exists,
-    // naming every offending note id, so a silent rollback of live,
-    // possibly-newer PII content can never happen.
-    std::fs::create_dir_all(pii_root)?;
-    let mut already_live: Vec<String> = Vec::new();
-    for (note_id, _) in &pii_files_to_write {
-        let dest_path = pii_root.join(format!("{note_id}.pii"));
-        match std::fs::metadata(&dest_path) {
-            Ok(_) => already_live.push((*note_id).clone()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(BackupError::Io(e.to_string())),
+    let Snapshot { reference, vault_files, pii_files } = snapshot;
+    let mut notes = Vec::new();
+    let mut other_files = Vec::new();
+    for (name, record) in vault_files {
+        let Some(note_id) = name.strip_suffix(".record").map(str::to_string) else {
+            other_files.push((name, record));
+            continue;
+        };
+        if excluded.contains(note_id.as_str()) {
+            continue;
         }
-    }
-    if !already_live.is_empty() {
-        already_live.sort();
-        return Err(BackupError::PiiAlreadyExists { note_ids: already_live });
-    }
-
-    // Both deletion-log checks AND the PII existence guard passed: NOW, and
-    // only now, extract.
-    std::fs::create_dir_all(destination_root)?;
-    for (name, content) in &vault_files_to_write {
-        let dest_path = destination_root.join(name);
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest_path, content)?;
+        let pii_plaintext = match pii_files.get(&note_id) {
+            Some(ciphertext) => Some(
+                pii_store
+                    .decrypt_backed_up_buffer(&note_id, ciphertext)
+                    .map_err(|_| BackupError::PiiUndecryptable { note_id: note_id.clone() })?,
+            ),
+            None => None,
+        };
+        notes.push(StagedNote { note_id, record, pii_plaintext });
     }
 
-    // Write every live `.pii` ciphertext file back to its PiiStore live
-    // location (`<pii_root>/<note_id>.pii`, the exact convention
-    // `PiiStore::live_path` uses) — never only the Markdown pointer. See
-    // this function's doc comment: a restore that wrote the pointer but not
-    // the ciphertext behind it would leave a sensitive note as a dangling
-    // `pii://` reference while still reporting success. Each write is
-    // staged-then-renamed ([`atomic_write_pii`]) rather than a plain
-    // `std::fs::write`, so a crash mid-loop can never leave a truncated
-    // `.pii` file over previously-valid ciphertext: the rename is the only
-    // operation that ever touches the final path.
-    for (note_id, content) in &pii_files_to_write {
-        let dest_path = pii_root.join(format!("{note_id}.pii"));
-        atomic_write_pii(&dest_path, content)?;
-    }
-
-    let restored_note_ids: Vec<String> = vault_files_to_write
-        .iter()
-        .filter_map(|(name, _)| name.strip_suffix(".record").map(|s| s.to_string()))
-        .collect();
-
-    Ok(RestoreOutcome {
+    Ok(StagedRestore {
         hash: recomputed_hash,
-        generation: snapshot.reference.generation,
-        restored_note_ids,
+        generation: reference.generation,
+        notes,
+        other_files,
         excluded_deleted_note_ids: deleted_since_backup,
     })
 }
@@ -975,6 +976,50 @@ mod tests {
         let log = DeletionLog::open(&dir.join("deletion-log.sqlite")).unwrap();
         let reference = FileTrustedReferenceStore::new(dir.join("trusted-reference.bin"));
         (log, reference)
+    }
+
+    /// Test adapter for the restore-promotion TOCTOU fix: [`restore`] no
+    /// longer writes anything, so this materializes its staged output the
+    /// way the pre-fix `restore_with_pii_root` used to write it — each
+    /// staged note's record into `destination`, its PII plaintext re-staged
+    /// and committed into a `PiiStore` at `restored_pii_root` (keyed by the
+    /// same `pii-master.key` the tests' source store uses) — so the existing
+    /// on-disk assertions keep checking exactly what [`restore`] decided to
+    /// stage and exclude. It is NOT the production promotion path (that is
+    /// `storage::restore_vault_from_backup`, with its own journal, lock and
+    /// final re-check, tested in `storage`); it deliberately adds no checks
+    /// of its own.
+    fn restore_and_materialize(
+        target: &dyn BackupTarget,
+        master_key: &MasterKey,
+        destination: &Path,
+        live_deletion_log: &DeletionLog,
+        live_trusted_ref: &dyn TrustedReferenceStore,
+        restored_pii_root: &Path,
+    ) -> Result<RestoreOutcome, BackupError> {
+        let key_path = restored_pii_root.parent().unwrap().join("pii-master.key");
+        let restored_store = PiiStore::open(restored_pii_root.to_path_buf(), &key_path).unwrap();
+        let staged = restore(target, master_key, live_deletion_log, live_trusted_ref, &restored_store)?;
+        std::fs::create_dir_all(destination).unwrap();
+        for (name, bytes) in &staged.other_files {
+            write_file(&destination.join(name), bytes);
+        }
+        let mut restored_note_ids = Vec::new();
+        for note in &staged.notes {
+            write_file(&destination.join(format!("{}.record", note.note_id())), note.record_bytes());
+            if let Some(plaintext) = note.pii_plaintext() {
+                let op = Uuid::new_v4();
+                restored_store.stage(note.note_id(), plaintext, op).unwrap();
+                restored_store.commit_staged(note.note_id(), op).unwrap();
+            }
+            restored_note_ids.push(note.note_id().to_string());
+        }
+        Ok(RestoreOutcome {
+            hash: staged.hash.clone(),
+            generation: staged.generation,
+            restored_note_ids,
+            excluded_deleted_note_ids: staged.excluded_deleted_note_ids.clone(),
+        })
     }
 
     fn all_files_under(root: &Path) -> Vec<PathBuf> {
@@ -1012,7 +1057,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
         assert_eq!(outcome.hash, manifest.hash, "restore must verify the same plaintext hash backup computed");
 
         assert_eq!(std::fs::read(destination.join("note-a.record")).unwrap(), b"0\n---\nhello world");
@@ -1052,7 +1097,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
             .expect("a stale backup must restore notes the later, unrelated deletion never touched");
         assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
         assert!(outcome.excluded_deleted_note_ids.is_empty(), "note-a was never deleted");
@@ -1096,7 +1141,7 @@ mod tests {
         // Restore from the EARLIER backup against that now-updated live log.
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
             .expect("the restore itself must succeed; the deleted note is excluded, not a reason to refuse everything");
         assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
         assert!(outcome.restored_note_ids.is_empty(), "this backup held only note-a, which is excluded");
@@ -1169,7 +1214,7 @@ mod tests {
         // fully-updated live trusted ref.
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
         // Post-N1 follow-up: check 2 (the specific per-note cross-check)
         // still runs before check 1 and still names note-a explicitly, via
         // `RestoreOutcome::excluded_deleted_note_ids` on a NOW-SUCCESSFUL
@@ -1220,7 +1265,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
         assert_eq!(outcome.hash, second_manifest.hash, "restore must reflect the SECOND backup, not a corrupted merge");
         assert_eq!(outcome.generation, 1);
 
@@ -1238,32 +1283,9 @@ mod tests {
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
 
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
         assert!(matches!(result, Err(BackupError::TargetEmpty)), "got {result:?}");
         assert!(!destination.exists());
-    }
-
-    #[test]
-    fn restore_refuses_to_write_into_a_non_empty_destination() {
-        let dir = tempdir().unwrap();
-        let vault_root = dir.path().join("vault");
-        std::fs::create_dir_all(&vault_root).unwrap();
-        write_file(&vault_root.join("note-a.record"), b"0\n---\nhello world");
-
-        let pii_store = open_pii_store(dir.path());
-        let (log, reference) = open_deletion_log_and_ref(dir.path());
-        let master_key = fresh_master_key(dir.path());
-        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
-        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
-
-        let destination = dir.path().join("restored");
-        write_file(&destination.join("pre-existing.txt"), b"already here");
-        let restored_pii_root = dir.path().join("restored-pii-store");
-
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
-        assert!(matches!(result, Err(BackupError::AlreadyExists)), "got {result:?}");
-        // Pre-existing content must be untouched.
-        assert_eq!(std::fs::read(destination.join("pre-existing.txt")).unwrap(), b"already here");
     }
 
     #[test]
@@ -1288,54 +1310,79 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
         assert!(matches!(result, Err(BackupError::HashMismatch)), "got {result:?}");
         assert!(!destination.exists() || all_files_under(&destination).is_empty());
     }
 
+    /// CRITICAL regression test, restated for the staged API: a restored
+    /// sensitive note must carry its PII content, never only the Markdown
+    /// pointer (a dangling `pii://` pointer while reporting success is the
+    /// durability failure this phase exists to prevent). Since the
+    /// restore-promotion TOCTOU fix, `restore` returns the decrypted
+    /// plaintext for the caller to re-stage (fresh data key and nonces)
+    /// rather than copying the backed-up ciphertext bytes verbatim, so the
+    /// assertion is on the plaintext, end to end.
     #[test]
-    fn restore_writes_the_pii_ciphertext_back_to_the_live_pii_store_byte_identical_to_what_was_backed_up() {
-        // CRITICAL regression test: restore()'s extraction loop must write
-        // snapshot.pii_files to the PiiStore's live location, not just the
-        // vault_files. Before the fix, a restored sensitive note is left as
-        // a dangling pii:// pointer with no ciphertext behind it at all,
-        // while restore() still returns Ok.
+    fn restore_stages_the_backed_up_pii_plaintext_alongside_the_pointer_and_writes_nothing_itself() {
         let dir = tempdir().unwrap();
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root).unwrap();
-        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+        write_file(&vault_root.join("note-a.record"), b"1
+---
+pii://note-a");
+        write_file(&vault_root.join("note-b.record"), b"1
+---
+plain");
 
         let pii_store = open_pii_store(dir.path());
         let op = Uuid::new_v4();
         pii_store.stage("note-a", b"sensitive content for round trip", op).unwrap();
         pii_store.commit_staged("note-a", op).unwrap();
 
-        // The exact live ciphertext bytes backed up, captured independently
-        // of restore(), so this test does not rely on restore() itself to
-        // tell us what "correct" looks like.
-        let original_pii_bytes = std::fs::read(pii_store.root().join("note-a.pii")).unwrap();
-
         let (log, reference) = open_deletion_log_and_ref(dir.path());
         let master_key = fresh_master_key(dir.path());
         let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
-
         backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
 
-        let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
-        assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
+        let restored_store = PiiStore::open(restored_pii_root.clone(), &dir.path().join("pii-master.key")).unwrap();
+        let before: Vec<PathBuf> = all_files_under(dir.path());
+        let staged = restore(&target, &master_key, &log, &reference, &restored_store).unwrap();
+        assert_eq!(all_files_under(dir.path()), before, "restore itself must write nothing anywhere");
 
-        let restored_pii_path = restored_pii_root.join("note-a.pii");
-        assert!(restored_pii_path.exists(), "restore() must write the .pii ciphertext back to the live PiiStore location, not just the Markdown pointer");
-        let restored_pii_bytes = std::fs::read(&restored_pii_path).unwrap();
-        assert_eq!(restored_pii_bytes, original_pii_bytes, "the restored .pii bytes must be byte-identical to what was backed up");
+        let ids: Vec<&str> = staged.notes.iter().map(|n| n.note_id()).collect();
+        assert_eq!(ids, vec!["note-a", "note-b"]);
+        assert_eq!(staged.notes[0].record_bytes(), b"1
+---
+pii://note-a");
+        assert_eq!(staged.notes[0].pii_plaintext(), Some(&b"sensitive content for round trip"[..]));
+        assert_eq!(staged.notes[1].pii_plaintext(), None);
+        let debug = format!("{staged:?}");
+        assert!(!debug.contains("sensitive content"), "StagedRestore's Debug must never print plaintext: {debug}");
+    }
 
-        // And it must actually decrypt back to the original plaintext via a
-        // PiiStore opened on the restored root (end-to-end proof, not just a
-        // byte comparison).
-        let restored_pii_store = PiiStore::open(restored_pii_root.clone(), &dir.path().join("pii-master.key")).unwrap();
-        assert_eq!(restored_pii_store.get("note-a").unwrap(), b"sensitive content for round trip");
+    /// The staged API's own fail-closed case: a store whose key cannot
+    /// decrypt the backed-up ciphertext stages nothing.
+    #[test]
+    fn restore_with_a_pii_store_under_a_different_key_fails_closed_as_pii_undecryptable() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        write_file(&vault_root.join("note-a.record"), b"1
+---
+pii://note-a");
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"secret", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        let other_store = PiiStore::open(dir.path().join("other"), &dir.path().join("other-key.key")).unwrap();
+        let result = restore(&target, &master_key, &log, &reference, &other_store);
+        assert!(matches!(&result, Err(BackupError::PiiUndecryptable { note_id }) if note_id == "note-a"), "got {result:?}");
     }
 
     #[test]
@@ -1373,7 +1420,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
         assert!(
             matches!(result, Err(BackupError::DeletionLogRejected(DeletionLogError::ReferenceMissing))),
             "a live log with real history but a missing reference must fail closed via the normal path (ReferenceMissing), not silently proceed via the sentinel exception, got {result:?}"
@@ -1402,7 +1449,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
         assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
     }
 
@@ -1472,7 +1519,7 @@ mod tests {
             let restore_time_reader = DeletionLog::open(log.db_path()).unwrap();
             let destination = dir.path().join("restored");
             let restored_pii_root = dir.path().join("restored-pii-store");
-            let result = restore_with_pii_root(&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
+            let result = restore_and_materialize(&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
             let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
 
             // Resume BEFORE asserting: a failed assertion here must fail the
@@ -1555,7 +1602,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
 
         assert!(
             result.is_err(),
@@ -1604,7 +1651,7 @@ mod tests {
         // accept it), and neither note-a nor note-c was ever deleted.
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
             .expect("a stale-but-otherwise-valid backup must restore the notes it holds that were never deleted");
         assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string(), "note-c".to_string()]);
         assert!(outcome.excluded_deleted_note_ids.is_empty(), "neither restored note was ever deleted");
@@ -1648,7 +1695,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
             .expect("the old backup must restore note-b and exclude only note-a, not be rejected wholesale");
         assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
         assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
@@ -1690,7 +1737,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
+        let result = restore_and_materialize(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
         assert!(
             result.is_err(),
             "a stale backup must still fail closed when the live log cannot be trusted, got {result:?}"
@@ -1775,7 +1822,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &racer, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &racer, &restored_pii_root)
             .expect("the restore itself must still succeed for note-b");
         assert_eq!(
             outcome.excluded_deleted_note_ids,
@@ -1830,7 +1877,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
             .expect("a backup taken after the deletion must restore, not be rejected wholesale");
         assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
         assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()], "the excluded note must be reported, never silently dropped");
@@ -1865,7 +1912,7 @@ mod tests {
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
         assert!(outcome.restored_note_ids.is_empty());
         assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
         assert!(all_files_under(&destination).is_empty() || !destination.exists());
@@ -1932,70 +1979,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_must_not_silently_roll_back_live_pii_ciphertext_that_was_committed_after_the_backup_was_taken() {
-        // Reviewer's exact repro (Task 7 round 2 finding): back up note-a
-        // with content "OLD". Commit NEWER content to the SAME live store
-        // afterward (a completely ordinary, independent write — no
-        // deletion involved, so neither deletion-log check fires). Restore
-        // to a brand-new, EMPTY vault destination (not even restoring the
-        // vault's Markdown records matters here — the point is that
-        // `destination_root` being empty says nothing about whether the
-        // LIVE `pii_root` already has files). Before the fix, restore
-        // silently overwrote the LIVE note-a.pii back to "OLD" ciphertext,
-        // with no before-image kept: a silent rollback of current, valid
-        // sensitive content. After the fix, restore must FAIL and the live
-        // content must remain "NEWER", untouched, byte for byte.
-        let dir = tempdir().unwrap();
-        let vault_root = dir.path().join("vault");
-        std::fs::create_dir_all(&vault_root).unwrap();
-        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
-
-        // The LIVE pii store — restore in this test targets THIS SAME
-        // store's root, exactly like production's `restore` (not
-        // `restore_with_pii_root` pointed at an isolated root), because the
-        // whole point of the finding is restoring into a live, in-use
-        // PiiStore.
-        let pii_store = open_pii_store(dir.path());
-        let op1 = Uuid::new_v4();
-        pii_store.stage("note-a", b"OLD", op1).unwrap();
-        pii_store.commit_staged("note-a", op1).unwrap();
-
-        let (log, reference) = open_deletion_log_and_ref(dir.path());
-        let master_key = fresh_master_key(dir.path());
-        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
-
-        // Back up note-a while it still holds "OLD".
-        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
-
-        // Commit NEWER content to the SAME live store, after the backup was
-        // taken. No deletion is involved anywhere in this sequence.
-        let op2 = Uuid::new_v4();
-        pii_store.stage("note-a", b"NEWER", op2).unwrap();
-        pii_store.commit_staged("note-a", op2).unwrap();
-        let live_pii_path = pii_store.root().join("note-a.pii");
-        let live_bytes_before_restore = std::fs::read(&live_pii_path).unwrap();
-        assert_eq!(pii_store.get("note-a").unwrap(), b"NEWER", "precondition: the live store now holds NEWER");
-
-        // Attempt to restore into a brand-new, EMPTY vault destination,
-        // targeting the SAME live `pii_store` the backup read from.
-        let destination = dir.path().join("restored");
-        assert!(!destination.exists(), "precondition: destination does not exist yet");
-        let result = restore(&target, &master_key, &destination, &log, &reference, &pii_store);
-
-        assert!(
-            matches!(&result, Err(BackupError::PiiAlreadyExists { note_ids }) if note_ids == &["note-a".to_string()]),
-            "restore must fail closed naming note-a, not silently succeed, got {result:?}"
-        );
-
-        // The live content must remain NEWER, untouched, byte for byte —
-        // no silent rollback to OLD, and no before-image side effect either
-        // (this path never touches PiiStore's own stage/commit machinery at
-        // all).
-        assert_eq!(std::fs::read(&live_pii_path).unwrap(), live_bytes_before_restore, "the live .pii file on disk must be byte-identical to before the restore attempt");
-        assert_eq!(pii_store.get("note-a").unwrap(), b"NEWER", "the live content must remain NEWER, not rolled back to OLD");
-    }
-
-    #[test]
     fn restore_into_a_pii_root_with_no_existing_pii_files_still_succeeds_normally() {
         // Happy-path regression guard: the new existence guard must not
         // block the ordinary case where the target pii_root has nothing
@@ -2020,47 +2003,10 @@ mod tests {
         let restored_pii_root = dir.path().join("restored-pii-store");
         assert!(!restored_pii_root.exists(), "precondition: no pii root exists yet at the restore target");
 
-        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
+        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root).unwrap();
         assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
         assert!(restored_pii_root.join("note-a.pii").exists());
         let restored_store = PiiStore::open(restored_pii_root.clone(), &dir.path().join("pii-master.key")).unwrap();
         assert_eq!(restored_store.get("note-a").unwrap(), b"sensitive content");
-    }
-
-    #[test]
-    fn pii_writes_during_restore_go_through_a_sibling_temp_file_and_rename_never_a_direct_write() {
-        // Required test 3 (atomicity, by code inspection + an observable
-        // proxy): atomic_write_pii must never leave a stray temp file
-        // behind on success, and the final file must be reachable only via
-        // rename, never via a partially-written direct `std::fs::write`.
-        // This exercises atomic_write_pii directly (the same function
-        // restore()'s loop calls for every `.pii` file) and confirms: (a)
-        // the final file's content is exactly what was requested, (b) no
-        // `.tmp-` sibling is left behind, and (c) by inspection of
-        // `atomic_write_pii` itself (see the function above in this same
-        // module) the only call that ever touches the FINAL path is
-        // `std::fs::rename` — there is no code path in which the final
-        // path receives partial bytes directly.
-        let dir = tempdir().unwrap();
-        let pii_root = dir.path().join("pii-root");
-        std::fs::create_dir_all(&pii_root).unwrap();
-        let final_path = pii_root.join("note-a.pii");
-
-        atomic_write_pii(&final_path, b"full content, never partial").unwrap();
-
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"full content, never partial");
-        let leftover_tmp: Vec<_> = std::fs::read_dir(&pii_root)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(leftover_tmp.is_empty(), "atomic_write_pii must leave no temp file behind on success: {leftover_tmp:?}");
-
-        // Overwriting again (simulating a second restore of the same note
-        // into an otherwise-cleared root) must also go cleanly through the
-        // same rename, never corrupting the destination with a partial
-        // write even though content differs in length.
-        atomic_write_pii(&final_path, b"short").unwrap();
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"short", "rename must fully replace prior content, never append or truncate in place");
     }
 }

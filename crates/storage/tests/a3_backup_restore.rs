@@ -124,8 +124,11 @@ fn a_vault_that_has_deleted_a_sensitive_note_can_still_back_up_and_restore_from_
     ] {
         let destination = unique_test_dir().join("restored");
         let restored_pii_store = PiiStore::open(unique_test_dir().join("restored-pii"), &pii_key_path(&root)).unwrap();
-        let outcome = vault_security::restore(target, &master_key, &destination, &log, &reference, &restored_pii_store)
-            .expect("a backup taken after the deletion must restore successfully, not be rejected wholesale");
+        let journal_path = unique_test_dir().join("restored-journal.sqlite");
+        let (restored_vault, outcome) =
+            storage::restore_vault_from_backup(target, &master_key, &destination, &journal_path, &log, &reference, &restored_pii_store)
+                .expect("a backup taken after the deletion must restore successfully, not be rejected wholesale");
+        drop(restored_vault);
 
         let mut restored = outcome.restored_note_ids.clone();
         restored.sort();

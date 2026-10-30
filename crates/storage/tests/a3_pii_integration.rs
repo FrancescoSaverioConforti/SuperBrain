@@ -292,12 +292,16 @@ fn writing_new_sensitive_content_to_a_previously_deleted_note_id_is_rejected_as_
     storage::propose_and_commit(&vault, &sensitive_note("note-retired", "original secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
     let v1 = vault.current_version(&id).unwrap();
     storage::propose_and_commit(&vault, &sensitive_tombstone("note-retired"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
-    let tombstone_record = vault.read_note(&id).unwrap();
+    let tombstone_version = vault.current_version(&id).unwrap();
+    assert!(
+        matches!(vault.read_note(&id), Err(StorageError::Deleted { .. })),
+        "read_note withholds a deleted sensitive note's pointer record (restore-promotion TOCTOU fix, raw API boundary)"
+    );
 
     let result = storage::propose_and_commit(
         &vault,
         &sensitive_note("note-retired", "resurrected content"),
-        tombstone_record.version,
+        tombstone_version,
         Uuid::new_v4(),
         &known,
         &pending,
@@ -308,7 +312,7 @@ fn writing_new_sensitive_content_to_a_previously_deleted_note_id_is_rejected_as_
         matches!(&result, Err(ProposeError::Storage(StorageError::NoteDeleted { note_id })) if note_id == "note-retired"),
         "a write of new content to a deleted note id must be refused with NoteDeleted, got {result:?}"
     );
-    assert_eq!(vault.read_note(&id).unwrap(), tombstone_record, "the tombstone record is untouched");
+    assert_eq!(vault.current_version(&id).unwrap(), tombstone_version, "the tombstone record is untouched");
     assert_eq!(pii_store.get("note-retired").unwrap(), b"", "the live ciphertext is still the empty tombstone");
 }
 
@@ -325,15 +329,19 @@ fn writing_internal_content_to_a_previously_deleted_sensitive_note_id_is_rejecte
     storage::propose_and_commit(&vault, &sensitive_note("note-retired-internal", "original secret"), Version(0), Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
     let v1 = vault.current_version(&id).unwrap();
     storage::propose_and_commit(&vault, &sensitive_tombstone("note-retired-internal"), v1, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store)).unwrap();
-    let tombstone_record = vault.read_note(&id).unwrap();
+    let tombstone_version = vault.current_version(&id).unwrap();
+    assert!(
+        matches!(vault.read_note(&id), Err(StorageError::Deleted { .. })),
+        "read_note withholds a deleted sensitive note's pointer record (restore-promotion TOCTOU fix, raw API boundary)"
+    );
 
     let internal = sensitive_note("note-retired-internal", "now internal").replace("classification: sensitive", "classification: internal");
-    let result = storage::propose_and_commit(&vault, &internal, tombstone_record.version, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
+    let result = storage::propose_and_commit(&vault, &internal, tombstone_version, Uuid::new_v4(), &known, &pending, &gate, Some(&pii_store));
     assert!(
         matches!(&result, Err(ProposeError::Storage(StorageError::NoteDeleted { .. }))),
         "got {result:?}"
     );
-    assert_eq!(vault.read_note(&id).unwrap(), tombstone_record);
+    assert_eq!(vault.current_version(&id).unwrap(), tombstone_version);
 }
 
 /// I2: re-issuing the tombstone for an already-deleted id is accepted (it

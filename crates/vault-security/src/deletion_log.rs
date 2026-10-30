@@ -29,6 +29,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -284,6 +285,13 @@ pub enum DeletionLogError {
     /// guessing.
     #[error("deletion log and trusted reference are inconsistent in a way that cannot be safely auto-resolved")]
     Inconsistent,
+
+    /// [`DeletionLog::acquire_write_lock`] (and so `record_deletion`, which
+    /// takes it for its whole span) could not obtain the cross-process
+    /// deletion-log write lock within its bounded wait. Fails closed: the
+    /// caller never proceeds as if it held the lock.
+    #[error("could not acquire the deletion log's cross-process write lock within {timeout_ms} ms")]
+    WriteLockUnavailable { timeout_ms: u64 },
 }
 
 /// A full deletion-log row. Not a public API — used internally. `note_id`
@@ -428,6 +436,38 @@ pub struct DeletionLog {
     /// serializes writers across processes/files; this mutex additionally
     /// protects the single `rusqlite::Connection` this struct owns.
     conn: Mutex<Connection>,
+    /// How long [`DeletionLog::acquire_write_lock`] waits for the
+    /// cross-process write lock before failing closed with
+    /// [`DeletionLogError::WriteLockUnavailable`].
+    write_lock_timeout: Duration,
+}
+
+/// Default bounded wait for the cross-process deletion-log write lock. Long
+/// enough to ride out any legitimate holder (one `record_deletion` call, or
+/// one restored note's final re-check-and-rename), short enough that a stuck
+/// holder surfaces as an explicit error instead of a hang.
+const DEFAULT_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for the write lock.
+const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// RAII guard for the deletion log's cross-process write lock (see
+/// [`DeletionLog::acquire_write_lock`]). The lock is released when this
+/// guard is dropped — on every return path, including early returns and
+/// panics — and, because it is an OS-level file lock held through an open
+/// handle, also automatically when the holding process dies.
+#[derive(Debug)]
+pub struct DeletionLogWriteGuard {
+    file: std::fs::File,
+}
+
+impl Drop for DeletionLogWriteGuard {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock anyway; unlocking explicitly
+        // first just makes the release not depend on when the OS gets
+        // around to closing it. An error here cannot be acted on.
+        let _ = self.file.unlock();
+    }
 }
 
 impl DeletionLog {
@@ -448,12 +488,85 @@ impl DeletionLog {
             );",
         )
         .map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        Ok(Self { db_path: db_path.to_path_buf(), conn: Mutex::new(conn) })
+        Ok(Self { db_path: db_path.to_path_buf(), conn: Mutex::new(conn), write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT })
     }
 
     /// The path to this log's own SQLite file.
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// `<same dir as db_path>/<db file stem>.writelock` (for the standard
+    /// `deletion-log.sqlite`, `deletion-log.writelock`): the dedicated file
+    /// the cross-process write lock is taken on. Never read or written; it
+    /// exists only to be locked. Derived from `db_path`, so every handle
+    /// opened on the same log — in this process or another — locks the same
+    /// file.
+    pub fn write_lock_path(&self) -> PathBuf {
+        self.db_path.with_extension("writelock")
+    }
+
+    /// Test-only: shortens the bounded wait so a test can observe
+    /// [`DeletionLogError::WriteLockUnavailable`] without waiting the full
+    /// production timeout.
+    #[cfg(test)]
+    pub(crate) fn set_write_lock_timeout(&mut self, timeout: Duration) {
+        self.write_lock_timeout = timeout;
+    }
+
+    /// Acquires the deletion log's cross-process write lock: an exclusive
+    /// OS-level advisory lock (`std::fs::File::try_lock`: `LockFileEx` on
+    /// Windows, `flock` on Unix) on [`DeletionLog::write_lock_path`], waiting
+    /// at most this log's bounded timeout and otherwise failing closed with
+    /// [`DeletionLogError::WriteLockUnavailable`] — never proceeding
+    /// unlocked.
+    ///
+    /// This is a mutual-exclusion GATE around the existing protocols, not a
+    /// transaction: [`DeletionLog::record_deletion`] holds it for its whole
+    /// span, while each of its three SQL commits (C5 steps 1-3) stays its own
+    /// standalone, immediately durable statement exactly as before; and
+    /// `storage`'s restore promotion holds it across one restored note's
+    /// final `is_deleted` re-check and its pointer rename. Two such spans can
+    /// therefore never interleave, whether they run in two threads of one
+    /// process or in two processes sharing one vault (each acquisition opens
+    /// its own handle, and OS file locks conflict across handles).
+    ///
+    /// Lock ordering (outermost first): `storage::Vault`'s per-note lock
+    /// (held by the live sensitive-write path around `record_deletion`) ->
+    /// this write lock -> this log's internal connection mutex (taken and
+    /// released per statement). Nothing may take a `Vault` per-note lock
+    /// while holding this one. `is_deleted`, `is_empty` and `reconcile` do
+    /// not take it.
+    ///
+    /// Not re-entrant: a caller already holding the guard must not call
+    /// `record_deletion` (it would wait on itself until the timeout).
+    pub fn acquire_write_lock(&self) -> Result<DeletionLogWriteGuard, DeletionLogError> {
+        let path = self.write_lock_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let deadline = Instant::now() + self.write_lock_timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(DeletionLogWriteGuard { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(DeletionLogError::WriteLockUnavailable {
+                            timeout_ms: self.write_lock_timeout.as_millis() as u64,
+                        });
+                    }
+                    std::thread::sleep(WRITE_LOCK_POLL_INTERVAL);
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(DeletionLogError::Io(e.to_string())),
+            }
+        }
     }
 
     fn latest_row(conn: &Connection) -> Result<Option<Row>, DeletionLogError> {
@@ -514,6 +627,15 @@ impl DeletionLog {
     /// protocol synchronously: (1) write+sync a new `Pending` generation
     /// entry; (2) update the trusted reference; (3) mark the entry
     /// `Completed`. Returns only after step 3 has completed.
+    ///
+    /// The whole call runs under [`DeletionLog::acquire_write_lock`] (failing
+    /// closed with [`DeletionLogError::WriteLockUnavailable`] if it cannot be
+    /// taken), so it can never interleave with `storage`'s restore promotion
+    /// of a note between that promotion's final `is_deleted` re-check and its
+    /// pointer rename. The lock gates the protocol; it does not wrap it in a
+    /// transaction: each of the three steps below still commits on its own,
+    /// immediately and durably, so a crash after step 1 still leaves a
+    /// durable, already-authoritative `Pending` row (C5).
     pub fn record_deletion(
         &self,
         note_id: &str,
@@ -528,6 +650,11 @@ impl DeletionLog {
         trusted_ref: &dyn TrustedReferenceStore,
         injector: &FaultInjector,
     ) -> Result<DeletionReceipt, DeletionLogError> {
+        // Outer: the cross-process write lock, held (RAII) until this
+        // function returns by ANY path — including the injected-crash early
+        // returns below, mirroring a real crash, where process death drops
+        // the OS lock. Inner: the connection mutex. Never the other order.
+        let _write_lock = self.acquire_write_lock()?;
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
 
         let (prev_chain_hash, next_generation) = match Self::latest_row(&conn)? {
@@ -1331,5 +1458,96 @@ mod tests {
         let restored_snapshot = GenerationRef { generation: live.generation, chain_hash: live.chain_hash.clone() };
         let result = log.verify_safe_to_expose_after_restore(&restored_snapshot, &live_reference);
         assert!(result.is_ok(), "got {result:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Restore-promotion TOCTOU fix: the cross-process write lock
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_write_lock_file_lives_beside_the_sqlite_file() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert_eq!(log.write_lock_path(), dir.path().join("deletion-log.writelock"));
+    }
+
+    /// Two independently-opened handles on the SAME log path (the in-process
+    /// proxy for two processes sharing one vault): while one holds the write
+    /// lock, the other's `record_deletion` must not write anything — not even
+    /// its step-1 `Pending` row — until the lock is released, and must then
+    /// complete normally.
+    #[test]
+    fn record_deletion_through_a_second_handle_blocks_while_the_write_lock_is_held_then_completes() {
+        let dir = tempdir().unwrap();
+        let holder = open_log(dir.path());
+        let guard = holder.acquire_write_lock().unwrap();
+
+        let db_path = holder.db_path().to_path_buf();
+        let ref_path = dir.path().join("trusted-reference.bin");
+        let deleter = std::thread::spawn(move || {
+            let second_handle = DeletionLog::open(&db_path).unwrap();
+            second_handle.record_deletion("note-a", &FileTrustedReferenceStore::new(ref_path)).unwrap()
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        let observer = DeletionLog::open(holder.db_path()).unwrap();
+        let blocked = !deleter.is_finished() && !observer.is_deleted("note-a").unwrap();
+        drop(guard);
+        let receipt = deleter.join().unwrap();
+        assert!(blocked, "record_deletion must not write its Pending row while another handle holds the write lock");
+        assert_eq!(receipt.generation, 1);
+        assert!(observer.is_deleted("note-a").unwrap(), "once the lock is released the deletion completes normally");
+    }
+
+    /// The wait is bounded: a lock that is never released surfaces as
+    /// `WriteLockUnavailable`, and nothing is written (fail closed, never
+    /// "proceed unlocked").
+    #[test]
+    fn record_deletion_fails_closed_with_write_lock_unavailable_when_the_lock_is_never_released() {
+        let dir = tempdir().unwrap();
+        let holder = open_log(dir.path());
+        let _guard = holder.acquire_write_lock().unwrap();
+
+        let mut second_handle = DeletionLog::open(holder.db_path()).unwrap();
+        second_handle.set_write_lock_timeout(Duration::from_millis(100));
+        let result = second_handle.record_deletion("note-a", &file_ref(dir.path()));
+        assert_eq!(result, Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
+        assert!(second_handle.is_empty().unwrap(), "nothing may be written without the lock");
+        assert!(file_ref(dir.path()).read().unwrap().is_none(), "the reference must be untouched");
+    }
+
+    /// The lock is purely a gate: an injected crash (early return) at each of
+    /// the three C5 fault points still leaves exactly the durable state it
+    /// always did (asserted by the existing crash tests above), AND releases
+    /// the lock, exactly as a real crash would (process death drops an OS
+    /// file lock).
+    #[test]
+    fn an_injected_crash_at_every_c5_fault_point_releases_the_write_lock() {
+        for point in [FaultPoint::AfterGenerationWrittenPending, FaultPoint::AfterReferenceUpdated, FaultPoint::BeforeMarkedCompleted] {
+            let dir = tempdir().unwrap();
+            let log = open_log(dir.path());
+            log.record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(point)).unwrap();
+            assert!(log.is_deleted("note-a").unwrap(), "{point:?}: step 1 is durable and authoritative");
+
+            let mut other = DeletionLog::open(log.db_path()).unwrap();
+            other.set_write_lock_timeout(Duration::from_millis(100));
+            assert!(other.acquire_write_lock().is_ok(), "{point:?}: the early return must have released the write lock");
+        }
+    }
+
+    /// The same exclusivity, observed directly on `acquire_write_lock`: a
+    /// second handle cannot take the lock while the first holds it, and can
+    /// as soon as the first guard drops.
+    #[test]
+    fn the_write_lock_is_exclusive_across_handles_and_released_on_guard_drop() {
+        let dir = tempdir().unwrap();
+        let first = open_log(dir.path());
+        let mut second = DeletionLog::open(first.db_path()).unwrap();
+        second.set_write_lock_timeout(Duration::from_millis(100));
+
+        let guard = first.acquire_write_lock().unwrap();
+        assert_eq!(second.acquire_write_lock().unwrap_err(), DeletionLogError::WriteLockUnavailable { timeout_ms: 100 });
+        drop(guard);
+        assert!(second.acquire_write_lock().is_ok());
     }
 }

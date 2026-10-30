@@ -384,21 +384,20 @@ fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_conte
         "the raw backup blob must not contain the literal pii:// pointer string in the clear; its presence would mean the backup's AEAD encryption layer did not actually run"
     );
 
-    // Sanity: a different-but-also-sensitive-looking correct decrypt DOES
-    // produce the pointer (proving the backup path actually ran, not that
-    // it silently skipped the note). Restored into a FRESH, isolated
-    // `PiiStore` rather than the original live `pii_store` the backup was
-    // taken from: `restore` now (A3 Task 7 round 2 fix) refuses to write a
-    // `.pii` file over one that already exists at the destination, and
-    // `note-backup-audit.pii` already lives in the original `pii_store` —
-    // restoring there again would be exactly the live-clobber case that
-    // guard exists to reject, not a legitimate round-trip to audit.
-    let destination = unique_test_dir().join("restored-for-audit");
+    // Sanity: a correct decrypt DOES produce the pointer (proving the
+    // backup path actually ran, not that it silently skipped the note).
+    // Since the restore-promotion TOCTOU fix `vault_restore` writes nothing
+    // and returns the staged notes instead; it decrypts the backed-up `.pii`
+    // ciphertext with the given store's key, so it is handed a store on an
+    // isolated root that shares the original store's master key file.
     let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.root().join("deletion-log-reference.dpapi"));
     let isolated_pii_root = unique_test_dir().join("restored-pii-store-for-audit");
-    let isolated_pii_store = PiiStore::open(isolated_pii_root.clone(), &isolated_pii_root.join("master.key")).unwrap();
-    let outcome = vault_restore(&target, &master_key, &destination, &deletion_log, &trusted_ref, &isolated_pii_store).unwrap();
-    assert!(outcome.restored_note_ids.contains(&"note-backup-audit".to_string()));
-    let restored_record = std::fs::read_to_string(destination.join("note-backup-audit.record")).unwrap();
-    assert!(restored_record.contains("pii://note-backup-audit"), "the pointer itself is allowed and expected in the restored Markdown record");
+    let isolated_pii_store = PiiStore::open(isolated_pii_root.clone(), &root.join(".pii-store").join("master.key")).unwrap();
+    let staged = vault_restore(&target, &master_key, &deletion_log, &trusted_ref, &isolated_pii_store).unwrap();
+    let note = staged.notes.iter().find(|n| n.note_id() == "note-backup-audit").expect("the note is staged");
+    assert!(
+        String::from_utf8_lossy(note.record_bytes()).contains("pii://note-backup-audit"),
+        "the pointer itself is allowed and expected in the restored Markdown record"
+    );
+    assert!(!format!("{staged:?}").contains(SENSITIVE_PLAINTEXT), "the staged restore's Debug output must not echo plaintext");
 }
