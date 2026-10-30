@@ -209,6 +209,18 @@ impl RealIndexer {
         self.bm25.lock().unwrap().query_ranked(query, k)
     }
 
+    /// Candidate ids only: never expose cached content or scores as evidence.
+    /// All locks are released before the caller can enter Vault::read_note.
+    /// Do not truncate here: stale/filtered high-ranked candidates must not
+    /// hide valid lower-ranked candidates from the final top-k selection.
+    pub(crate) fn candidate_ids(&self, query: &str) -> Vec<NoteId> {
+        let mut ids: HashSet<NoteId> = self.trigram.lock().unwrap().query_exact(query).into_iter().collect();
+        ids.extend(self.bm25_ranked(query, usize::MAX).into_iter().map(|(id, _)| id));
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
     /// Indexes an already-built [`Document`] (shared by `mark_current` and
     /// the cold-start rebuild function below, so both paths use IDENTICAL
     /// insertion logic — no drift between "index on write" and "index on

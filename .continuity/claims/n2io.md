@@ -24,3 +24,23 @@ A3's Task 3 (crates/storage/tests/a3_confidentiality_boundary.rs) explicitly def
 Verified against docs/handoffs/B1-to-codex.md section 8 and the reviewer-verified Task 4 report. Status remains open; summary and attachment surfaces also remain open.
 
 > **[n2io] — index surface, partial closure (B1 Task 4).** The in-memory `TrigramIndex`/`Bm25Index` postings structures and the `RealIndexer::mark_current` log/error-output path are now confidentiality-audited: a Sensitive note's `source` field and `relations` targets (the two allowlist-excluded fields, alongside the body already covered by Tasks 2/3) are proven, via `crates/index/tests/b1_confidentiality_boundary.rs`, to never reach either postings structure's query results — tested both via direct `Document` construction and via the full `propose_and_commit` → `RealIndexer::mark_current` production write path. The log/error-output surface (`Document::from_record_bytes`'s error path, `storage::SplitRecordError`'s `Debug`/`Display`, and `RealIndexer::mark_current`'s absorption of both a malformed record and a `poison_next_mark_current`-injected fault) is confirmed to never echo note content, including a distinctive marker standing in for sensitive content. **This closes [n2io] only for the surfaces that exist today.** The `SearchResponse`/search-API-response surface named in the original item remains **open**, pending Task 6 (which defines that type) — do not treat [n2io] as fully closed until that surface is also audited. Embedding and cache surfaces remain open as before, unrelated to this task: no such subsystems exist anywhere in this codebase yet.
+
+## Partial update - B1 Task 6 (2026-10-30)
+
+The core SearchResponse surface deferred by Task 4 is now implemented and audited
+in crates/index/tests/b1_search.rs: separate production-path canary tests prove
+Sensitive body, source and relations never appear in results or Debug, while
+structured-field matches remain available. Reclassification Internal -> Sensitive
+between indexing and search re-applies the current record's allowlist. Every
+candidate is read through Vault::read_note, re-derived, query-matched, filtered
+and rescored from the current committed version. Deleted/missing/inconsistent
+candidates are excluded; operational/deletion-log failures produce a sanitized
+ReadUnavailable error rather than a successful NotPresent response. Independent
+review GO after one Important finding was fixed and re-reviewed. See
+eval/results/B1/task-6.md for evidence and remaining limitations.
+
+The B1 core index/postings/log/SearchResponse surfaces are covered. This does not
+close n2io wholesale: embedding, summary, attachment and cache remain open for
+future phases, and future API/transport wrappers must preserve the audited core
+behavior. Direct retrieve legitimately retains full pointer-record frontmatter;
+this search-only allowlist does not impose new retrieve redaction.

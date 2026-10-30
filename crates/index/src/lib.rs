@@ -17,8 +17,9 @@
 //!   governed by their own tests in `vault.rs`, not by anything in this crate.
 //! - **[n2io] remains partially open.** Task 4 audited the in-memory
 //!   trigram/BM25 postings and indexing log/error-output paths. The search
-//!   response surface remains open for Task 6's dedicated body/source/relations
-//!   tests. Embedding, summary, attachment and cache surfaces remain open for
+//!   response surface is covered by Task 6's dedicated body/source/relations
+//!   tests, including current-classification revalidation. Embedding, summary,
+//!   attachment and cache surfaces remain open for
 //!   their future phases. See `.continuity/claims/n2io.md` and the B1 handoff.
 //!
 //! # B1 Task 1
@@ -56,5 +57,8 @@
 pub mod bm25;
 pub mod document;
 pub mod indexer_impl;
+pub mod search;
 pub mod time_range;
 pub mod trigram;
+
+pub use search::Index;

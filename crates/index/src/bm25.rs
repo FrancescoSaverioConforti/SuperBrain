@@ -204,7 +204,7 @@ fn idf(n: f64, doc_freq: f64) -> f64 {
 
 /// Case-folded, whitespace-delimited tokenization (Unicode-aware). See the
 /// module doc comment.
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split_whitespace().map(|token| token.to_lowercase()).collect()
 }
 
