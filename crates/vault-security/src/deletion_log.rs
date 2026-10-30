@@ -535,11 +535,26 @@ impl DeletionLog {
     /// (held by the live sensitive-write path around `record_deletion`) ->
     /// this write lock -> this log's internal connection mutex (taken and
     /// released per statement). Nothing may take a `Vault` per-note lock
-    /// while holding this one. `is_deleted`, `is_empty` and `reconcile` do
-    /// not take it.
+    /// while holding this one.
     ///
-    /// Not re-entrant: a caller already holding the guard must not call
-    /// `record_deletion` (it would wait on itself until the timeout).
+    /// Which APIs take it (F2, independent review of 41005c6):
+    ///
+    /// - Acquire it themselves, for their whole span: `record_deletion` (and
+    ///   `record_deletion_with_injector`), `reconcile`, and
+    ///   `verify_safe_to_expose_after_restore` (which runs its reconcile and
+    ///   its reference read under one hold, via the private
+    ///   `reconcile_locked`). Every writer of the log's rows or of the
+    ///   trusted reference is in this list.
+    /// - Never take it, and are safe to call with it held: `is_deleted`,
+    ///   `is_empty`, `verify_chain`, `db_path`, `write_lock_path`: pure reads.
+    ///   This is what `storage`'s restore promotion relies on (it calls
+    ///   `is_deleted` under the guard).
+    ///
+    /// Not re-entrant: a caller already holding the guard must not call any
+    /// API in the first list (it would wait on itself until the timeout and
+    /// fail closed with `WriteLockUnavailable`). No production path does:
+    /// the restore promotion only calls `is_deleted` under it, and
+    /// `record_deletion` never calls `reconcile`.
     pub fn acquire_write_lock(&self) -> Result<DeletionLogWriteGuard, DeletionLogError> {
         let path = self.write_lock_path();
         if let Some(parent) = path.parent() {
@@ -801,7 +816,34 @@ impl DeletionLog {
     /// - Anything else (reference ahead of the log, any other mismatch,
     ///   hash disagreement, missing/corrupt/tampered reference, etc.) is
     ///   failed closed: never guessed.
+    ///
+    /// Takes [`DeletionLog::acquire_write_lock`] itself, for its whole span
+    /// (the reads it decides from as well as the roll-forward writes), and
+    /// fails closed with [`DeletionLogError::WriteLockUnavailable`] if it
+    /// cannot (independent review of 41005c6, F2). Without it, a reconcile
+    /// that had read "generation N `Pending`, reference N-1" could be
+    /// overtaken by another handle's (or process's) reconcile and a further
+    /// `record_deletion`, then write its stale reference N over the live
+    /// N+1, after which every later reconcile failed closed. A caller that
+    /// already holds the guard must not call this (the lock is not
+    /// re-entrant); inside this module such a caller uses
+    /// `reconcile_locked` instead, as `verify_safe_to_expose_after_restore`
+    /// does.
     pub fn reconcile(&self, trusted_ref: &dyn TrustedReferenceStore) -> Result<ReconcileOutcome, DeletionLogError> {
+        let write_lock = self.acquire_write_lock()?;
+        self.reconcile_locked(&write_lock, trusted_ref)
+    }
+
+    /// The body of [`DeletionLog::reconcile`], for a caller that already
+    /// holds this log's write lock: `_held` is the caller's guard, required
+    /// as evidence so this can never be called unlocked. Takes only the
+    /// connection mutex (innermost, per the lock order on
+    /// `acquire_write_lock`).
+    fn reconcile_locked(
+        &self,
+        _held: &DeletionLogWriteGuard,
+        trusted_ref: &dyn TrustedReferenceStore,
+    ) -> Result<ReconcileOutcome, DeletionLogError> {
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
         // I5: the whole chain must verify before anything is rolled forward
         // or declared consistent.
@@ -827,8 +869,8 @@ impl DeletionLog {
                 //    reference, which has therefore never been written at
                 //    all yet — not merely stale, but nonexistent). This is
                 //    the roll-forward case: safe, because nothing has ever
-                //    been exposed under a prior reference and this log is
-                //    the only writer of its own chain.
+                //    been exposed under a prior reference and every writer
+                //    of this chain holds the write lock this call holds.
                 // 2. A restore where the reference was lost/not carried
                 //    along ("registro assente" in C5's test list) while the
                 //    log already has completed history. This must fail
@@ -878,8 +920,10 @@ impl DeletionLog {
                     // instead) — either way, rolling forward is safe because
                     // nothing has been exposed yet (is_deleted already
                     // returns true for the Pending row) and no other writer
-                    // can have produced a DIFFERENT generation N here: this
-                    // log is the only writer of its own chain.
+                    // can have produced a DIFFERENT generation N here, nor
+                    // advance past it while this runs: every writer of this
+                    // chain and its reference, in any handle or process,
+                    // holds the write lock this call holds (F2).
                     trusted_ref.write(&GenerationRef { generation: row.generation, chain_hash: row.chain_hash.clone() })?;
                     conn.execute(
                         "UPDATE deletions SET state = ?1 WHERE generation = ?2",
@@ -937,9 +981,13 @@ impl DeletionLog {
         live_trusted_ref: &dyn TrustedReferenceStore,
     ) -> Result<(), DeletionLogError> {
         // The live log's own head must agree with the live reference before
-        // this gate trusts either of them for the comparison below.
-        self.reconcile(live_trusted_ref)?;
+        // this gate trusts either of them for the comparison below. Both run
+        // under one hold of the write lock (F2), so no deletion can advance
+        // the reference between the reconcile and the read it vouches for.
+        let write_lock = self.acquire_write_lock()?;
+        self.reconcile_locked(&write_lock, live_trusted_ref)?;
         let live = live_trusted_ref.read()?.ok_or(DeletionLogError::ReferenceMissing)?;
+        drop(write_lock);
         if restored_reference_snapshot.generation < live.generation {
             return Err(DeletionLogError::BackupReferenceStale {
                 backup_generation: restored_reference_snapshot.generation,
@@ -1549,5 +1597,208 @@ mod tests {
         assert_eq!(second.acquire_write_lock().unwrap_err(), DeletionLogError::WriteLockUnavailable { timeout_ms: 100 });
         drop(guard);
         assert!(second.acquire_write_lock().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // F2 (independent review of 41005c6): reconcile and the write lock
+    // -----------------------------------------------------------------
+
+    /// A trusted-reference store that reads the real one, then pauses on its
+    /// FIRST `read` before returning that (by then possibly stale) value:
+    /// the reviewer's "reconcile paused mid-way" seam.
+    struct PauseAfterFirstRead {
+        inner: FileTrustedReferenceStore,
+        paused: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+        first: std::sync::atomic::AtomicBool,
+    }
+
+    impl TrustedReferenceStore for PauseAfterFirstRead {
+        fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
+            let value = self.inner.read();
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.paused.send(());
+                let _ = self.resume.recv();
+            }
+            value
+        }
+
+        fn write(&self, r: &GenerationRef) -> Result<(), DeletionLogError> {
+            self.inner.write(r)
+        }
+    }
+
+    /// The reviewer's F2 repro. A crashed first deletion leaves generation 1
+    /// `Pending`. Reconcile A (handle 1) reads that state and pauses before
+    /// rolling forward; meanwhile reconcile B (handle 2) and a new
+    /// `record_deletion` (handle 3) run. Before the fix nothing stopped B and
+    /// the deletion from completing during the pause, after which A wrote
+    /// its stale generation-1 reference over the live generation-2 one, and
+    /// the NEXT reconcile failed closed with `Inconsistent` (blocking every
+    /// vault open and restore). Now A holds the write lock for its whole
+    /// span, so B and the deletion wait for it, and the log converges.
+    #[test]
+    fn f2_concurrent_reconciles_and_a_deletion_through_three_handles_never_roll_the_reference_backwards() {
+        let dir = tempdir().unwrap();
+        let setup = open_log(dir.path());
+        setup
+            .record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending))
+            .unwrap();
+        assert!(file_ref(dir.path()).read().unwrap().is_none(), "precondition: crashed before step 2");
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let pausing = PauseAfterFirstRead {
+            inner: file_ref(dir.path()),
+            paused: paused_tx,
+            resume: resume_rx,
+            first: std::sync::atomic::AtomicBool::new(true),
+        };
+        let handle_a = DeletionLog::open(setup.db_path()).unwrap();
+        let handle_b = DeletionLog::open(setup.db_path()).unwrap();
+        let handle_c = DeletionLog::open(setup.db_path()).unwrap();
+
+        let (a, b, c, others_waited) = std::thread::scope(|scope| {
+            let a = scope.spawn(move || handle_a.reconcile(&pausing));
+            paused_rx.recv().unwrap();
+            let b = scope.spawn(|| handle_b.reconcile(&file_ref(dir.path())));
+            let c = scope.spawn(|| handle_c.record_deletion("note-b", &file_ref(dir.path())));
+            std::thread::sleep(Duration::from_millis(300));
+            let others_waited = !b.is_finished() && !c.is_finished();
+            resume_tx.send(()).unwrap();
+            (a.join().unwrap(), b.join().unwrap(), c.join().unwrap(), others_waited)
+        });
+        assert_eq!(a, Ok(ReconcileOutcome::RolledForward { generation: 1 }));
+        assert!(b.is_ok(), "{b:?}");
+        assert_eq!(c.unwrap().generation, 2);
+
+        let fresh = DeletionLog::open(setup.db_path()).unwrap();
+        assert_eq!(
+            fresh.reconcile(&file_ref(dir.path())),
+            Ok(ReconcileOutcome::AlreadyConsistent),
+            "the log/reference pair must still agree after the interleaving"
+        );
+        assert_eq!(file_ref(dir.path()).read().unwrap().unwrap().generation, 2, "the reference was never rolled backwards");
+        assert!(others_waited, "the second reconcile and the deletion must wait for the paused reconcile's write lock");
+    }
+
+    /// `reconcile` acquires the write lock itself and is bounded by the same
+    /// timeout: while another handle holds the lock it fails closed with
+    /// `WriteLockUnavailable` and writes nothing, rather than rolling forward
+    /// unlocked.
+    #[test]
+    fn f2_reconcile_fails_closed_without_writing_while_another_handle_holds_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let holder = open_log(dir.path());
+        holder
+            .record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending))
+            .unwrap();
+        let guard = holder.acquire_write_lock().unwrap();
+
+        let mut other = DeletionLog::open(holder.db_path()).unwrap();
+        other.set_write_lock_timeout(Duration::from_millis(100));
+        assert_eq!(other.reconcile(&file_ref(dir.path())), Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
+        assert_eq!(
+            other.verify_safe_to_expose_after_restore(&GenerationRef { generation: 1, chain_hash: String::new() }, &file_ref(dir.path())),
+            Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }),
+            "the restore gate's reconcile is locked too"
+        );
+        assert!(file_ref(dir.path()).read().unwrap().is_none(), "no roll-forward may happen without the lock");
+
+        drop(guard);
+        assert_eq!(other.reconcile(&file_ref(dir.path())), Ok(ReconcileOutcome::RolledForward { generation: 1 }));
+        // Taken and released by reconcile itself: the lock is free again,
+        // and a deletion (which takes it too) still completes normally.
+        assert_eq!(holder.record_deletion("note-b", &file_ref(dir.path())).unwrap().generation, 2);
+        assert_eq!(other.reconcile(&file_ref(dir.path())), Ok(ReconcileOutcome::AlreadyConsistent));
+    }
+
+    /// Environment variable that turns
+    /// [`f2_child_process_holds_the_write_lock_until_released`] from a
+    /// no-op into the child half of the cross-process test below.
+    const CHILD_LOCK_DIR_ENV: &str = "SUPERBRAIN_F2_CHILD_LOCK_DIR";
+
+    /// The child half of the cross-process test (a no-op in an ordinary test
+    /// run): holds the write lock of the log in `$SUPERBRAIN_F2_CHILD_LOCK_DIR`
+    /// until the parent creates a `release` file there.
+    #[test]
+    fn f2_child_process_holds_the_write_lock_until_released() {
+        let Some(dir) = std::env::var_os(CHILD_LOCK_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let log = open_log(&dir);
+        let guard = log.acquire_write_lock().unwrap();
+        std::fs::write(dir.join("child-holds-lock"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !dir.join("release").exists() {
+            assert!(Instant::now() < deadline, "the parent never released the child");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(guard);
+    }
+
+    /// F2 across real processes: the test binary re-spawns itself running
+    /// only the child half above, which takes the write lock. While the
+    /// CHILD holds it, `reconcile` in this process neither rolls forward nor
+    /// writes anything (bounded: `WriteLockUnavailable`; unbounded: it
+    /// waits), and once the child releases it, the same pending call
+    /// completes the roll-forward.
+    #[test]
+    fn f2_reconcile_waits_for_the_write_lock_held_by_another_process() {
+        if std::env::var_os(CHILD_LOCK_DIR_ENV).is_some() {
+            return; // never recurse inside the child
+        }
+        let dir = tempdir().unwrap();
+        {
+            let setup = open_log(dir.path());
+            setup
+                .record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending))
+                .unwrap();
+        }
+        /// Releases and reaps the child on every exit path, so a failing
+        /// assertion here never leaves it holding the lock.
+        struct ChildGuard(std::process::Child, PathBuf);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.1.join("release"), b"");
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "deletion_log::tests::f2_child_process_holds_the_write_lock_until_released", "--test-threads=1", "--nocapture"])
+                .env(CHILD_LOCK_DIR_ENV, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+            dir.path().to_path_buf(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !dir.path().join("child-holds-lock").exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "the child exited before taking the lock");
+            assert!(Instant::now() < deadline, "the child never took the lock");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut bounded = open_log(dir.path());
+        bounded.set_write_lock_timeout(Duration::from_millis(100));
+        assert_eq!(bounded.reconcile(&file_ref(dir.path())), Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
+
+        let waiting = open_log(dir.path());
+        let (outcome, waited) = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| waiting.reconcile(&file_ref(dir.path())));
+            std::thread::sleep(Duration::from_millis(300));
+            let waited = !pending.is_finished() && file_ref(dir.path()).read().unwrap().is_none();
+            std::fs::write(dir.path().join("release"), b"").unwrap();
+            (pending.join().unwrap(), waited)
+        });
+        assert!(child.0.wait().unwrap().success(), "the child half must pass");
+        assert!(waited, "reconcile must wait for, and write nothing under, another process's write lock");
+        assert_eq!(outcome, Ok(ReconcileOutcome::RolledForward { generation: 1 }));
+        assert_eq!(file_ref(dir.path()).read().unwrap().unwrap().generation, 1);
     }
 }

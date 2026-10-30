@@ -558,8 +558,10 @@ impl PiiStore {
         }
     }
 
+    /// RAW, UNGATED primitive, under the same contract as [`PiiStore::get`]
+    /// (and `pub` for the same cross-crate reason, documented there).
     /// Reads back and decrypts this operation's before-image, exactly as
-    /// [`PiiStore::get_staged`] does for a staged file:
+    /// [`PiiStore::get`] does for the live file:
     /// [`PiiStoreError::NotFound`] if there is none,
     /// [`PiiStoreError::Inconsistent`] if it does not decrypt,
     /// [`PiiStoreError::Io`] on any other read failure. Used by `storage`'s
@@ -618,6 +620,20 @@ impl PiiStore {
     /// `storage::restore_vault_from_backup` calls this (the restore stages
     /// plaintext from the backup itself, after its own deletion checks,
     /// never from a live `.pii` file).
+    ///
+    /// Why this is still `pub` (F4, independent review of 41005c6): its one
+    /// production caller is in ANOTHER crate, `storage`'s crash recovery
+    /// (`recovery::classify_live_pii`, which hashes the live plaintext to
+    /// decide roll-forward vs. rollback and never returns it). Rust has no
+    /// visibility between "this crate" and "every crate", so narrowing it
+    /// would need restructuring (moving that recovery logic into this
+    /// crate, or a shared private crate), which is out of scope. The same
+    /// holds for [`PiiStore::get_before_image`] (`storage`'s
+    /// `recovery::roll_back_pii`). Residual exposed surface: these two raw
+    /// decrypting reads, reachable by any code that holds a `PiiStore`;
+    /// the guard is this contract plus `storage`'s source-inspection test
+    /// pinning that neither its restore nor its `read_note` path calls them.
+    /// `get_staged` had no such caller and is now crate-private.
     pub fn get(&self, note_id: &str) -> Result<Vec<u8>, PiiStoreError> {
         let path = self.live_path(note_id);
         let bytes = match std::fs::read(&path) {
@@ -630,11 +646,23 @@ impl PiiStore {
         self.decrypt_buffer(note_id, &bytes)
     }
 
+    /// Whether a staged file exists for `(note_id, operation_id)`, without
+    /// decrypting it (F4: what callers outside this crate used the raw
+    /// `get_staged` for, which only ever asserted absence).
+    pub fn has_staged(&self, note_id: &str, operation_id: Uuid) -> bool {
+        self.staging_path(note_id, operation_id).is_file()
+    }
+
     /// Reads back and decrypts a STAGED (not yet committed) record for
     /// `(note_id, operation_id)`, exactly as `get` does for the live file.
-    /// Used by `storage`'s crash-recovery path to verify a staged
-    /// ciphertext's hash before rolling the pipeline forward.
-    pub fn get_staged(&self, note_id: &str, operation_id: Uuid) -> Result<Vec<u8>, PiiStoreError> {
+    ///
+    /// F4 (independent review of 41005c6): restricted to this crate's own
+    /// tests. No production code anywhere needs to decrypt a staged file
+    /// (`storage`'s recovery verifies only the LIVE file, deliberately; see
+    /// its `pii_is_consistent`), and `storage`'s tests only checked absence,
+    /// which [`PiiStore::has_staged`] answers without decrypting anything.
+    #[cfg(test)]
+    pub(crate) fn get_staged(&self, note_id: &str, operation_id: Uuid) -> Result<Vec<u8>, PiiStoreError> {
         let path = self.staging_path(note_id, operation_id);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,

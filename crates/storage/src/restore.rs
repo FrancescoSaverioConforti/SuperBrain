@@ -60,9 +60,9 @@
 //! git": the restored root has no git history). No new journal column and no
 //! new state machine: a crash at any point leaves a row `recovery::reconcile`
 //! already knows how to resolve (rolled back if its pointer never landed or
-//! its ciphertext does not verify, rolled forward otherwise — and, since this
-//! fix, never forwarded for a sensitive row whose note the deletion log
-//! records as deleted).
+//! its ciphertext does not verify, rolled forward otherwise — and never
+//! forwarded, whatever its classification, for a row whose note the deletion
+//! log records as deleted; F1 extended this from sensitive rows to all).
 //!
 //! # Resuming an interrupted restore
 //!
@@ -978,6 +978,157 @@ mod tests {
         assert!(matches!(f.pii_store.get_unless_deleted("note-a"), Err(PiiStoreError::Deleted { .. })));
         assert!(vault.read_note(&id("note-b")).is_ok(), "other notes are unaffected");
         assert!(vault.current_version(&id("note-a")).is_ok(), "the version stays available to writers (a re-issued tombstone needs it)");
+    }
+
+    /// F1 (independent review of 41005c6): a note that is deleted while its
+    /// promotion is interrupted must never become readable again, whatever its
+    /// classification. The reviewer's repro: crash after the pointer rename
+    /// (both rename-side boundaries), deletion before recovery, then the
+    /// documented resume. Before the fix, a non-sensitive row was forwarded
+    /// to `JournalCommitted`, `read_note` served the deleted body, and
+    /// `RestoreOutcome` reported the note as excluded at the same time.
+    fn crash_then_delete_then_resume(classification: &str, body: &str, point: FaultPoint) {
+        let f = fixture(&[("note-a", classification, body), ("note-b", "internal", "b\n")]);
+        let result = f.restore(&FaultInjector::trigger_at(point));
+        assert!(
+            matches!(&result, Err(RestoreError::Storage(StorageError::Interrupted(p))) if *p == point),
+            "{classification}/{point:?}: precondition, the first hit is note-a's: {:?}",
+            result.err()
+        );
+        f.delete("note-a");
+
+        let (vault, outcome) = f.restore(&FaultInjector::none()).unwrap_or_else(|e| panic!("{classification}/{point:?}: resume failed: {e}"));
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()], "{classification}/{point:?}");
+        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()], "{classification}/{point:?}");
+        assert!(
+            matches!(vault.read_note(&id("note-a")), Err(StorageError::NotFound { .. } | StorageError::Deleted { .. })),
+            "{classification}/{point:?}: a note reported as excluded must not be readable: {:?}",
+            vault.read_note(&id("note-a")).map(|r| r.content)
+        );
+        assert!(
+            f.rows_for("note-a").iter().all(|r| r.state == WriteState::Failed),
+            "{classification}/{point:?}: no row of a deleted note may be committed: {:?}",
+            f.rows_for("note-a").iter().map(|r| r.state).collect::<Vec<_>>()
+        );
+        f.assert_nothing_of("note-a");
+        assert!(vault.read_note(&id("note-b")).is_ok(), "{classification}/{point:?}: other notes are unaffected");
+    }
+
+    #[test]
+    fn f1_a_note_deleted_after_a_crash_past_the_pointer_rename_is_never_resurrected_by_the_resume_for_any_classification() {
+        for (classification, body) in [
+            ("internal", "OLD INTERNAL BODY OF A NOW-DELETED NOTE\n"),
+            ("public", "OLD PUBLIC BODY OF A NOW-DELETED NOTE\n"),
+            ("sensitive", "OLD SENSITIVE BODY OF A NOW-DELETED NOTE"),
+        ] {
+            for point in [FaultPoint::AfterRenameBeforeContentPersisted, FaultPoint::AfterRenameBeforeJournalCommitted] {
+                crash_then_delete_then_resume(classification, body, point);
+            }
+        }
+    }
+
+    /// F1, the no-crash variant: a note restored and THEN deleted through the
+    /// live log is withheld by `read_note` whatever its classification, not
+    /// only when it is `Sensitive`.
+    #[test]
+    fn f1_read_note_withholds_a_note_deleted_after_its_restore_for_every_classification() {
+        let f = fixture(&[
+            ("note-i", "internal", "internal body\n"),
+            ("note-p", "public", "public body\n"),
+            ("note-s", "sensitive", "SECRET S"),
+            ("note-z", "internal", "kept\n"),
+        ]);
+        let (vault, outcome) = f.restore(&FaultInjector::none()).unwrap();
+        assert_eq!(outcome.restored_note_ids.len(), 4);
+        for note in ["note-i", "note-p", "note-s"] {
+            assert!(vault.read_note(&id(note)).is_ok(), "{note}: precondition, readable before the deletion");
+            f.delete(note);
+            assert!(
+                matches!(vault.read_note(&id(note)), Err(StorageError::Deleted { ref note_id }) if note_id == note),
+                "{note}: a deleted note must be withheld: {:?}",
+                vault.read_note(&id(note)).map(|r| r.content)
+            );
+            assert!(vault.current_version(&id(note)).is_ok(), "{note}: the version stays available to writers");
+        }
+        assert!(vault.read_note(&id("note-z")).is_ok(), "an undeleted note is unaffected");
+        drop(vault);
+        let vault = f.reopen();
+        for note in ["note-i", "note-p", "note-s"] {
+            assert!(matches!(vault.read_note(&id(note)), Err(StorageError::Deleted { .. })), "{note}: still withheld after a reopen");
+        }
+    }
+
+    /// F1, point 5: a note committed by an interrupted earlier call of the
+    /// same restore and deleted before the resume is reported as excluded by
+    /// the resume, so it must not be readable either (historical backup:
+    /// the backup still holds the note's old, non-sensitive content).
+    #[test]
+    fn f1_a_note_committed_by_an_interrupted_restore_then_deleted_is_excluded_and_not_readable_after_the_resume() {
+        for classification in ["internal", "public", "sensitive"] {
+            let f = fixture(&[("note-a", classification, "HISTORICAL BODY\n"), ("note-b", "internal", "b\n")]);
+            // The second hit is note-b: note-a is already JournalCommitted.
+            let result = f.restore(&FaultInjector::trigger_at_nth(FaultPoint::RestoreWriteLockHeld, 2));
+            assert!(matches!(result, Err(RestoreError::Storage(StorageError::Interrupted(FaultPoint::RestoreWriteLockHeld)))));
+            f.delete("note-a");
+            let (vault, outcome) = f.restore(&FaultInjector::none()).unwrap();
+            assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()], "{classification}");
+            assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()], "{classification}");
+            for excluded in &outcome.excluded_deleted_note_ids {
+                assert!(
+                    vault.read_note(&id(excluded)).is_err(),
+                    "{classification}: RestoreOutcome reports {excluded} as excluded, so no read API may serve it"
+                );
+            }
+            assert!(matches!(f.pii_store.get_unless_deleted("note-a"), Err(PiiStoreError::Deleted { .. } | PiiStoreError::NotFound { .. })));
+        }
+    }
+
+    /// F1, concurrent deletion, non-sensitive: whichever side wins each
+    /// race, a deleted internal or public note is never readable afterwards.
+    #[test]
+    fn f1_concurrent_restore_and_deletion_never_expose_a_deleted_non_sensitive_note() {
+        for round in 0..8 {
+            let classification = if round % 2 == 0 { "internal" } else { "public" };
+            let f = fixture(&[("note-a", "sensitive", "a"), ("note-b", classification, "B BODY\n"), ("note-c", "internal", "c\n")]);
+            let deleter_handle = DeletionLog::open(f.live_log.db_path()).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            let outcome = std::thread::scope(|scope| {
+                let restore = scope.spawn(|| {
+                    barrier.wait();
+                    f.restore(&FaultInjector::none())
+                });
+                barrier.wait();
+                deleter_handle.record_deletion("note-b", &f.live_ref).unwrap();
+                restore.join().unwrap()
+            });
+            let (vault, outcome) = outcome.unwrap();
+            let restored = outcome.restored_note_ids.contains(&"note-b".to_string());
+            let excluded = outcome.excluded_deleted_note_ids.contains(&"note-b".to_string());
+            assert!(restored != excluded, "note-b is exactly one of restored or excluded: {outcome:?}");
+            assert!(matches!(vault.read_note(&id("note-b")), Err(StorageError::Deleted { .. } | StorageError::NotFound { .. })));
+            drop(vault);
+            let vault = f.reopen();
+            assert!(matches!(vault.read_note(&id("note-b")), Err(StorageError::Deleted { .. } | StorageError::NotFound { .. })));
+            assert!(vault.read_note(&id("note-c")).is_ok());
+        }
+    }
+
+    /// F3: a restore promotion row is never a tombstone (promotion only ever
+    /// writes backed-up content), so the empty-plaintext tombstone exemption
+    /// must not apply to it. A `Sensitive` note whose backed-up body is
+    /// empty, interrupted after its pointer rename and deleted before
+    /// recovery, is discarded, not forwarded.
+    #[test]
+    fn f3_an_empty_bodied_sensitive_restore_row_is_not_mistaken_for_a_tombstone_by_reconcile() {
+        let f = fixture(&[("note-a", "sensitive", "")]);
+        let result = f.restore(&FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted));
+        assert!(matches!(result, Err(RestoreError::Storage(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted)))));
+        assert_eq!(f.rows_for("note-a")[0].pii_content_hash.as_deref(), Some(content_hash(b"").as_str()), "precondition: tombstone-shaped");
+        f.delete("note-a");
+        let vault = f.reopen();
+        assert_eq!(f.rows_for("note-a")[0].state, WriteState::Failed, "a deleted note's restore row is never forwarded");
+        f.assert_nothing_of("note-a");
+        assert!(matches!(vault.read_note(&id("note-a")), Err(StorageError::NotFound { .. })));
     }
 
     /// Required test 5, the raw-API boundary, pinned by inspection of the

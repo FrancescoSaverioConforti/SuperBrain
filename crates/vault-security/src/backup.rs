@@ -1481,6 +1481,11 @@ pii://note-a");
 
         let deleter_log = &log;
         let deleter_reference_path = dir.path().join("trusted-reference.bin");
+        // Declared outside the scope so the restore thread spawned in it can
+        // borrow them (F2: the restore now runs on its own thread).
+        let restore_time_reader = DeletionLog::open(log.db_path()).unwrap();
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
         std::thread::scope(|scope| {
             let handle = scope.spawn(move || {
                 let reference_for_thread = FileTrustedReferenceStore::new(deleter_reference_path.clone());
@@ -1516,11 +1521,21 @@ pii://note-a");
             // held by the deleter thread's blocked call for the whole pause
             // (by design), so calling `is_empty`/`is_deleted` through `log`
             // directly here would deadlock against that held mutex.
-            let restore_time_reader = DeletionLog::open(log.db_path()).unwrap();
-            let destination = dir.path().join("restored");
-            let restored_pii_root = dir.path().join("restored-pii-store");
-            let result = restore_and_materialize(&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
-            let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
+            //
+            // F2 (independent review of 41005c6): that roll-forward is no
+            // longer performed UNDER the still-running deletion. `reconcile`
+            // now takes the deletion log's write lock, which the paused
+            // `record_deletion` holds, so the restore started here waits
+            // (writing nothing) until the deletion completes, and then
+            // finds the log/reference pair already consistent. The outcome
+            // is the same: note-a excluded, nothing exposed.
+            let restore = {
+                let (target, master_key, destination, reader, reference, restored_pii_root) =
+                    (&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
+                scope.spawn(move || restore_and_materialize(target, master_key, destination, reader, reference, restored_pii_root))
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let restore_waited = !restore.is_finished() && reference.read().unwrap().is_none();
 
             // Resume BEFORE asserting: a failed assertion here must fail the
             // test, not leave the deleter thread parked forever and hang the
@@ -1528,6 +1543,9 @@ pii://note-a");
             resume_tx.send(()).unwrap();
             let receipt = handle.join().unwrap();
             assert_eq!(receipt.generation, 1);
+            let result = restore.join().unwrap();
+            let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
+            assert!(restore_waited, "the restore's reconcile must wait for the in-flight deletion's write lock, writing nothing");
 
             let outcome = result.expect("the restore must succeed; the still-pending note is excluded, not a reason to refuse everything");
             assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
