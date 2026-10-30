@@ -10,3 +10,14 @@ description = "SuperBrain deterministic search index (scaffold)."
 [dependencies]
 domain = { path = "../domain" }
 storage = { path = "../storage" }
+
+[dev-dependencies]
+# Test-only: `propose_and_commit` (the one sanctioned write path, per
+# `storage`'s own public-surface discipline) requires a `policy::Gate`.
+# `index` itself never writes and has no production dependency on `policy`.
+policy = { path = "../policy" }
+uuid = { version = "1", features = ["v4"] }
+# Test-only: the seam test needs a real git repo (with an initial commit) at
+# the vault root for a write to reach GitCommitted/IndexCurrent rather than
+# resting at GitPending; `index` has no production dependency on git2.
+git2 = "0.21"

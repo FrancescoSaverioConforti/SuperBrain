@@ -413,7 +413,10 @@ name = "index"
 version = "0.1.0"
 dependencies = [
  "domain",
+ "git2",
+ "policy",
  "storage",
+ "uuid",
 ]
 
 [[package]]

@@ -261,12 +261,24 @@ fn resolve(
                 let version = row
                     .new_version
                     .ok_or_else(|| inconsistent(op, "GitCommitted row has no new_version"))?;
+                let note_id = parse_note_id(row)?;
+                // B1 Task 1: resolve this row's own record bytes for
+                // `Indexer::mark_current`'s now-mandatory `record_bytes`
+                // parameter, BEFORE the before-image delete below — the
+                // delete may remove the one place `own_content` could still
+                // recover them from (a successor's before-image) if
+                // `record_path` itself no longer matches. No callback into
+                // `Vault::read_note`: this runs during `Vault::open`'s
+                // startup reconciliation, before any `Vault` value exists.
+                let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
+                let record_bytes = own_content(root, journal, row, &note_id, &record_path)?
+                    .ok_or_else(|| inconsistent(op, "GitCommitted row has no recoverable own content for the index step"))?;
                 // Item 1(c): a row resumed from GitCommitted (a crash after
                 // the advance, before the before-image deletes) gets the
                 // same cleanup as one that just arrived from row 3. A no-op
                 // repeat for the latter.
-                delete_before_images_at_git_committed(root, pii_store, &parse_note_id(row)?, row)?;
-                indexer.mark_current(&row.note_id, version);
+                delete_before_images_at_git_committed(root, pii_store, &note_id, row)?;
+                indexer.mark_current(&row.note_id, version, &record_bytes);
                 journal.advance(op, WriteState::IndexCurrent, AdvanceFields::none())?;
                 return Ok(Outcome::Completed);
             }

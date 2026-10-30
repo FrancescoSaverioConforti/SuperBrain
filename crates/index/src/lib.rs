@@ -22,3 +22,14 @@
 //!   deterministic-search plan. Until that task lands, the index surface
 //!   must not be treated as audited; the other four surfaces remain open
 //!   for B2/C2/future phases.
+//!
+//! # B1 Task 1
+//!
+//! [`indexer_impl`] adds the first concrete piece: a skeleton
+//! `storage::Indexer` implementation (no real indexing logic — that is
+//! Tasks 2/3) that proves the integration seam Task 1 designed is usable
+//! from outside `storage`. See that module's doc comment for the full
+//! design note, including the Step 5 scalability-benchmark protocol Task 9
+//! will execute once real indexes exist.
+
+pub mod indexer_impl;
