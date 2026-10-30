@@ -60,6 +60,60 @@ pub(crate) fn parse_record(bytes: &[u8], note_id: &NoteId) -> Result<VaultRecord
     })
 }
 
+/// Every way [`split_record`] can fail to turn raw record bytes into parsed
+/// metadata plus body.
+#[derive(Debug, thiserror::Error)]
+pub enum SplitRecordError {
+    /// `record_bytes` is not valid UTF-8, so it cannot even be split into
+    /// frontmatter/body text. Mirrors this module's own `parse_record` UTF-8
+    /// check on the same raw-bytes-from-disk shape.
+    #[error("record is not valid utf-8")]
+    InvalidUtf8,
+    /// The frontmatter half failed `domain::parse_frontmatter`.
+    #[error("invalid frontmatter: {0}")]
+    Schema(#[from] domain::ValidationError),
+}
+
+/// Splits raw record bytes — the same shape [`VaultRecord::content`] holds
+/// (minus the version header, which callers of `split_record` are not
+/// expected to carry), and the same shape a `storage::Indexer`'s
+/// `mark_current(note_id, version, record_bytes: &[u8])` callback receives —
+/// into already-parsed [`domain::NoteMetadata`] plus the extracted body.
+///
+/// This is an additive, read-side parsing helper: it calls the existing
+/// private `crate::propose::frontmatter_of` / `crate::propose::body_of`
+/// splitters and `domain::parse_frontmatter` internally rather than
+/// duplicating their delimiter-finding logic, so a caller outside this
+/// crate (e.g. `index`'s real indexer wiring) never has to reimplement CRLF
+/// handling or YAML block-scalar-dash edge cases to go from raw bytes to a
+/// `(NoteMetadata, body)` pair — it stays in sync with `storage`'s own
+/// notion of where a body starts by construction, not by convention.
+///
+/// `body` is `None` for a bare-frontmatter record with no body at all (the
+/// same case `body_of` reports as `""`); `Some(body)` otherwise, including
+/// `Some(String::new())` if a closing delimiter is immediately followed by
+/// nothing. Callers that treat `None` and `Some("")` identically (as
+/// `index::Document::new` does) do not need to special-case which one they
+/// get.
+///
+/// Deliberately placed in `vault.rs`, not `propose.rs`: it is a pure
+/// read-side parser with no write-path involvement, and `propose.rs` is
+/// guarded (see `tests/integration.rs`'s
+/// `storage_exposes_exactly_one_public_write_function`) to expose exactly
+/// one public function, `propose_and_commit` — the single sanctioned write
+/// entry point. `split_record` never touches the vault, the journal, or any
+/// write primitive.
+pub fn split_record(record_bytes: &[u8]) -> Result<(domain::NoteMetadata, Option<String>), SplitRecordError> {
+    let text = std::str::from_utf8(record_bytes).map_err(|_| SplitRecordError::InvalidUtf8)?;
+
+    let metadata = domain::parse_frontmatter(crate::propose::frontmatter_of(text))?;
+
+    let body = crate::propose::body_of(text);
+    let body = if body.is_empty() { None } else { Some(body.to_string()) };
+
+    Ok((metadata, body))
+}
+
 /// A monotonically increasing per-note version number, used for optimistic
 /// concurrency: a write must present the version it believes is current, and
 /// is rejected with an explicit [`StorageError::Conflict`] if that belief is
@@ -2157,6 +2211,51 @@ pub(crate) fn read_before_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FULL_NOTE: &str = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---\n# Body\nsome prose here\n";
+
+    #[test]
+    fn split_record_round_trips_a_full_notes_raw_bytes() {
+        let (metadata, body) = split_record(FULL_NOTE.as_bytes()).expect("valid frontmatter must parse");
+
+        // Matches what frontmatter_of + domain::parse_frontmatter would have
+        // produced separately.
+        let expected_metadata =
+            domain::parse_frontmatter(crate::propose::frontmatter_of(FULL_NOTE)).expect("same parse");
+        assert_eq!(metadata.id, expected_metadata.id);
+        assert_eq!(metadata.schema_version, expected_metadata.schema_version);
+        assert_eq!(metadata.project, expected_metadata.project);
+
+        // Matches what body_of would have produced separately.
+        let expected_body = crate::propose::body_of(FULL_NOTE);
+        assert_eq!(body.as_deref(), Some(expected_body));
+        assert_eq!(body, Some("# Body\nsome prose here\n".to_string()));
+    }
+
+    #[test]
+    fn split_record_reports_none_body_for_bare_frontmatter_with_no_body() {
+        let note = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---";
+
+        let (_, body) = split_record(note.as_bytes()).expect("valid frontmatter must parse");
+
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn split_record_rejects_invalid_utf8() {
+        let invalid = [0xFF, 0xFE, 0xFD];
+
+        let result = split_record(&invalid);
+
+        assert!(matches!(result, Err(SplitRecordError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn split_record_surfaces_schema_errors() {
+        let result = split_record(b"not: frontmatter");
+
+        assert!(matches!(result, Err(SplitRecordError::Schema(_))));
+    }
 
     fn unique_test_dir() -> PathBuf {
         // A per-process counter on top of the timestamp: parallel tests can read
