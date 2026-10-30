@@ -417,6 +417,7 @@ dependencies = [
  "policy",
  "storage",
  "uuid",
+ "vault-security",
 ]
 
 [[package]]

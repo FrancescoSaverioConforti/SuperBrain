@@ -39,9 +39,23 @@
 //! (this task) and `Bm25Index` (Task 3) consume. [`trigram`] defines
 //! `TrigramIndex` itself: a standalone insert/remove/exact-query postings
 //! structure over `Document::text_searchable`, with no knowledge of
-//! structured metadata, classification, or filters. Neither module wires
-//! into `SkeletonIndexer` yet — that real-indexer wiring is Task 3's job.
+//! structured metadata, classification, or filters. Neither module wired
+//! into a real indexer yet — that real-indexer wiring was Task 3's job.
+//!
+//! # B1 Task 3
+//!
+//! [`bm25`] defines `Bm25Index`: the second (ranked) postings structure
+//! over `Document::text_searchable`, with the same text-only contract
+//! `TrigramIndex` has. [`indexer_impl`] now also defines `RealIndexer`, the
+//! first real `storage::Indexer` implementor: it wires both `TrigramIndex`
+//! and `Bm25Index` behind `mark_current`/`state_for`, and
+//! `indexer_impl::rebuild_index` is the cold-start rebuild function that
+//! populates a fresh `RealIndexer` from every live note a `Vault` holds,
+//! using `Vault::list_note_ids` + `Vault::read_note` outside any writer's
+//! lock. `SkeletonIndexer` is kept alongside `RealIndexer`, unchanged, as
+//! the Task 1 seam-proof it always was — it is not used in production.
 
+pub mod bm25;
 pub mod document;
 pub mod indexer_impl;
 pub mod trigram;
