@@ -764,6 +764,34 @@ pub(crate) fn restore_with_pii_root(
     // bypass that same fail-closed judgment merely because the reference
     // happens to be unreadable; only a genuinely empty log justifies the
     // exception.
+    // Post-N1 follow-up (user requirement): a backup whose OWN embedded
+    // reference is merely BEHIND an already-trustworthy live state —
+    // `BackupReferenceStale`, which `verify_safe_to_expose_after_restore`
+    // can only return AFTER its own internal `reconcile` call has already
+    // proved the live log/reference pair agrees with itself — no longer
+    // rejects the whole restore. Exclusion (already computed above, against
+    // the SAME live, trustworthy log, independent of how stale the
+    // backup's own snapshot is) is the real protection against
+    // resurrection; staleness alone is not a reason to refuse notes that
+    // were never touched by whatever happened after this backup was taken.
+    // Spec Fase A item 5: "un restore applica prima le cancellazioni più
+    // recenti e solo dopo diventa consultabile" — exclusion already applies
+    // the most recent deletions; a stale backup reference no longer needs
+    // to block the "diventa consultabile" that follows.
+    //
+    // Every OTHER check-1 outcome (`ChainBroken`, `ReferenceMissing`,
+    // `ReferenceStale` — the LIVE log disagreeing with its OWN reference,
+    // a genuinely different situation from `BackupReferenceStale`, see that
+    // variant's doc comment — or any other `Inconsistent` disagreement)
+    // still rejects the whole restore unconditionally: those mean the live
+    // log itself could not be positively verified, so nothing it reports —
+    // including which notes are deleted — can be trusted enough to act on.
+    // C5's "se il registro è assente, corrotto o non verificabile, i dati
+    // potenzialmente cancellati non vengono esposti" stays enforced exactly
+    // as before; only the narrower, syntactically-distinct "valido ma
+    // obsoleto" case — and only at the BACKUP's own snapshot level, never
+    // at the live log's own level — is now handled by exclusion instead of
+    // outright refusal.
     let check_1 = (|| -> Result<(), DeletionLogError> {
         let live_reference_for_check1 = live_trusted_ref.read()?;
         let live_log_is_empty = live_deletion_log.is_empty()?;
@@ -775,10 +803,15 @@ pub(crate) fn restore_with_pii_root(
         live_deletion_log.verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
     })();
     if let Err(e) = check_1 {
-        if !deleted_since_backup.is_empty() {
+        if matches!(e, DeletionLogError::BackupReferenceStale { .. }) {
+            // The live log/reference pair is trustworthy (reconcile
+            // already proved it); only this backup's own snapshot is
+            // older. Fall through to exclusion.
+        } else if !deleted_since_backup.is_empty() {
             return Err(BackupError::DeletedSinceBackup { note_ids: deleted_since_backup });
+        } else {
+            return Err(BackupError::DeletionLogRejected(e));
         }
-        return Err(BackupError::DeletionLogRejected(e));
     }
 
     // Both checks passed: drop every deleted note from what gets written.
@@ -929,8 +962,16 @@ mod tests {
         assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string(), "note-b".to_string()]);
     }
 
+    /// Post-N1 follow-up: renamed and re-asserted. Before this fix, a
+    /// backup whose own embedded reference snapshot was behind the live one
+    /// refused the WHOLE restore with `ReferenceStale`, even though
+    /// `note-a` here was never deleted — only an UNRELATED note was. That
+    /// blanket refusal is exactly the behavior the user's requirements
+    /// asked to relax: a stale backup must now restore the notes it holds
+    /// that were never deleted, excluding nothing, since nothing in this
+    /// backup was ever deleted.
     #[test]
-    fn restore_refuses_to_write_anything_when_the_backups_own_reference_snapshot_is_stale() {
+    fn restore_from_a_stale_backup_still_restores_notes_untouched_by_the_unrelated_later_deletion() {
         let dir = tempdir().unwrap();
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root).unwrap();
@@ -944,21 +985,29 @@ mod tests {
         // Take the backup while the reference is still at generation 0.
         backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
 
-        // Now advance the LIVE log/reference past what the backup captured.
+        // Now advance the LIVE log/reference past what the backup captured
+        // — but note-a itself, the only note in this backup, was never
+        // deleted; only an unrelated note was.
         log.record_deletion("note-unrelated", &reference).unwrap();
         let live = reference.read().unwrap().unwrap();
         assert_eq!(live.generation, 1, "the live reference must now be ahead of the backup's embedded snapshot");
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
-        assert!(
-            matches!(result, Err(BackupError::DeletionLogRejected(DeletionLogError::ReferenceStale { .. }))),
-            "got {result:?}"
-        );
-        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty, not partially populated");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+            .expect("a stale backup must restore notes the later, unrelated deletion never touched");
+        assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string()]);
+        assert!(outcome.excluded_deleted_note_ids.is_empty(), "note-a was never deleted");
+        assert_eq!(std::fs::read(destination.join("note-a.record")).unwrap(), b"0\n---\nhello world");
     }
 
+    /// Post-N1 follow-up: re-asserted. The note under test still must never
+    /// reappear — that goal is unchanged — but the user's new requirement 1
+    /// means the OUTCOME is now `Ok`, with the note excluded, rather than a
+    /// blanket `Err(DeletedSinceBackup)` refusing the whole restore. This
+    /// backup held only `note-a`, so there is nothing else to restore here;
+    /// `an_old_backup_holding_a_later_deleted_note_restores_the_rest_and_excludes_only_that_note`
+    /// covers the case where OTHER notes in the same stale backup survive.
     #[test]
     fn a_note_deleted_after_the_backup_was_taken_does_not_reappear_on_restore_even_though_the_backups_own_snapshot_predates_the_deletion(
     ) {
@@ -989,12 +1038,12 @@ mod tests {
         // Restore from the EARLIER backup against that now-updated live log.
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
-        assert!(
-            matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &["note-a".to_string()]),
-            "got {result:?}"
-        );
-        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+            .expect("the restore itself must succeed; the deleted note is excluded, not a reason to refuse everything");
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
+        assert!(outcome.restored_note_ids.is_empty(), "this backup held only note-a, which is excluded");
+        assert!(!destination.join("note-a.record").exists(), "the deleted note must never reappear");
+        assert!(!restored_pii_root.join("note-a.pii").exists(), "the deleted note's ciphertext must never reappear");
     }
 
     #[test]
@@ -1063,20 +1112,22 @@ mod tests {
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
         let result = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
-        // Check 2 (the specific per-note cross-check) runs before check 1,
-        // so this surfaces as DeletedSinceBackup naming note-a explicitly —
-        // the same outcome the deleted-after-backup test asserts, because
-        // is_deleted's "pending window is already non-consultable" rule
-        // (C5 line 409) holds for a backup taken mid-window exactly as it
-        // holds for an ordinary read taken mid-window: the live log already
-        // reports note-a deleted at the moment restore's check 2 runs,
-        // regardless of whether record_deletion's step 2/3 had completed
-        // yet when the backup itself was taken.
-        assert!(
-            matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &["note-a".to_string()]),
-            "got {result:?}"
-        );
-        assert!(!destination.exists() || all_files_under(&destination).is_empty(), "destination must remain completely empty");
+        // Post-N1 follow-up: check 2 (the specific per-note cross-check)
+        // still runs before check 1 and still names note-a explicitly, via
+        // `RestoreOutcome::excluded_deleted_note_ids` on a NOW-SUCCESSFUL
+        // restore rather than `Err(DeletedSinceBackup)` refusing the whole
+        // operation. `is_deleted`'s "pending window is already
+        // non-consultable" rule (C5 line 409) still holds exactly as it did
+        // before this fix: the live log already reports note-a deleted at
+        // the moment restore's check 2 runs, regardless of whether
+        // record_deletion's step 2/3 had completed yet when the backup
+        // itself was taken — only the OUTCOME for the backup's OTHER,
+        // unaffected notes (there are none in this backup) has changed.
+        let outcome = result.expect("the restore must succeed; note-a is excluded, not a reason to refuse everything");
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
+        assert!(outcome.restored_note_ids.is_empty(), "this backup held only note-a");
+        assert!(!destination.join("note-a.record").exists(), "note-a must never be exposed");
+        assert!(!restored_pii_root.join("note-a.pii").exists(), "note-a's ciphertext must never be exposed");
         // note-a must not be readable/present in any form.
         if destination.exists() {
             for path in all_files_under(&destination) {
@@ -1343,8 +1394,17 @@ mod tests {
 
             // Restore WHILE STILL PAUSED, against the still-pending state —
             // the live reference is still None and the log still has the
-            // Pending row for note-a. Must be rejected: the pending note is
-            // caught by check 2's is_deleted (true for any row state).
+            // Pending row for note-a. Post-N1 follow-up: `check_1`'s
+            // `reconcile` call safely rolls this forward (generation 1,
+            // still Pending, no reference yet, is exactly `reconcile`'s own
+            // "first-ever deletion crashed mid-protocol" roll-forward case
+            // — the same completion a live `Vault::open` would perform),
+            // after which the backup's sentinel-embedding snapshot is
+            // `BackupReferenceStale` against the now-rolled-forward live
+            // reference. The note is still never exposed — caught by check
+            // 2's `is_deleted` (true for any row state) and excluded — but
+            // the restore as a whole now succeeds, reporting the exclusion
+            // explicitly rather than refusing everything.
             //
             // Uses a SEPARATE DeletionLog connection onto the same SQLite
             // file, exactly like `concurrent_reader` above: `log` itself is
@@ -1364,11 +1424,10 @@ mod tests {
             let receipt = handle.join().unwrap();
             assert_eq!(receipt.generation, 1);
 
-            assert!(
-                matches!(&result, Err(BackupError::DeletedSinceBackup { note_ids }) if note_ids == &["note-a".to_string()]),
-                "restoring while the deletion is still pending must be rejected as DeletedSinceBackup naming note-a, not silently succeed, got {result:?}"
-            );
-            assert!(destination_untouched, "destination must remain completely empty");
+            let outcome = result.expect("the restore must succeed; the still-pending note is excluded, not a reason to refuse everything");
+            assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
+            assert!(outcome.restored_note_ids.is_empty(), "this backup held only the still-pending note-a");
+            assert!(destination_untouched || !destination.join("note-a.record").exists(), "note-a must never be exposed, pending or not");
         });
     }
 
@@ -1447,6 +1506,148 @@ mod tests {
         assert!(destination_untouched, "nothing must be written, including note-a's real content, when the live log itself cannot be trusted");
     }
 
+    /// Post-N1 follow-up, requirement 1: a backup taken BEFORE the latest
+    /// deletion must still restore its still-valid notes, provided the live
+    /// deletion log is complete, authenticated, and consistent with its own
+    /// trusted reference (exactly what `reconcile`, reused by
+    /// `verify_safe_to_expose_after_restore` since N1, already proves).
+    /// Before this fix, check 1 rejected ANY backup whose own embedded
+    /// reference was behind the live one — even when every note the backup
+    /// held was still perfectly valid and the only thing that happened since
+    /// was an unrelated deletion. The user's note-a and note-c here were
+    /// never touched by the later deletion of note-b; their restore must not
+    /// depend on it.
+    #[test]
+    fn a_backup_older_than_the_latest_deletion_still_restores_notes_the_deletion_never_touched() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"1\n---\nstill valid note a");
+        write_file(&vault_root.join("note-c.record"), b"1\n---\nstill valid note c");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Backup taken BEFORE any deletion has ever happened.
+        let old_manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(old_manifest.generation, 0);
+
+        // A later, unrelated deletion (note-b never appeared in the vault
+        // above at all — this models "something elsewhere was deleted").
+        log.record_deletion("note-b", &reference).unwrap();
+        assert_eq!(reference.read().unwrap().unwrap().generation, 1, "the live reference has moved on");
+
+        // Restoring the OLD backup (generation 0, strictly behind the live
+        // reference's generation 1) must still succeed: the live log is
+        // complete and consistent with its reference (reconcile would
+        // accept it), and neither note-a nor note-c was ever deleted.
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+            .expect("a stale-but-otherwise-valid backup must restore the notes it holds that were never deleted");
+        assert_eq!(outcome.restored_note_ids, vec!["note-a".to_string(), "note-c".to_string()]);
+        assert!(outcome.excluded_deleted_note_ids.is_empty(), "neither restored note was ever deleted");
+        assert_eq!(std::fs::read(destination.join("note-a.record")).unwrap(), b"1\n---\nstill valid note a");
+        assert_eq!(std::fs::read(destination.join("note-c.record")).unwrap(), b"1\n---\nstill valid note c");
+    }
+
+    /// Post-N1 follow-up, requirement 2: an OLD backup that also happens to
+    /// hold a note deleted AFTER it was taken must still exclude that note,
+    /// combining staleness-tolerance with per-note exclusion in one restore.
+    #[test]
+    fn an_old_backup_holding_a_later_deleted_note_restores_the_rest_and_excludes_only_that_note() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"1\n---\npii://note-a");
+        write_file(&vault_root.join("note-b.record"), b"1\n---\nstays valid");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"SENSITIVE, SOON DELETED", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Backup taken while BOTH notes are still fully valid.
+        let old_manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(old_manifest.generation, 0);
+
+        // note-a is deleted AFTER this backup was taken.
+        log.record_deletion("note-a", &reference).unwrap();
+
+        // A SECOND, unrelated deletion happens too, so the live reference is
+        // now TWO generations ahead of this backup's own snapshot —
+        // confirming exclusion does not depend on being exactly one
+        // generation stale.
+        log.record_deletion("note-does-not-exist-in-this-backup", &reference).unwrap();
+        assert_eq!(reference.read().unwrap().unwrap().generation, 2);
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &reference, &restored_pii_root)
+            .expect("the old backup must restore note-b and exclude only note-a, not be rejected wholesale");
+        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
+        assert!(!destination.join("note-a.record").exists());
+        assert!(!restored_pii_root.join("note-a.pii").exists());
+        assert_eq!(std::fs::read(destination.join("note-b.record")).unwrap(), b"1\n---\nstays valid");
+    }
+
+    /// Post-N1 follow-up, requirement 3: an old backup must still fail
+    /// closed — not be waved through by the new staleness tolerance — when
+    /// the live log itself cannot be trusted (here: the log file is lost,
+    /// exactly N1's scenario, but now checked specifically against a STALE
+    /// backup rather than N1's same-generation one). Staleness tolerance
+    /// must never become a loophole for an unverifiable live log.
+    #[test]
+    fn a_stale_backup_still_fails_closed_when_the_live_log_cannot_be_trusted() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"1\n---\nnever deleted");
+
+        let pii_store = open_pii_store(dir.path());
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // Advance the live reference so the backup above is now stale...
+        log.record_deletion("note-elsewhere", &reference).unwrap();
+        // ...then lose the live log file itself (reconcile can no longer
+        // vouch that the reference it just advanced actually matches what
+        // the log holds, because there is no log left to check).
+        let db_path = log.db_path().to_path_buf();
+        drop(log);
+        std::fs::remove_file(&db_path).unwrap();
+        let log_after_loss = DeletionLog::open(&db_path).unwrap();
+        assert!(log_after_loss.is_empty().unwrap());
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let result = restore_with_pii_root(&target, &master_key, &destination, &log_after_loss, &reference, &restored_pii_root);
+        assert!(
+            result.is_err(),
+            "a stale backup must still fail closed when the live log cannot be trusted, got {result:?}"
+        );
+        let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
+        assert!(destination_untouched, "nothing must be written when the live log is untrustworthy, stale backup or not");
+    }
+
+    /// Post-N1 follow-up, requirement 5 ("ripristino effettivo tramite API
+    /// storage"): confirms the stale-but-valid restore is not just correct
+    /// at the `vault-security` level but produces a vault the `storage`
+    /// crate's own API can actually read — mirrors I1's own test shape.
+    /// Exercised fully in `crates/storage/tests/a3_backup_restore.rs`
+    /// (`a_stale_backup_restores_through_storages_own_api_excluding_only_the_later_deleted_note`);
+    /// this comment anchors the cross-crate link for a reader of this file.
+    ///
     /// Final whole-branch review, CRITICAL C1: a backup taken AFTER a
     /// deletion (its own embedded reference already reflects it) must be
     /// restorable. Before the fix, check 2 rejected the WHOLE restore as

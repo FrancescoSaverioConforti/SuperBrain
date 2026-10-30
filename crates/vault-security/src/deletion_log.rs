@@ -232,11 +232,33 @@ pub enum DeletionLogError {
     #[error("deletion log hash chain is broken")]
     ChainBroken,
 
-    /// The trusted reference's generation is strictly behind the log's (or
-    /// behind what a restore is being checked against) — a syntactically
-    /// valid but obsolete reference, per C5 "valido ma obsoleto."
+    /// The trusted reference's generation is strictly BEHIND the LOG's own
+    /// head, inside [`DeletionLog::reconcile`] — the log is the sole writer
+    /// of its own generations, so the log can never legitimately be ahead
+    /// of its own reference; this means the reference (or, equivalently,
+    /// the log) disagrees with itself and cannot be trusted. Distinct from
+    /// [`DeletionLogError::BackupReferenceStale`], which is a DIFFERENT,
+    /// safe-to-proceed-past situation: a BACKUP's own embedded snapshot
+    /// being older than an ALREADY-RECONCILED, trustworthy live state.
+    /// Conflating the two was a real bug (post-N1 follow-up): callers that
+    /// correctly want to tolerate the second case would otherwise also
+    /// tolerate the first, which is the general "the live log/reference
+    /// pair itself disagrees" case C5 requires be fail-closed
+    /// unconditionally.
     #[error("trusted reference is stale: log is at generation {log_generation}, reference at {reference_generation}")]
     ReferenceStale { log_generation: u64, reference_generation: u64 },
+
+    /// [`DeletionLog::verify_safe_to_expose_after_restore`] only: the live
+    /// log/reference pair has already been proven mutually consistent by
+    /// `reconcile` (see that function's own doc comment), and a BACKUP's
+    /// own embedded reference snapshot is simply older than that
+    /// already-trustworthy live state — "valido ma obsoleto" at the
+    /// backup level, not at the live-log level. Safe for a caller to treat
+    /// as "this specific backup's snapshot predates some deletions," never
+    /// as "the live log itself cannot be trusted" ([`DeletionLogError::ReferenceStale`]
+    /// is for that).
+    #[error("backup's own reference snapshot is stale: snapshot is at generation {backup_generation}, live reference at {live_generation}")]
+    BackupReferenceStale { backup_generation: u64, live_generation: u64 },
 
     /// The trusted reference is entirely absent (e.g. at restore time).
     #[error("trusted reference is missing")]
@@ -759,7 +781,14 @@ impl DeletionLog {
     /// the LIVE trusted reference (never the backup's own embedded
     /// snapshot, per C5/the plan's restore rule). Equal or ahead of the
     /// live reference is fine; strictly behind is
-    /// [`DeletionLogError::ReferenceStale`].
+    /// [`DeletionLogError::BackupReferenceStale`] — distinct from
+    /// [`DeletionLogError::ReferenceStale`], which `reconcile` (called
+    /// first, below) would have already returned if the LIVE log/reference
+    /// pair itself disagreed. A caller MUST NOT treat the two the same way:
+    /// `BackupReferenceStale` means only this backup's own snapshot is old
+    /// against an already-trustworthy live state (safe to proceed past,
+    /// e.g. to a per-note exclusion check); `ReferenceStale` means the live
+    /// state itself could not be trusted (never safe to proceed past).
     ///
     /// Final-review re-review, N1: this used to compare
     /// `restored_reference_snapshot` only against whatever
@@ -785,9 +814,9 @@ impl DeletionLog {
         self.reconcile(live_trusted_ref)?;
         let live = live_trusted_ref.read()?.ok_or(DeletionLogError::ReferenceMissing)?;
         if restored_reference_snapshot.generation < live.generation {
-            return Err(DeletionLogError::ReferenceStale {
-                log_generation: restored_reference_snapshot.generation,
-                reference_generation: live.generation,
+            return Err(DeletionLogError::BackupReferenceStale {
+                backup_generation: restored_reference_snapshot.generation,
+                live_generation: live.generation,
             });
         }
         Ok(())
@@ -1258,7 +1287,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn restore_with_a_syntactically_valid_but_lower_generation_reference_is_rejected_as_stale_not_accepted() {
+    fn restore_with_a_syntactically_valid_but_lower_generation_reference_is_reported_as_backup_reference_stale() {
         let dir = tempdir().unwrap();
         let log = open_log(dir.path());
         let live_reference = file_ref(dir.path());
@@ -1271,11 +1300,19 @@ mod tests {
         // The backup's embedded snapshot is from before "note-b" was deleted.
         let restored_snapshot = GenerationRef { generation: 1, chain_hash: "irrelevant-but-present".to_string() };
 
+        // This low-level function still reports the staleness — it is the
+        // CALLER (`backup::restore_with_pii_root`, post-N1 follow-up) that
+        // decides to treat `BackupReferenceStale` specifically as safe to
+        // proceed past (via per-note exclusion), never this function
+        // itself. `BackupReferenceStale`, not `ReferenceStale`: the live
+        // log/reference pair here is mutually consistent (reconcile, run
+        // first inside this call, would accept it) — only the BACKUP's own
+        // snapshot is behind.
         let result = log.verify_safe_to_expose_after_restore(&restored_snapshot, &live_reference);
         assert!(
             matches!(
                 result,
-                Err(DeletionLogError::ReferenceStale { log_generation: 1, reference_generation: 2 })
+                Err(DeletionLogError::BackupReferenceStale { backup_generation: 1, live_generation: 2 })
             ),
             "got {result:?}"
         );
