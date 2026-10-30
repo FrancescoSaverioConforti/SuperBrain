@@ -611,6 +611,56 @@ mod tests {
         assert_eq!(indexer.state_for("note-a"), IndexState::Current, "the fault must not persist beyond the one poisoned call");
     }
 
+    // --- B1 Task 4: log/error-output confidentiality audit, the
+    // poison_next_mark_current-driven half. `poison_next_mark_current` and
+    // `trigram_hits` are #[cfg(test)]-gated, so only a unit test living
+    // INSIDE this crate (here) can reach them — an external integration
+    // test under `crates/index/tests/` cannot (confirmed directly: a probe
+    // call from that directory fails to compile). This test is the
+    // counterpart cross-referenced from
+    // `crates/index/tests/b1_confidentiality_boundary.rs`'s module doc
+    // comment, so a reviewer auditing "is the index surface's
+    // confidentiality story complete" has a pointer to both halves. Per
+    // Task 3's own GO-reviewed finding (restated in the Task 4 brief), a
+    // Sensitive note's `record_bytes` reaching `mark_current` is always the
+    // pointer record, never real content — so this is expected to be
+    // trivially true, but is asserted directly rather than merely inferred,
+    // exactly as Task 4 asks.
+
+    #[test]
+    fn poisoned_mark_current_debug_and_display_output_never_echoes_a_distinctive_marker() {
+        const POINTER_RECORD_MARKER: &str = "DISTINCTIVE-POISONED-PATH-MARKER-must-never-appear-in-any-log-or-error";
+
+        let indexer = RealIndexer::new();
+        indexer.poison_next_mark_current("note-sensitive-poisoned");
+
+        // The pointer-record shape a Sensitive note's record_bytes actually
+        // has on the real write path (per Task 3's finding): the body here
+        // stands in for a pointer string, but even if it held the marker
+        // directly, mark_current's poisoned branch returns `()` with no
+        // error value and no panic — there is nothing for a Debug/Display
+        // impl to even be called on. This test proves that absence of any
+        // observable output, not just the absence of a specific field.
+        let text = note_text("note-sensitive-poisoned", "sensitive", POINTER_RECORD_MARKER);
+        let record_bytes = format!("1\n---\n{text}");
+
+        // Must not panic, and there is no Result/error value returned by
+        // mark_current at all (its signature is `fn mark_current(...)`,
+        // i.e. `-> ()`) for any Debug/Display formatting to have run on in
+        // the first place — the strongest possible form of "no echo".
+        indexer.mark_current("note-sensitive-poisoned", 1, record_bytes.as_bytes());
+
+        assert_eq!(
+            indexer.state_for("note-sensitive-poisoned"),
+            IndexState::Stale,
+            "a poisoned mark_current call must leave the note Stale, with nothing indexed to later echo"
+        );
+        assert!(
+            indexer.trigram_hits(POINTER_RECORD_MARKER).is_empty(),
+            "the poisoned call's marker must never have reached the postings structures either"
+        );
+    }
+
     #[test]
     fn an_indexing_failure_during_mark_current_does_not_fail_the_write_through_propose_and_commit() {
         // The full end-to-end version of the test above: drives the fault
