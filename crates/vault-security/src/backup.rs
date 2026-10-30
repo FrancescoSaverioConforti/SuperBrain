@@ -14,9 +14,14 @@
 //!
 //! 1. [`DeletionLog::verify_safe_to_expose_after_restore`] — the backup's
 //!    own embedded reference snapshot against the LIVE trusted reference.
-//!    This catches a backup blob that is itself stale relative to deletions
-//!    the log already knew about when the backup was taken (Task 5b's
-//!    check, reused verbatim).
+//!    Internally runs `DeletionLog::reconcile` FIRST, so this check only
+//!    ever reports staleness (or anything else) about a live log/reference
+//!    pair that has already been proven mutually consistent. Post-N1
+//!    follow-up: a backup that is merely OLDER than the live state —
+//!    [`DeletionLogError::BackupReferenceStale`] — no longer aborts the
+//!    whole restore; every other failure here (the live log itself
+//!    disagreeing with its own reference, a broken chain, a missing
+//!    reference, or any other inconsistency) still does.
 //! 2. A per-note cross-check: every note id the backup would restore is
 //!    checked against `live_deletion_log.is_deleted(note_id)`. This catches
 //!    what check 1 cannot see: which specific notes the live log reports
@@ -26,17 +31,32 @@
 //!    the whole restore (final whole-branch review, CRITICAL C1: a deletion
 //!    is a tombstone write, so every backup taken after a deletion names
 //!    the deleted note, and the old "reject if any note is deleted" rule
-//!    made such a vault permanently unrestorable). If check 1 fails while
-//!    the snapshot names a deleted note, the refusal is reported as
-//!    [`BackupError::DeletedSinceBackup`], naming those notes.
+//!    made such a vault permanently unrestorable). This cross-check runs
+//!    TWICE: once before check 1 (a best-effort hint used only to choose
+//!    which error to report if check 1 fails for a reason other than mere
+//!    backup staleness), and once again AFTER check 1 has resolved — the
+//!    second run is the ONLY one that ever decides what gets excluded, so a
+//!    deletion landing in the window between the two runs (a real race an
+//!    earlier draft of this fix missed) is still caught, never resurrected.
+//!    If check 1 fails for a reason other than `BackupReferenceStale` while
+//!    the first-pass hint names a deleted note, the refusal is reported as
+//!    [`BackupError::DeletedSinceBackup`] rather than the more generic
+//!    [`BackupError::DeletionLogRejected`] — a label choice only, made
+//!    before anything is written either way.
 //!
 //! Both checks run before ANY byte is written to `destination_root`.
 //! On any ambiguity — an I/O error reading either reference, a corrupt or
-//! tampered reference, a missing live reference — this fails closed
+//! tampered reference, a missing live reference, or the live log itself
+//! disagreeing with its own reference — this fails closed
 //! ([`BackupError::DeletionLogRejected`]) and extracts nothing, per the same
 //! discipline Task 6 arrived at only after several rounds: a destructive or
 //! exposing action is gated on a POSITIVE, VERIFIED "safe," never on a
-//! default taken when something is merely absent or unreadable.
+//! default taken when something is merely absent or unreadable. Only the
+//! narrower, syntactically distinct "this specific backup's own snapshot is
+//! older than an already-trustworthy live state" case is treated
+//! differently, and only because the second, post-check-1 note-level
+//! cross-check is what actually decides exposure in that case, not check 1
+//! itself.
 //!
 //! # Key separation
 //!
@@ -146,15 +166,21 @@ pub enum BackupError {
     #[error("deletion log rejected this restore: {0}")]
     DeletionLogRejected(DeletionLogError),
 
-    /// Check 1 (see module docs) refused this backup — its embedded
-    /// reference is older than the live one, or the live reference cannot
-    /// be verified — AND at least one note in it is deleted in the LIVE
-    /// deletion log, typically because it was deleted after this backup was
-    /// taken. Named explicitly and distinctly from
-    /// [`BackupError::DeletionLogRejected`] so a caller can tell "the
-    /// reference itself is unusable" apart from "specific notes must not be
-    /// exposed." When check 1 passes, deleted notes are instead excluded and
-    /// reported in [`RestoreOutcome::excluded_deleted_note_ids`].
+    /// Check 1 (see module docs) refused this backup for a reason OTHER
+    /// than mere staleness against an already-trustworthy live state (the
+    /// live reference cannot be verified, the live log itself disagrees
+    /// with its own reference, the chain is broken, etc. —
+    /// [`DeletionLogError::BackupReferenceStale`] on its own never produces
+    /// this error; see module docs) — AND at least one note the backup
+    /// would have restored is deleted in the LIVE deletion log, typically
+    /// because it was deleted after this backup was taken. Named
+    /// explicitly and distinctly from [`BackupError::DeletionLogRejected`]
+    /// so a caller can tell "the live state itself is unusable" apart from
+    /// "specific notes must not be exposed." When check 1 passes (either
+    /// outright, or via the `BackupReferenceStale` fall-through), deleted
+    /// notes are instead excluded and reported in
+    /// [`RestoreOutcome::excluded_deleted_note_ids`] on a successful
+    /// restore of everything else.
     #[error("note(s) deleted since this backup was taken must not be exposed by restore: {note_ids:?}")]
     DeletedSinceBackup { note_ids: Vec<String> },
 
@@ -706,17 +732,24 @@ pub(crate) fn restore_with_pii_root(
     // deleted id is correct in both cases: a deleted note has nothing left
     // that a restore should expose.
     //
-    // Check 1 (the backup's embedded reference vs the live reference) is
-    // unchanged and still fails closed on a stale, corrupt, tampered or
-    // missing reference. When it fails AND the snapshot names a deleted
-    // note, the more specific `DeletedSinceBackup { note_ids }` is returned
-    // (unchanged precedence from before this fix); exclusion only applies
-    // once check 1 has passed.
+    // Check 1 (the backup's embedded reference vs the live reference,
+    // below) still fails closed on a corrupt, tampered, or missing
+    // reference, or on the LIVE log disagreeing with its OWN reference —
+    // but, post-N1 follow-up, no longer on mere staleness against an
+    // already-trustworthy live state (`BackupReferenceStale`). When check 1
+    // fails for any OTHER reason AND this early, best-effort hint named a
+    // deleted note, the more specific `DeletedSinceBackup { note_ids }` is
+    // returned instead of the generic `DeletionLogRejected`; exclusion
+    // itself only ever applies once check 1 has passed (outright, or via
+    // the `BackupReferenceStale` fall-through), and is decided by a SECOND,
+    // later recomputation of this same lookup — see that recomputation's
+    // own comment for why.
 
-    // Check 2: which note ids in the snapshot the LIVE log reports deleted.
-    // A note is named here if EITHER its Markdown record (vault_files,
-    // keyed by relative path ending in ".record") OR its PII ciphertext
-    // (pii_files, keyed by bare note id) is present in the snapshot.
+    // Check 2 (part A): the candidate note ids in the snapshot — pure
+    // computation, no I/O, safe to do before check 1. A note is named here
+    // if EITHER its Markdown record (vault_files, keyed by relative path
+    // ending in ".record") OR its PII ciphertext (pii_files, keyed by bare
+    // note id) is present in the snapshot.
     let mut candidate_note_ids: Vec<String> = Vec::new();
     for name in snapshot.vault_files.keys() {
         if let Some(stem) = name.strip_suffix(".record") {
@@ -729,14 +762,24 @@ pub(crate) fn restore_with_pii_root(
     candidate_note_ids.sort();
     candidate_note_ids.dedup();
 
-    let mut deleted_since_backup = Vec::new();
-    for note_id in &candidate_note_ids {
-        // Any error here (I/O failure reading the log) must fail closed:
-        // never treat "couldn't check" as "not deleted."
-        if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
-            deleted_since_backup.push(note_id.clone());
-        }
-    }
+    // Reviewer-found race (post-N1 follow-up to the post-N1 follow-up):
+    // Check 2's actual `is_deleted` LOOKUPS must run AFTER check 1 has
+    // resolved, never before. Before this fix they ran first; a deletion
+    // landing in the gap between this lookup and check 1's own read of the
+    // live reference was invisible to this check, and — once staleness
+    // alone stopped unconditionally blocking the whole restore — nothing
+    // else caught it either, so that note could be written out already
+    // deleted. This is now split in two: `pre_check_1_deleted_hint`, a
+    // best-effort snapshot used ONLY to pick which error variant to report
+    // if check 1 fails for a reason OTHER than `BackupReferenceStale` (an
+    // error-labeling convenience, not a safety decision); and
+    // `deleted_since_backup` (below, after check 1), which is the ONLY list
+    // ever used to decide what gets excluded from the write.
+    let pre_check_1_deleted_hint: Vec<String> = candidate_note_ids
+        .iter()
+        .filter(|note_id| live_deletion_log.is_deleted(note_id).unwrap_or(false))
+        .cloned()
+        .collect();
 
     // Check 1: the backup's OWN embedded reference snapshot against the
     // LIVE trusted reference. Any error here (corrupt, tampered, missing
@@ -807,10 +850,25 @@ pub(crate) fn restore_with_pii_root(
             // The live log/reference pair is trustworthy (reconcile
             // already proved it); only this backup's own snapshot is
             // older. Fall through to exclusion.
-        } else if !deleted_since_backup.is_empty() {
-            return Err(BackupError::DeletedSinceBackup { note_ids: deleted_since_backup });
+        } else if !pre_check_1_deleted_hint.is_empty() {
+            return Err(BackupError::DeletedSinceBackup { note_ids: pre_check_1_deleted_hint });
         } else {
             return Err(BackupError::DeletionLogRejected(e));
+        }
+    }
+
+    // Check 2 (part B): NOW, after check 1 has resolved (reconcile has run
+    // and the live log/reference pair is known trustworthy, or the
+    // sentinel exception applied), compute the REAL exclusion list. This
+    // closes the race above: a deletion that landed anywhere up to and
+    // including check 1 itself is reflected here, because this is the
+    // very last read of the live log before anything is written.
+    let mut deleted_since_backup = Vec::new();
+    for note_id in &candidate_note_ids {
+        // Any error here (I/O failure reading the log) must fail closed:
+        // never treat "couldn't check" as "not deleted."
+        if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
+            deleted_since_backup.push(note_id.clone());
         }
     }
 
@@ -1428,6 +1486,7 @@ mod tests {
             assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
             assert!(outcome.restored_note_ids.is_empty(), "this backup held only the still-pending note-a");
             assert!(destination_untouched || !destination.join("note-a.record").exists(), "note-a must never be exposed, pending or not");
+            assert!(!restored_pii_root.join("note-a.pii").exists(), "note-a's ciphertext must never be exposed, pending or not");
         });
     }
 
@@ -1638,6 +1697,94 @@ mod tests {
         );
         let destination_untouched = !destination.exists() || all_files_under(&destination).is_empty();
         assert!(destination_untouched, "nothing must be written when the live log is untrustworthy, stale backup or not");
+    }
+
+    /// Reviewer-found race (post-N1 follow-up to the post-N1 follow-up):
+    /// `TrustedReferenceStore` wrapper that records a deletion on its FIRST
+    /// `read()` call — which is the very first thing check 1 does inside
+    /// `verify_safe_to_expose_after_restore`/`reconcile`. This simulates a
+    /// deletion landing in the gap between check 2's note-id lookups and
+    /// check 1's own read of the live reference.
+    struct DeleteOnFirstRead<'a> {
+        inner: &'a dyn TrustedReferenceStore,
+        log: &'a DeletionLog,
+        note_id_to_delete: &'a str,
+        fired: std::cell::Cell<bool>,
+    }
+
+    impl<'a> TrustedReferenceStore for DeleteOnFirstRead<'a> {
+        fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
+            if !self.fired.replace(true) {
+                self.log.record_deletion(self.note_id_to_delete, self.inner).unwrap();
+            }
+            self.inner.read()
+        }
+        fn write(&self, r: &GenerationRef) -> Result<(), DeletionLogError> {
+            self.inner.write(r)
+        }
+    }
+
+    /// Reviewer-found race, now fixed: a deletion landing in the window
+    /// between check 2's ORIGINAL note-id lookups and check 1's own read of
+    /// the live reference must still be caught. Before this fix,
+    /// `deleted_since_backup` was computed once, before check 1 ran; a
+    /// deletion racing in after that computation but before (or during)
+    /// check 1 was invisible to it, and — once staleness alone stopped
+    /// unconditionally blocking the whole restore — nothing else caught it,
+    /// so the raced note was written out already deleted. Fixed by
+    /// recomputing the exclusion list AFTER check 1 has resolved, as the
+    /// very last read of the live log before anything is written.
+    #[test]
+    fn a_deletion_racing_in_between_check_2_and_check_1_is_still_caught_not_resurrected() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+        write_file(&vault_root.join("note-b.record"), b"0\n---\nstays valid");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"RACED SECRET MUST NOT RESURFACE", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Backup taken while BOTH notes are still fully valid — no
+        // deletion has happened yet, so this is a sentinel backup, which is
+        // exactly the case where the old code's blanket staleness rejection
+        // used to (incidentally) close this same race window.
+        backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+
+        // An UNRELATED deletion happens first, so the backup is already
+        // provably stale (not the never-deleted sentinel case) by the time
+        // restore runs — forcing execution through the NEW BackupReferenceStale
+        // fall-through path, not the sentinel exception.
+        log.record_deletion("note-unrelated", &reference).unwrap();
+
+        // note-a's deletion races in on check 1's FIRST read of the live
+        // reference — after check 2's original lookups would have already
+        // run, in the pre-fix code.
+        let racer = DeleteOnFirstRead {
+            inner: &reference,
+            log: &log,
+            note_id_to_delete: "note-a",
+            fired: std::cell::Cell::new(false),
+        };
+
+        let destination = dir.path().join("restored");
+        let restored_pii_root = dir.path().join("restored-pii-store");
+        let outcome = restore_with_pii_root(&target, &master_key, &destination, &log, &racer, &restored_pii_root)
+            .expect("the restore itself must still succeed for note-b");
+        assert_eq!(
+            outcome.excluded_deleted_note_ids,
+            vec!["note-a".to_string()],
+            "note-a's race-landed deletion must still be excluded, not resurrected"
+        );
+        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
+        assert!(!destination.join("note-a.record").exists(), "the raced note must never be written");
+        assert!(!restored_pii_root.join("note-a.pii").exists(), "the raced note's ciphertext must never be written");
     }
 
     /// Post-N1 follow-up, requirement 5 ("ripristino effettivo tramite API
