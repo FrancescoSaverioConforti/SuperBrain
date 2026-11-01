@@ -1,0 +1,48 @@
+crates/api/src/lib.rs:55:9: replace <impl std::fmt::Display for ApiError>::fmt -> std::fmt::Result with Ok(Default::default())
+crates/api/src/retrieve.rs:53:13: replace && with || in retrieve
+crates/api/src/retrieve.rs:52:13: replace && with || in retrieve
+crates/api/src/retrieve.rs:51:13: replace && with || in retrieve
+crates/api/src/retrieve.rs:50:13: replace && with || in retrieve
+crates/index/src/bm25.rs:156:35: replace || with && in Bm25Index::query_ranked
+crates/index/src/bm25.rs:163:26: replace / with % in Bm25Index::query_ranked
+crates/index/src/bm25.rs:163:26: replace / with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:32: replace + with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:37: replace * with + in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:37: replace * with / in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:48: replace + with - in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:48: replace + with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:44: replace - with + in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:44: replace - with / in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:62: replace / with % in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:62: replace / with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:52: replace * with + in Bm25Index::query_ranked
+crates/index/src/bm25.rs:180:52: replace * with / in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:58: replace / with % in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:58: replace / with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:38: replace * with + in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:38: replace * with / in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:44: replace * with + in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:44: replace * with / in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:50: replace + with - in Bm25Index::query_ranked
+crates/index/src/bm25.rs:181:50: replace + with * in Bm25Index::query_ranked
+crates/index/src/bm25.rs:186:92: replace > with >= in Bm25Index::query_ranked
+crates/index/src/bm25.rs:202:5: replace idf -> f64 with 1.0
+crates/index/src/bm25.rs:202:27: replace / with * in idf
+crates/index/src/bm25.rs:202:20: replace + with * in idf
+crates/index/src/bm25.rs:202:9: replace - with + in idf
+crates/index/src/bm25.rs:202:9: replace - with / in idf
+crates/index/src/bm25.rs:202:39: replace + with - in idf
+crates/index/src/bm25.rs:202:39: replace + with * in idf
+crates/index/src/document.rs:183:5: replace type_as_str -> &'static str with ""
+crates/index/src/document.rs:183:5: replace type_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:195:5: replace status_as_str -> &'static str with ""
+crates/index/src/document.rs:195:5: replace status_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:206:5: replace trust_as_str -> &'static str with ""
+crates/index/src/document.rs:206:5: replace trust_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:214:5: replace classification_as_str -> &'static str with ""
+crates/index/src/document.rs:214:5: replace classification_as_str -> &'static str with "xyzzy"
+crates/index/src/search.rs:164:9: replace <impl std::fmt::Display for SearchError>::fmt -> std::fmt::Result with Ok(Default::default())
+crates/index/src/search.rs:388:51: replace < with <= in matches_value
+crates/index/src/time_range.rs:49:9: replace <impl std::fmt::Display for TimeResolutionError>::fmt -> std::fmt::Result with Ok(Default::default())
+crates/index/src/trigram.rs:169:21: replace < with == in trigrams_of
+crates/index/src/trigram.rs:169:21: replace < with <= in trigrams_of

@@ -1,0 +1,2 @@
+crates/index/src/bm25.rs:156:35: replace || with && in Bm25Index::query_ranked
+crates/index/src/bm25.rs:186:92: replace > with >= in Bm25Index::query_ranked

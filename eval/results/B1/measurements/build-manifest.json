@@ -1,0 +1,12 @@
+{
+    "core_commit":  "d798c74",
+    "harness_changes":  "authoritative resumable synthetic setup, native process IO, fixed 100-query sample",
+    "binary_sha256":  "DCB3E209AC45866B7200435019C118D4B917F25C0B7CF6F3D261AB709FFF2989",
+    "example_sha256":  "403CDEA5687EF78375C8BFE4D331BC1BED74B23800BEF01A9FFB50F9AC221CF1",
+    "core_indexer_sha256":  "FB291B8D1C8DD842A39EEAA3FD5D05AB548E55B898538C0EF66A430710253E1B",
+    "cargo_lock_sha256":  "E37A47902EC01B2436F0F5BA1BC97B66E81215910456F63AFC4F826FE82534A3",
+    "query_count_authorized":  100,
+    "exact":  40,
+    "bm25":  40,
+    "filtered":  20
+}

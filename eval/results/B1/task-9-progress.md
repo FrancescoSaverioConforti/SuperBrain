@@ -122,3 +122,64 @@ This checkpoint is not final evidence.md and does not declare B1 complete.
 Already-authorized measurements/mutations may continue in the background. Do not
 interpret an unfinished process as completion; inspect exit status and final
 artifacts on resume. Architectural changes and final B1 closure await user ruling.
+
+## Current continuation: post-fix measurements, 2026-11-01
+
+The authorized Important fix is committed as d798c74; related prior hardening and
+diagnostics are separated in c8a1974. Workspace510 Rust tests,5 Python runner
+tests, Clippy and cargo-deny passed. Full post-fix mutation237:177 caught,
+58 unviable,2 independently justified equivalents,0 timeouts; extra read policy2/2.
+
+A reviewed hidden supervisor is now running the100-query sample at every scale,
+serially, without further approvals or Git operations. Current local status:
+.superpowers/sdd/2026-10-30-b1-deterministic-search/perf-postfix/job-status.json.
+The supervisor PID is recorded alongside that file in driver.pid; do not launch a
+second supervisor while it holds coordinator.lock. Before restarting after an
+external kill, inspect native workers to avoid concurrent recovery of one vault.
+
+Two operational harness issues were found and closed before unattended execution:
+PowerShell native stderr under Stop is now handled through Start-Process with
+separate files and explicit ExitCode; and absent synthetic notes are created only
+on typed NotFound, while existing notes require a full authoritative read with
+exact version/content. Other errors fail closed. Native stderr/exit-code smoke
+checks, spaced paths, reducer percentile anchors, missing-data rejection and
+Python-O rejection passed; independent reviewer confirmed GO on these changes.
+
+Post-fix complete actual samples already observed at this checkpoint:
+
+| N | measured queries | rebuild s | populated RSS bytes | P50 ms | P95 ms |
+| --- | --- | --- | --- | --- | --- |
+|100|100|0.029705|13328384|6.563300|24.685700|
+|1000|100|0.360931|52875264|77.206200|287.053300|
+
+The larger scales are still running/queued. No estimate replaces an unmeasured
+value. Differences from historical pilots are not a controlled causal estimate
+of optimization: workload count, cache and competing activity differ. The prior
+Important scalability observations remain recorded; no runtime performance
+optimization or disk-backed index was introduced. B1 remains in progress until
+all four samples and the final numerical review are complete.
+
+### Completed 10,000-note post-fix measurement (2026-11-01)
+
+The third scale has now completed all 100 measurements (40 exact / 40 BM25 /
+20 filtered). Actual rebuild: 17.270152 s; populated process RSS: 412983296
+bytes; RSS baseline: 16736256 bytes; delta: 396247040 bytes; lifetime peak:
+412983296 bytes. Nearest-rank P50: 4285.351800 ms; P95: 16355.083600 ms.
+Completed raw CSV/TSV files for the first three scales are retained under
+measurements/; this remains a partial checkpoint, without the all-scale manifest.
+
+Across the 100 queries, measured wall time totals 630058.9399 ms. Non-overlapping
+phase totals are candidate generation 632.9751 ms (0.100%), authoritative
+Vault::read_note 614559.0314 ms (97.540%), revalidation 12868.6833 ms (2.042%),
+and response construction 1510.1431 ms (0.240%). Remaining timer/other overhead
+is approximately 488.1070 ms (0.077%). Percentages use aggregate wall time,
+not a decomposition of the P95 query.
+
+This is a significant observed scalability limitation: retrieval at this scale
+already takes seconds, and authoritative reads dominate measured query time.
+The phase timer includes the entire authoritative read path; it does not isolate
+SQL, filesystem, integrity checks or locking. A source inspection hypothesis
+about repeated journal lookups is not a measured causal attribution. No storage
+optimization, architectural redesign or persistent index has been introduced.
+N=100,000 is running; its rebuild/RSS/percentiles remain unmeasured until actual
+artifacts complete. No extrapolation is reported as measurement.

@@ -1,0 +1,101 @@
+category	query	type_filter	date_field	start	end
+exact	bench-note-000448				
+exact	bench-note-000904				
+bm25	file network				
+bm25	or repository. handler does				
+filtered	reads. lookups	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000214				
+exact	bench-note-000436				
+bm25	common before The and				
+bm25	test_847 derived not				
+filtered	before parsing range.	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000096				
+exact	bench-note-000450				
+bm25	range. reduce				
+bm25	and query documents Decision				
+filtered	review checks rolled	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000146				
+exact	bench-note-000557				
+bm25	work The timeout. can				
+bm25	deterministic request_424 result				
+filtered	review can an Method:	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000441				
+exact	bench-note-000020				
+bm25	committed rollback.				
+bm25	a Memory required				
+filtered	derived timeout.	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000246				
+exact	bench-note-000585				
+bm25	validation validation experiment_295 keeps				
+bm25	request_12 rare and				
+filtered	Alternatives this verifies	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000293				
+exact	bench-note-000866				
+bm25	and sampled derived lookups				
+bm25	Method: reproducible limits answers				
+filtered	evaluate checks deployment	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000997				
+exact	bench-note-000360				
+bm25	enabling back.				
+bm25	test_59 Memory availability				
+filtered	populate then parsing	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000674				
+exact	bench-note-000221				
+bm25	can Additional				
+bm25	before network limits transient				
+filtered	separates pattern_894 not	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000854				
+exact	bench-note-000963				
+bm25	database does				
+bm25	and cost.				
+filtered	only access.	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000033				
+exact	bench-note-000141				
+bm25	enabling read sampled cancellation				
+bm25	rebuild storage				
+filtered	pattern_802 Memory	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000749				
+exact	bench-note-000270				
+bm25	sampled checks dependencies.				
+bm25	keeps answers repository.				
+filtered	limits and considered:	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000657				
+exact	bench-note-000186				
+bm25	Pattern latency common				
+bm25	checks rolled project				
+filtered	result followup_687 derived Additional	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000571				
+exact	bench-note-000946				
+bm25	request_936 task Implementation validation.				
+bm25	parser_198 explicit				
+filtered	environment back.	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000608				
+exact	bench-note-000473				
+bm25	the corpus sizes. with				
+bm25	task_81 and deployment documents				
+filtered	and separate	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000304				
+exact	bench-note-000701				
+bm25	keeps time a and				
+bm25	this across				
+filtered	rebuild. retries	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000353				
+exact	bench-note-000965				
+bm25	then The parsing				
+bm25	can Request				
+filtered	and Pattern use	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000855				
+exact	bench-note-000092				
+bm25	observation new				
+bm25	identifiers test_771 distinguishes				
+filtered	migration storage required and	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000865				
+exact	bench-note-000534				
+bm25	observation repeated				
+bm25	cancellation configuration				
+filtered	from database handler is	bug	created_at	2026-05-01	2026-09-01
+exact	bench-note-000136				
+exact	bench-note-000256				
+bm25	Alternatives this cost. Followup				
+bm25	populate Decision observation Followup				
+filtered	compares transaction	bug	created_at	2026-05-01	2026-09-01

@@ -144,3 +144,25 @@ complete CSV results; N=100,000 has only incomplete setup/corpus output, no
 rebuild/latency summary. The old process session19915 no longer exists. Final
 post-fix scalability measurements and remaining whole-B1 evidence must still be
 completed before closing B1. No merge, tag or push performed.
+
+## Follow-on Task 9 execution (2026-11-01)
+
+The full post-fix index+api mutation run has completed:237 considered,177 caught,
+58 unviable,2 equivalent,0 timeouts. The additional read-policy pass caught both
+mutants. See mutation-triage.md and the committed relative-source lists. These
+supersede the earlier pre-fix mutation totals for the current core.
+
+The benchmark is now supervised automatically with the core from d798c74 and a
+separately reviewed resumable fixture harness. It serializes scale runs, checks
+the executable SHA256, separates native stdout/stderr, rejects native failures,
+and validates all four actual100-query samples before publishing the aggregate.
+The exact count is40 exact/40 BM25/20 filtered at each scale. Python optimization
+cannot disable validation. No Git operation is performed by the measurement job.
+
+This is still NOT a claim that B1 or the original full protocol is complete.
+Current progress is in the local ignored perf-postfix/job-status.json; process
+logs and partial latency CSVs remain available while a scale runs. The supervisor
+updates status at stage boundaries; raw process stderr/CSV shows in-stage progress.
+Final artifacts will appear under eval/results/B1/measurements only as measured
+results, with a manifest flag explicitly denying execution of the original full
+N-dependent protocol. Final independent numerical review remains required.

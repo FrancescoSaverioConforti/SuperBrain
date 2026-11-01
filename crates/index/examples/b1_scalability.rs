@@ -1,5 +1,5 @@
 //! Task 9 protocol runner, not runtime search code. Never reads eval labels.
-//! Usage: b1_scalability N output-directory [query-limit; default 100].
+//! Usage: b1_scalability N output-directory [query-limit; default 100] [synthetic-vault-root].
 //! Authorized deviation: 100 queries/scale, exactly 40 exact/40 BM25/20 filtered.
 //! The original N-dependent full protocol is NOT claimed as executed.
 use chrono::NaiveDate;
@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
-use storage::{Vault, Version};
+use storage::{NoteId, StorageError, Vault, Version};
 use uuid::Uuid;
 
 const SEED: u64 = 0xB1_2026_1030;
@@ -115,7 +115,9 @@ fn main() {
         .filter(|_| !wait)
         .map(|s| s.parse().unwrap())
         .unwrap_or(100);
-    let root = std::env::temp_dir().join(format!("superbrain-b1-scale-{n}-{}", Uuid::new_v4()));
+    let root = args.get(4).map(PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("superbrain-b1-scale-{n}-{}", Uuid::new_v4()))
+    });
     fs::create_dir_all(&root).unwrap();
     // Setup is not timed. Public sanctioned writes only; a non-git vault keeps
     // durable JournalCommitted content with explicit GitPending outcomes. This
@@ -128,27 +130,45 @@ fn main() {
     let mut vocabulary = Vec::new();
     let empty = HashSet::new();
     let pending = HashSet::new();
+    let setup = Instant::now();
     for i in 0..n {
         let (text, body) = note(i);
         vocabulary.extend(body.split_whitespace().map(str::to_owned));
         writeln!(corpus, "{}\n{}", text.len(), text).unwrap();
-        let result = storage::propose_and_commit(
-            &vault,
-            &text,
-            Version(0),
-            Uuid::new_v4(),
-            &empty,
-            &pending,
-            &gate,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(result, storage::CommitResult::GitPending { .. }));
+        let id = NoteId::parse(&format!("bench-note-{i:06}")).unwrap();
+        match vault.read_note(&id) {
+            Err(StorageError::NotFound { .. }) => {
+                let result = storage::propose_and_commit(
+                    &vault,
+                    &text,
+                    Version(0),
+                    Uuid::new_v4(),
+                    &empty,
+                    &pending,
+                    &gate,
+                    None,
+                )
+                .unwrap();
+                assert!(matches!(result, storage::CommitResult::GitPending { .. }));
+            }
+            Ok(record) => {
+                // Resume only identical deterministic synthetic records,
+                // confirmed through the authoritative gates; never raw SQL.
+                assert_eq!(record.version, Version(1));
+                assert_eq!(record.content, text, "existing synthetic corpus differs");
+            }
+            Err(error) => panic!("synthetic fixture cannot be authoritatively read: {error}"),
+        }
         if (i + 1) % 1000 == 0 {
-            eprintln!("{n}: populated {}", i + 1);
+            eprintln!(
+                "{n}: populated/verified {} in {:.1}s",
+                i + 1,
+                setup.elapsed().as_secs_f64()
+            );
         }
     }
     corpus.flush().unwrap();
+    assert_eq!(vault.list_note_ids().unwrap().len(), n);
     let mut rng = SEED;
     let mut queries = Vec::new();
     // Authorized fixed-size stratified sample, deterministically selected.
@@ -207,7 +227,7 @@ fn main() {
         after.0, after.1
     );
     if wait {
-        eprintln!("{n}: rebuild complete; enter measured query limit (0 = full protocol)");
+        eprintln!("{n}: rebuild complete; enter measured query limit (0 = all generated queries, authorized 100-query sample)");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();
         limit = line.trim().parse().expect("explicit query limit required");
