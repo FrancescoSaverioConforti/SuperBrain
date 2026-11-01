@@ -193,3 +193,29 @@ is 16155.7740 ms. Ranked and filtered queries fan out to 2,500-10,000 reads.
 These measured differences explain why the mixed P95 is poor while exact lookup
 remains much faster. They do not bypass or justify weakening authoritative gates.
 The fourth scale and final whole-B1 review remain pending.
+
+## Independent whole-branch review: NO-GO (2026-11-01)
+
+The reviewer confirmed a new Important, B1-SEC-001: `created`, `updated` and
+`event_period` only require String values in the domain schema, while the plan
+assumes date-shaped values cannot carry identifying free text. A minimal
+reproduction for each field passes schema and the real gate and makes a canary
+searchable in both indices for a Sensitive pointer record. The implemented field
+list matches the approved plan; the faulty security premise requires an explicit
+decision about validation/legacy values or restricting the search surface.
+No fix or spec change was applied. See evidence.md and the retained standalone
+sensitive-date-metadata-repro.rs. The concurrency fix remains approved; the
+reviewer found no additional coordinator/lock/gate/API/C4 regression.
+
+Per Task9Step4, stop for this new Important rather than make an autonomous
+architectural decision. Task9/B1 remain open; evidence.md records NO-GO and
+separates the security blocker from B1-PERF-001. The optimization proposal under
+docs/superpowers/plans/2026-11-01-b1-search-performance-proposal.md is unapproved
+and implements nothing.
+
+The existing N=100,000 supervisor5500/native30872 continues unchanged. Snapshot
+at 15:22 Europe/Rome:17/100 actual queries completed (8 exact/6 BM25/3 filtered),
+rebuild log1454.158s, populated RSS3727187968 bytes, peak3729625088 bytes. Raw
+partial latency/log snapshots are retained separately; no full-sample P50/P95,
+baseline/delta or fourth-scale numeric PASS is asserted. No second supervisor,
+interruption, runtime optimization, canonical-spec change, merge, tag or push.

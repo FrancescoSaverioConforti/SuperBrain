@@ -14,6 +14,13 @@ The current partial checkpoint includes actual raw samples for N=100, 1,000 and
 10,000, plus the executable/source build hashes. N=100,000 remains in progress.
 There is deliberately no completed all-scale manifest or aggregate CSV yet.
 
+`latencies-100000.partial.csv` and `rebuild-100000.partial.log` are a historical
+15:22 Europe/Rome checkpoint on 2026-11-01, with 17 completed queries and a
+completed rebuild. They are not the completed 100-query input expected by the
+reducer. The existing job continues independently. Final B1 review returned
+NO-GO for a separate Sensitive-metadata finding; this does not stop or change the
+authorized benchmark. See ../evidence.md for scope and outstanding numeric audit.
+
 The local supervisor configuration/status/logs are under:
 
 ```text

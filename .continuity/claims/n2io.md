@@ -44,3 +44,16 @@ close n2io wholesale: embedding, summary, attachment and cache remain open for
 future phases, and future API/transport wrappers must preserve the audited core
 behavior. Direct retrieve legitimately retains full pointer-record frontmatter;
 this search-only allowlist does not impose new retrieve redaction.
+
+## Qualification — final B1 review (2026-11-01)
+
+Status remains open. The previous body/source/relations exclusion checks still
+pass, but the final independent review confirmed Important B1-SEC-001: arbitrary
+String values in created/updated/event_period pass schema and gate and enter
+Sensitive searchable text. The approved allowlist's assumption that these fields
+are constrained dates is not enforced. A standalone schema/gate/Document/index
+reproduction is retained in eval/results/B1/sensitive-date-metadata-repro.rs;
+the scope and NO-GO verdict are in eval/results/B1/evidence.md. No claim of full
+metadata confidentiality closure is made. Validation/legacy-value handling or
+a narrower Sensitive search surface requires an explicit decision; no fix or
+canonical-spec amendment was applied.
