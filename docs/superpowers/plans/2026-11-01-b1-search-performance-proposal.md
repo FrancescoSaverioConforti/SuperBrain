@@ -7,9 +7,10 @@ write path. Final B1 benchmark/review status is recorded in
 `eval/results/B1/evidence.md`, not inferred from this proposal.
 
 The final whole-branch review found Important B1-SEC-001 (unvalidated free-text
-date values in Sensitive searchable metadata). B1 closure is NO-GO pending an
-explicit security-contract decision. Resolve/review that issue before applying
-performance changes; this proposal neither resolves nor accepts that risk.
+date values in Sensitive searchable metadata). A separate user-authorized fix
+at `3c6b1bb` excludes those fields from Sensitive text and validates their filter
+representations; independent re-review is GO. That security fix implements no
+performance optimization. Benchmark completion and B1 closure remain distinct.
 
 ## Measured problem
 
@@ -19,8 +20,11 @@ The completed post-fix N=10,000 sample has 100 queries, split 40 exact / 40 BM25
 P95 is 16155.7740 ms. Ranked/filtered queries perform 2,500–10,000 authoritative
 reads. The read phase consumes 614559.0314 of 630058.9399 ms (97.539927%).
 This is an observed fan-out problem; the timer includes all of `Vault::read_note`,
-not just disk I/O. N=100,000 remains in progress when this proposal is drafted;
-its complete percentiles must not be guessed.
+not just disk I/O. The N=100,000 run was intentionally interrupted after 19
+queries when residual cost became disproportionate. One measured query used
+100,000 reads and took 2416827.1975 ms (about 40 minutes); complete-sample
+percentiles are unavailable. All these measurements are from `d798c74`, before
+the temporal fix, and are not final-core performance results.
 
 `candidate_ids` unions all exact and positive BM25 candidates, without a k cap.
 `search` reads each candidate, reconstructs the current allowlisted Document,

@@ -219,3 +219,44 @@ rebuild log1454.158s, populated RSS3727187968 bytes, peak3729625088 bytes. Raw
 partial latency/log snapshots are retained separately; no full-sample P50/P95,
 baseline/delta or fourth-scale numeric PASS is asserted. No second supervisor,
 interruption, runtime optimization, canonical-spec change, merge, tag or push.
+
+## Current status — authorized temporal fix and interrupted benchmark
+
+The user resolved B1-SEC-001 by excluding all temporal fields from Sensitive
+postings text, including valid dates, and retaining C4 only through validated
+structured representations. Fix commit **3c6b1bb** changes Document fields to
+optional validated instants/event point-or-interval values and makes search
+filter those values directly. Invalid temporal strings are not retained in a
+Sensitive Document/Debug/text; no malformed-value fallback, schema/storage
+change, performance optimization or spec amendment is included.
+
+Actual TDD: one unit RED (`created trigram marker leak`) and three production
+search RED failures before the fix; then GREEN. Eight added tests include both
+postings, valid C4, malformed/calendar/interval handling, live update/repeated
+rebuild, paused-index Internal -> Sensitive and a deterministic barrier race
+between stale Internal rebuild v1 and Sensitive live v2. Existing exclusions and
+version/coordinator gates remain intact. Workspace **518/0/0** default parallel;
+Clippy clean, Cargo Deny all categories OK with existing warnings. Targeted
+mutations **77:65 caught/12 unviable/0 missed/timeouts, exit0**. Independent
+review **GO**, no Critical/Important residual in the authorized scope; reviewer
+personally passed index84+6+31, API11 and Clippy. See temporal-metadata-fix.md.
+
+The user also authorized assessing a controlled interruption. At
+2026-11-01T14:52:54Z the sole worker was stopped after verified completed setup/
+rebuild, in the source-verified read-only search phase; the supervisor exited
+through native nonzero-exit handling. No fixture write was in flight, no vault
+deletion/repair/restart or second supervisor. The native stop status is preserved;
+job-status.json now records intentional interruption. Neither process is active.
+
+All **19** complete rows are retained in measurements/latencies-100000.interrupted.csv,
+indices0–18, mix8 exact/8 BM25/3 filtered. Independent partial numeric audit PASS;
+max query17=2416827.1975ms with100000 reads. Actual rebuild log1454.158s,
+RSS3727187968 bytes, peak3729625088 bytes; baseline/delta and full100-query
+P50/P95 unavailable. Unfinished query19 is discarded, never estimated. Generated
+queries and corpus/build hashes are retained. All scalability data are core
+d798c74, before the temporal fix; no final-core performance claim is made.
+
+The security NO-GO is resolved for the authorized fix. **Task9/B1 closure remains
+open** because the100-query N=100,000 sample is incomplete; the intentional stop
+is documented without claiming the protocol ran in full. B1-PERF-001 stays open,
+with the separate unimplemented optimization proposal. No merge, tag or push.

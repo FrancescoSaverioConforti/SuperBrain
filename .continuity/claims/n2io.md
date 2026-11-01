@@ -57,3 +57,19 @@ the scope and NO-GO verdict are in eval/results/B1/evidence.md. No claim of full
 metadata confidentiality closure is made. Validation/legacy-value handling or
 a narrower Sensitive search surface requires an explicit decision; no fix or
 canonical-spec amendment was applied.
+
+## Authorized temporal-surface fix — 2026-11-01
+
+B1-SEC-001 is fixed at 3c6b1bb after the explicit user ruling: Sensitive created,
+updated and event_period values never enter postings/search text, even when
+valid. C4 consumes validated optional dates/instants and event point/interval
+representations; invalid fields become None with no text or Debug fallback.
+Storage/domain schema and direct retrieve are unchanged. Body/source/relations
+exclusions remain covered. Eight new regressions include live writes, rebuild,
+current reclassification and a barrier-controlled stale Internal rebuild racing
+Sensitive v2 in both postings. Workspace 518/0/0, Clippy/Deny pass; targeted
+mutations 77 (65 caught, 12 unviable, 0 missed/timeouts); independent re-review GO.
+See eval/results/B1/temporal-metadata-fix.md. This supersedes the prior open-date
+qualification only, not the overall status: embedding/summary/attachment/cache
+and future wrappers remain open. No claim that arbitrary non-temporal identifiers
+cannot contain identifying text; no canonical-spec amendment or performance fix.

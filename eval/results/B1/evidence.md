@@ -1,11 +1,12 @@
 # B1 — deterministic retrieval evidence
 
-**Verdict at this checkpoint: NO-GO. Task 9 remains open.** Final independent
-whole-branch review confirmed a new Important Sensitive-metadata issue requiring
-a user decision (B1-SEC-001 below). The approved plan requires stopping rather
-than fixing a new architectural finding autonomously. N=100,000 is still running
-unchanged; its complete numeric review is pending. This is not a merge
-authorization or a claim that the original benchmark protocol was executed.
+**GO on the authorized B1-SEC-001 fix; Task 9/B1 closure remains open.** The user
+resolved the Sensitive temporal-metadata decision, the fix is committed as
+`3c6b1bb`, and independent re-review reports no residual Critical/Important within
+scope. N=100,000 was intentionally interrupted after 19 complete queries under
+the user's cost-assessment authorization. The interrupted evidence is audited,
+but the approved 100-query sample is not complete. No full-sample percentiles,
+protocol-completion claim, merge authorization or unilateral B1 closure follows.
 
 ## Scope and implementation
 
@@ -29,13 +30,15 @@ Tasks 0–4. The implementation/review record is:
 | Mutation hardening and opt-in four-phase diagnostics | c8a1974 | [Mutation triage](mutation-triage.md) |
 | Authorized rebuild/live ordering fix | d798c74 | [Coordination fix](coordination-fix.md) |
 | Resumable measurement tooling and first-three-scale audit | 75abcb4, 5080a41 | [Checkpoint](task-9-progress.md), [raw measurements](measurements/README.md) |
+| Sensitive temporal text exclusion and validated filter metadata | 3c6b1bb | [Temporal fix](temporal-metadata-fix.md) |
 
 All task reviews were independent of implementation. The fresh whole-branch
 review found the rebuild/live race, reproduced it through public APIs and stopped
 for the user's architectural ruling. After explicit authorization, the fix went
-through deterministic TDD and independent re-review. Final closing review returns
-NO-GO on the new B1-SEC-001 below; earlier GO on the concurrency fix is not a
-whole-B1 closure. The fourth-scale numeric audit is still pending.
+through deterministic TDD and independent re-review. Closing review then found
+B1-SEC-001 and returned NO-GO. After the user's explicit temporal-surface ruling,
+the new fix also passed TDD and independent re-review: GO, no new Critical/Important.
+The interrupted fourth-scale numeric evidence is verified as partial only.
 
 ## Architecture, safety and result contracts
 
@@ -59,6 +62,9 @@ whole-B1 closure. The fourth-scale numeric audit is still pending.
   No global cross-note snapshot or complete/current candidate-set claim is made.
 - Sensitive body, source and relation targets are excluded from postings/search
   responses and diagnostic formatting; current reclassification is reapplied.
+  Created/updated/event-period fields are also excluded from Sensitive text,
+  including valid values. Document stores validated optional dates/instants and
+  point/nonempty intervals for C4; invalid values become None without text fallback.
   Deleted/missing/inconsistent candidates are excluded. Operational/gate failures
   return sanitized `ReadUnavailable`, rather than successful `NotPresent`.
 - Active-project scoping is default; explicit other-project requests are visible
@@ -76,24 +82,26 @@ whole-B1 closure. The fourth-scale numeric audit is still pending.
 The exact partial `[n2io]` text was checked against handoff section 8 before being
 recorded. Postings/log and core SearchResponse surfaces are audited; the overall
 claim remains open. Those audits cover the tested body/source/relations
-exclusions; B1-SEC-001 leaves allowed date metadata unresolved. Embedding,
+exclusions and the new temporal-field regressions; B1-SEC-001 is closed within
+its authorized search-surface scope. Embedding,
 summary, attachment and cache also remain open for future phases.
 SEC-001/002/003 remain deferred as documented. `docs/Spec_mvp.md` is unchanged.
 
 ## Verification of the final runtime core
 
-At runtime commit `d798c74`:
+At patched runtime commit `3c6b1bb` (historical full mutation results separately labelled):
 
 | Check | Actual outcome |
 | --- | --- |
-| `cargo test --workspace` | 510 passed, 0 failed, 0 ignored, default parallel run |
-| Deterministic coordination tests | 12 passed; first eight reproduced old failures RED before fix |
+| `cargo test --workspace --locked --quiet` | 518 passed, 0 failed, 0 ignored, default parallel run |
+| Deterministic coordination tests | 13 passed, including temporal-marker race; first eight originally RED before coordination fix |
 | `cargo clippy --workspace --locked -- -D warnings` | clean |
 | `cargo deny check --hide-inclusion-graph` | advisories/bans/licenses/sources OK; existing duplicate/unused-allowance warnings |
 | Evaluation runner tests | 5 passed |
-| Full post-fix index+api mutation pass | 237: 177 caught, 58 unviable, 2 equivalent, 0 timeouts |
-| Targeted coordinator mutation pass | 35: 24 caught, 11 unviable, 0 missed/timeouts |
+| Full index+api mutation pass at earlier d798c74 | 237: 177 caught, 58 unviable, 2 equivalent, 0 timeouts |
+| Targeted coordinator mutation pass at earlier d798c74 | 35: 24 caught, 11 unviable, 0 missed/timeouts |
 | Additional ReadPolicy mutation pass | 2 caught of 2 |
+| Targeted temporal-fix mutation pass at 3c6b1bb | 77: 65 caught, 12 unviable, 0 missed/timeouts, exit0 |
 
 The two full-pass survivors are explicitly justified equivalent BM25 mutations,
 not hidden failures: the empty query/corpus shortcut and accepting zero scores
@@ -107,8 +115,9 @@ interleavings and the final runs have no timeouts.
 Earlier default-parallel workspace runs hit pre-existing restore/deletion
 `ReferenceCorrupt` scheduling flakes. The named failures and serial successful
 rerun are retained in Task 7; storage recovery/restore were not changed to hide
-them. The final default-parallel 510-test run passed. Later changes affect only
-benchmark harness, tooling and evidence, not the verified runtime core.
+them. Both the previous 510-test run and patched default-parallel 518-test run
+passed. The temporal fix adds eight tests, preserves the storage gates and
+coordinator protocol, and is not a performance optimization.
 
 ## Authorized scalability measurements
 
@@ -126,12 +135,16 @@ authoritative existing-record checks in an isolated non-git synthetic vault;
 outside rebuild/search measurements. Original historical pilots remain separate
 and are not a controlled A/B performance comparison.
 
+All measurement rows below belong to core `d798c74`, before the temporal fix.
+No scalability measurement of final core `3c6b1bb` is claimed. Moving date parsing
+into Document is not assumed performance-neutral or credited with an improvement.
+
 | Notes | Actual queries | Rebuild s | Populated RSS bytes | RSS delta bytes | P50 ms | P95 ms |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 100 | 100 | 0.029705 | 13328384 | 4370432 | 6.563300 | 24.685700 |
 | 1000 | 100 | 0.360931 | 52875264 | 43458560 | 77.206200 | 287.053300 |
 | 10000 | 100 | 17.270152 | 412983296 | 396247040 | 4285.351800 | 16355.083600 |
-| 100000 | 17/100, partial snapshot | 1454.158 (rounded log) | 3727187968 (log) | unavailable | not measured completely | not measured completely |
+| 100000 | 19/100, interrupted | 1454.158 (rounded log) | 3727187968 (log) | unavailable | not measured completely | not measured completely |
 
 RSS/peak are process working set/lifetime high-water marks; delta is approximate
 attribution, not isolated index allocator usage. Raw data retains baselines/peaks.
@@ -144,22 +157,24 @@ checks query composition, finite/non-overlapping times, counters, nearest-rank
 percentiles and memory consistency. The original protocol flag stays false.
 
 Independent numerical review of the first three completed samples: PASS.
-Final fourth-scale review remains pending. The 2026-11-01 15:22 Europe/Rome
-snapshot has rows 0–16 only: 8 exact / 6 BM25 / 3 filtered, not the authorized
-completed 40/40/20 sample. Populated lifetime peak in the actual rebuild log is
-3729625088 bytes. The longest completed query in that snapshot took
-2061965.7653 ms and performed 100000 authoritative reads. These observations
-are actual but partial; there is no completed-sample percentile or RSS baseline/
-delta for N=100,000 yet. The native worker/supervisor remain active; the benchmark
-has neither failed nor been interrupted at this checkpoint. See the retained
-`latencies-100000.partial.csv`, `rebuild-100000.partial.log` and
-[measurement scope](measurements/README.md). Live files may subsequently advance;
-the partial snapshot is not substituted for the completed reducer input.
+The interrupted fourth-scale evidence also passed independent numeric audit,
+as partial data only: 19 rows 0–18, mix 8 exact / 8 BM25 / 3 filtered, finite times,
+phase budgets and counters coherent. At 2026-11-01T14:52:54Z the sole worker was
+stopped after verified completed setup/rebuild, in its read-only query phase,
+under the user's cost-assessment authorization. The supervisor exited through
+native nonzero-exit handling. There was no second supervisor, restart, fixture
+deletion/repair or storage mutation; the vault is retained. The unfinished query
+19 has no recorded time and is excluded. No process remains active.
 
-Independent partial-snapshot audit: PASS for row indices/composition, finite
-non-overlapping phase times and count consistency, without asserting completion
-of the authorized sample. Snapshot SHA256:
-`922dccdc357b89d75b88b7159ea736d4226571d426223346345203dd750acfd8`.
+Actual populated lifetime peak is 3729625088 bytes (log). The longest complete
+query, index 17, took 2416827.1975 ms with 100000 reads. RSS baseline/delta and the
+100-query P50/P95 are unavailable, not estimated. See
+`latencies-100000.interrupted.csv`, `benchmark-outcome.json` and
+[measurement scope](measurements/README.md). Final interrupted CSV SHA256:
+`0329b1d577c9488d75983d346b914ad07c710dadd57296dd16c7d69f41191f51`.
+The previous 17-row snapshot remains historical evidence, not reducer input.
+Neither interrupted file substitutes for the missing full-sample summary or
+creates an all-scale completion manifest.
 
 ## Open finding B1-PERF-001 — authoritative-read fan-out
 
@@ -179,8 +194,10 @@ Total wall time is 630058.9399 ms. These are aggregate phase shares, not a
 decomposition of the P95 query. The timer includes journal, locks, integrity,
 classification/deletion gates and I/O; a journal-scan hypothesis is not a measured
 causal attribution. This is a significant observed sustainability limit, not
-an authorization to weaken gates or persist the index. N=100,000 findings must
-be added only after actual completion/failure/interruption data are collected.
+an authorization to weaken gates or persist the index. At N=100,000 the 19
+completed rows include broad queries with 100000 authoritative reads; one took
+2416827.1975 ms (about 40 minutes). This is actual interrupted-run evidence,
+not a complete-sample percentile or a prediction of unmeasured queries.
 
 The separate [optimization proposal](../../../docs/superpowers/plans/2026-11-01-b1-search-performance-proposal.md)
 describes attribution, conservative version-safe pruning, exact ranking proof
@@ -188,16 +205,17 @@ obligations and optional storage-owned batching. It requires separate approval
 and implements nothing. No arbitrary top-k candidate cap, stale-metadata filter,
 gate cache, persistent index or automatic architectural optimization is applied.
 
-## Blocking finding B1-SEC-001 — free text in Sensitive date metadata
+## Closed finding B1-SEC-001 — free text in Sensitive date metadata
 
-**Important, open; decision required.** The approved plan's allowlist is
-implemented as written, but its safety premise is false for the current schema.
+**Important, fixed at `3c6b1bb` after explicit user ruling; independent GO.**
+The original approved allowlist was implemented as written, but its safety
+premise was false for the current schema.
 Plan lines 24–25 claim the ten fields cannot carry free text, unlike `source`.
 `domain::parse_frontmatter` (`crates/domain/src/note.rs`, lines 123–125) only
 requires Strings for `created`, `updated` and `event_period`; it does not enforce
-date syntax. `Document::structured_fields_as_text` indexes these values verbatim,
-and Sensitive search uses that text in its excerpt. Arbitrary identifying text
-can therefore be discoverable under these ostensibly constrained fields.
+date syntax. The old Document indexed these values verbatim, and Sensitive
+search used that text in its excerpt. Arbitrary identifying text was therefore
+discoverable under these ostensibly constrained fields.
 
 The independent reviewer ran a minimal reproduction for each of the three
 fields using actual domain parsing, `Gate::evaluate`, a Sensitive pointer record,
@@ -213,28 +231,37 @@ encrypted-store commit reproduction: the minimal harness describes store
 availability to the real gate and constructs the pointer record directly.
 Source is retained in [sensitive-date-metadata-repro.rs](sensitive-date-metadata-repro.rs).
 It is a standalone diagnostic, not a newly installed workspace test or fix.
-To rerun, create an external temporary Cargo binary with this file as main.rs
-and path dependencies on this checkout's domain, index, storage, policy and
-vault-security crates; no benchmark vault access is needed.
+To reproduce the old finding, create an external temporary Cargo binary with
+this file as main.rs and path dependencies on domain/index/storage/policy/
+vault-security from pre-fix `338fbf1`. Its canary-presence assertion intentionally
+fails against the patched implementation. No benchmark vault access is needed.
 
-The schema permissiveness predates B1; indexing it exposes the unsound allowlist
-premise. The existing twelve-field exclusion tests did not exercise this input
-class. Resolving it requires an explicit decision about validating/handling
-legacy date values or restricting/sanitizing the Sensitive searchable surface.
-Project/identifier text assumptions should be assessed in that decision rather
-than automatically claimed safe. No broader schema change, migration, index fix,
-specification amendment or acceptance of this residual risk is inferred here.
+The schema permissiveness predates B1; indexing exposed the unsound allowlist
+premise. The original twelve-field tests did not exercise this input class.
+The user chose filter-only structured temporal values for Sensitive rather than
+a domain-schema migration. Eight added tests cover both postings, valid C4,
+invalid values, reclassification, live updates and a barrier-controlled stale
+rebuild. 518 workspace tests and 77 targeted mutants passed as documented above.
+Independent re-review: GO, no new Critical/Important. See
+[temporal-metadata-fix.md](temporal-metadata-fix.md). Other allowlisted fields
+retain approved behavior; this narrow fix does not assert that arbitrary
+project/identifier strings cannot contain identifying text. No broader schema
+change, migration or canonical-spec amendment was introduced.
 
 ## Closing review and verdict
 
-**NO-GO for B1 closure at this checkpoint.** The final independent whole-branch
-review found B1-SEC-001 and the approved plan's stop rule applies before an
-autonomous architectural fix. The previously authorized concurrency fix remains
-approved; no new concurrency finding was reported. B1-PERF-001 remains open and
-has a separate unimplemented optimization proposal.
+**Independent technical review: GO on the authorized fix and branch re-review,
+no residual Critical/Important within scope.** The previous security NO-GO is
+resolved by the explicit user decision and `3c6b1bb`. The reviewer personally
+passed 84 index unit + 6 confidentiality + 31 search + 11 API and Clippy, and
+audited all 19 interrupted rows. Targeted mutations: 77 tested, 65 caught,
+12 unviable, 0 missed/timeouts. The full workspace passed 518/0/0.
+No new concurrency finding was reported.
 
-Task 9 is not complete. The N=100,000 process continues under the existing
-supervisor, unchanged; full-sample measurement and final numeric audit remain
-pending. This verdict does not assert the benchmark failed or authorize stopping
-it. Only actual completed/partial observations are recorded. No merge, tag or
-push has been performed, and the canonical specification is unchanged.
+**Task 9/B1 closure remains open:** the N=100,000 authorized 100-query sample was
+interrupted after 19; its full-sample metrics are unavailable. The intentional
+stop is authorized and documented, but is not silently equated with execution
+of the complete replacement protocol. The performance finding B1-PERF-001 stays
+open with an unimplemented separate proposal. No runtime optimization or disk
+index was added. Only actual complete/partial observations are recorded. No
+merge, tag or push; canonical specification unchanged.

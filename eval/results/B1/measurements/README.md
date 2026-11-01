@@ -1,25 +1,32 @@
 # Authorized post-fix scalability sample
 
-Core implementation: `d798c74`. The user authorized **100 queries at each of
+Measured core: `d798c74`, after the coordinator fix and before the Sensitive
+temporal-metadata fix `3c6b1bb`. These are not measurements of the final patched
+core. The user authorized **100 queries at each of
 100, 1,000, 10,000 and 100,000 notes**, with 40 exact, 40 BM25 and 20 filtered.
 This is an explicit deviation from the original N-dependent query budget.
 The original full protocol is not claimed as executed.
 
-This directory is incomplete until the measurement supervisor produces all raw
-files and `manifest.json`. Completion of that manifest means the authorized
-sample passed mechanical validation, **not** that the final B1 review is done.
-Missing values must stay missing; no extrapolation or imputed percentile is used.
+The authorized sample is incomplete. N=100,000 was intentionally interrupted
+under the user's cost-assessment authorization at 2026-11-01T14:52:54Z, after
+completed setup/rebuild and 19 queries. There is no completion manifest or
+all-scale aggregate, and no process remains active. Missing values stay missing;
+no extrapolation or imputed percentile is used.
 
 The current partial checkpoint includes actual raw samples for N=100, 1,000 and
-10,000, plus the executable/source build hashes. N=100,000 remains in progress.
-There is deliberately no completed all-scale manifest or aggregate CSV yet.
+10,000, plus executable/source build hashes. For N=100,000,
+`latencies-100000.interrupted.csv` has rows 0–18 (8 exact / 8 BM25 / 3 filtered).
+The unfinished query 19 is not timed or counted. Generated queries and the
+corpus hash are retained. `benchmark-outcome.json` records rounded rebuild time,
+populated RSS/peak, missing baseline/delta/P50/P95 and the intentional stop cause.
+Independent numerical audit of all 19 rows: PASS as partial evidence only.
 
 `latencies-100000.partial.csv` and `rebuild-100000.partial.log` are a historical
 15:22 Europe/Rome checkpoint on 2026-11-01, with 17 completed queries and a
 completed rebuild. They are not the completed 100-query input expected by the
-reducer. The existing job continues independently. Final B1 review returned
-NO-GO for a separate Sensitive-metadata finding; this does not stop or change the
-authorized benchmark. See ../evidence.md for scope and outstanding numeric audit.
+reducer. The newer interrupted CSV supersedes that latency snapshot. The user
+authorized the separate Sensitive-metadata fix; its independent review is GO.
+See ../evidence.md for scope and the still-incomplete benchmark protocol.
 
 The local supervisor configuration/status/logs are under:
 
@@ -27,11 +34,15 @@ The local supervisor configuration/status/logs are under:
 .superpowers/sdd/2026-10-30-b1-deterministic-search/perf-postfix/
 ```
 
-`job-status.json` records the current stage; `driver.pid` identifies the
-supervisor. While a native scale process runs, inspect its `process-N.stderr.log`
+`job-status.json` now records intentional interruption. `native-stop-status.json`
+preserves the supervisor's native failure status after the verified worker was
+stopped in the source-verified read-only query phase. The vault was retained;
+there was no restart, fixture repair or database mutation. `driver.pid` is a
+historical supervisor id, not a claim of current liveness.
+While a native scale process runs, inspect its `process-N.stderr.log`
 and `latencies-N.csv` for in-stage progress. Status timestamps are stage updates,
-not a claim that an uncompleted sample has been validated. The supervisor holds
-an exclusive file lock. Before relaunching after an external kill, verify that
+not a claim that an uncompleted sample has been validated. A running supervisor
+holds an exclusive file lock. Before any separately authorized relaunch, verify that
 no orphaned native worker owns the same synthetic vault.
 
 The reviewed PowerShell driver runs scales serially, uses a single SHA256-pinned
@@ -55,5 +66,5 @@ validated search path: candidates, authoritative reads, revalidation, response
 construction/ranking. Other setup/drop/timer overhead is a reported residual.
 There is one measured run per scale, without confidence intervals or a pass/fail
 threshold. Historical pre-fix pilots are separate and are not a controlled A/B
-estimate of improvement. Final interpretation belongs in B1 evidence after all
-samples and independent numerical review are complete.
+estimate of improvement. Interpretation of this incomplete run is in B1 evidence;
+the interrupted prefix is not a balanced substitute for the authorized sample.

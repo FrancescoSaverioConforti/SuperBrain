@@ -1,0 +1,65 @@
+crates/index/src/document.rs:70:5: replace parse_instant -> Option<DateTime<Tz>> with None
+crates/index/src/document.rs:75:44: replace != with == in parse_instant
+crates/index/src/document.rs:83:5: replace parse_event_period -> Option<EventPeriod> with None
+crates/index/src/document.rs:85:23: replace < with > in parse_event_period
+crates/index/src/document.rs:85:23: replace < with == in parse_event_period
+crates/index/src/document.rs:85:23: replace < with <= in parse_event_period
+crates/index/src/document.rs:155:5: replace structured_fields_as_text -> String with String::new()
+crates/index/src/document.rs:155:5: replace structured_fields_as_text -> String with "xyzzy".into()
+crates/index/src/document.rs:169:5: replace build_text_searchable -> String with String::new()
+crates/index/src/document.rs:169:5: replace build_text_searchable -> String with "xyzzy".into()
+crates/index/src/document.rs:184:20: delete ! in build_text_searchable
+crates/index/src/document.rs:188:16: delete ! in build_text_searchable
+crates/index/src/document.rs:202:5: replace relation_targets -> impl Iterator<Item =&String> with ::std::iter::empty()
+crates/index/src/document.rs:219:5: replace type_as_str -> &'static str with ""
+crates/index/src/document.rs:219:5: replace type_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:231:5: replace status_as_str -> &'static str with ""
+crates/index/src/document.rs:231:5: replace status_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:242:5: replace trust_as_str -> &'static str with ""
+crates/index/src/document.rs:242:5: replace trust_as_str -> &'static str with "xyzzy"
+crates/index/src/document.rs:250:5: replace classification_as_str -> &'static str with ""
+crates/index/src/document.rs:250:5: replace classification_as_str -> &'static str with "xyzzy"
+crates/index/src/search.rs:226:14: replace == with != in Index<'a>::search_impl
+crates/index/src/search.rs:164:9: replace <impl std::fmt::Display for SearchError>::fmt -> std::fmt::Result with Ok(Default::default())
+crates/index/src/search.rs:291:29: replace += with -= in Index<'a>::search_impl
+crates/index/src/search.rs:291:29: replace += with *= in Index<'a>::search_impl
+crates/index/src/search.rs:311:28: replace != with == in Index<'a>::search_impl
+crates/index/src/search.rs:314:53: replace == with != in Index<'a>::search_impl
+crates/index/src/search.rs:320:17: replace && with || in Index<'a>::search_impl
+crates/index/src/search.rs:319:17: replace && with || in Index<'a>::search_impl
+crates/index/src/search.rs:318:17: replace && with || in Index<'a>::search_impl
+crates/index/src/search.rs:317:17: replace && with || in Index<'a>::search_impl
+crates/index/src/search.rs:339:17: replace || with && in Index<'a>::search_impl
+crates/index/src/search.rs:338:17: replace || with && in Index<'a>::search_impl
+crates/index/src/search.rs:337:17: replace || with && in Index<'a>::search_impl
+crates/index/src/search.rs:336:17: replace || with && in Index<'a>::search_impl
+crates/index/src/search.rs:335:33: replace != with == in Index<'a>::search_impl
+crates/index/src/search.rs:336:58: replace != with == in Index<'a>::search_impl
+crates/index/src/search.rs:337:60: replace != with == in Index<'a>::search_impl
+crates/index/src/search.rs:338:59: replace != with == in Index<'a>::search_impl
+crates/index/src/search.rs:339:50: delete ! in Index<'a>::search_impl
+crates/index/src/search.rs:346:28: replace += with -= in Index<'a>::search_impl
+crates/index/src/search.rs:346:28: replace += with *= in Index<'a>::search_impl
+crates/index/src/search.rs:351:31: replace match guard !sensitive && query_match(&body, query).is_some() with true in Index<'a>::search_impl
+crates/index/src/search.rs:351:31: replace match guard !sensitive && query_match(&body, query).is_some() with false in Index<'a>::search_impl
+crates/index/src/search.rs:351:42: replace && with || in Index<'a>::search_impl
+crates/index/src/search.rs:351:31: delete ! in Index<'a>::search_impl
+crates/index/src/search.rs:407:5: replace query_match -> Option<MatchKind> with None
+crates/index/src/search.rs:408:36: replace && with || in query_match
+crates/index/src/search.rs:408:31: replace >= with < in query_match
+crates/index/src/search.rs:419:5: replace matches_time -> bool with true
+crates/index/src/search.rs:419:5: replace matches_time -> bool with false
+crates/index/src/search.rs:419:71: replace && with || in matches_time
+crates/index/src/search.rs:419:54: replace >= with < in matches_time
+crates/index/src/search.rs:419:80: replace < with == in matches_time
+crates/index/src/search.rs:419:80: replace < with > in matches_time
+crates/index/src/search.rs:419:80: replace < with <= in matches_time
+crates/index/src/search.rs:428:77: replace && with || in matches_time
+crates/index/src/search.rs:428:63: replace < with == in matches_time
+crates/index/src/search.rs:428:63: replace < with > in matches_time
+crates/index/src/search.rs:428:63: replace < with <= in matches_time
+crates/index/src/search.rs:428:84: replace > with == in matches_time
+crates/index/src/search.rs:428:84: replace > with < in matches_time
+crates/index/src/search.rs:428:84: replace > with >= in matches_time
+crates/index/src/search.rs:435:50: replace || with && in matches_time
+crates/index/src/search.rs:435:37: replace || with && in matches_time

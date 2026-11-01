@@ -283,4 +283,29 @@ After reviewing the consolidated plan and the targeted review's verdict, the use
 
 **Benchmark execution timing, per explicit user instruction:** the scalability benchmark's *protocol* stays defined in Task 1 Step 5 (what to measure, at what four scales, with what query set), but its *execution* moves to Task 9 Step 3, run only once `TrigramIndex`/`Bm25Index`/`Index::search` actually exist — not against stubs. Task 9 Step 4 (final whole-branch review) now also carries an explicit standing instruction: stop and report to the user, rather than fixing autonomously, on any new Critical/Important finding requiring an architectural decision.
 
+## Subsequent explicit user decision — 2026-11-01, B1-SEC-001
+
+This ruling supersedes the earlier ten-field **Sensitive text-search** allowlist
+for `created`, `updated` and `event_period`. The final review demonstrated that
+the domain schema accepts free String values in these fields, invalidating the
+earlier assumption that they are necessarily constrained dates.
+
+- Sensitive temporal fields are never postings text, including valid dates.
+  Preserve temporal filtering through validated structured representations only;
+  invalid values have no text-search fallback. Body/source/relations exclusions
+  remain unchanged. Seven non-temporal fields retain their approved text behavior.
+- Use validated date/instant and point/nonempty-interval representations in the
+  derived Document and current-record filters. Do not change the canonical MVP
+  specification or storage/domain write schema or rewrite legacy records.
+- Required verification includes marker RED/GREEN tests, real C4 filters, current
+  Internal -> Sensitive revalidation, live updates/rebuilds, independent review,
+  targeted mutations, regression suite, Clippy and Cargo Deny.
+- Keep performance work separate. The user permits controlled interruption of
+  the existing N=100,000 sample if remaining cost is disproportionate, preserving
+  actual results and the fixture. This does not authorize a second supervisor,
+  fabricated complete-sample metrics or automatic architectural optimization.
+
+The original protocol and its approved 100-query-per-scale replacement remain
+distinct from any recorded interrupted outcome. No merge, tag or push authorized.
+
 This consolidation is now closed. The user has authorized implementation to begin via subagent-driven-development, following TDD RED→GREEN, with independent review per task, a dedicated checkpoint on the Indexer/Vault seam (Task 1 Steps 3/6), the full suite plus Clippy/cargo-deny/mutation-testing bar, and a final independent whole-branch review — no merge, tag, or push without the user's explicit authorization.

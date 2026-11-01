@@ -12,7 +12,8 @@
 //!   `status_filter` / `trust_filter` / `date_filter` / `ProjectScope`,
 //!   Task 6), never for term search. Every one of the ten is present
 //!   regardless of classification. Temporal values are validated separately;
-//!   malformed temporal strings are discarded from this derived Document.
+//!   malformed values become None in the typed fields. Their text disposition
+//!   remains classification-dependent, as specified below.
 //! - **`text_searchable`** — a single `String`, separately computed, that is
 //!   the ONLY thing `TrigramIndex` (this task) or `Bm25Index` (Task 3) ever
 //!   tokenizes. Its content depends on classification:

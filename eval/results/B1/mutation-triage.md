@@ -9,8 +9,18 @@ to indexer_impl.rs; an extra policy pass runs API tests against ReadPolicy.
 | Initial pre-hardening index+api | 209 | 108 | 53 | 0 | 48 |
 | After initial hardening, pre-coordination-fix | 218 | 162 | 54 | 0 | 2 |
 | Authorized coordinator fix, targeted | 35 | 24 | 11 | 0 | 0 |
-| Complete index+api post-fix | 237 | 177 | 58 | 0 | 2 equivalent |
+| Complete index+api coordinator fix, d798c74 | 237 | 177 | 58 | 0 | 2 equivalent |
 | Additional ReadPolicy, API tests | 2 | 2 | 0 | 0 | 0 |
+| Sensitive temporal fix, Document/search, 3c6b1bb | 77 | 65 | 12 | 0 | 0 |
+
+The last row is a scoped post-temporal-fix run over document.rs/search.rs,
+with an unmutated baseline and exit0. Exact lists are
+mutations/temporal-fix-caught.txt and temporal-fix-unviable.txt. Command:
+`cargo mutants -p index --file crates/index/src/document.rs --file
+crates/index/src/search.rs --test-workspace false --jobs 2 --timeout 60`.
+It covers the changed parser, searchable-field assembly and structured filter
+path; it is not a new full index+api pass. Earlier full results remain historical
+for d798c74, not silently relabelled as a full run of the patched core.
 
 Baseline scenarios passed separately and are not counted as mutants. Unviable
 means the mutant did not compile, not a passing test. cargo-mutants exits1 when
