@@ -1,0 +1,11 @@
+crates/index/src/indexer_impl.rs:96:9: replace <impl Indexer for SkeletonIndexer>::state_for -> IndexState with Default::default()
+crates/index/src/indexer_impl.rs:166:9: replace RealIndexer::data -> std::sync::MutexGuard<'_, IndexData> with MutexGuard::new()
+crates/index/src/indexer_impl.rs:166:9: replace RealIndexer::data -> std::sync::MutexGuard<'_, IndexData> with MutexGuard::from_iter([Default::default()])
+crates/index/src/indexer_impl.rs:166:9: replace RealIndexer::data -> std::sync::MutexGuard<'_, IndexData> with MutexGuard::new(Default::default())
+crates/index/src/indexer_impl.rs:166:9: replace RealIndexer::data -> std::sync::MutexGuard<'_, IndexData> with MutexGuard::from(Default::default())
+crates/index/src/indexer_impl.rs:203:9: replace RealIndexer::bm25_ranked -> Vec<(NoteId, f64)> with vec![(Default::default(), 0.0)]
+crates/index/src/indexer_impl.rs:203:9: replace RealIndexer::bm25_ranked -> Vec<(NoteId, f64)> with vec![(Default::default(), 1.0)]
+crates/index/src/indexer_impl.rs:203:9: replace RealIndexer::bm25_ranked -> Vec<(NoteId, f64)> with vec![(Default::default(), -1.0)]
+crates/index/src/indexer_impl.rs:209:9: replace RealIndexer::candidate_ids -> Vec<NoteId> with vec![Default::default()]
+crates/index/src/indexer_impl.rs:351:9: replace <impl Indexer for RealIndexer>::state_for -> IndexState with Default::default()
+crates/index/src/indexer_impl.rs:357:48: replace == with != in <impl Indexer for RealIndexer>::state_for

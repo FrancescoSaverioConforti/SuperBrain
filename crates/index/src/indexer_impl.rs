@@ -1,29 +1,7 @@
-//! B1 Task 1 skeleton: a concrete, `storage::Indexer`-implementing struct
-//! that proves the integration seam Task 1 designed is actually usable from
-//! *outside* `storage`, with a `Vault` constructible against it.
-//!
-//! This file deliberately contains **no indexing logic**. There is no
-//! trigram index, no BM25 index, and `mark_current`/`state_for` below store
-//! nothing beyond what is needed to prove the trait is implementable and the
-//! seam compiles end-to-end. Real tokenization, postings and scoring are
-//! Tasks 2 and 3; `search` does not exist yet. Anything written here that
-//! looks like a design decision for THOSE tasks (field shapes, storage
-//! layout, etc.) should be treated as provisional scaffolding, not as a
-//! commitment Task 2/3 must honor.
-//!
-//! # Why this struct exists at all (recap of the Task 1 design note in
-//! `storage::vault`'s `Indexer` trait doc comment)
-//!
-//! `storage::Indexer` is `pub` (B1 Task 1's Step 2 decision). `index` is the
-//! one real implementor that decision was made for. This type —
-//! [`SkeletonIndexer`] — is that implementor, for now holding only enough
-//! state to answer `state_for` honestly (nothing is ever `Current`, because
-//! nothing is indexed yet) and to let `mark_current` run without touching
-//! any real index structure. A `storage::Vault` can already be opened with
-//! `Box::new(SkeletonIndexer::new())` via `Vault::open_with_indexer` /
-//! `Vault::open_with_pii_store_and_indexer` (both added in Task 1) — that
-//! end-to-end construction path is exactly what this skeleton exists to
-//! prove compiles and runs, ahead of Task 2/3 filling in real logic.
+//! Storage/index integration. SkeletonIndexer retains Task 1's seam proof;
+//! RealIndexer owns the in-memory indexes and versioned atomic publication.
+//! Rebuild reads committed records outside the index lock; live indexing uses
+//! only bytes already supplied by storage and never calls back into Vault.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -45,6 +23,17 @@ use crate::trigram::TrigramIndex;
 /// `storage::split_record` precisely to avoid this kind of duplication; see
 /// `document.rs`'s module doc comment for that distinction).
 const RECORD_SEPARATOR: &str = "\n---\n";
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestPoint {
+    AfterObserved,
+    RebuildRead,
+    BeforePublish,
+    AfterTrigram,
+}
+#[cfg(test)]
+type TestHook = std::sync::Arc<dyn Fn(TestPoint, &str, u64) + Send + Sync>;
 
 /// Strips the version header + separator off `record_bytes` (the exact
 /// shape `Indexer::mark_current` receives — see `vault.rs`'s
@@ -80,7 +69,9 @@ pub struct SkeletonIndexer {
 
 impl SkeletonIndexer {
     pub fn new() -> Self {
-        Self { seen: Mutex::new(HashSet::new()) }
+        Self {
+            seen: Mutex::new(HashSet::new()),
+        }
     }
 }
 
@@ -114,121 +105,227 @@ impl Indexer for SkeletonIndexer {
 // B1 Task 3: `RealIndexer` — the first real `storage::Indexer` implementor.
 // ---------------------------------------------------------------------------
 
-/// The real [`Indexer`] implementation: a [`TrigramIndex`] and a
-/// [`Bm25Index`], both behind their own `Mutex` (so a read-heavy future
-/// `search` call and the single write-path `mark_current` call never need
-/// the same lock held across both structures at once — each structure
-/// guards its own invariants independently), plus a per-note [`IndexState`]
-/// map.
+/// In-memory index with a single publication lock. All index readers share
+/// this lock; no reader can observe mixed trigram/BM25/metadata versions.
 ///
-/// `mark_current`'s contract (pinned by Task 1, closed for real here):
+/// Each note has a monotonic expected version (latest observed live callback
+/// or authoritative rebuild read) and an optional published Document/version.
+/// Current means those versions agree. A failed newer update leaves the old
+/// snapshot available only as stale candidates. An older delivery cannot lower
+/// the high-water mark, overwrite a newer snapshot or repair its Stale state.
 ///
-/// - Builds a [`Document`] from `record_bytes` via
-///   [`strip_version_header`] + [`Document::from_record_bytes`].
-/// - On success: removes any prior postings for this note id from BOTH
-///   `TrigramIndex` and `Bm25Index` (`insert` already does this internally,
-///   so a plain `insert` call is the correct "this might be an update"
-///   handling — no separate removal step is needed), inserts the new
-///   `text_searchable`, and marks `state_for` `Current`.
-/// - On failure (version header missing, invalid UTF-8, or a schema error
-///   from `domain::parse_frontmatter`, OR the test-only injected fault
-///   below): nothing is inserted into either structure, any PRIOR postings
-///   for this note id are left exactly as they were (a failed re-index must
-///   not silently erase a previously-successful index entry), and
-///   `state_for` is left/set `Stale`. `mark_current`'s return type is `()`,
-///   so there is nothing to propagate to the caller regardless — the
-///   discipline here is purely "don't panic, don't partially insert."
+/// Observation and publication are separate critical sections so parsing does
+/// not hold the lock; publication rechecks the version UNDER that same lock.
+/// Rebuild never holds it while reading Vault. The live callback never calls
+/// Vault at all. Lock ordering: Vault note lock -> index publication lock;
+/// index observers release their lock before any authoritative Vault read.
 ///
-/// # Lock-scope guarantee (Task 1's seam, closed against real code)
-///
-/// `mark_current` never calls `Vault::read_note` or any other `Vault`
-/// method — it only ever touches its own three `Mutex`-protected fields.
-/// This is the property the real wiring had to preserve: every call site in
-/// `storage::vault` invokes `mark_current` while already holding the
-/// writing note's per-note lock, so a callback into `Vault` here would
-/// self-deadlock. Nothing in this impl reaches outside `self`.
+/// Recoverable parse/fault errors do not fail storage commits. A publication
+/// unwind rolls back both postings under the lock. Unexpected mutex poisoning
+/// discards derived snapshots coherently (all Stale), allowing a later rebuild.
+/// Process-aborting allocation failures are outside Rust unwind recovery.
 pub struct RealIndexer {
-    trigram: Mutex<TrigramIndex>,
-    bm25: Mutex<Bm25Index>,
-    states: Mutex<HashMap<String, IndexState>>,
-    /// Test-only injected-fault hook (Task 3, Step 2): the set of note ids
-    /// for which the NEXT `mark_current` call must behave as though its
-    /// internal indexing logic hit an invariant violation, without
-    /// `storage`-layer I/O being involved at all (`mark_current` is pure
-    /// in-memory logic: tokenize + insert into postings, no filesystem, no
-    /// git, no journal — there is no I/O fault to inject here, unlike
-    /// `storage::fault::FaultPoint`, which exists for crash-injection on
-    /// disk/journal/git operations). A note id is removed from this set the
-    /// moment its poisoned call runs, so the fault fires exactly once per
-    /// `poison` call, mirroring how a real internal bug would affect one
-    /// specific write, not every future write to that note id forever.
+    data: Mutex<IndexData>,
     #[cfg(test)]
     poisoned: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    hook: Mutex<Option<TestHook>>,
+}
+
+#[derive(Default)]
+struct IndexData {
+    trigram: TrigramIndex,
+    bm25: Bm25Index,
+    notes: HashMap<String, NoteProgress>,
+}
+
+#[derive(Default)]
+struct NoteProgress {
+    expected_version: u64,
+    published: Option<PublishedNote>,
+}
+
+#[derive(Clone)]
+struct PublishedNote {
+    version: u64,
+    document: Document,
 }
 
 impl RealIndexer {
     pub fn new() -> Self {
         Self {
-            trigram: Mutex::new(TrigramIndex::new()),
-            bm25: Mutex::new(Bm25Index::new()),
-            states: Mutex::new(HashMap::new()),
+            data: Mutex::new(IndexData::default()),
             #[cfg(test)]
             poisoned: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            hook: Mutex::new(None),
         }
     }
 
-    /// Test-only (Step 2): arms the fault hook so the NEXT `mark_current`
-    /// call for `note_id` fails its internal indexing step — simulating an
-    /// invariant violation inside `mark_current`'s own logic (not a
-    /// malformed-input parse failure: see the module-level test for why a
-    /// real `propose_and_commit` call can never actually produce
-    /// `record_bytes` that fail `Document::from_record_bytes`, since
-    /// `propose_and_commit` already parsed the identical content
-    /// successfully earlier in the same call). This is the simplest
-    /// mechanism that lets a test deterministically trigger the "indexing
-    /// failed, write must still succeed" path end-to-end through a real
-    /// `propose_and_commit` call, without inventing a new
-    /// `storage::fault::FaultPoint` variant for in-memory indexer logic
-    /// that has no I/O to fault-inject in the first place.
+    fn data(&self) -> std::sync::MutexGuard<'_, IndexData> {
+        match self.data.lock() {
+            Ok(data) => data,
+            Err(poisoned) => {
+                let mut data = poisoned.into_inner();
+                data.trigram = TrigramIndex::new();
+                data.bm25 = Bm25Index::new();
+                for note in data.notes.values_mut() {
+                    note.published = None;
+                }
+                self.data.clear_poison();
+                data
+            }
+        }
+    }
+
+    /// Linearization point for learning the expected committed version.
+    fn observe_version(&self, id: &str, version: u64) -> bool {
+        let mut data = self.data();
+        let note = data.notes.entry(id.to_owned()).or_default();
+        if version < note.expected_version {
+            return false;
+        }
+        note.expected_version = version;
+        true
+    }
+
     #[cfg(test)]
     pub fn poison_next_mark_current(&self, note_id: &str) {
         self.poisoned.lock().unwrap().insert(note_id.to_string());
     }
 
-    /// Returns every note id currently indexed in the `TrigramIndex`
-    /// (test/introspection helper for the cold-start rebuild test).
     #[cfg(test)]
     pub fn trigram_hits(&self, term: &str) -> Vec<NoteId> {
-        self.trigram.lock().unwrap().query_exact(term)
+        self.data().trigram.query_exact(term)
     }
 
-    /// Returns the top `k` BM25 ranked hits for `query` (test/introspection
-    /// helper, and the shape a future `search` implementation will also
-    /// need).
     pub fn bm25_ranked(&self, query: &str, k: usize) -> Vec<(NoteId, f64)> {
-        self.bm25.lock().unwrap().query_ranked(query, k)
+        self.data().bm25.query_ranked(query, k)
     }
 
-    /// Candidate ids only: never expose cached content or scores as evidence.
-    /// All locks are released before the caller can enter Vault::read_note.
-    /// Do not truncate here: stale/filtered high-ranked candidates must not
-    /// hide valid lower-ranked candidates from the final top-k selection.
+    /// Read one coherent candidate snapshot; return ids only, without a
+    /// preliminary k limit. The guard is dropped before any Vault read.
     pub(crate) fn candidate_ids(&self, query: &str) -> Vec<NoteId> {
-        let mut ids: HashSet<NoteId> = self.trigram.lock().unwrap().query_exact(query).into_iter().collect();
-        ids.extend(self.bm25_ranked(query, usize::MAX).into_iter().map(|(id, _)| id));
+        let data = self.data();
+        let mut ids: HashSet<_> = data.trigram.query_exact(query).into_iter().collect();
+        ids.extend(
+            data.bm25
+                .query_ranked(query, usize::MAX)
+                .into_iter()
+                .map(|(id, _)| id),
+        );
         let mut ids: Vec<_> = ids.into_iter().collect();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         ids
     }
 
-    /// Indexes an already-built [`Document`] (shared by `mark_current` and
-    /// the cold-start rebuild function below, so both paths use IDENTICAL
-    /// insertion logic — no drift between "index on write" and "index on
-    /// rebuild").
-    fn index_document(&self, note_id: NoteId, document: &Document) {
-        self.trigram.lock().unwrap().insert(note_id.clone(), &document.text_searchable);
-        self.bm25.lock().unwrap().insert(note_id.clone(), &document.text_searchable);
-        self.states.lock().unwrap().insert(note_id.as_str().to_string(), IndexState::Current);
+    /// Version check AND both postings/metadata publication are synchronized.
+    /// No cached Document is ever served as content: search still re-reads.
+    fn index_document(&self, note_id: NoteId, version: u64, document: &Document) {
+        #[cfg(test)]
+        let hook = self.hook.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook(TestPoint::BeforePublish, note_id.as_str(), version);
+        }
+        let mut data = self.data();
+        let Some(note) = data.notes.get(note_id.as_str()) else {
+            return;
+        };
+        if version != note.expected_version || document.id != note_id.as_str() {
+            return;
+        }
+        let previous = note.published.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            data.trigram
+                .insert(note_id.clone(), &document.text_searchable);
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook(TestPoint::AfterTrigram, note_id.as_str(), version);
+            }
+            data.bm25.insert(note_id.clone(), &document.text_searchable);
+        }));
+        if outcome.is_err() {
+            // Guard lives outside the unwind boundary: readers remain excluded
+            // through rollback and the mutex itself is not poisoned here.
+            data.trigram.remove(&note_id);
+            data.bm25.remove(&note_id);
+            if let Some(previous) = previous {
+                data.trigram
+                    .insert(note_id.clone(), &previous.document.text_searchable);
+                data.bm25
+                    .insert(note_id, &previous.document.text_searchable);
+            }
+            return;
+        }
+        // Only now do metadata/version become visible together with postings.
+        if let Some(note) = data.notes.get_mut(note_id.as_str()) {
+            note.published = Some(PublishedNote {
+                version,
+                document: document.clone(),
+            });
+        }
+    }
+
+    fn apply_live(&self, note_id: &str, version: u64, record_bytes: &[u8]) {
+        let Ok(id) = NoteId::parse(note_id) else {
+            return;
+        };
+        if !self.observe_version(note_id, version) {
+            return;
+        }
+        #[cfg(test)]
+        self.run_hook(TestPoint::AfterObserved, note_id, version);
+        #[cfg(test)]
+        if self.poisoned.lock().unwrap().remove(note_id) {
+            return;
+        }
+        // The enriched storage callback carries both the version and bytes.
+        // Reject contradictory inputs instead of publishing mislabeled data.
+        let Some(content_bytes) = strip_version_header(record_bytes) else {
+            return;
+        };
+        let Some(header) = std::str::from_utf8(record_bytes)
+            .ok()
+            .and_then(|s| s.split_once(RECORD_SEPARATOR))
+            .map(|(h, _)| h)
+        else {
+            return;
+        };
+        if header.parse::<u64>().ok() != Some(version) {
+            return;
+        }
+        let Ok(document) = Document::from_record_bytes(content_bytes) else {
+            return;
+        };
+        self.index_document(id, version, &document);
+    }
+
+    #[cfg(test)]
+    fn run_hook(&self, point: TestPoint, id: &str, version: u64) {
+        // Clone before invoking: test hooks never retain this secondary lock.
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point, id, version);
+        }
+    }
+
+    #[cfg(test)]
+    fn represented_version(&self, id: &str) -> Option<u64> {
+        self.data()
+            .notes
+            .get(id)?
+            .published
+            .as_ref()
+            .map(|p| p.version)
+    }
+
+    #[cfg(test)]
+    fn publication_is_locked(&self) -> bool {
+        matches!(
+            self.data.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 }
 
@@ -239,56 +336,30 @@ impl Default for RealIndexer {
 }
 
 impl Indexer for RealIndexer {
-    fn mark_current(&self, note_id: &str, _version: u64, record_bytes: &[u8]) {
-        // Test-only fault injection (Step 2): checked first, before any real
-        // parsing, so a poisoned call fails deterministically regardless of
-        // whether `record_bytes` would otherwise have parsed fine.
-        #[cfg(test)]
-        {
-            let mut poisoned = self.poisoned.lock().unwrap();
-            if poisoned.remove(note_id) {
-                // Simulates an internal invariant violation inside the
-                // indexing step itself. Absorbed right here: nothing is
-                // inserted into either postings structure, `state_for`
-                // stays whatever it already was (Stale, for a note never
-                // successfully indexed before), and — critically — this
-                // function does not panic and has no error to propagate
-                // (its return type is `()`), so `propose_and_commit`'s own
-                // call is completely unaffected.
-                return;
-            }
-        }
-
-        let Some(content_bytes) = strip_version_header(record_bytes) else {
-            // No version-header separator, or not valid UTF-8: cannot even
-            // locate the content half of the buffer. Leave this note id's
-            // state exactly as it was (Stale if never indexed before);
-            // don't panic, don't insert anything.
-            return;
-        };
-
-        match Document::from_record_bytes(content_bytes) {
-            Ok(document) => {
-                let Ok(id) = NoteId::parse(note_id) else {
-                    // `note_id` always comes from a real `storage::NoteId`
-                    // on every production call site, so this cannot
-                    // actually happen on the write path; defensive-only.
-                    return;
-                };
-                self.index_document(id, &document);
-            }
-            Err(_) => {
-                // `record_bytes`' content half failed to parse as a note
-                // (bad frontmatter / schema error). Absorbed here, exactly
-                // like the poisoned-fault branch above: no insertion into
-                // either postings structure, no panic, no error
-                // propagated. `state_for` is left as it was.
-            }
+    fn mark_current(&self, note_id: &str, version: u64, record_bytes: &[u8]) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.apply_live(note_id, version, record_bytes)
+        }));
+        if outcome.is_err() {
+            // Also recovers a poisoned publication lock coherently. No error
+            // or unwind may escape this derived-index callback into storage.
+            drop(self.data());
         }
     }
 
     fn state_for(&self, note_id: &str) -> IndexState {
-        self.states.lock().unwrap().get(note_id).copied().unwrap_or(IndexState::Stale)
+        let data = self.data();
+        match data.notes.get(note_id) {
+            Some(note)
+                if note
+                    .published
+                    .as_ref()
+                    .is_some_and(|p| p.version == note.expected_version) =>
+            {
+                IndexState::Current
+            }
+            _ => IndexState::Stale,
+        }
     }
 }
 
@@ -340,11 +411,16 @@ pub fn rebuild_index(vault: &Vault, indexer: &RealIndexer) -> Result<(), storage
             // comment already documents for a cold-start rebuild.
             Err(_) => continue,
         };
+        if !indexer.observe_version(note_id.as_str(), record.version.0) {
+            continue;
+        }
+        #[cfg(test)]
+        indexer.run_hook(TestPoint::RebuildRead, note_id.as_str(), record.version.0);
         let Ok((metadata, body)) = storage::split_record(record.content.as_bytes()) else {
             continue;
         };
         let document = Document::new(metadata, body.as_deref());
-        indexer.index_document(note_id, &document);
+        indexer.index_document(note_id, record.version.0, &document);
     }
     Ok(())
 }
@@ -623,6 +699,29 @@ mod tests {
         assert_eq!(indexer.state_for("note-a"), IndexState::Current, "the fault must not persist beyond the one poisoned call");
     }
 
+    #[test]
+    fn failed_update_of_previously_current_note_reports_stale_and_keeps_old_postings() {
+        let text = note_text("note-a", "internal", "old-searchable-content");
+        let bytes = format!("1\n---\n{text}");
+        for fail in 0..3 {
+            // Each independent failure starts at v1. A previously observed v2
+            // cannot be reset by redelivering v1 under monotonic ordering.
+            let indexer = RealIndexer::new();
+            indexer.mark_current("note-a", 1, bytes.as_bytes());
+            assert_eq!(indexer.state_for("note-a"), IndexState::Current);
+            match fail {
+                0 => indexer.mark_current("note-a", 2, b"no version separator"),
+                1 => indexer.mark_current("note-a", 2, b"2\n---\nmalformed record"),
+                _ => {
+                    indexer.poison_next_mark_current("note-a");
+                    indexer.mark_current("note-a", 2, bytes.as_bytes());
+                }
+            }
+            assert_eq!(indexer.state_for("note-a"), IndexState::Stale);
+            assert_eq!(indexer.trigram_hits("old-searchable-content").len(), 1);
+        }
+    }
+
     // --- B1 Task 4: log/error-output confidentiality audit, the
     // poison_next_mark_current-driven half. `poison_next_mark_current` and
     // `trigram_hits` are #[cfg(test)]-gated, so only a unit test living
@@ -853,3 +952,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;
