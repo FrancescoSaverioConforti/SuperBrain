@@ -145,6 +145,43 @@ fn rebuild_snapshot_v1_cannot_replace_committed_live_v2() {
 }
 
 #[test]
+fn sensitive_temporal_markers_cannot_return_from_late_internal_rebuild() {
+    let f = Fixture::new();
+    let marker = "TEMPORAL-REBUILD-CANARY";
+    let write = |expected, class| {
+        storage::propose_and_commit(
+            &f.vault,
+            &text(class, "private-body").replace("2026-10-30", marker),
+            Version(expected),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &policy::Gate::new(policy::SecretPolicy::new(1)),
+            Some(&f.pii),
+        )
+        .unwrap()
+    };
+    assert!(matches!(write(0, "internal"), CommitResult::Committed(_)));
+    both(&f.indexer, marker, 1);
+    let (arrived, resume) = pause(&f.indexer, TestPoint::RebuildRead, 1);
+    let worker = rebuild(&f);
+    arrived.wait();
+    let committed = write(1, "sensitive");
+    resume.wait();
+    worker.join().unwrap();
+    assert!(matches!(committed, CommitResult::Committed(_)));
+    both(&f.indexer, marker, 0);
+    assert_eq!(f.indexer.represented_version("note-race"), Some(2));
+    assert_eq!(f.indexer.state_for("note-race"), IndexState::Current);
+    rebuild_index(&f.vault, &f.indexer).unwrap();
+    both(&f.indexer, marker, 0);
+    assert_eq!(
+        f.query(marker).outcome,
+        crate::search::SearchOutcome::NotPresent
+    );
+}
+
+#[test]
 fn observed_live_v2_stays_stale_until_atomic_publication() {
     let f = Fixture::new();
     f.write(0, "internal", "oldonlyneedle");

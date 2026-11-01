@@ -17,15 +17,14 @@
 //! if the body does not match. B1 has no summarization or snippet-size policy.
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, NaiveDate, TimeZone};
-use chrono_tz::Europe::Rome;
+use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
 use domain::{Classification, NoteStatus, NoteType, TrustLevel};
 use storage::{NoteId, StorageError, Vault, Version};
 
 use crate::bm25::{tokenize, Bm25Index};
 use crate::diagnostics::{PhaseTimer, SearchProfile};
-use crate::document::Document;
+use crate::document::{Document, EventPeriod};
 use crate::indexer_impl::RealIndexer;
 use crate::time_range::{resolve_time_expression, TimeExpression, TimeResolutionError};
 
@@ -417,36 +416,22 @@ fn query_match(text: &str, query: &str) -> Option<MatchKind> {
 }
 
 fn matches_time(document: &Document, filter: &AppliedTimeFilter) -> bool {
+    let point_matches = |point: &DateTime<Tz>| point >= &filter.start && point < &filter.end;
+    let created = || document.created.as_ref().is_some_and(point_matches);
+    let updated = || document.updated.as_ref().is_some_and(point_matches);
+    let event = || {
+        document
+            .event_period
+            .as_ref()
+            .is_some_and(|period| match period {
+                EventPeriod::Point(point) => point_matches(point),
+                EventPeriod::Interval { start, end } => start < &filter.end && end > &filter.start,
+            })
+    };
     match filter.field {
-        TimeField::CreatedAt => matches_value(&document.created, filter, false),
-        TimeField::UpdatedAt => matches_value(&document.updated, filter, false),
-        TimeField::EventPeriod => matches_value(&document.event_period, filter, true),
-        TimeField::Any => {
-            matches_value(&document.created, filter, false)
-                || matches_value(&document.updated, filter, false)
-                || matches_value(&document.event_period, filter, true)
-        }
+        TimeField::CreatedAt => created(),
+        TimeField::UpdatedAt => updated(),
+        TimeField::EventPeriod => event(),
+        TimeField::Any => created() || updated() || event(),
     }
-}
-
-fn matches_value(value: &str, filter: &AppliedTimeFilter, allow_interval: bool) -> bool {
-    if allow_interval {
-        if let Some((start, end)) = value.split_once('/') {
-            return match (parse_instant(start), parse_instant(end)) {
-                (Some(start), Some(end)) => start < end && start < filter.end && end > filter.start,
-                _ => false,
-            };
-        }
-    }
-    parse_instant(value).is_some_and(|point| point >= filter.start && point < filter.end)
-}
-
-fn parse_instant(value: &str) -> Option<DateTime<Tz>> {
-    if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
-        return Some(instant.with_timezone(&Rome));
-    }
-    let midnight = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)?;
-    Rome.from_local_datetime(&midnight).single()
 }

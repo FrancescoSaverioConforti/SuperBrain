@@ -393,6 +393,113 @@ fn sensitive_relations_never_reach_search_response() {
 }
 
 #[test]
+fn sensitive_temporal_markers_excluded_on_live_update_and_rebuild() {
+    let f = Fixture::new();
+    let mut n = Note::new("note-temporal", "PRIVATE-BODY-CANARY");
+    n.classification = "sensitive";
+    n.created = "CREATED-CANARY-8e42";
+    n.updated = "UPDATED-CANARY-9f53";
+    n.event = "PERIOD-CANARY-0a64";
+    for version in 0..2 {
+        f.write(&n, version);
+        for rebuild in [false, true] {
+            if rebuild {
+                index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+            }
+            for marker in [n.created, n.updated, n.event] {
+                assert!(
+                    f.indexer.bm25_ranked(marker, 10).is_empty(),
+                    "postings: {marker}"
+                );
+                assert_eq!(
+                    f.search(marker, Default::default(), 10).outcome,
+                    SearchOutcome::NotPresent
+                );
+            }
+            let response = f.search(n.id, Default::default(), 10);
+            assert_eq!(results(&response)[0].version, Version(version + 1));
+            for marker in [n.created, n.updated, n.event, n.body, n.source, n.relation] {
+                assert!(!format!("{response:?}").contains(marker));
+            }
+            for field in [
+                TimeField::CreatedAt,
+                TimeField::UpdatedAt,
+                TimeField::EventPeriod,
+                TimeField::Any,
+            ] {
+                assert!(results(&f.search(n.id, august(field), 10)).is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn sensitive_temporal_markers_revalidated_after_classification_change() {
+    let f = Fixture::new();
+    let mut n = Note::new("note-temporal-transition", "private-body");
+    n.created = "TRANSITION-CREATED-MARKER";
+    n.updated = "TRANSITION-UPDATED-MARKER";
+    n.event = "TRANSITION-PERIOD-MARKER";
+    f.write(&n, 0);
+    for marker in [n.created, n.updated, n.event] {
+        assert_eq!(ids(&f.search(marker, Default::default(), 10)), [n.id]);
+    }
+    f.lag();
+    n.classification = "sensitive";
+    f.write(&n, 1);
+    for marker in [n.created, n.updated, n.event] {
+        assert!(
+            !f.indexer.bm25_ranked(marker, 10).is_empty(),
+            "prove stale candidates exist"
+        );
+        assert_eq!(
+            f.search(marker, Default::default(), 10).outcome,
+            SearchOutcome::NotPresent
+        );
+        assert!(!format!("{:?}", f.search(n.id, Default::default(), 10)).contains(marker));
+    }
+    f.paused.store(false, Ordering::SeqCst);
+    f.write(&n, 2);
+    for marker in [n.created, n.updated, n.event] {
+        assert!(f.indexer.bm25_ranked(marker, 10).is_empty());
+    }
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    for marker in [n.created, n.updated, n.event] {
+        assert!(f.indexer.bm25_ranked(marker, 10).is_empty());
+    }
+}
+
+#[test]
+fn sensitive_temporal_filters_work_without_date_postings() {
+    let f = Fixture::new();
+    let mut n = Note::new("note-temporal-valid", "private-body");
+    n.classification = "sensitive";
+    n.created = "2026-08-10";
+    n.updated = "2026-08-11T12:00:00+02:00";
+    n.event = "2026-07-31/2026-08-02";
+    f.write(&n, 0);
+    for field in [
+        TimeField::CreatedAt,
+        TimeField::UpdatedAt,
+        TimeField::EventPeriod,
+        TimeField::Any,
+    ] {
+        assert_eq!(ids(&f.search(n.id, august(field), 10)), [n.id]);
+    }
+    for value in [n.created, n.updated, n.event] {
+        assert_eq!(
+            f.search(value, Default::default(), 10).outcome,
+            SearchOutcome::NotPresent
+        );
+    }
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    assert_eq!(
+        ids(&f.search(n.id, august(TimeField::EventPeriod), 10)),
+        [n.id]
+    );
+}
+
+#[test]
 fn changed_project_and_each_structured_filter_are_rechecked() {
     let f = Fixture::new();
     let mut n = Note::new("note-filters", "needle");
