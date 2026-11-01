@@ -454,4 +454,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn time_errors_have_nonempty_sanitized_diagnostics() {
+        for error in [
+            TimeResolutionError::NeedsClarification(ClarificationReason::MonthYear),
+            TimeResolutionError::InvalidDate,
+            TimeResolutionError::InvalidRange,
+            TimeResolutionError::OutOfRange,
+            TimeResolutionError::NonUniqueLocalMidnight,
+        ] {
+            assert!(!error.to_string().trim().is_empty());
+        }
+    }
 }

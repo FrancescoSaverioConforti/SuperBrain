@@ -24,6 +24,7 @@ use domain::{Classification, NoteStatus, NoteType, TrustLevel};
 use storage::{NoteId, StorageError, Vault, Version};
 
 use crate::bm25::{tokenize, Bm25Index};
+use crate::diagnostics::{PhaseTimer, SearchProfile};
 use crate::document::Document;
 use crate::indexer_impl::RealIndexer;
 use crate::time_range::{resolve_time_expression, TimeExpression, TimeResolutionError};
@@ -200,6 +201,29 @@ impl<'a> Index<'a> {
         filters: SearchFilters,
         k: usize,
     ) -> Result<SearchResponse, SearchError> {
+        self.search_impl(query, filters, k, None)
+    }
+
+    /// Same validated path, with aggregate timings only. Normal search does
+    /// not read the profiling clock. Errors retain the normal sanitized type.
+    pub fn search_profiled(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        k: usize,
+    ) -> Result<(SearchResponse, SearchProfile), SearchError> {
+        let mut profile = SearchProfile::default();
+        let response = self.search_impl(query, filters, k, Some(&mut profile))?;
+        Ok((response, profile))
+    }
+
+    fn search_impl(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        k: usize,
+        mut profile: Option<&mut SearchProfile>,
+    ) -> Result<SearchResponse, SearchError> {
         if k == 0 {
             return Err(SearchError::InvalidLimit);
         }
@@ -252,10 +276,26 @@ impl<'a> Index<'a> {
 
         let mut fresh_scores = Bm25Index::new();
         let mut fresh_results = Vec::new();
-        for id in self.indexer.candidate_ids(query) {
+        let candidates = {
+            let _timer =
+                PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.candidate_generation));
+            self.indexer.candidate_ids(query)
+        };
+        if let Some(p) = profile.as_deref_mut() {
+            p.candidates = candidates.len();
+        }
+        for id in candidates {
             // Only rejected individual candidates are silently omitted.
             // Operational/gate unavailability must not become Ok(NotPresent).
-            let record = match self.vault.read_note(&id) {
+            let read = {
+                if let Some(p) = profile.as_deref_mut() {
+                    p.reads += 1;
+                }
+                let _timer =
+                    PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.authoritative_reads));
+                self.vault.read_note(&id)
+            };
+            let record = match read {
                 Ok(record) => record,
                 Err(
                     StorageError::Deleted { .. }
@@ -265,6 +305,7 @@ impl<'a> Index<'a> {
                 ) => continue,
                 Err(_) => return Err(SearchError::ReadUnavailable),
             };
+            let validation = PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.revalidation));
             let Ok((metadata, body)) = storage::split_record(record.content.as_bytes()) else {
                 continue;
             };
@@ -301,6 +342,12 @@ impl<'a> Index<'a> {
                 continue;
             }
             fresh_scores.insert(id.clone(), &document.text_searchable);
+            drop(validation);
+            if let Some(p) = profile.as_deref_mut() {
+                p.eligible += 1;
+            }
+            let _response_timer =
+                PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.response_building));
             let excerpt = match body {
                 Some(body) if !sensitive && query_match(&body, query).is_some() => body,
                 _ => document.text_searchable,
@@ -322,6 +369,7 @@ impl<'a> Index<'a> {
                 references,
             });
         }
+        let _response_timer = PhaseTimer::new(profile.map(|p| &mut p.response_building));
         let scores: HashMap<_, _> = fresh_scores
             .query_ranked(query, usize::MAX)
             .into_iter()

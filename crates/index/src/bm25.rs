@@ -212,6 +212,22 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn independently_calculated_scores_pin_idf_tf_and_length_normalization() {
+        // N=3 (including the empty document), avgdl=(3+6+0)/3=3.
+        // df(rust)=2 -> ln(1.6), df(systems)=1 -> ln(8/3).
+        // a: ln(1.6)*1.375 + ln(8/3); b: ln(1.6)*2.2/3.1.
+        let mut index = Bm25Index::new();
+        index.insert(id("note-a"), "rust rust systems");
+        index.insert(id("note-b"), "rust coding is fun with tests");
+        index.insert(id("note-empty"), "");
+        let scores = index.query_ranked("rust systems", 10);
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].0, id("note-a"));
+        assert!((scores[0].1 - 1.6270842432246126).abs() < 1e-12);
+        assert!((scores[1].1 - 0.3335509626905221).abs() < 1e-12);
+    }
+
     fn id(s: &str) -> NoteId {
         NoteId::parse(s).unwrap()
     }

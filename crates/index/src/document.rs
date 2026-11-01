@@ -269,6 +269,15 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_searchable_metadata_retains_all_ten_canonical_field_values() {
+        let doc = Document::new(base_metadata(Classification::Sensitive), Some("excluded-body"));
+        assert_eq!(doc.text_searchable.split_whitespace().collect::<Vec<_>>(), [
+            "bug-2026-10-30-example", "1", "bug", "draft", "internal", "sensitive",
+            "project-x", "2026-10-30", "2026-10-30", "2026-10-30",
+        ]);
+    }
+
+    #[test]
     fn structured_fields_are_kept_as_typed_values_regardless_of_classification() {
         let metadata = base_metadata(Classification::Sensitive);
         let doc = Document::new(metadata, Some("anything"));

@@ -333,3 +333,50 @@ fn held_out_labels() {
         ));
     }
 }
+
+#[test]
+fn every_nonempty_relation_kind_is_reported_as_not_revalidated() {
+    let f = Fixture::new();
+    for kind in [
+        "supports",
+        "contradicts",
+        "derived_from",
+        "supersedes",
+        "applies_to",
+    ] {
+        let id = format!("note-{kind}");
+        let text = format!("---\nid: {id}\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: fixture\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations:\n  {kind}: [pending-target]\n---\nneedle");
+        storage::propose_and_commit(
+            &f.vault,
+            &text,
+            Version(0),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::from(["pending-target".into()]),
+            &policy::Gate::new(policy::SecretPolicy::new(1)),
+            Some(&f.pii),
+        )
+        .unwrap();
+        assert_eq!(
+            f.get(&id).result.unwrap().references,
+            index::search::ReferenceState::NotRevalidated
+        );
+    }
+}
+
+#[test]
+fn errors_have_nonempty_sanitized_diagnostics() {
+    for error in [
+        ApiError::UnsupportedSchema,
+        ApiError::PermissionDenied,
+        ApiError::UnsupportedChunk,
+        ApiError::NotFound,
+        ApiError::Deleted,
+        ApiError::Inconsistent,
+        ApiError::ReadUnavailable,
+        ApiError::Search(index::search::SearchError::EmptyQuery),
+    ] {
+        assert!(!error.to_string().trim().is_empty());
+        assert!(!error.to_string().contains("CANARY"));
+    }
+}

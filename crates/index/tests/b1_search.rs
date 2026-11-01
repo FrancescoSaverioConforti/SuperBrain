@@ -530,6 +530,9 @@ fn date_points_and_event_intervals_respect_half_open_overlap_and_rome_offsets() 
         ("offset-inside", "2026-07-31T22:00:00Z"),
         ("offset-outside", "2026-08-31T22:00:00Z"),
         ("bad-date", "2026-99-99"),
+        ("zero-period", "2026-08-15/2026-08-15"),
+        ("reversed-period", "2026-08-16/2026-08-15"),
+        ("end-period", "2026-09-01/2026-09-02"),
     ] {
         let mut n = Note::new(id, "needle");
         n.event = event;
@@ -639,4 +642,87 @@ fn citations_report_unknown_reference_state_without_guessing_pending_or_resolved
     .unwrap();
     let response = f.search("needle", Default::default(), 10);
     assert_eq!(results(&response)[0].references, ReferenceState::Unlinked);
+}
+
+#[test]
+fn all_relation_kinds_are_reported_honestly_without_exposing_targets() {
+    let f = Fixture::new();
+    for kind in [
+        "supports",
+        "contradicts",
+        "derived_from",
+        "supersedes",
+        "applies_to",
+    ] {
+        let id = format!("note-{kind}");
+        let text = Note::new(&id, "needle")
+            .text()
+            .replace("  supports:", &format!("  {kind}:"));
+        storage::propose_and_commit(
+            &f.vault,
+            &text,
+            Version(0),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::from(["opaque-pending".into()]),
+            &policy::Gate::new(policy::SecretPolicy::new(1)),
+            Some(&f.pii),
+        )
+        .unwrap();
+        let response = f.search(&id, Default::default(), 10);
+        assert_eq!(
+            results(&response)[0].references,
+            ReferenceState::NotRevalidated
+        );
+    }
+}
+
+#[test]
+fn search_errors_have_nonempty_sanitized_diagnostics() {
+    for error in [
+        SearchError::InvalidLimit,
+        SearchError::EmptyQuery,
+        SearchError::EmptyProject,
+        SearchError::ReadUnavailable,
+        SearchError::TimeResolution(TimeResolutionError::InvalidDate),
+    ] {
+        assert!(!error.to_string().trim().is_empty());
+    }
+}
+
+#[test]
+fn profiling_preserves_response_and_counts_both_accepted_and_filtered_candidates() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-good", "needle"), 0);
+    let mut other = Note::new("note-other", "needle");
+    other.project = "project-y";
+    f.write(&other, 0);
+    let expected = f.search("needle", Default::default(), 10);
+    let start = std::time::Instant::now();
+    let (actual, profile) = f
+        .index()
+        .search_profiled("needle", Default::default(), 10)
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        (profile.candidates, profile.reads, profile.eligible),
+        (2, 2, 1)
+    );
+    for phase in [
+        profile.candidate_generation,
+        profile.authoritative_reads,
+        profile.revalidation,
+        profile.response_building,
+    ] {
+        assert!(phase > std::time::Duration::ZERO);
+    }
+    assert!(
+        profile.candidate_generation
+            + profile.authoritative_reads
+            + profile.revalidation
+            + profile.response_building
+            <= elapsed
+    );
+    assert!(!format!("{profile:?}").contains("needle"));
 }

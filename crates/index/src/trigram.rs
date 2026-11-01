@@ -177,6 +177,14 @@ fn trigrams_of(text: &str) -> HashSet<[char; 3]> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn exactly_three_characters_are_searchable_and_two_are_not() {
+        let mut index = TrigramIndex::new();
+        index.insert(id("note-three"), "cat");
+        assert_eq!(index.query_exact("cat"), vec![id("note-three")]);
+        assert!(index.query_exact("ca").is_empty());
+    }
+
     fn id(s: &str) -> NoteId {
         NoteId::parse(s).unwrap()
     }
