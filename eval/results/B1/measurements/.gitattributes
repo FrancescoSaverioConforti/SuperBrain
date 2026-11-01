@@ -1,3 +1,4 @@
 *.csv text eol=lf
-*.tsv text eol=lf
+# Trailing tabs encode empty optional columns in the measured query schema.
+*.tsv text eol=lf whitespace=-blank-at-eol
 *.json text eol=lf

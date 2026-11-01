@@ -183,3 +183,13 @@ about repeated journal lookups is not a measured causal attribution. No storage
 optimization, architectural redesign or persistent index has been introduced.
 N=100,000 is running; its rebuild/RSS/percentiles remain unmeasured until actual
 artifacts complete. No extrapolation is reported as measurement.
+
+Independent numerical review: PASS for all three completed post-fix samples.
+The reviewer independently checked query mix/index/category alignment, phase
+budgets, candidate/read/eligible/result counts, nearest-rank percentiles and
+RSS/peak/delta consistency. At N=10,000 the exact subset P95 is 15.0333 ms
+(one authoritative read per query), BM25 P95 is 16662.6147 ms and filtered P95
+is 16155.7740 ms. Ranked and filtered queries fan out to 2,500-10,000 reads.
+These measured differences explain why the mixed P95 is poor while exact lookup
+remains much faster. They do not bypass or justify weakening authoritative gates.
+The fourth scale and final whole-B1 review remain pending.
