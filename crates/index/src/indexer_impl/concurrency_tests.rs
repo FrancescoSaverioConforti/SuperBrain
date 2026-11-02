@@ -37,6 +37,7 @@ impl Fixture {
         let pii = Arc::new(
             vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap(),
         );
+        pii.bootstrap_deletion_log().unwrap();
         let indexer = Arc::new(RealIndexer::new());
         let vault = Arc::new(
             Vault::open_with_pii_store_and_indexer(

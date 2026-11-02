@@ -305,7 +305,7 @@ pub(crate) fn restore_vault_from_backup_with_injector(
         if !already_live.is_empty() {
             return Ok(Err(already_live));
         }
-        promote_all(&vault, &staged, &prepared, &already_restored, pii_store, live_deletion_log, injector).map(Ok)
+        promote_all(&vault, &staged, &prepared, &already_restored, pii_store, live_deletion_log, live_trusted_ref, injector).map(Ok)
     });
     let (restored, excluded_by_recheck) = match result {
         Ok(Ok(lists)) => lists,
@@ -423,6 +423,7 @@ fn live_pii_in_the_way(pii_store: &PiiStore, prepared: &[Prepared<'_>], already_
 /// Promotes every prepared note not already restored. Returns
 /// `(restored_note_ids, excluded_by_final_recheck)`; the first includes the
 /// already-restored ones and is sorted.
+#[allow(clippy::too_many_arguments)] // The separately-bound live log/reference pair is security-critical context.
 fn promote_all(
     vault: &Vault,
     staged: &vault_security::StagedRestore,
@@ -430,6 +431,7 @@ fn promote_all(
     already_restored: &BTreeSet<String>,
     pii_store: &PiiStore,
     live_deletion_log: &DeletionLog,
+    live_trusted_ref: &dyn TrustedReferenceStore,
     injector: &FaultInjector,
 ) -> Result<(Vec<String>, Vec<String>), StorageError> {
     for (name, bytes) in &staged.other_files {
@@ -444,7 +446,7 @@ fn promote_all(
     let mut excluded = Vec::new();
     for note in prepared.iter().filter(|n| !already_restored.contains(n.note_id.as_str())) {
         let operation_id = next_attempt_id(vault, &staged.hash, note)?;
-        match promote_note(vault, note, operation_id, pii_store, live_deletion_log, injector)? {
+        match promote_note(vault, note, operation_id, pii_store, live_deletion_log, live_trusted_ref, injector)? {
             Promotion::Committed => restored.push(note.note_id.as_str().to_string()),
             Promotion::ExcludedDeleted => excluded.push(note.note_id.as_str().to_string()),
         }
@@ -476,6 +478,7 @@ fn promote_note(
     operation_id: Uuid,
     pii_store: &PiiStore,
     live_deletion_log: &DeletionLog,
+    live_trusted_ref: &dyn TrustedReferenceStore,
     injector: &FaultInjector,
 ) -> Result<Promotion, StorageError> {
     let interrupted = |crate::fault::Interrupted::At(point)| StorageError::Interrupted(point);
@@ -516,7 +519,10 @@ fn promote_note(
     injector.check(FaultPoint::RestoreBeforeDeletionRecheck).map_err(interrupted)?;
     let write_lock = live_deletion_log.acquire_write_lock().map_err(deletion_log_err)?;
     injector.check(FaultPoint::RestoreWriteLockHeld).map_err(interrupted)?;
-    if live_deletion_log.is_deleted(note_id.as_str()).map_err(deletion_log_err)? {
+    if live_deletion_log
+        .is_deleted_verified_locked(&write_lock, live_trusted_ref, note_id.as_str())
+        .map_err(deletion_log_err)?
+    {
         // Deleted after `vault_security::restore`'s own checks: exclude it.
         // The pointer was never renamed, so the note was never readable;
         // undo its committed (or staged) ciphertext with the same
@@ -603,6 +609,7 @@ mod tests {
         let source_root = unique_dir();
         let key_path = source_root.join(".pii-store").join("master.key");
         let source_pii = PiiStore::open(source_root.join(".pii-store"), &key_path).unwrap();
+        source_pii.bootstrap_deletion_log().unwrap();
         let source_vault = Vault::open_with_pii_store(source_root.clone(), &unique_dir().join("journal.sqlite"), &source_pii).unwrap();
         let gate = policy::Gate::new(policy::SecretPolicy::new(1));
         for (id, classification, body) in notes {
@@ -618,14 +625,14 @@ mod tests {
             )
             .unwrap();
         }
-        let source_log = DeletionLog::open(&source_pii.deletion_log_path()).unwrap();
+        let source_log = source_pii.open_deletion_log().unwrap();
         let master_key = MasterKey::load_or_create(&unique_dir().join("backup-master.key"), None).unwrap();
         let target = FilesystemBackupTarget::new(unique_dir().join("target"));
         vault_security::backup(&source_root, &source_pii, &source_log, &master_key, &target).unwrap();
 
         let pii_store = PiiStore::open(unique_dir().join("restored-pii"), &key_path).unwrap();
-        let live_log = DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
         let live_ref = DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+        let live_log = DeletionLog::bootstrap_new(&pii_store.deletion_log_path(), &live_ref).unwrap();
         Fixture {
             target,
             master_key,
@@ -733,9 +740,9 @@ mod tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let injector =
             FaultInjector::pause_at_each(vec![FaultPoint::RestoreBeforeDeletionRecheck, FaultPoint::RestoreWriteLockHeld], paused_tx, resume_rx);
-        let second_handle = DeletionLog::open(f.live_log.db_path()).unwrap();
+        let second_handle = f.pii_store.open_deletion_log().unwrap();
         let deleter_log = if separate_handle { &second_handle } else { &f.live_log };
-        let observer = DeletionLog::open(f.live_log.db_path()).unwrap();
+        let observer = f.pii_store.open_deletion_log().unwrap();
 
         let (outcome, blocked) = std::thread::scope(|scope| {
             let restore = {
@@ -747,11 +754,11 @@ mod tests {
             assert_eq!(paused_rx.recv().unwrap(), FaultPoint::RestoreWriteLockHeld); // note-a, lock held
             let deleter = scope.spawn(|| deleter_log.record_deletion("note-b", &f.live_ref).unwrap());
             std::thread::sleep(Duration::from_millis(300));
-            let blocked = !deleter.is_finished() && !observer.is_deleted("note-b").unwrap();
+            let blocked = !deleter.is_finished();
             resume_tx.send(()).unwrap();
             assert_eq!(paused_rx.recv().unwrap(), FaultPoint::RestoreBeforeDeletionRecheck); // note-b
             deleter.join().unwrap(); // note-a's promotion released the lock
-            assert!(observer.is_deleted("note-b").unwrap());
+            assert!(observer.with_verified_not_deleted(&f.live_ref, "note-b", || Ok(())).unwrap().is_none());
             drop(resume_tx);
             (restore.join().unwrap(), blocked)
         });
@@ -783,7 +790,7 @@ mod tests {
     fn concurrent_restore_and_deletion_through_independent_handles_never_expose_the_deleted_note() {
         for _ in 0..8 {
             let f = fixture(&[("note-a", "sensitive", "a"), ("note-b", "sensitive", "B SECRET"), ("note-c", "internal", "c\n")]);
-            let deleter_handle = DeletionLog::open(f.live_log.db_path()).unwrap();
+            let deleter_handle = f.pii_store.open_deletion_log().unwrap();
             let barrier = std::sync::Barrier::new(2);
             let outcome = std::thread::scope(|scope| {
                 let restore = scope.spawn(|| {
@@ -1090,7 +1097,7 @@ mod tests {
         for round in 0..8 {
             let classification = if round % 2 == 0 { "internal" } else { "public" };
             let f = fixture(&[("note-a", "sensitive", "a"), ("note-b", classification, "B BODY\n"), ("note-c", "internal", "c\n")]);
-            let deleter_handle = DeletionLog::open(f.live_log.db_path()).unwrap();
+            let deleter_handle = f.pii_store.open_deletion_log().unwrap();
             let barrier = std::sync::Barrier::new(2);
             let outcome = std::thread::scope(|scope| {
                 let restore = scope.spawn(|| {

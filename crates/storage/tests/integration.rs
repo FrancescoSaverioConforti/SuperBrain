@@ -57,7 +57,9 @@ fn open_vault(root: PathBuf) -> Vault {
 /// doc comment).
 fn test_pii_store() -> vault_security::PiiStore {
     let dir = unique_test_dir();
-    vault_security::PiiStore::open(dir.join(".pii-store"), &dir.join(".pii-store").join("master.key")).unwrap()
+    let store = vault_security::PiiStore::open(dir.join(".pii-store"), &dir.join(".pii-store").join("master.key")).unwrap();
+    store.bootstrap_deletion_log().unwrap();
+    store
 }
 
 fn valid_yaml(id: &str) -> String {

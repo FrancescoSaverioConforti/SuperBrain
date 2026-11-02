@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use storage::{NoteId, Vault, Version};
-use vault_security::{backup as vault_backup, restore as vault_restore, DeletionLog, DpapiTrustedReferenceStore, FilesystemBackupTarget, MasterKey, PiiStore};
+use vault_security::{backup as vault_backup, restore as vault_restore, DpapiTrustedReferenceStore, FilesystemBackupTarget, MasterKey, PiiStore};
 
 fn unique_test_dir() -> PathBuf {
     static UNIQUE_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -63,6 +63,7 @@ fn open_vault_and_pii_store(root: PathBuf) -> (Vault, PiiStore) {
     }
     let pii_root = root.join(".pii-store");
     let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+    pii_store.bootstrap_deletion_log().unwrap();
     let vault = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store).unwrap();
     (vault, pii_store)
 }
@@ -347,7 +348,7 @@ fn a_backup_blob_written_to_a_backuptarget_contains_no_plaintext_sensitive_conte
     storage::propose_and_commit(&vault, &note_text, Version(0), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate, Some(&pii_store))
         .unwrap();
 
-    let deletion_log = DeletionLog::open(&pii_store.root().join("deletion-log.sqlite")).unwrap();
+    let deletion_log = pii_store.open_deletion_log().unwrap();
     let master_key = MasterKey::load_or_create(&root.join("backup-master.key"), None).unwrap();
     let backup_target_dir = unique_test_dir();
     let target = FilesystemBackupTarget::new(backup_target_dir.clone());

@@ -762,8 +762,9 @@ impl Vault {
         // journal's reconcile does for an unrecoverable operation. Runs first
         // so a half-finished deletion is completed before anything else.
         if let Some(store) = pii_store {
-            let log = DeletionLog::open(&store.deletion_log_path()).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(store.deletion_log_reference_path());
+            let log = DeletionLog::open_existing(&store.deletion_log_path(), &trusted_ref)
+                .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
             log.reconcile(&trusted_ref).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
         }
 
@@ -856,8 +857,22 @@ impl Vault {
         let note_lock = self.note_lock(note_id);
         let _guard = note_lock.lock().unwrap();
         let record = self.read_note_locked(note_id)?;
-        refuse_read_if_deleted(self.deletion_log_path.as_deref(), note_id, &record)?;
-        Ok(record)
+        let Some(path) = self.deletion_log_path.as_deref() else {
+            refuse_read_if_deleted(None, note_id, &record)?;
+            return Ok(record);
+        };
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+            path.with_file_name("deletion-log-reference.dpapi"),
+        );
+        let log = DeletionLog::open_existing(path, &trusted_ref)
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+        match log
+            .with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(record))
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?
+        {
+            None => Err(StorageError::Deleted { note_id: note_id.as_str().to_string() }),
+            Some(record) => Ok(record),
+        }
     }
 
     /// The body of `read_note`, run while the caller already holds the
@@ -944,34 +959,39 @@ impl Vault {
     /// `read_note`'s own `StorageError::Deleted`/`StorageError::NotFound`)
     /// when it actually reads it, which it already must do regardless.
     pub fn list_note_ids(&self) -> Result<Vec<NoteId>, StorageError> {
-        let deletion_log = self.deletion_log_path.as_deref().map(DeletionLog::open).transpose().map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+        let deletion_log = self
+            .deletion_log_path
+            .as_deref()
+            .map(|path| {
+                let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+                    path.with_file_name("deletion-log-reference.dpapi"),
+                );
+                DeletionLog::open_existing(path, &trusted_ref).map(|log| (log, trusted_ref))
+            })
+            .transpose()
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
 
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&self.root).map_err(StorageError::Io)? {
-            let entry = entry.map_err(StorageError::Io)?;
-            let file_type = entry.file_type().map_err(StorageError::Io)?;
-            if !file_type.is_file() {
-                // Skips `.before-images/` and `.pii-store/` (both
-                // directories) without naming them specially here.
-                continue;
-            }
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else { continue };
-            // Exactly `<id>.record`, never a `.record.tmp-*` temp file
-            // (`atomic::atomic_write`'s naming) or anything else.
-            let Some(candidate) = name.strip_suffix(".record") else { continue };
-            let Ok(note_id) = NoteId::parse(candidate) else { continue };
-
-            if let Some(log) = &deletion_log {
-                match log.is_deleted(note_id.as_str()) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => return Err(StorageError::DeletionLog(e.to_string())),
+        let enumerate = |is_deleted: &dyn Fn(&str) -> Result<bool, vault_security::DeletionLogError>| {
+            let mut ids = Vec::new();
+            for entry in std::fs::read_dir(&self.root).map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))? {
+                let entry = entry.map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))?;
+                if !entry.file_type().map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))?.is_file() {
+                    continue;
                 }
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else { continue };
+                let Some(candidate) = name.strip_suffix(".record") else { continue };
+                let Ok(note_id) = NoteId::parse(candidate) else { continue };
+                if is_deleted(note_id.as_str())? { continue; }
+                ids.push(note_id);
             }
-            ids.push(note_id);
+            Ok(ids)
+        };
+        match deletion_log {
+            Some((log, trusted_ref)) => log.with_verified_lookup(&trusted_ref, enumerate)
+                .map_err(|e| StorageError::DeletionLog(e.to_string())),
+            None => enumerate(&|_| Ok(false)).map_err(|e| StorageError::DeletionLog(e.to_string())),
         }
-        Ok(ids)
     }
 
     /// Returns (creating if absent) the `Arc<Mutex<()>>` for `note_id`,
@@ -1506,7 +1526,8 @@ impl Vault {
             Some(deletion) => {
                 let already_deleted = deletion
                     .log
-                    .is_deleted(note_id.as_str())
+                    .with_verified_not_deleted(deletion.trusted_ref, note_id.as_str(), || Ok(()))
+                    .map(|value| value.is_none())
                     .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
                 if !already_deleted {
                     deletion
@@ -1916,8 +1937,12 @@ impl Vault {
     /// this call's own journal row is advanced to `Failed`, as for a
     /// `Conflict`.
     fn refuse_if_deleted(&self, pii_store: &PiiStore, note_id: &NoteId, operation_id: Uuid) -> Result<(), StorageError> {
-        let deleted = DeletionLog::open(&pii_store.deletion_log_path())
-            .and_then(|log| log.is_deleted(note_id.as_str()))
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+        let deleted = DeletionLog::open_existing(&pii_store.deletion_log_path(), &trusted_ref)
+            .and_then(|log| {
+                log.with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(()))
+                    .map(|value| value.is_none())
+            })
             .map_err(|e| StorageError::DeletionLog(e.to_string()));
         let refusal = match deleted {
             Ok(false) => return Ok(()),
@@ -2054,7 +2079,13 @@ fn refuse_read_if_deleted(deletion_log_path: Option<&Path>, note_id: &NoteId, re
             note_id.as_str()
         )));
     };
-    match DeletionLog::open(path).and_then(|log| log.is_deleted(note_id.as_str())) {
+    let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+        path.with_file_name("deletion-log-reference.dpapi"),
+    );
+    match DeletionLog::open_existing(path, &trusted_ref).and_then(|log| {
+        log.with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(()))
+            .map(|value| value.is_none())
+    }) {
         Ok(false) => Ok(()),
         Ok(true) => Err(StorageError::Deleted { note_id: note_id.as_str().to_string() }),
         Err(e) => Err(StorageError::DeletionLog(e.to_string())),
@@ -2413,6 +2444,7 @@ mod tests {
         let journal_path = unique_test_dir().join("journal.sqlite");
         let pii_root = root.join(".pii-store");
         let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii_store.bootstrap_deletion_log().unwrap();
 
         let live_id = NoteId::parse("note-live").unwrap();
         let deleted_id = NoteId::parse("note-deleted").unwrap();
@@ -2426,7 +2458,7 @@ mod tests {
         // exactly where `Vault::open_with_pii_store` looks for it — no need
         // to drive a full tombstone write through the sensitive pipeline
         // just to prove list_note_ids consults this log.
-        let log = DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+        let log = pii_store.open_deletion_log().unwrap();
         let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
         log.record_deletion(deleted_id.as_str(), &trusted_ref).unwrap();
 
@@ -4578,7 +4610,9 @@ mod tests {
 
         fn open_pii_store(vault_root: &Path) -> PiiStore {
             let pii_root = vault_root.join(".pii-store");
-            PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap()
+            let store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+            store.bootstrap_deletion_log().unwrap();
+            store
         }
 
         fn pointer_content_for(note_id: &str) -> String {
@@ -5087,8 +5121,7 @@ mod tests {
             // recorded via PendingDeletion, interrupted at
             // AfterJournalCommittedBeforeGit — the before-image (the real,
             // now-deleted content) exists at this exact point.
-            let deletion_log_path = pii_store.root().join("deletion-log.sqlite");
-            let deletion_log = vault_security::DeletionLog::open(&deletion_log_path).unwrap();
+            let deletion_log = pii_store.open_deletion_log().unwrap();
             let trusted_ref_path = pii_store.root().join("deletion-log-reference.dpapi");
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(trusted_ref_path);
             let op2 = Uuid::new_v4();
@@ -5111,7 +5144,10 @@ mod tests {
                     pii_store.has_before_image("note-tombstone-cleanup", op2),
                     "the before-image (the real, now-deleted content) must exist at this crash point"
                 );
-                assert!(deletion_log.is_deleted("note-tombstone-cleanup").unwrap(), "the deletion must already be logged");
+                assert!(deletion_log
+                    .with_verified_not_deleted(&trusted_ref, "note-tombstone-cleanup", || Ok(()))
+                    .unwrap()
+                    .is_none(), "the deletion must already be logged");
             }
 
             let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
@@ -5161,7 +5197,7 @@ mod tests {
                 );
                 assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
             }
-            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            let log = pii_store.open_deletion_log().unwrap();
             log.record_deletion("note-live-gap", &vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()))
                 .unwrap();
 
@@ -5189,7 +5225,7 @@ mod tests {
                     .write_sensitive_record_unchecked(&id, &pointer_content, b"REAL SECRET", Version(0), Uuid::new_v4(), &pii_store, None)
                     .unwrap();
             }
-            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            let log = pii_store.open_deletion_log().unwrap();
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
             let op = Uuid::new_v4();
             {
@@ -5245,7 +5281,7 @@ mod tests {
                         );
                         assert!(matches!(result, Err(StorageError::Interrupted(p)) if p == point), "{point:?}/{update}");
                     }
-                    let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+                    let log = pii_store.open_deletion_log().unwrap();
                     log.record_deletion(
                         "note-live-plain",
                         &vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()),

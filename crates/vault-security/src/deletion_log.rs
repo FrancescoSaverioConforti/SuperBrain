@@ -26,14 +26,15 @@
 //! ([`DeletionLogError::ReferenceTamperDetected`]), not as a value that
 //! happens to parse as some other generation.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::keys::{dpapi_protect, dpapi_unprotect};
 
@@ -42,6 +43,7 @@ use crate::keys::{dpapi_protect, dpapi_unprotect};
 /// formula `sha256(prev_chain_hash || generation || note_id)` has a
 /// well-defined input even for generation 1.
 const GENESIS_PREV_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const DELETION_LOG_FORMAT_VERSION: u32 = 1;
 
 /// A generation-entry's lifecycle state. Modeled on
 /// `domain::write_state::WriteState`'s `valid_transition` idiom: a small
@@ -85,6 +87,8 @@ pub fn valid_transition(from: DeletionLogState, to: DeletionLogState) -> bool {
 pub struct GenerationRef {
     pub generation: u64,
     pub chain_hash: String,
+    pub format_version: Option<u32>,
+    pub store_id: Option<String>,
 }
 
 impl GenerationRef {
@@ -95,7 +99,12 @@ impl GenerationRef {
     /// `chain_hash` is a fixed-width hex string, so a single `:` separator
     /// is sufficient and unambiguous).
     fn serialize(&self) -> Vec<u8> {
-        format!("{}:{}", self.generation, self.chain_hash).into_bytes()
+        match (&self.format_version, &self.store_id) {
+            (Some(version), Some(store_id)) => {
+                format!("v{version}:{store_id}:{}:{}", self.generation, self.chain_hash).into_bytes()
+            }
+            _ => format!("{}:{}", self.generation, self.chain_hash).into_bytes(),
+        }
     }
 
     /// Inverse of [`GenerationRef::serialize`]. Returns `None` if `bytes`
@@ -103,12 +112,28 @@ impl GenerationRef {
     /// to `DeletionLogError::ReferenceCorrupt`.
     fn deserialize(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
+        if let Some(versioned) = text.strip_prefix('v') {
+            let mut parts = versioned.splitn(4, ':');
+            let format_version = parts.next()?.parse::<u32>().ok()?;
+            let store_id = parts.next()?.to_string();
+            let generation = parts.next()?.parse::<u64>().ok()?;
+            let hash = parts.next()?;
+            if format_version == 0 || store_id.is_empty() || hash.is_empty() {
+                return None;
+            }
+            return Some(GenerationRef {
+                generation,
+                chain_hash: hash.to_string(),
+                format_version: Some(format_version),
+                store_id: Some(store_id),
+            });
+        }
         let (gen_str, hash) = text.split_once(':')?;
         let generation = gen_str.parse::<u64>().ok()?;
         if hash.is_empty() {
             return None;
         }
-        Some(GenerationRef { generation, chain_hash: hash.to_string() })
+        Some(GenerationRef { generation, chain_hash: hash.to_string(), format_version: None, store_id: None })
     }
 }
 
@@ -121,6 +146,7 @@ impl GenerationRef {
 pub trait TrustedReferenceStore {
     fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError>;
     fn write(&self, r: &GenerationRef) -> Result<(), DeletionLogError>;
+    fn bound_path(&self) -> Option<&Path> { None }
 }
 
 /// The REAL trusted-reference store: the serialized [`GenerationRef`] is
@@ -143,7 +169,52 @@ impl DpapiTrustedReferenceStore {
     }
 }
 
+/// Durably replaces a small coordination file without ever truncating the
+/// previous authenticated value in place. A crash leaves either the old
+/// reference or the fully synced replacement; reconciliation understands both.
+fn atomic_write_reference(path: &Path, contents: &[u8]) -> Result<(), DeletionLogError> {
+    let parent = path.parent().ok_or_else(|| DeletionLogError::Io("reference path has no parent".to_string()))?;
+    std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+    let tmp = parent.join(format!(".{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4()));
+    let write_result = (|| -> Result<(), DeletionLogError> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        file.write_all(contents).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        atomic_replace_reference(&tmp, path)?;
+        #[cfg(unix)]
+        if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }
+        Ok(())
+    })();
+    if write_result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    write_result
+}
+
+#[cfg(windows)]
+fn atomic_replace_reference(source: &Path, destination: &Path) -> Result<(), DeletionLogError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source_wide.as_ptr()),
+            PCWSTR(destination_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|e| DeletionLogError::Io(e.to_string()))
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_reference(source: &Path, destination: &Path) -> Result<(), DeletionLogError> {
+    std::fs::rename(source, destination).map_err(|e| DeletionLogError::Io(e.to_string()))
+}
+
 impl TrustedReferenceStore for DpapiTrustedReferenceStore {
+    fn bound_path(&self) -> Option<&Path> { Some(&self.path) }
     fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
         let wrapped = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -166,11 +237,7 @@ impl TrustedReferenceStore for DpapiTrustedReferenceStore {
     fn write(&self, r: &GenerationRef) -> Result<(), DeletionLogError> {
         let plaintext = r.serialize();
         let wrapped = dpapi_protect(&plaintext).map_err(|_| DeletionLogError::ReferenceTamperDetected)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        }
-        std::fs::write(&self.path, wrapped).map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        Ok(())
+        atomic_write_reference(&self.path, &wrapped)
     }
 }
 
@@ -200,6 +267,7 @@ impl FileTrustedReferenceStore {
 
 #[cfg(test)]
 impl TrustedReferenceStore for FileTrustedReferenceStore {
+    fn bound_path(&self) -> Option<&Path> { Some(&self.path) }
     fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
         match std::fs::read(&self.path) {
             Ok(bytes) => {
@@ -227,6 +295,18 @@ impl TrustedReferenceStore for FileTrustedReferenceStore {
 pub enum DeletionLogError {
     #[error("I/O error in deletion log: {0}")]
     Io(String),
+
+    #[error("deletion log is uninitialized")]
+    Uninitialized,
+
+    #[error("deletion log is a legacy state that requires explicit administrative migration")]
+    LegacyNeedsMigration,
+
+    #[error("deletion log is corrupt, tampered with, or has lost required coordination state")]
+    CorruptOrTampered,
+
+    #[error("deletion log format or schema is incompatible")]
+    Incompatible,
 
     /// A chained entry's `chain_hash` does not match
     /// `sha256(prev_chain_hash || generation || note_id)`.
@@ -323,6 +403,23 @@ pub enum ReconcileOutcome {
     /// `Pending` (a crash between step 1 and step 2, or step 2 and step 3).
     /// The reference was rolled forward and the entry marked `Completed`.
     RolledForward { generation: u64 },
+}
+
+/// Explicit operator assertion required to migrate an ambiguous legacy-empty
+/// state. Constructing this value is an administrative act, never a read path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyNoDeletionAttestation {
+    pub operation_id: Uuid,
+    pub authority: String,
+    pub timestamp: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReceipt {
+    pub operation_id: Uuid,
+    pub store_id: String,
+    pub format_version: u32,
 }
 
 /// Crash-injectable boundaries in the three-step deletion protocol.
@@ -429,6 +526,8 @@ impl FaultInjector {
 /// SQLite database file (never the A2 journal's file).
 pub struct DeletionLog {
     db_path: PathBuf,
+    db_identity: FileIdentity,
+    reference_path: Option<PathBuf>,
     /// Serializes access to this log's own SQLite connection within this
     /// process, so a concurrent read during `record_deletion` (same
     /// `DeletionLog` instance, different thread) observes a consistent
@@ -461,6 +560,55 @@ pub struct DeletionLogWriteGuard {
     file: std::fs::File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    index: u64,
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity, DeletionLogError> {
+    let file = std::fs::File::open(path).map_err(|_| DeletionLogError::CorruptOrTampered)?;
+    identity_of_open_file(&file)
+}
+
+fn identity_of_open_file(file: &std::fs::File) -> Result<FileIdentity, DeletionLogError> {
+    let metadata = file.metadata().map_err(|_| DeletionLogError::CorruptOrTampered)?;
+    if !metadata.is_file() { return Err(DeletionLogError::CorruptOrTampered); }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)
+                .map_err(|_| DeletionLogError::CorruptOrTampered)?;
+        }
+        Ok(FileIdentity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity { volume: metadata.dev(), index: metadata.ino() })
+    }
+}
+
+fn acquire_initialization_lock(db_path: &Path) -> Result<DeletionLogWriteGuard, DeletionLogError> {
+    let parent = db_path.parent().ok_or(DeletionLogError::Uninitialized)?;
+    std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+    let path = db_path.with_extension("writelock");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
+        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+    file.lock().map_err(|e| DeletionLogError::Io(e.to_string()))?;
+    if identity_of_open_file(&file)? != file_identity(&path)? {
+        return Err(DeletionLogError::CorruptOrTampered);
+    }
+    Ok(DeletionLogWriteGuard { file })
+}
+
 impl Drop for DeletionLogWriteGuard {
     fn drop(&mut self) {
         // Closing the handle releases the lock anyway; unlocking explicitly
@@ -471,13 +619,271 @@ impl Drop for DeletionLogWriteGuard {
 }
 
 impl DeletionLog {
-    /// Opens (creating if necessary) the deletion-log SQLite database at
-    /// `db_path`, e.g. `<root>/deletion-log.sqlite`.
-    pub fn open(db_path: &Path) -> Result<Self, DeletionLogError> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+    /// Administratively converts only a provably empty legacy layout into
+    /// authenticated generation zero and persists a non-sensitive receipt.
+    pub fn migrate_legacy_empty(
+        db_path: &Path,
+        trusted_ref: &dyn TrustedReferenceStore,
+        attestation: &LegacyNoDeletionAttestation,
+    ) -> Result<MigrationReceipt, DeletionLogError> {
+        if attestation.authority.trim().is_empty()
+            || attestation.timestamp.trim().is_empty()
+            || attestation.reason.trim().is_empty()
+        {
+            return Err(DeletionLogError::LegacyNeedsMigration);
         }
-        let conn = Connection::open(db_path).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let initialization_lock = acquire_initialization_lock(db_path)?;
+        if let Some(reference) = trusted_ref.read()? {
+            if !Self::is_genesis_reference(&reference) {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+            drop(initialization_lock);
+            let log = Self::open_existing(db_path, trusted_ref)?;
+            let conn = log.conn.lock().expect("deletion log mutex poisoned");
+            let operation: String = conn
+                .query_row(
+                    "SELECT migration_operation_id FROM deletion_log_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| DeletionLogError::CorruptOrTampered)?;
+            if operation != attestation.operation_id.to_string() {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+            return Ok(MigrationReceipt {
+                operation_id: attestation.operation_id,
+                store_id: reference.store_id.expect("verified P0 reference has store id"),
+                format_version: DELETION_LOG_FORMAT_VERSION,
+            });
+        }
+
+        if db_path.exists() {
+            let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+            let table_count: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'", [], |row| row.get(0),
+            ).map_err(|_| DeletionLogError::Incompatible)?;
+            let count: i64 = if table_count == 0 {
+                0
+            } else {
+                conn.query_row("SELECT count(*) FROM deletions", [], |row| row.get(0))
+                    .map_err(|_| DeletionLogError::Incompatible)?
+            };
+            if count != 0 {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+        }
+
+        let store_id = Uuid::new_v4().to_string();
+        if !db_path.exists() {
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(db_path)
+                .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        }
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        Self::create_schema(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deletion_log_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                format_version INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                migration_operation_id TEXT NOT NULL,
+                migration_authority TEXT NOT NULL,
+                migration_timestamp TEXT NOT NULL,
+                migration_reason TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let existing_migration: Option<(String, String)> = conn.query_row(
+            "SELECT store_id, migration_operation_id FROM deletion_log_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|_| DeletionLogError::CorruptOrTampered)?;
+        let store_id = match existing_migration {
+            Some((existing_id, operation_id)) if operation_id == attestation.operation_id.to_string() => existing_id,
+            Some(_) => return Err(DeletionLogError::CorruptOrTampered),
+            None => store_id,
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO deletion_log_meta(singleton, format_version, store_id, migration_operation_id,
+             migration_authority, migration_timestamp, migration_reason) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                DELETION_LOG_FORMAT_VERSION,
+                store_id,
+                attestation.operation_id.to_string(),
+                attestation.authority,
+                attestation.timestamp,
+                attestation.reason,
+            ],
+        )
+        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let genesis = Self::genesis_reference(store_id.clone());
+        trusted_ref.write(&genesis)?;
+        Ok(MigrationReceipt {
+            operation_id: attestation.operation_id,
+            store_id: genesis.store_id.expect("new genesis has store id"),
+            format_version: DELETION_LOG_FORMAT_VERSION,
+        })
+    }
+
+    /// Explicitly creates a new deletion log and its authenticated genesis.
+    /// Normal consumers must use [`DeletionLog::open_existing`] instead.
+    pub fn bootstrap_new(
+        db_path: &Path,
+        trusted_ref: &dyn TrustedReferenceStore,
+    ) -> Result<Self, DeletionLogError> {
+        let initialization_lock = acquire_initialization_lock(db_path)?;
+        let existing_reference = trusted_ref.read()?;
+        if let Some(existing) = &existing_reference {
+            if !Self::is_genesis_reference(existing) {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+            if db_path.exists() && !Self::is_retryable_genesis_partial(db_path)? {
+                drop(initialization_lock);
+                return Self::open_existing(db_path, trusted_ref);
+            }
+        } else if db_path.exists() {
+            return Err(DeletionLogError::LegacyNeedsMigration);
+        }
+
+        let genesis = existing_reference.unwrap_or_else(|| Self::genesis_reference(Uuid::new_v4().to_string()));
+        if trusted_ref.read()?.is_none() {
+            trusted_ref.write(&genesis)?;
+        }
+
+        if !db_path.exists() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(db_path)
+                .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        }
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        Self::create_schema(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deletion_log_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                format_version INTEGER NOT NULL,
+                store_id TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO deletion_log_meta(singleton, format_version, store_id) VALUES (1, ?1, ?2)",
+            rusqlite::params![DELETION_LOG_FORMAT_VERSION, genesis.store_id.as_deref().unwrap_or_default()],
+        )
+        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let log = Self {
+            db_path: db_path.to_path_buf(),
+            db_identity: file_identity(db_path)?,
+            reference_path: trusted_ref.bound_path().map(Path::to_path_buf),
+            conn: Mutex::new(conn),
+            write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT,
+        };
+        log.verify_consistent(trusted_ref)?;
+        log.verify_file_identities(&initialization_lock)?;
+        Ok(log)
+    }
+
+    /// A bootstrap retry may finish only a DB created after the authenticated
+    /// genesis reference but before schema/meta initialization. It may never
+    /// reinterpret rows, metadata, or unrelated tables as a fresh genesis.
+    fn is_retryable_genesis_partial(db_path: &Path) -> Result<bool, DeletionLogError> {
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .map_err(|_| DeletionLogError::Incompatible)?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| DeletionLogError::Incompatible)?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| DeletionLogError::Incompatible)?;
+        if names.iter().any(|name| name != "deletions") { return Ok(false); }
+        if names.iter().any(|name| name == "deletions") {
+            let count: i64 = conn.query_row("SELECT count(*) FROM deletions", [], |row| row.get(0))
+                .map_err(|_| DeletionLogError::Incompatible)?;
+            if count != 0 { return Ok(false); }
+        }
+        Ok(true)
+    }
+
+    /// Opens an existing log without creating any filesystem or SQLite state.
+    pub fn open_existing(
+        db_path: &Path,
+        trusted_ref: &dyn TrustedReferenceStore,
+    ) -> Result<Self, DeletionLogError> {
+        // Inspect the authenticated reference before classifying an absent
+        // artifact as legacy. A versioned reference proves initialization, so
+        // a missing DB or lock is loss/tampering, never migratable emptiness.
+        let reference_exists = trusted_ref.read()?.is_some();
+        if !db_path.is_file() {
+            return Err(if reference_exists { DeletionLogError::CorruptOrTampered } else { DeletionLogError::LegacyNeedsMigration });
+        }
+        if !db_path.with_extension("writelock").is_file() {
+            return Err(if reference_exists { DeletionLogError::CorruptOrTampered } else { DeletionLogError::LegacyNeedsMigration });
+        }
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        let schema_ok = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='deletions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| DeletionLogError::Io(e.to_string()))?
+            == 1;
+        if !schema_ok {
+            return Err(DeletionLogError::Incompatible);
+        }
+        let log = Self {
+            db_path: db_path.to_path_buf(),
+            db_identity: file_identity(db_path)?,
+            reference_path: trusted_ref.bound_path().map(Path::to_path_buf),
+            conn: Mutex::new(conn),
+            write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT,
+        };
+        let guard = log.acquire_existing_write_lock()?;
+        log.verify_file_identities(&guard)?;
+        log.verify_existing_or_pending(trusted_ref)?;
+        Ok(log)
+    }
+
+    fn verify_existing_or_pending(&self, trusted_ref: &dyn TrustedReferenceStore) -> Result<(), DeletionLogError> {
+        let conn = self.conn.lock().expect("deletion log mutex poisoned");
+        Self::verify_chain_on(&conn)?;
+        let latest = Self::latest_row(&conn)?;
+        let reference = trusted_ref.read()?.ok_or_else(|| {
+            if latest.is_none() { DeletionLogError::LegacyNeedsMigration }
+            else { DeletionLogError::CorruptOrTampered }
+        })?;
+        Self::verify_binding_on(&conn, &reference, latest.is_none())?;
+        match latest {
+            None if Self::is_genesis_reference(&reference) => Ok(()),
+            Some(row) if row.generation == reference.generation && row.chain_hash == reference.chain_hash => Ok(()),
+            Some(row) if row.state == DeletionLogState::Pending
+                && row.generation == reference.generation + 1
+                && row.prev_chain_hash == reference.chain_hash => Ok(()),
+            _ => Err(DeletionLogError::CorruptOrTampered),
+        }
+    }
+
+    fn genesis_reference(store_id: String) -> GenerationRef {
+        GenerationRef {
+            generation: 0,
+            chain_hash: GENESIS_PREV_CHAIN_HASH.to_string(),
+            format_version: Some(DELETION_LOG_FORMAT_VERSION),
+            store_id: Some(store_id),
+        }
+    }
+
+    fn is_genesis_reference(reference: &GenerationRef) -> bool {
+        reference.generation == 0
+            && reference.chain_hash == GENESIS_PREV_CHAIN_HASH
+            && reference.format_version == Some(DELETION_LOG_FORMAT_VERSION)
+            && reference.store_id.as_ref().is_some_and(|id| !id.is_empty())
+    }
+
+    fn create_schema(conn: &Connection) -> Result<(), DeletionLogError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deletions (
                 generation INTEGER PRIMARY KEY,
@@ -487,8 +893,19 @@ impl DeletionLog {
                 state TEXT NOT NULL CHECK(state IN ('pending','completed'))
             );",
         )
-        .map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        Ok(Self { db_path: db_path.to_path_buf(), conn: Mutex::new(conn), write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT })
+        .map_err(|e| DeletionLogError::Io(e.to_string()))
+    }
+
+    /// Opens (creating if necessary) the deletion-log SQLite database at
+    /// `db_path`, e.g. `<root>/deletion-log.sqlite`.
+    #[cfg(test)]
+    pub(crate) fn open(db_path: &Path) -> Result<Self, DeletionLogError> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        }
+        let conn = Connection::open(db_path).map_err(|e| DeletionLogError::Io(e.to_string()))?;
+        Self::create_schema(&conn)?;
+        Ok(Self { db_path: db_path.to_path_buf(), db_identity: file_identity(db_path)?, reference_path: None, conn: Mutex::new(conn), write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT })
     }
 
     /// The path to this log's own SQLite file.
@@ -556,32 +973,7 @@ impl DeletionLog {
     /// the restore promotion only calls `is_deleted` under it, and
     /// `record_deletion` never calls `reconcile`.
     pub fn acquire_write_lock(&self) -> Result<DeletionLogWriteGuard, DeletionLogError> {
-        let path = self.write_lock_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| DeletionLogError::Io(e.to_string()))?;
-        let deadline = Instant::now() + self.write_lock_timeout;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(DeletionLogWriteGuard { file }),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        return Err(DeletionLogError::WriteLockUnavailable {
-                            timeout_ms: self.write_lock_timeout.as_millis() as u64,
-                        });
-                    }
-                    std::thread::sleep(WRITE_LOCK_POLL_INTERVAL);
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(DeletionLogError::Io(e.to_string())),
-            }
-        }
+        self.acquire_existing_write_lock()
     }
 
     fn latest_row(conn: &Connection) -> Result<Option<Row>, DeletionLogError> {
@@ -665,11 +1057,15 @@ impl DeletionLog {
         trusted_ref: &dyn TrustedReferenceStore,
         injector: &FaultInjector,
     ) -> Result<DeletionReceipt, DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
         // Outer: the cross-process write lock, held (RAII) until this
         // function returns by ANY path — including the injected-crash early
         // returns below, mirroring a real crash, where process death drops
         // the OS lock. Inner: the connection mutex. Never the other order.
-        let _write_lock = self.acquire_write_lock()?;
+        let write_lock = self.acquire_write_lock()?;
+        self.verify_file_identities(&write_lock)?;
+        self.reconcile_locked(&write_lock, trusted_ref)?;
+        self.verify_consistent(trusted_ref)?;
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
 
         let (prev_chain_hash, next_generation) = match Self::latest_row(&conn)? {
@@ -701,7 +1097,13 @@ impl DeletionLog {
         }
 
         // Step 2: update + sync the trusted reference.
-        trusted_ref.write(&GenerationRef { generation: next_generation, chain_hash: chain_hash.clone() })?;
+        let binding = trusted_ref.read()?.ok_or(DeletionLogError::CorruptOrTampered)?;
+        trusted_ref.write(&GenerationRef {
+            generation: next_generation,
+            chain_hash: chain_hash.clone(),
+            format_version: binding.format_version,
+            store_id: binding.store_id,
+        })?;
 
         if injector.check(FaultPoint::AfterReferenceUpdated).is_err() {
             return Ok(DeletionReceipt { generation: next_generation, chain_hash });
@@ -730,6 +1132,7 @@ impl DeletionLog {
     /// [`DeletionLog::reconcile`] itself fails closed on via
     /// [`DeletionLogError::ReferenceMissing`] rather than treating as
     /// harmless).
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> Result<bool, DeletionLogError> {
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
         Ok(Self::latest_row(&conn)?.is_none())
@@ -738,13 +1141,164 @@ impl DeletionLog {
     /// Returns `true` if `note_id` has a deletion entry in ANY state
     /// (`Pending` or `Completed`). Per C5, the note becomes non-consultable
     /// starting at step 1 — a `Pending` entry must already read as deleted.
-    pub fn is_deleted(&self, note_id: &str) -> Result<bool, DeletionLogError> {
+    pub(crate) fn is_deleted(&self, note_id: &str) -> Result<bool, DeletionLogError> {
         let conn = self.conn.lock().expect("deletion log mutex poisoned");
         let mut stmt = conn
             .prepare("SELECT 1 FROM deletions WHERE note_id = ?1 LIMIT 1")
             .map_err(|e| DeletionLogError::Io(e.to_string()))?;
         let mut rows = stmt.query([note_id]).map_err(|e| DeletionLogError::Io(e.to_string()))?;
         Ok(rows.next().map_err(|e| DeletionLogError::Io(e.to_string()))?.is_some())
+    }
+
+    /// Verified lookup for a caller already holding this log's write guard,
+    /// such as restore promotion. The caller retains the guard through its
+    /// promotion decision and pointer rename.
+    pub fn is_deleted_verified_locked(
+        &self,
+        guard: &DeletionLogWriteGuard,
+        trusted_ref: &dyn TrustedReferenceStore,
+        note_id: &str,
+    ) -> Result<bool, DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
+        self.verify_file_identities(guard)?;
+        self.verify_consistent(trusted_ref)?;
+        let deleted = self.is_deleted(note_id)?;
+        self.verify_file_identities(guard)?;
+        Ok(deleted)
+    }
+
+    /// Verifies the complete log/reference pair and performs the lookup while
+    /// holding the same cross-process lock used by deletion writers.
+    pub fn with_verified_not_deleted<T>(
+        &self,
+        trusted_ref: &dyn TrustedReferenceStore,
+        note_id: &str,
+        expose: impl FnOnce() -> Result<T, DeletionLogError>,
+    ) -> Result<Option<T>, DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
+        let _guard = self.acquire_existing_write_lock()?;
+        self.verify_file_identities(&_guard)?;
+        self.verify_consistent(trusted_ref)?;
+        if self.is_deleted(note_id)? {
+            return Ok(None);
+        }
+        let value = expose()?;
+        self.verify_consistent(trusted_ref)?;
+        self.verify_file_identities(&_guard)?;
+        Ok(Some(value))
+    }
+
+    /// Runs a non-note-specific operation against one verified, locked view.
+    pub fn with_verified<T>(
+        &self,
+        trusted_ref: &dyn TrustedReferenceStore,
+        operation: impl FnOnce(&GenerationRef) -> Result<T, DeletionLogError>,
+    ) -> Result<T, DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
+        let _guard = self.acquire_existing_write_lock()?;
+        self.verify_file_identities(&_guard)?;
+        self.verify_consistent(trusted_ref)?;
+        let before = trusted_ref.read()?.ok_or(DeletionLogError::CorruptOrTampered)?;
+        let value = operation(&before)?;
+        self.verify_consistent(trusted_ref)?;
+        let after = trusted_ref.read()?.ok_or(DeletionLogError::CorruptOrTampered)?;
+        if before != after {
+            return Err(DeletionLogError::CorruptOrTampered);
+        }
+        self.verify_file_identities(&_guard)?;
+        Ok(value)
+    }
+
+    /// Enumerates against one verified view while retaining the deletion
+    /// lock through the caller's entire enumeration and result construction.
+    pub fn with_verified_lookup<T>(
+        &self,
+        trusted_ref: &dyn TrustedReferenceStore,
+        operation: impl FnOnce(&dyn Fn(&str) -> Result<bool, DeletionLogError>) -> Result<T, DeletionLogError>,
+    ) -> Result<T, DeletionLogError> {
+        self.with_verified(trusted_ref, |_| operation(&|note_id| self.is_deleted(note_id)))
+    }
+
+    fn verify_file_identities(&self, guard: &DeletionLogWriteGuard) -> Result<(), DeletionLogError> {
+        if file_identity(&self.db_path)? != self.db_identity {
+            return Err(DeletionLogError::CorruptOrTampered);
+        }
+        let current = file_identity(&self.write_lock_path())?;
+        if identity_of_open_file(&guard.file)? != current {
+            return Err(DeletionLogError::CorruptOrTampered);
+        }
+        Ok(())
+    }
+
+    fn verify_consistent(&self, trusted_ref: &dyn TrustedReferenceStore) -> Result<(), DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
+        let conn = self.conn.lock().expect("deletion log mutex poisoned");
+        Self::verify_chain_on(&conn)?;
+        let latest = Self::latest_row(&conn)?;
+        let reference = trusted_ref.read()?.ok_or(DeletionLogError::CorruptOrTampered)?;
+        Self::verify_binding_on(&conn, &reference, latest.is_none())?;
+        match latest {
+            None if Self::is_genesis_reference(&reference) => Ok(()),
+            None => Err(DeletionLogError::CorruptOrTampered),
+            Some(row) if row.generation == reference.generation && row.chain_hash == reference.chain_hash => Ok(()),
+            Some(_) => Err(DeletionLogError::CorruptOrTampered),
+        }
+    }
+
+    fn verify_binding_on(conn: &Connection, reference: &GenerationRef, log_is_empty: bool) -> Result<(), DeletionLogError> {
+        if let (Some(version), Some(reference_store_id)) = (reference.format_version, reference.store_id.as_deref()) {
+            let metadata = conn
+                .query_row(
+                    "SELECT format_version, store_id FROM deletion_log_meta WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|_| DeletionLogError::Incompatible)?;
+            if metadata.0 != version || metadata.0 != DELETION_LOG_FORMAT_VERSION || metadata.1 != reference_store_id {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+        } else if log_is_empty {
+            return Err(DeletionLogError::LegacyNeedsMigration);
+        }
+        Ok(())
+    }
+
+    fn assert_reference_bound(&self, reference: &dyn TrustedReferenceStore) -> Result<(), DeletionLogError> {
+        if let Some(expected) = &self.reference_path {
+            if reference.bound_path() != Some(expected.as_path()) {
+                return Err(DeletionLogError::CorruptOrTampered);
+            }
+        } else if !cfg!(test) {
+            return Err(DeletionLogError::CorruptOrTampered);
+        }
+        Ok(())
+    }
+
+    fn acquire_existing_write_lock(&self) -> Result<DeletionLogWriteGuard, DeletionLogError> {
+        let path = self.write_lock_path();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => DeletionLogError::LegacyNeedsMigration,
+                _ => DeletionLogError::Io(e.to_string()),
+            })?;
+        let deadline = Instant::now() + self.write_lock_timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(DeletionLogWriteGuard { file }),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(WRITE_LOCK_POLL_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(DeletionLogError::WriteLockUnavailable {
+                        timeout_ms: self.write_lock_timeout.as_millis() as u64,
+                    });
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(DeletionLogError::Io(e.to_string())),
+            }
+        }
     }
 
     /// Walks the WHOLE chain from genesis and verifies every link (final
@@ -830,6 +1384,7 @@ impl DeletionLog {
     /// `reconcile_locked` instead, as `verify_safe_to_expose_after_restore`
     /// does.
     pub fn reconcile(&self, trusted_ref: &dyn TrustedReferenceStore) -> Result<ReconcileOutcome, DeletionLogError> {
+        self.assert_reference_bound(trusted_ref)?;
         let write_lock = self.acquire_write_lock()?;
         self.reconcile_locked(&write_lock, trusted_ref)
     }
@@ -850,9 +1405,13 @@ impl DeletionLog {
         Self::verify_chain_on(&conn)?;
         let latest = Self::latest_row(&conn)?;
         let reference = trusted_ref.read()?;
+        if let Some(reference) = &reference {
+            Self::verify_binding_on(&conn, reference, latest.is_none())?;
+        }
 
         match (latest, reference) {
-            (None, None) => Ok(ReconcileOutcome::AlreadyConsistent),
+            (None, None) => Err(DeletionLogError::LegacyNeedsMigration),
+            (None, Some(r)) if Self::is_genesis_reference(&r) => Ok(ReconcileOutcome::AlreadyConsistent),
             (None, Some(r)) => {
                 // The reference claims a generation but the log has no
                 // rows at all: the log can never be ahead by construction,
@@ -860,7 +1419,7 @@ impl DeletionLog {
                 // exactly the kind of disagreement that must fail closed.
                 Err(DeletionLogError::ReferenceStale { log_generation: 0, reference_generation: r.generation })
             }
-            (Some(row), None) => {
+            (Some(_row), None) => {
                 // No reference at all. Two genuinely different scenarios
                 // produce this exact same observable state:
                 //
@@ -881,17 +1440,7 @@ impl DeletionLog {
                 // else with no reference present (log at a later
                 // generation, or already Completed) fails closed as
                 // ReferenceMissing.
-                if row.generation == 1 && row.state == DeletionLogState::Pending {
-                    trusted_ref.write(&GenerationRef { generation: row.generation, chain_hash: row.chain_hash.clone() })?;
-                    conn.execute(
-                        "UPDATE deletions SET state = ?1 WHERE generation = ?2",
-                        rusqlite::params![DeletionLogState::Completed.as_sql(), row.generation as i64],
-                    )
-                    .map_err(|e| DeletionLogError::Io(e.to_string()))?;
-                    Ok(ReconcileOutcome::RolledForward { generation: row.generation })
-                } else {
-                    Err(DeletionLogError::ReferenceMissing)
-                }
+                Err(DeletionLogError::ReferenceMissing)
             }
             (Some(row), Some(r)) => {
                 if row.generation == r.generation {
@@ -924,7 +1473,12 @@ impl DeletionLog {
                     // advance past it while this runs: every writer of this
                     // chain and its reference, in any handle or process,
                     // holds the write lock this call holds (F2).
-                    trusted_ref.write(&GenerationRef { generation: row.generation, chain_hash: row.chain_hash.clone() })?;
+                    trusted_ref.write(&GenerationRef {
+                        generation: row.generation,
+                        chain_hash: row.chain_hash.clone(),
+                        format_version: r.format_version,
+                        store_id: r.store_id,
+                    })?;
                     conn.execute(
                         "UPDATE deletions SET state = ?1 WHERE generation = ?2",
                         rusqlite::params![DeletionLogState::Completed.as_sql(), row.generation as i64],
@@ -980,6 +1534,7 @@ impl DeletionLog {
         restored_reference_snapshot: &GenerationRef,
         live_trusted_ref: &dyn TrustedReferenceStore,
     ) -> Result<(), DeletionLogError> {
+        self.assert_reference_bound(live_trusted_ref)?;
         // The live log's own head must agree with the live reference before
         // this gate trusts either of them for the comparison below. Both run
         // under one hold of the write lock (F2), so no deletion can advance
@@ -1004,11 +1559,171 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_log(dir: &Path) -> DeletionLog {
-        DeletionLog::open(&dir.join("deletion-log.sqlite")).expect("open deletion log")
+        let reference = file_ref(dir);
+        DeletionLog::bootstrap_new(&dir.join("deletion-log.sqlite"), &reference).expect("bootstrap deletion log")
     }
 
     fn file_ref(dir: &Path) -> FileTrustedReferenceStore {
         FileTrustedReferenceStore::new(dir.join("trusted-reference.bin"))
+    }
+
+    #[test]
+    fn p0_open_existing_absent_fails_without_creating_any_state() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("missing").join("deletion-log.sqlite");
+        let reference = FileTrustedReferenceStore::new(dir.path().join("missing").join("reference"));
+
+        assert!(matches!(
+            DeletionLog::open_existing(&db, &reference),
+            Err(DeletionLogError::LegacyNeedsMigration)
+        ));
+        assert!(!db.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn p0_explicit_bootstrap_creates_authenticated_generation_zero_and_reopens() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        assert!(reference.read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference));
+        assert!(!log.is_deleted("note-a").unwrap());
+        drop(log);
+        DeletionLog::open_existing(&db, &reference).unwrap();
+    }
+
+    #[test]
+    fn p0_explicit_bootstrap_recovers_only_the_authenticated_partial_genesis_db() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let genesis = DeletionLog::genesis_reference(Uuid::new_v4().to_string());
+        reference.write(&genesis).unwrap();
+        std::fs::File::create(&db).unwrap(); // crash after DB creation, before schema/meta
+
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        assert!(log.with_verified(&reference, |_| Ok(())).is_ok());
+        DeletionLog::open_existing(&db, &reference).unwrap();
+    }
+
+    #[test]
+    fn p0_missing_db_after_open_is_not_recreated_by_a_consumer() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        drop(log);
+        std::fs::remove_file(&db).unwrap();
+
+        assert!(matches!(
+            DeletionLog::open_existing(&db, &reference),
+            Err(DeletionLogError::CorruptOrTampered)
+        ));
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn p0_reference_removed_after_open_denies_exposure() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        std::fs::remove_file(dir.path().join("trusted-reference.bin")).unwrap();
+
+        assert_eq!(
+            log.with_verified_not_deleted(&reference, "note-a", || Ok(())).unwrap_err(),
+            DeletionLogError::CorruptOrTampered
+        );
+    }
+
+    #[test]
+    fn p0_open_existing_rejects_a_genesis_reference_bound_to_another_store() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        drop(log);
+        reference.write(&GenerationRef {
+            generation: 0,
+            chain_hash: GENESIS_PREV_CHAIN_HASH.to_string(),
+            format_version: Some(DELETION_LOG_FORMAT_VERSION),
+            store_id: Some(Uuid::new_v4().to_string()),
+        }).unwrap();
+
+        assert!(matches!(
+            DeletionLog::open_existing(&db, &reference),
+            Err(DeletionLogError::CorruptOrTampered)
+        ));
+    }
+
+    #[test]
+    fn p0_open_existing_rejects_a_reference_which_does_not_match_the_head() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        log.record_deletion("deleted-note", &reference).unwrap();
+        let actual = reference.read().unwrap().unwrap();
+        drop(log);
+        reference.write(&GenerationRef {
+            chain_hash: "0".repeat(64),
+            ..actual
+        }).unwrap();
+
+        assert!(matches!(
+            DeletionLog::open_existing(&db, &reference),
+            Err(DeletionLogError::CorruptOrTampered)
+        ));
+    }
+
+    #[test]
+    fn p0_attested_legacy_migration_is_explicit_auditable_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let attestation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: "security-admin".to_string(),
+            timestamp: "2026-11-02T00:00:00Z".to_string(),
+            reason: "verified no historic deletions".to_string(),
+        };
+
+        let first = DeletionLog::migrate_legacy_empty(&db, &reference, &attestation).unwrap();
+        let retry = DeletionLog::migrate_legacy_empty(&db, &reference, &attestation).unwrap();
+        assert_eq!(first, retry);
+        DeletionLog::open_existing(&db, &reference).unwrap();
+
+        let different_operation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            ..attestation
+        };
+        assert_eq!(
+            DeletionLog::migrate_legacy_empty(&db, &reference, &different_operation),
+            Err(DeletionLogError::CorruptOrTampered)
+        );
+    }
+
+    #[test]
+    fn p0_migration_refuses_a_legacy_database_with_deletion_history() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        log.record_deletion("historic-note", &reference).unwrap();
+        drop(log);
+        std::fs::remove_file(dir.path().join("trusted-reference.bin")).unwrap();
+        let attestation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: "security-admin".to_string(),
+            timestamp: "2026-11-02T00:00:00Z".to_string(),
+            reason: "must not override deletion history".to_string(),
+        };
+
+        assert_eq!(
+            DeletionLog::migrate_legacy_empty(&db, &reference, &attestation),
+            Err(DeletionLogError::CorruptOrTampered)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1052,8 +1767,7 @@ mod tests {
         // 2. Even in this half-finished state, is_deleted must be true.
         assert!(log.is_deleted("note-a").unwrap(), "note must already be non-consultable at step 1");
 
-        // The reference was never written (crash before step 2).
-        assert!(reference.read().unwrap().is_none(), "reference must still be stale/absent before reconcile");
+        assert!(reference.read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference), "reference must still be at authenticated genesis before reconcile");
 
         // 3. Open a FRESH DeletionLog against the same db_path (restart).
         let restarted = DeletionLog::open(log.db_path()).expect("reopen deletion log");
@@ -1080,12 +1794,13 @@ mod tests {
 
         // Log has one Completed entry at generation 1.
         log.record_deletion("note-a", &reference).unwrap();
+        let valid_reference = reference.read().unwrap().unwrap();
 
         // Now hand-craft a reference claiming generation 5 (ahead of the
         // log, which has never reached generation 5) with a hash that
         // cannot possibly be valid for this chain.
         reference
-            .write(&GenerationRef { generation: 5, chain_hash: "f".repeat(64) })
+            .write(&GenerationRef { generation: 5, chain_hash: "f".repeat(64), format_version: None, store_id: None })
             .unwrap();
 
         let result = log.reconcile(&reference);
@@ -1093,15 +1808,17 @@ mod tests {
             matches!(result, Err(DeletionLogError::Inconsistent)),
             "reference ahead of the log must fail closed as Inconsistent, got {result:?}"
         );
+        assert!(matches!(log.record_deletion("note-b", &reference), Err(DeletionLogError::Inconsistent)));
 
         // Another unexplained mismatch: log two generations ahead (not the
         // specific "exactly one ahead, Pending" pattern). Record a second
         // deletion normally (reference tracks it, landing at generation 2),
         // then rewind the reference to generation 0 so the log sits two
         // generations ahead of it.
-        log.record_deletion("note-b", &file_ref(dir.path())).unwrap();
+        reference.write(&valid_reference).unwrap();
+        log.record_deletion("note-b", &reference).unwrap();
         let stale_reference = file_ref(dir.path());
-        stale_reference.write(&GenerationRef { generation: 0, chain_hash: "0".repeat(64) }).unwrap();
+        stale_reference.write(&GenerationRef { generation: 0, chain_hash: "0".repeat(64), format_version: None, store_id: None }).unwrap();
         let result2 = log.reconcile(&stale_reference);
         assert!(
             matches!(result2, Err(DeletionLogError::Inconsistent)),
@@ -1111,11 +1828,30 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn p0_dpapi_reference_atomically_replaces_on_each_generation() {
+        // CI sandboxes without a usable user DPAPI profile cannot exercise
+        // this OS integration; production Windows profiles must run it.
+        if dpapi_protect(b"p0-reference-write-probe").is_err() { return; }
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = DpapiTrustedReferenceStore::new(dir.path().join("trusted-reference.dpapi"));
+        let log = DeletionLog::bootstrap_new(&db, &reference).unwrap();
+        log.record_deletion("first", &reference).unwrap();
+        log.record_deletion("second", &reference).unwrap();
+        drop(log);
+
+        let reopened = DeletionLog::open_existing(&db, &reference).unwrap();
+        assert!(reopened.with_verified_not_deleted(&reference, "first", || Ok(())).unwrap().is_none());
+        assert!(reopened.with_verified_not_deleted(&reference, "second", || Ok(())).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn a_tampered_trusted_reference_file_is_detected_as_tamper_distinct_from_plain_corruption() {
         let dir = tempdir().unwrap();
-        let log = open_log(dir.path());
         let ref_path = dir.path().join("trusted-reference.dpapi");
         let dpapi_reference = DpapiTrustedReferenceStore::new(ref_path.clone());
+        let log = DeletionLog::bootstrap_new(&dir.path().join("deletion-log.sqlite"), &dpapi_reference).unwrap();
 
         log.record_deletion("note-a", &dpapi_reference).unwrap();
 
@@ -1192,7 +1928,7 @@ mod tests {
         // Hand-craft a reference claiming a generation higher than the log
         // has ever reached, with a syntactically valid (just not matching)
         // chain hash.
-        reference.write(&GenerationRef { generation: 7, chain_hash: "a".repeat(64) }).unwrap();
+        reference.write(&GenerationRef { generation: 7, chain_hash: "a".repeat(64), format_version: None, store_id: None }).unwrap();
 
         let result = log.reconcile(&reference);
         assert!(matches!(result, Err(DeletionLogError::Inconsistent)), "got {result:?}");
@@ -1473,7 +2209,7 @@ mod tests {
         assert_eq!(live.generation, 2);
 
         // The backup's embedded snapshot is from before "note-b" was deleted.
-        let restored_snapshot = GenerationRef { generation: 1, chain_hash: "irrelevant-but-present".to_string() };
+        let restored_snapshot = GenerationRef { generation: 1, chain_hash: "irrelevant-but-present".to_string(), format_version: None, store_id: None };
 
         // This low-level function still reports the staleness — it is the
         // CALLER (`backup::restore_with_pii_root`, post-N1 follow-up) that
@@ -1503,7 +2239,7 @@ mod tests {
         let live = live_reference.read().unwrap().unwrap();
         assert_eq!(live.generation, receipt.generation);
 
-        let restored_snapshot = GenerationRef { generation: live.generation, chain_hash: live.chain_hash.clone() };
+        let restored_snapshot = GenerationRef { generation: live.generation, chain_hash: live.chain_hash.clone(), format_version: live.format_version, store_id: live.store_id.clone() };
         let result = log.verify_safe_to_expose_after_restore(&restored_snapshot, &live_reference);
         assert!(result.is_ok(), "got {result:?}");
     }
@@ -1561,7 +2297,7 @@ mod tests {
         let result = second_handle.record_deletion("note-a", &file_ref(dir.path()));
         assert_eq!(result, Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
         assert!(second_handle.is_empty().unwrap(), "nothing may be written without the lock");
-        assert!(file_ref(dir.path()).read().unwrap().is_none(), "the reference must be untouched");
+        assert!(file_ref(dir.path()).read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference), "the reference must be untouched");
     }
 
     /// The lock is purely a gate: an injected crash (early return) at each of
@@ -1614,6 +2350,7 @@ mod tests {
     }
 
     impl TrustedReferenceStore for PauseAfterFirstRead {
+        fn bound_path(&self) -> Option<&Path> { self.inner.bound_path() }
         fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
             let value = self.inner.read();
             if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1644,7 +2381,7 @@ mod tests {
         setup
             .record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending))
             .unwrap();
-        assert!(file_ref(dir.path()).read().unwrap().is_none(), "precondition: crashed before step 2");
+        assert!(file_ref(dir.path()).read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference), "precondition: crashed before step 2");
 
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -1699,11 +2436,11 @@ mod tests {
         other.set_write_lock_timeout(Duration::from_millis(100));
         assert_eq!(other.reconcile(&file_ref(dir.path())), Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
         assert_eq!(
-            other.verify_safe_to_expose_after_restore(&GenerationRef { generation: 1, chain_hash: String::new() }, &file_ref(dir.path())),
+            other.verify_safe_to_expose_after_restore(&GenerationRef { generation: 1, chain_hash: String::new(), format_version: None, store_id: None }, &file_ref(dir.path())),
             Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }),
             "the restore gate's reconcile is locked too"
         );
-        assert!(file_ref(dir.path()).read().unwrap().is_none(), "no roll-forward may happen without the lock");
+        assert!(file_ref(dir.path()).read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference), "no roll-forward may happen without the lock");
 
         drop(guard);
         assert_eq!(other.reconcile(&file_ref(dir.path())), Ok(ReconcileOutcome::RolledForward { generation: 1 }));
@@ -1792,7 +2529,8 @@ mod tests {
         let (outcome, waited) = std::thread::scope(|scope| {
             let pending = scope.spawn(|| waiting.reconcile(&file_ref(dir.path())));
             std::thread::sleep(Duration::from_millis(300));
-            let waited = !pending.is_finished() && file_ref(dir.path()).read().unwrap().is_none();
+            let waited = !pending.is_finished()
+                && file_ref(dir.path()).read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference);
             std::fs::write(dir.path().join("release"), b"").unwrap();
             (pending.join().unwrap(), waited)
         });

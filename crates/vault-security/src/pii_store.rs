@@ -344,6 +344,19 @@ impl PiiStore {
         self.root.join(DELETION_LOG_REFERENCE_FILE)
     }
 
+    /// Explicitly initializes this store's deletion-log genesis. This is a
+    /// bootstrap operation, never called by [`PiiStore::open`] or a reader.
+    pub fn bootstrap_deletion_log(&self) -> Result<crate::deletion_log::DeletionLog, crate::deletion_log::DeletionLogError> {
+        let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(self.deletion_log_reference_path());
+        crate::deletion_log::DeletionLog::bootstrap_new(&self.deletion_log_path(), &trusted_ref)
+    }
+
+    /// Opens this store's existing deletion log without creating state.
+    pub fn open_deletion_log(&self) -> Result<crate::deletion_log::DeletionLog, crate::deletion_log::DeletionLogError> {
+        let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(self.deletion_log_reference_path());
+        crate::deletion_log::DeletionLog::open_existing(&self.deletion_log_path(), &trusted_ref)
+    }
+
     /// `<root>/<note_id>.pii`.
     fn live_path(&self, note_id: &str) -> PathBuf {
         self.root.join(format!("{note_id}.pii"))
@@ -593,11 +606,16 @@ impl PiiStore {
             note_id: note_id.to_string(),
             reason: e.to_string(),
         };
-        let log = crate::deletion_log::DeletionLog::open(&self.deletion_log_path()).map_err(unavailable)?;
-        if log.is_deleted(note_id).map_err(unavailable)? {
-            return Err(PiiStoreError::Deleted { note_id: note_id.to_string() });
+        let trusted_ref = crate::deletion_log::DpapiTrustedReferenceStore::new(self.deletion_log_reference_path());
+        let log = crate::deletion_log::DeletionLog::open_existing(&self.deletion_log_path(), &trusted_ref)
+            .map_err(unavailable)?;
+        match log
+            .with_verified_not_deleted(&trusted_ref, note_id, || Ok(self.get(note_id)))
+            .map_err(unavailable)?
+        {
+            None => Err(PiiStoreError::Deleted { note_id: note_id.to_string() }),
+            Some(result) => result,
         }
-        self.get(note_id)
     }
 
     /// Unwraps the data key, decrypts, and returns the plaintext for

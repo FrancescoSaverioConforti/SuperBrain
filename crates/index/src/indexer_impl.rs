@@ -851,6 +851,7 @@ mod tests {
         let journal_path = dir.join("journal.sqlite");
         let pii_root = dir.join(".pii-store");
         let pii_store = vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii_store.bootstrap_deletion_log().unwrap();
 
         let gate = policy::Gate::new(policy::SecretPolicy::new(1));
         let known: HashSet<storage::NoteId> = HashSet::new();

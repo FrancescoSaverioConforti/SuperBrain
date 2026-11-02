@@ -217,6 +217,7 @@ fn sensitive_notes_source_field_never_reaches_the_real_indexer_via_propose_and_c
 
     let pii_root = dir.join(".pii-store");
     let pii_store = vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+    pii_store.bootstrap_deletion_log().unwrap();
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
 
     // The relations target is not under test in THIS function (the
@@ -320,6 +321,7 @@ fn sensitive_notes_relations_targets_never_reach_the_real_indexer_via_propose_an
 
     let pii_root = dir.join(".pii-store");
     let pii_store = vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+    pii_store.bootstrap_deletion_log().unwrap();
     let gate = policy::Gate::new(policy::SecretPolicy::new(1));
 
     let note_text = sensitive_note_with_source_and_relations_markers("note-relations-e2e", "agent:coder@prompt-v3", RELATIONS_MARKER_E2E);

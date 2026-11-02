@@ -30,6 +30,7 @@ impl Fixture {
         let pii_root = root.join(".pii-store");
         let pii =
             vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii.bootstrap_deletion_log().unwrap();
         // Rebuild after writes exercises the same public read-only seam as a
         // cold-start client; no direct access to raw record internals.
         let vault =

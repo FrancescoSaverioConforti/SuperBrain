@@ -42,7 +42,9 @@ fn pii_key_path(vault_root: &Path) -> PathBuf {
 }
 
 fn open_pii_store(vault_root: &Path) -> PiiStore {
-    PiiStore::open(vault_root.join(".pii-store"), &pii_key_path(vault_root)).unwrap()
+    let store = PiiStore::open(vault_root.join(".pii-store"), &pii_key_path(vault_root)).unwrap();
+    store.bootstrap_deletion_log().unwrap();
+    store
 }
 
 fn yaml(id: &str, classification: &str) -> String {
@@ -65,7 +67,7 @@ fn write(vault: &Vault, pii_store: &PiiStore, text: &str, expected: Version) -> 
 }
 
 fn live_log_and_ref(pii_store: &PiiStore) -> (DeletionLog, DpapiTrustedReferenceStore) {
-    let log = DeletionLog::open(&pii_store.root().join("deletion-log.sqlite")).unwrap();
+    let log = pii_store.open_deletion_log().unwrap();
     let reference = DpapiTrustedReferenceStore::new(pii_store.root().join("deletion-log-reference.dpapi"));
     (log, reference)
 }
@@ -108,7 +110,8 @@ fn a_vault_that_has_deleted_a_sensitive_note_can_still_back_up_and_restore_from_
     write(&vault, &pii_store, &note("note-del", "sensitive", storage::SENSITIVE_TOMBSTONE_BODY), current);
 
     let (log, reference) = live_log_and_ref(&pii_store);
-    assert!(log.is_deleted("note-del").unwrap(), "precondition: the tombstone write recorded the deletion");
+    let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+    assert!(log.with_verified_not_deleted(&trusted_ref, "note-del", || Ok(())).unwrap().is_none(), "precondition: the tombstone write recorded the deletion");
 
     let master_key = MasterKey::load_or_create(&unique_test_dir().join("backup-master.key"), None).unwrap();
     let target_1 = FilesystemBackupTarget::new(unique_test_dir().join("target-1"));
@@ -124,6 +127,7 @@ fn a_vault_that_has_deleted_a_sensitive_note_can_still_back_up_and_restore_from_
     ] {
         let destination = unique_test_dir().join("restored");
         let restored_pii_store = PiiStore::open(unique_test_dir().join("restored-pii"), &pii_key_path(&root)).unwrap();
+        restored_pii_store.bootstrap_deletion_log().unwrap();
         let journal_path = unique_test_dir().join("restored-journal.sqlite");
         let (restored_vault, outcome) =
             storage::restore_vault_from_backup(target, &master_key, &destination, &journal_path, &log, &reference, &restored_pii_store)
@@ -187,6 +191,7 @@ fn a_restored_vault_is_readable_through_vault_open_and_read_note_for_plain_and_s
     let destination = unique_test_dir().join("restored");
     let journal_path = unique_test_dir().join("restored-journal.sqlite");
     let restored_pii_store = PiiStore::open(unique_test_dir().join("restored-pii"), &pii_key_path(&root)).unwrap();
+    restored_pii_store.bootstrap_deletion_log().unwrap();
     let (restored_vault, outcome) =
         storage::restore_vault_from_backup(&target, &master_key, &destination, &journal_path, &log, &reference, &restored_pii_store)
             .expect("restore into a usable vault");
@@ -248,7 +253,8 @@ fn a_stale_backup_restores_through_storages_own_api_excluding_only_the_later_del
     let later_deleted_id = NoteId::parse("note-later-deleted").unwrap();
     let current = vault.current_version(&later_deleted_id).unwrap();
     write(&vault, &pii_store, &note("note-later-deleted", "sensitive", storage::SENSITIVE_TOMBSTONE_BODY), current);
-    assert!(log.is_deleted("note-later-deleted").unwrap());
+    let trusted_ref = DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+    assert!(log.with_verified_not_deleted(&trusted_ref, "note-later-deleted", || Ok(())).unwrap().is_none());
 
     // Restore the OLD backup — taken before note-later-deleted ever
     // existed — against the NOW-advanced live log/reference, into a usable
@@ -256,6 +262,7 @@ fn a_stale_backup_restores_through_storages_own_api_excluding_only_the_later_del
     let destination = unique_test_dir().join("restored");
     let journal_path = unique_test_dir().join("restored-journal.sqlite");
     let restored_pii_store = PiiStore::open(unique_test_dir().join("restored-pii"), &pii_key_path(&root)).unwrap();
+    restored_pii_store.bootstrap_deletion_log().unwrap();
     let (restored_vault, outcome) = storage::restore_vault_from_backup(
         &old_target,
         &master_key,
@@ -296,7 +303,7 @@ fn a_stale_backup_restores_through_storages_own_api_excluding_only_the_later_del
 fn restore_vault_from_backup_refuses_an_existing_journal_path() {
     let root = unique_test_dir();
     let pii_store = open_pii_store(&root);
-    let log = DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+    let log = pii_store.open_deletion_log().unwrap();
     let reference = DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
     let master_key = MasterKey::load_or_create(&unique_test_dir().join("backup-master.key"), None).unwrap();
     let target = FilesystemBackupTarget::new(unique_test_dir().join("target"));

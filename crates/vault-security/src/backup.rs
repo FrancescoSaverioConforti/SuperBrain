@@ -173,6 +173,9 @@ pub enum BackupError {
     #[error("backup content hash verification failed")]
     HashMismatch,
 
+    #[error("legacy backup has no authenticated deletion-log genesis; administrative import is required")]
+    LegacyNeedsMigration,
+
     /// Either of [`restore`]'s two deletion-log checks failed for a reason
     /// the deletion log itself names (corrupt/tampered/missing reference,
     /// stale generation, etc.) — distinct from [`BackupError::DeletedSinceBackup`],
@@ -548,6 +551,9 @@ fn collect_pii_files(pii_store: &PiiStore) -> Result<BTreeMap<String, Vec<u8>>, 
 /// module.
 fn serialize_snapshot(reference: &GenerationRef, vault_files: &BTreeMap<String, Vec<u8>>, pii_files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(b"DLR1");
+    buf.extend_from_slice(&reference.format_version.unwrap_or(0).to_le_bytes());
+    write_len_prefixed_u32(&mut buf, reference.store_id.as_deref().unwrap_or_default().as_bytes());
     buf.extend_from_slice(&reference.generation.to_le_bytes());
     write_len_prefixed_u32(&mut buf, reference.chain_hash.as_bytes());
 
@@ -578,11 +584,25 @@ struct Snapshot {
 /// does not even parse can never have been the one the manifest hashed).
 fn deserialize_snapshot(bytes: &[u8]) -> Option<Snapshot> {
     let mut offset = 0usize;
+    let (format_version, store_id) = if bytes.starts_with(b"DLR1") {
+        offset += 4;
+        let version = read_u32(bytes, &mut offset)?;
+        let store_id_len = read_u32(bytes, &mut offset)? as usize;
+        let store_id = std::str::from_utf8(read_bytes(bytes, &mut offset, store_id_len)?).ok()?.to_string();
+        (version, store_id)
+    } else {
+        (0, String::new())
+    };
     let generation = u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?);
     offset += 8;
     let chain_hash_len = read_u32(bytes, &mut offset)? as usize;
     let chain_hash = std::str::from_utf8(read_bytes(bytes, &mut offset, chain_hash_len)?).ok()?.to_string();
-    let reference = GenerationRef { generation, chain_hash };
+    let reference = GenerationRef {
+        generation,
+        chain_hash,
+        format_version: (format_version != 0).then_some(format_version),
+        store_id: (!store_id.is_empty()).then_some(store_id),
+    };
 
     let vault_count = read_u32(bytes, &mut offset)?;
     let mut vault_files = BTreeMap::new();
@@ -616,10 +636,6 @@ fn deserialize_snapshot(bytes: &[u8]) -> Option<Snapshot> {
 /// [`crate::deletion_log::GENESIS_PREV_CHAIN_HASH`]) is never a value a real
 /// deletion can produce (the first real deletion is always generation 1),
 /// so this sentinel can never collide with genuine backup content.
-fn no_deletions_ever_reference() -> GenerationRef {
-    GenerationRef { generation: 0, chain_hash: "0".repeat(64) }
-}
-
 /// Encrypts a snapshot of the Markdown vault at `vault_root`, `pii_store`'s
 /// live ciphertext files, and a [`GenerationRef`] snapshot of
 /// `deletion_log`'s current trusted reference, and writes the result via
@@ -660,7 +676,7 @@ pub fn backup(
 pub(crate) fn backup_with_reference(
     vault_root: &Path,
     pii_store: &PiiStore,
-    _deletion_log: &DeletionLog,
+    deletion_log: &DeletionLog,
     master_key: &MasterKey,
     target: &dyn BackupTarget,
     trusted_ref: &dyn TrustedReferenceStore,
@@ -671,10 +687,17 @@ pub(crate) fn backup_with_reference(
     // reference (corrupt, tampered) DOES propagate: backup must not
     // silently embed a fabricated reference over a reference that exists
     // but cannot be trusted.
-    let reference = trusted_ref.read().map_err(BackupError::DeletionLogRejected)?.unwrap_or_else(no_deletions_ever_reference);
-
-    let vault_files = collect_vault_files(vault_root)?;
-    let pii_files = collect_pii_files(pii_store)?;
+    let (reference, vault_files, pii_files) = deletion_log
+        .with_verified(trusted_ref, |reference| {
+            Ok((
+                reference.clone(),
+                collect_vault_files(vault_root),
+                collect_pii_files(pii_store),
+            ))
+        })
+        .map_err(BackupError::DeletionLogRejected)?;
+    let vault_files = vault_files?;
+    let pii_files = pii_files?;
 
     let plaintext_snapshot = serialize_snapshot(&reference, &vault_files, &pii_files);
     let hash = content_hash(&plaintext_snapshot);
@@ -744,6 +767,9 @@ pub fn restore(
     let recomputed_hash = content_hash(&plaintext_snapshot);
 
     let snapshot = deserialize_snapshot(&plaintext_snapshot).ok_or(BackupError::HashMismatch)?;
+    if snapshot.reference.generation == 0 && snapshot.reference.format_version.is_none() {
+        return Err(BackupError::LegacyNeedsMigration);
+    }
 
     // Both checks (module docs) run before anything is written.
     //
@@ -814,12 +840,6 @@ pub fn restore(
     // error-labeling convenience, not a safety decision); and
     // `deleted_since_backup` (below, after check 1), which is the ONLY list
     // ever used to decide what gets excluded from the write.
-    let pre_check_1_deleted_hint: Vec<String> = candidate_note_ids
-        .iter()
-        .filter(|note_id| live_deletion_log.is_deleted(note_id).unwrap_or(false))
-        .cloned()
-        .collect();
-
     // Check 1: the backup's OWN embedded reference snapshot against the
     // LIVE trusted reference. Any error here (corrupt, tampered, missing
     // reference, or a genuinely stale generation) fails closed as
@@ -874,23 +894,13 @@ pub fn restore(
     // obsoleto" case — and only at the BACKUP's own snapshot level, never
     // at the live log's own level — is now handled by exclusion instead of
     // outright refusal.
-    let check_1 = (|| -> Result<(), DeletionLogError> {
-        let live_reference_for_check1 = live_trusted_ref.read()?;
-        let live_log_is_empty = live_deletion_log.is_empty()?;
-        let both_sides_have_never_seen_a_deletion =
-            snapshot.reference == no_deletions_ever_reference() && live_reference_for_check1.is_none() && live_log_is_empty;
-        if both_sides_have_never_seen_a_deletion {
-            return Ok(());
-        }
-        live_deletion_log.verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
-    })();
+    let check_1 = live_deletion_log
+        .verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref);
     if let Err(e) = check_1 {
         if matches!(e, DeletionLogError::BackupReferenceStale { .. }) {
             // The live log/reference pair is trustworthy (reconcile
             // already proved it); only this backup's own snapshot is
             // older. Fall through to exclusion.
-        } else if !pre_check_1_deleted_hint.is_empty() {
-            return Err(BackupError::DeletedSinceBackup { note_ids: pre_check_1_deleted_hint });
         } else {
             return Err(BackupError::DeletionLogRejected(e));
         }
@@ -906,14 +916,15 @@ pub fn restore(
     // deletion-log write lock right before its pointer rename (see this
     // function's doc comment), which is what closes the window between here
     // and the write.
-    let mut deleted_since_backup = Vec::new();
-    for note_id in &candidate_note_ids {
-        // Any error here (I/O failure reading the log) must fail closed:
-        // never treat "couldn't check" as "not deleted."
-        if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
-            deleted_since_backup.push(note_id.clone());
-        }
-    }
+    let deleted_since_backup = live_deletion_log
+        .with_verified_lookup(live_trusted_ref, |is_deleted| {
+            let mut deleted = Vec::new();
+            for note_id in &candidate_note_ids {
+                if is_deleted(note_id)? { deleted.push(note_id.clone()); }
+            }
+            Ok(deleted)
+        })
+        .map_err(BackupError::DeletionLogRejected)?;
 
     // Both checks passed: stage every surviving note, dropping every
     // deleted one. Nothing is written here; see the doc comment.
@@ -973,8 +984,8 @@ mod tests {
     }
 
     fn open_deletion_log_and_ref(dir: &Path) -> (DeletionLog, FileTrustedReferenceStore) {
-        let log = DeletionLog::open(&dir.join("deletion-log.sqlite")).unwrap();
         let reference = FileTrustedReferenceStore::new(dir.join("trusted-reference.bin"));
+        let log = DeletionLog::bootstrap_new(&dir.join("deletion-log.sqlite"), &reference).unwrap();
         (log, reference)
     }
 
