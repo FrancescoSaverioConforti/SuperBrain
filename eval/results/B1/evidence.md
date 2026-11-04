@@ -1,12 +1,15 @@
 # B1 — deterministic retrieval evidence
 
-**GO on the authorized B1-SEC-001 fix; Task 9/B1 closure remains open.** The user
-resolved the Sensitive temporal-metadata decision, the fix is committed as
-`3c6b1bb`, and independent re-review reports no residual Critical/Important within
-scope. N=100,000 was intentionally interrupted after 19 complete queries under
-the user's cost-assessment authorization. The interrupted evidence is audited,
-but the approved 100-query sample is not complete. No full-sample percentiles,
-protocol-completion claim, merge authorization or unilateral B1 closure follows.
+**GO — B1 is formally closed at HEAD `3ca2203`.** The user resolved the
+Sensitive temporal-metadata decision (B1-SEC-001, fixed at `3c6b1bb`); the
+separate P0 DeletionLog fail-closed increment then landed on this branch
+(`e92dc78`/`3ca2203`) without regressing B1 (fixture-only diff to
+`index`/`api`); and a final independent whole-branch review at HEAD `3ca2203`
+returned GO with no residual Critical/Important finding. N=100,000 was
+intentionally interrupted after 19 complete queries under the user's
+cost-assessment authorization and stays recorded as partial, not complete.
+B1-PERF-001 (performance) and the listed security residuals remain explicitly
+OPEN/deferred — see "B1 verdict" below. No merge, tag, or push authorized.
 
 ## Scope and implementation
 
@@ -248,7 +251,7 @@ retain approved behavior; this narrow fix does not assert that arbitrary
 project/identifier strings cannot contain identifying text. No broader schema
 change, migration or canonical-spec amendment was introduced.
 
-## Closing review and verdict
+## Prior closing review (at `3c6b1bb`, before the P0 DeletionLog landing)
 
 **Independent technical review: GO on the authorized fix and branch re-review,
 no residual Critical/Important within scope.** The previous security NO-GO is
@@ -258,10 +261,101 @@ audited all 19 interrupted rows. Targeted mutations: 77 tested, 65 caught,
 12 unviable, 0 missed/timeouts. The full workspace passed 518/0/0.
 No new concurrency finding was reported.
 
-**Task 9/B1 closure remains open:** the N=100,000 authorized 100-query sample was
-interrupted after 19; its full-sample metrics are unavailable. The intentional
-stop is authorized and documented, but is not silently equated with execution
-of the complete replacement protocol. The performance finding B1-PERF-001 stays
-open with an unimplemented separate proposal. No runtime optimization or disk
-index was added. Only actual complete/partial observations are recorded. No
-merge, tag or push; canonical specification unchanged.
+## P0 DeletionLog landing on this branch (`e92dc78`/`3ca2203`)
+
+The separate P0 DeletionLog fail-closed increment (DL-02/DL-03) landed on this
+same branch after the above review, closed with its own independent GO — see
+`docs/handoffs/P0-deletionlog-handoff.md`. P0 is a `storage`/`vault-security`
+security increment, not a B1 task; it is recorded here only to confirm it did
+not regress B1's search/retrieve behavior.
+
+`git diff 3c6b1bb..3ca2203 -- crates/index crates/api` contains exactly seven
+added `pii.bootstrap_deletion_log().unwrap()` fixture lines (adapting test
+fixtures to the new fail-closed DeletionLog lifecycle) and one doc-comment
+rewording in `document.rs`. No search/trigram/BM25/citation logic changed.
+Workspace tests at HEAD `3ca2203`: **556 passed, 0 failed, 0 ignored** (up from
+518 at `3c6b1bb`, entirely accounted for by P0's own `vault-security`/`storage`
+tests). B1's prior mutation evidence (77 targeted mutants at `3c6b1bb`) remains
+applicable: P0 introduced no logic change to the `index`/`api` crates.
+
+## Final B1 closure review (at HEAD `3ca2203`)
+
+**Independent whole-branch review, dispatched fresh and uninvolved in any
+task's implementation: GO.** The reviewer re-verified, rather than trusted,
+all of the following against the actual code at HEAD `3ca2203`:
+
+- Task 1's Indexer seam: `RealIndexer::mark_current` works only on the bytes
+  the write path already holds; it never calls back into `Vault::read_note`.
+  Only `rebuild_index` reads the vault directly, always outside the index
+  lock.
+- Task 6's mandatory five-point re-validation discipline (`crates/index/src/search.rs`)
+  is structural, not a bypassable convention: every candidate passes through
+  a fresh `read_note`, a fresh `Document` re-derivation under current
+  classification, a fresh query-match re-check, every filter re-applied, and a
+  score recomputed from a per-request BM25 index built only from the eligible
+  fresh documents. There is no code path that reaches a `SearchResult` without
+  all five steps.
+- The P0 landing's diff to `crates/index`/`crates/api` is fixture-only, as
+  stated above; confirmed independently by the reviewer's own diff.
+- Sensitive-classification confidentiality (body/source/relations excluded
+  from both postings; B1-SEC-001's temporal-field exclusion) is in the code,
+  not just documented, with reclassification and live-update cases covered.
+- C4 date resolution uses real `chrono_tz::Europe::Rome` arithmetic, verified
+  against the actual 2026-10-25 and 2026-03-29 DST transitions, not naive UTC
+  math.
+- The rebuild/live coordination fix matches `coordination-fix.md`: one mutex
+  covers both postings plus the expected-version high-water mark; version
+  checks prevent a stale rebuild snapshot from overwriting a newer live write;
+  a poisoned lock resets affected notes to `Stale` rather than serving wrong
+  content.
+- `eval/results/B1/evidence.md` (this file) does not overstate the N=100,000
+  benchmark as complete and does not claim B1-PERF-001 resolved.
+- No undeclared `TODO`/`FIXME`/`XXX`/`unimplemented!`/`todo!()` in
+  `crates/index`/`crates/api`.
+- Independent re-run at HEAD `3ca2203`: `cargo test --workspace --locked`
+  556/0/0; `cargo clippy --workspace --locked -- -D warnings` clean;
+  `cargo deny check` advisories/bans/licenses/sources ok.
+
+No Critical or Important findings. Four non-blocking suggestions were noted:
+this evidence file's verification table predates the P0 landing's test-count
+change (518 vs. 556 at HEAD, fully explained by P0's own tests, now corrected
+above); `rebuild_index` skips per-note `read_note` failures during rebuild
+(already documented as `Completeness::IndexedCandidatesMayBeIncomplete`, not a
+correctness or confidentiality issue); P0 changed one internal error-kind
+mapping in `list_note_ids` (`Io` to `DeletionLog`) with no effect on B1's own
+error handling; and `id`/`project` remain text-searchable for Sensitive notes
+under the approved allowlist, which this file already states does not assert
+identifier/project strings are free of identifying text.
+
+## Task 9 status
+
+**Complete, on the evidence above.** All of Task 9's required checks ran
+clean at HEAD `3ca2203`: full workspace tests (556/0/0), Clippy, cargo-deny,
+the scalability benchmark protocol (executed at three full scales plus a
+documented partial fourth scale), and a final whole-branch independent review
+returning GO with no new Critical/Important finding. Mutation evidence from
+`3c6b1bb` carries forward unchanged, since P0's touch of `index`/`api` was
+fixture-only.
+
+## B1 verdict: GO, with two findings left intentionally open
+
+**GO to close B1 as implemented**, on the following explicit terms:
+
+- **B1-PERF-001 (performance) stays OPEN/deferred.** The N=100,000 scalability
+  sample is incomplete (19/100 queries, intentionally and authorizedly
+  interrupted); the N=10,000 sample shows authoritative-read fan-out
+  dominating BM25/filtered query latency. Correctness is not affected. An
+  unimplemented optimization proposal exists
+  (`docs/superpowers/plans/2026-11-01-b1-search-performance-proposal.md`) and
+  requires its own separate approval before any implementation work begins.
+- **The listed security residuals stay OPEN/deferred**, exactly as enumerated
+  in this handoff's instructions (temporal/schema validation debt beyond the
+  narrow Sensitive-search fix, PiiStore raw API confinement, AEAD/AAD binding,
+  backup provenance, SEC-001/002/003 filesystem hardening, DoS/resource
+  budgeting, future MCP/agent surfaces). B1 does not claim any of these
+  resolved. P0 DeletionLog (DL-02/DL-03) is the one exception: closed, GO,
+  confirmed on this branch's history.
+
+No runtime optimization, disk-backed index, schema migration, or canonical
+specification change was introduced to reach this verdict. No merge, tag, or
+push performed or authorized by this closure.
