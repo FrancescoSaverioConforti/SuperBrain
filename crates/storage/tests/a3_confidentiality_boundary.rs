@@ -178,6 +178,7 @@ fn open_vault_and_pii_store_with_journal(root: PathBuf) -> (Vault, PathBuf, PiiS
     }
     let pii_root = root.join(".pii-store");
     let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+    pii_store.bootstrap_deletion_log().unwrap();
     let journal_path = unique_test_dir().join("journal.sqlite");
     let vault = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
     (vault, journal_path, pii_store)

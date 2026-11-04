@@ -428,7 +428,8 @@ fn open_with_pii_store_rolls_a_crashed_pending_deletion_forward() {
     let db_path = pii_store.deletion_log_path();
     let chain_hash = write_pending_deletion_row(&db_path, 1, &"0".repeat(64), "note-crashed");
     let reference = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
-    assert!(reference.read().unwrap().is_none(), "precondition: step 2 never ran");
+    let genesis = reference.read().unwrap().expect("precondition: explicit bootstrap wrote genesis");
+    assert_eq!(genesis.generation, 0, "precondition: step 2 never advanced the authenticated genesis reference");
 
     let _vault = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store)
         .expect("a single pending first deletion is the one roll-forward case and must not block opening");

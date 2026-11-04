@@ -876,7 +876,7 @@ impl DeletionLog {
         }
     }
 
-    fn is_genesis_reference(reference: &GenerationRef) -> bool {
+    pub(crate) fn is_genesis_reference(reference: &GenerationRef) -> bool {
         reference.generation == 0
             && reference.chain_hash == GENESIS_PREV_CHAIN_HASH
             && reference.format_version == Some(DELETION_LOG_FORMAT_VERSION)
@@ -1677,6 +1677,54 @@ mod tests {
         ));
     }
 
+    /// `is_retryable_genesis_partial`'s three checks, called directly: (1)
+    /// ANY table other than `deletions` disqualifies the DB from being a
+    /// retryable genesis-partial — the `!=`->`==` mutant on the first
+    /// `.any()` would instead require EVERY table to differ from
+    /// `deletions`, wrongly treating an unrelated extra table as acceptable
+    /// as long as `deletions` itself isn't present. (2) `deletions`
+    /// genuinely present but non-empty disqualifies it too — the `==`->`!=`
+    /// mutant on the second `.any()` would skip the row-count check
+    /// entirely for the one case that matters (the table actually named
+    /// `deletions`). (3) `count != 0` itself (the `!=`->`==` mutant). No
+    /// existing bootstrap test ever produces a DB with an UNRELATED extra
+    /// table, since real bootstrap crash points only ever create
+    /// `deletions` and `deletion_log_meta`, never a third table.
+    #[test]
+    fn is_retryable_genesis_partial_rejects_an_unrelated_extra_table() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE some_other_table (id INTEGER PRIMARY KEY);").unwrap();
+        drop(conn);
+        assert_eq!(DeletionLog::is_retryable_genesis_partial(&db), Ok(false), "an unrelated extra table must disqualify genesis-partial retry, even with no `deletions` table present");
+    }
+
+    #[test]
+    fn is_retryable_genesis_partial_rejects_a_deletions_table_with_rows() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        DeletionLog::create_schema(&conn).unwrap();
+        conn.execute("INSERT INTO deletions VALUES (1, 'note-a', '0', 'x', 'completed')", []).unwrap();
+        drop(conn);
+        assert_eq!(DeletionLog::is_retryable_genesis_partial(&db), Ok(false), "a deletions table with real rows must disqualify genesis-partial retry");
+    }
+
+    #[test]
+    fn is_retryable_genesis_partial_accepts_an_empty_deletions_table_and_no_tables_at_all() {
+        let dir = tempdir().unwrap();
+        let no_tables_db = dir.path().join("no-tables.sqlite");
+        Connection::open(&no_tables_db).unwrap();
+        assert_eq!(DeletionLog::is_retryable_genesis_partial(&no_tables_db), Ok(true), "a genuinely empty DB file (no tables at all) is retryable");
+
+        let empty_deletions_db = dir.path().join("empty-deletions.sqlite");
+        let conn = Connection::open(&empty_deletions_db).unwrap();
+        DeletionLog::create_schema(&conn).unwrap();
+        drop(conn);
+        assert_eq!(DeletionLog::is_retryable_genesis_partial(&empty_deletions_db), Ok(true), "a deletions table with zero rows is retryable");
+    }
+
     #[test]
     fn p0_attested_legacy_migration_is_explicit_auditable_and_idempotent() {
         let dir = tempdir().unwrap();
@@ -1701,6 +1749,127 @@ mod tests {
         assert_eq!(
             DeletionLog::migrate_legacy_empty(&db, &reference, &different_operation),
             Err(DeletionLogError::CorruptOrTampered)
+        );
+    }
+
+    /// `migrate_legacy_empty`'s attestation-completeness guard is a 3-way
+    /// `||`: the `||`->`&&` mutants would wrongly require ALL THREE fields
+    /// empty simultaneously instead of rejecting on ANY one being empty.
+    /// The existing test only ever supplies a fully-populated attestation.
+    #[test]
+    fn migrate_legacy_empty_rejects_an_attestation_with_any_single_field_blank() {
+        let make = |authority: &str, timestamp: &str, reason: &str| LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: authority.to_string(),
+            timestamp: timestamp.to_string(),
+            reason: reason.to_string(),
+        };
+        for attestation in [
+            make("", "2026-11-02T00:00:00Z", "reason"),
+            make("admin", "", "reason"),
+            make("admin", "2026-11-02T00:00:00Z", ""),
+            make("   ", "2026-11-02T00:00:00Z", "reason"),
+        ] {
+            let dir = tempdir().unwrap();
+            let db = dir.path().join("deletion-log.sqlite");
+            let reference = file_ref(dir.path());
+            assert_eq!(
+                DeletionLog::migrate_legacy_empty(&db, &reference, &attestation),
+                Err(DeletionLogError::LegacyNeedsMigration),
+                "a blank/whitespace-only field alone must be enough to reject, attestation={attestation:?}"
+            );
+        }
+    }
+
+    /// `migrate_legacy_empty`'s legacy-schema inspection: a pre-existing DB
+    /// file with NO tables at all (`table_count == 0`) is the recognized
+    /// "truly empty legacy" shape and must be accepted for migration. The
+    /// `==`->`!=` mutant on this check would skip straight to querying a
+    /// nonexistent `deletions` table and fail with `Incompatible` instead.
+    #[test]
+    fn migrate_legacy_empty_accepts_a_pre_existing_db_file_with_zero_tables() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        // Create a genuinely empty SQLite file (0 tables) at the target
+        // path before migrating, rather than letting migrate_legacy_empty
+        // create it fresh.
+        Connection::open(&db).unwrap();
+        let reference = file_ref(dir.path());
+        let attestation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: "security-admin".to_string(),
+            timestamp: "2026-11-02T00:00:00Z".to_string(),
+            reason: "pre-existing empty legacy file".to_string(),
+        };
+        assert!(DeletionLog::migrate_legacy_empty(&db, &reference, &attestation).is_ok(), "a pre-existing DB file with zero tables must be accepted as the empty-legacy shape");
+    }
+
+    /// `migrate_legacy_empty`'s row-count guard: a pre-existing legacy DB
+    /// that already has the `deletions` table AND at least one row must be
+    /// rejected (it has real history, not empty-legacy). The `!=`->`==`
+    /// mutant would invert this, rejecting the TRULY empty case and
+    /// accepting the one with real history instead.
+    #[test]
+    fn migrate_legacy_empty_rejects_a_pre_existing_legacy_db_with_a_deletions_row() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE deletions (generation INTEGER PRIMARY KEY, note_id TEXT NOT NULL, prev_chain_hash TEXT NOT NULL, chain_hash TEXT NOT NULL, state TEXT NOT NULL);
+                 INSERT INTO deletions VALUES (1, 'note-a', '0', 'x', 'completed');",
+            )
+            .unwrap();
+        }
+        let reference = file_ref(dir.path());
+        let attestation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: "security-admin".to_string(),
+            timestamp: "2026-11-02T00:00:00Z".to_string(),
+            reason: "must not override a real row".to_string(),
+        };
+        assert_eq!(
+            DeletionLog::migrate_legacy_empty(&db, &reference, &attestation),
+            Err(DeletionLogError::CorruptOrTampered),
+            "a pre-existing deletions row must block migration even without a trusted reference present"
+        );
+    }
+
+    /// `migrate_legacy_empty`'s idempotent-retry guard: retrying with a
+    /// DIFFERENT `operation_id` than the one already persisted in a
+    /// completed migration's metadata must be rejected (not silently
+    /// treated as either "same operation" or "different, so start fresh").
+    /// The `==` match guard's `true`/`false` mutants and the `==`->`!=`
+    /// mutant on the comparison itself all target this exact line; the
+    /// existing `different_operation` test already covers this via the
+    /// FIRST migration's completed reference-bound path (`trusted_ref.read()
+    /// = Some`), but this one targets the SECOND code path specifically
+    /// (reached when `trusted_ref.read()` is itself `None`, i.e. the
+    /// reference file was lost after a completed migration but the DB's own
+    /// `deletion_log_meta` row survives) — a distinct branch from the one
+    /// the existing test exercises.
+    #[test]
+    fn migrate_legacy_empty_rejects_a_different_operation_id_when_the_reference_file_is_absent_but_the_db_metadata_survives() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("deletion-log.sqlite");
+        let reference = file_ref(dir.path());
+        let attestation = LegacyNoDeletionAttestation {
+            operation_id: Uuid::new_v4(),
+            authority: "security-admin".to_string(),
+            timestamp: "2026-11-02T00:00:00Z".to_string(),
+            reason: "first migration".to_string(),
+        };
+        DeletionLog::migrate_legacy_empty(&db, &reference, &attestation).unwrap();
+        // Lose the reference file while the DB's own deletion_log_meta
+        // metadata (including migration_operation_id) survives intact.
+        std::fs::remove_file(dir.path().join("trusted-reference.bin")).unwrap();
+        assert!(reference.read().unwrap().is_none(), "precondition: reference genuinely absent now");
+
+        let different_operation = LegacyNoDeletionAttestation { operation_id: Uuid::new_v4(), ..attestation };
+        assert_eq!(
+            DeletionLog::migrate_legacy_empty(&db, &reference, &different_operation),
+            Err(DeletionLogError::CorruptOrTampered),
+            "a different operation_id against surviving DB metadata must be rejected even without a trusted reference present"
         );
     }
 
@@ -1843,6 +2012,49 @@ mod tests {
         let reopened = DeletionLog::open_existing(&db, &reference).unwrap();
         assert!(reopened.with_verified_not_deleted(&reference, "first", || Ok(())).unwrap().is_none());
         assert!(reopened.with_verified_not_deleted(&reference, "second", || Ok(())).unwrap().is_none());
+    }
+
+    /// `DpapiTrustedReferenceStore::bound_path` must return `Some(&self.path)`
+    /// — `assert_reference_bound` compares this against the log's own
+    /// `reference_path` (captured at construction) to reject a reference
+    /// store that silently points somewhere else. A `None`-returning mutant
+    /// would make EVERY DPAPI reference "unbound," which `assert_reference_bound`
+    /// happens to treat as valid in test builds only
+    /// (`else if !cfg!(test)`), so this must be exercised in a NON-test-cfg
+    /// equivalent way: directly asserting the real return value, not relying
+    /// on the production/test branch split to expose a difference.
+    #[test]
+    #[cfg(windows)]
+    fn dpapi_reference_bound_path_returns_its_own_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trusted-reference.dpapi");
+        let reference = DpapiTrustedReferenceStore::new(path.clone());
+        assert_eq!(reference.bound_path(), Some(path.as_path()));
+    }
+
+    /// `DpapiTrustedReferenceStore::read`'s `NotFound` arm: a genuinely
+    /// absent reference file must read as `Ok(None)` ("no deletion has ever
+    /// been recorded"), not an I/O error. The `== with true` mutant on the
+    /// match guard would misclassify EVERY read error (permission denied,
+    /// path-too-long, etc.) as "absent," silently treating a real I/O
+    /// failure as "no deletions ever" instead of propagating
+    /// `DeletionLogError::Io`.
+    #[test]
+    #[cfg(windows)]
+    fn dpapi_reference_read_reports_a_genuinely_absent_file_as_none_not_as_an_io_error() {
+        let dir = tempdir().unwrap();
+        let reference = DpapiTrustedReferenceStore::new(dir.path().join("never-written.dpapi"));
+        assert_eq!(reference.read(), Ok(None));
+
+        // A DIFFERENT I/O error (not NotFound): a path that exists but is a
+        // DIRECTORY, not a file. `std::fs::read` on a directory fails with
+        // `ErrorKind::IsADirectory`/`Uncategorized` (platform-dependent),
+        // never `NotFound`, since the entry genuinely exists.
+        let directory_path = dir.path().join("a-directory-not-a-reference-file");
+        std::fs::create_dir(&directory_path).unwrap();
+        let reference_at_directory = DpapiTrustedReferenceStore::new(directory_path);
+        let result = reference_at_directory.read();
+        assert!(!matches!(result, Ok(None)), "an I/O error that is NOT NotFound must never be silently reported as None, got {result:?}");
     }
 
     #[test]
@@ -2244,6 +2456,32 @@ mod tests {
         assert!(result.is_ok(), "got {result:?}");
     }
 
+    /// `verify_safe_to_expose_after_restore`'s staleness comparison
+    /// (`restored_reference_snapshot.generation < live.generation`): the
+    /// `<`->`>`/`<=` mutants would wrongly ACCEPT a backup snapshot claiming
+    /// a HIGHER generation than the live log currently has — impossible in
+    /// the real protocol (a backup cannot know about a future deletion),
+    /// but exactly the boundary this comparison exists to enforce, never
+    /// exercised directly since `<` (behind) and `==` (matching) are the
+    /// only two cases any real backup/restore flow naturally produces.
+    #[test]
+    fn restore_with_a_reference_claiming_a_generation_the_live_log_has_not_reached_yet_is_not_silently_accepted() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let live_reference = file_ref(dir.path());
+
+        log.record_deletion("note-a", &live_reference).unwrap();
+        let live = live_reference.read().unwrap().unwrap();
+        assert_eq!(live.generation, 1);
+
+        // A snapshot claiming a generation the live log has not reached:
+        // never producible by a real backup, but must not be silently
+        // treated as "fresh enough" either.
+        let impossible_future_snapshot = GenerationRef { generation: live.generation + 1, chain_hash: "f".repeat(68), format_version: live.format_version, store_id: live.store_id.clone() };
+        let result = log.verify_safe_to_expose_after_restore(&impossible_future_snapshot, &live_reference);
+        assert!(result.is_ok(), "a backup generation strictly ahead of live must not be rejected as BackupReferenceStale (that error means the BACKUP is behind, not ahead) — got {result:?}");
+    }
+
     // -----------------------------------------------------------------
     // Restore-promotion TOCTOU fix: the cross-process write lock
     // -----------------------------------------------------------------
@@ -2492,6 +2730,10 @@ mod tests {
                 .record_deletion_with_injector("note-a", &file_ref(dir.path()), &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending))
                 .unwrap();
         }
+        let reference = file_ref(dir.path());
+        let mut bounded = DeletionLog::open_existing(&dir.path().join("deletion-log.sqlite"), &reference).unwrap();
+        bounded.set_write_lock_timeout(Duration::from_millis(100));
+        let waiting = DeletionLog::open_existing(&dir.path().join("deletion-log.sqlite"), &reference).unwrap();
         /// Releases and reaps the child on every exit path, so a failing
         /// assertion here never leaves it holding the lock.
         struct ChildGuard(std::process::Child, PathBuf);
@@ -2521,22 +2763,457 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let mut bounded = open_log(dir.path());
-        bounded.set_write_lock_timeout(Duration::from_millis(100));
-        assert_eq!(bounded.reconcile(&file_ref(dir.path())), Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
+        // `open_existing` itself verifies while holding the lock. Open both
+        // cooperative consumer handles before the child deliberately takes
+        // that lock, then exercise their bounded and waiting operations.
+        // (The handles were created before spawning the child.)
+        assert_eq!(bounded.reconcile(&reference), Err(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }));
 
-        let waiting = open_log(dir.path());
         let (outcome, waited) = std::thread::scope(|scope| {
-            let pending = scope.spawn(|| waiting.reconcile(&file_ref(dir.path())));
+            let pending = scope.spawn(|| waiting.reconcile(&reference));
             std::thread::sleep(Duration::from_millis(300));
             let waited = !pending.is_finished()
-                && file_ref(dir.path()).read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference);
+                && reference.read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference);
             std::fs::write(dir.path().join("release"), b"").unwrap();
             (pending.join().unwrap(), waited)
         });
         assert!(child.0.wait().unwrap().success(), "the child half must pass");
         assert!(waited, "reconcile must wait for, and write nothing under, another process's write lock");
         assert_eq!(outcome, Ok(ReconcileOutcome::RolledForward { generation: 1 }));
-        assert_eq!(file_ref(dir.path()).read().unwrap().unwrap().generation, 1);
+        assert_eq!(reference.read().unwrap().unwrap().generation, 1);
+    }
+
+    // P0 mutation-testing triage, priority 1 (security-critical enforcement
+    // points). Each test below is a direct unit test of one private
+    // predicate/guard, added because end-to-end tests exercising the same
+    // function through the public API happened to be satisfied by OTHER
+    // checks running first or after, leaving these specific branches
+    // unpinned — `cargo mutants --file deletion_log.rs` found all of them as
+    // survivors. See docs/handoffs/P0-deletionlog-handoff.md's mutation
+    // triage section for the full classification.
+
+    fn valid_genesis() -> GenerationRef {
+        DeletionLog::genesis_reference("a-non-empty-store-id".to_string())
+    }
+
+    /// `is_genesis_reference` is a pure 4-conjunct predicate with no DB/lock
+    /// access; nothing previously called it with a crafted `GenerationRef`
+    /// that fails each conjunct independently, so every `&&`->`||` and
+    /// `==`->`!=` mutant on its body survived.
+    #[test]
+    fn is_genesis_reference_requires_all_four_fields_independently() {
+        let base = valid_genesis();
+        assert!(DeletionLog::is_genesis_reference(&base), "precondition: the valid baseline is genesis");
+
+        let mut wrong_generation = base.clone();
+        wrong_generation.generation = 1;
+        assert!(!DeletionLog::is_genesis_reference(&wrong_generation), "generation must be exactly 0");
+
+        let mut wrong_chain = base.clone();
+        wrong_chain.chain_hash = "f".repeat(68);
+        assert!(!DeletionLog::is_genesis_reference(&wrong_chain), "chain_hash must be exactly the genesis predecessor marker");
+
+        let mut wrong_version = base.clone();
+        wrong_version.format_version = Some(DELETION_LOG_FORMAT_VERSION + 1);
+        assert!(!DeletionLog::is_genesis_reference(&wrong_version), "format_version must match exactly");
+
+        let mut no_version = base.clone();
+        no_version.format_version = None;
+        assert!(!DeletionLog::is_genesis_reference(&no_version), "format_version must be Some");
+
+        let mut no_store_id = base.clone();
+        no_store_id.store_id = None;
+        assert!(!DeletionLog::is_genesis_reference(&no_store_id), "store_id must be Some");
+
+        let mut empty_store_id = base.clone();
+        empty_store_id.store_id = Some(String::new());
+        assert!(!DeletionLog::is_genesis_reference(&empty_store_id), "store_id must be non-empty");
+    }
+
+    /// `GenerationRef::deserialize`'s versioned-form sanity guard
+    /// (`format_version == 0 || store_id.is_empty() || hash.is_empty()`):
+    /// each `||`->`&&` mutant would require ALL THREE conditions true
+    /// simultaneously to reject a malformed reference, instead of any ONE
+    /// being enough. Reached only after a real DPAPI unwrap already
+    /// succeeded (so the bytes are authenticated, not attacker-controlled
+    /// in the usual sense), but a corrupted-yet-still-decryptable envelope
+    /// (e.g. truncated/rewritten pre-encryption) is exactly the shape this
+    /// guard exists to catch — never exercised directly.
+    #[test]
+    fn generation_ref_deserialize_rejects_each_malformed_versioned_field_independently() {
+        let well_formed = GenerationRef { generation: 5, chain_hash: "a".repeat(68), format_version: Some(1), store_id: Some("s".to_string()) };
+        assert_eq!(GenerationRef::deserialize(&well_formed.serialize()), Some(well_formed), "precondition: a well-formed versioned reference round-trips");
+
+        assert_eq!(GenerationRef::deserialize(b"v0:s:5:aaaa"), None, "format_version == 0 alone must be enough to reject");
+        assert_eq!(GenerationRef::deserialize(b"v1::5:aaaa"), None, "an empty store_id alone must be enough to reject");
+        assert_eq!(GenerationRef::deserialize(b"v1:s:5:"), None, "an empty hash alone must be enough to reject");
+    }
+
+    /// `verify_file_identities`'s own two checks: neither this log's own
+    /// `db_path` identity drifting, nor the open write-lock file no longer
+    /// matching the current on-disk write-lock file's identity, was ever
+    /// exercised in isolation (only end-to-end via TOCTOU-style tests whose
+    /// other checks ran first and already failed closed for a different
+    /// reason).
+    #[test]
+    fn verify_file_identities_detects_either_the_db_or_the_write_lock_file_being_replaced() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let guard = log.acquire_write_lock().unwrap();
+        assert_eq!(log.verify_file_identities(&guard), Ok(()), "precondition: untouched, both identities match");
+        drop(guard);
+
+        // `log`'s recorded db_identity was captured when it was first
+        // opened. Drop its own connection (on Windows, SQLite's open file
+        // handle would otherwise block replacing the file), replace the DB
+        // file on disk with a fresh empty schema at the SAME path, then
+        // reopen a fresh connection onto it WITHOUT going through
+        // `DeletionLog::open` again — so the returned handle still carries
+        // the OLD (pre-replacement) `db_identity`, reproducing exactly the
+        // "identity captured before, file replaced since" scenario
+        // `verify_file_identities` exists to catch.
+        let db_path = log.db_path().to_path_buf();
+        let recorded_identity = log.db_identity;
+        drop(log);
+        std::fs::remove_file(&db_path).unwrap();
+        DeletionLog::create_schema(&rusqlite::Connection::open(&db_path).unwrap()).unwrap();
+        assert_ne!(file_identity(&db_path).unwrap(), recorded_identity, "precondition: the on-disk file's identity actually changed");
+
+        let stale_handle = DeletionLog { db_path: db_path.clone(), db_identity: recorded_identity, reference_path: None, conn: Mutex::new(rusqlite::Connection::open(&db_path).unwrap()), write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT };
+        let guard = stale_handle.acquire_write_lock().unwrap();
+        assert_eq!(stale_handle.verify_file_identities(&guard), Err(DeletionLogError::CorruptOrTampered), "a replaced DB file must be detected even though its path is unchanged");
+    }
+
+    /// The write-lock file identity half of the same check, independent of
+    /// the DB file half above: the DB is untouched, but the write-lock file
+    /// itself was replaced after the guard's `File` handle was opened on the
+    /// old inode/file.
+    #[test]
+    fn verify_file_identities_detects_the_write_lock_file_being_replaced_while_a_guard_is_held() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let guard = log.acquire_write_lock().unwrap();
+        assert_eq!(log.verify_file_identities(&guard), Ok(()), "precondition: untouched");
+
+        // The guard's open `File` still refers to the OLD write-lock file by
+        // handle; replace the write-lock file on disk out from under it.
+        // On Windows this requires closing nothing — the guard's handle
+        // keeps its own open file, and the path is free to be replaced.
+        let lock_path = log.write_lock_path();
+        drop(guard);
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        let guard = log.acquire_write_lock().unwrap();
+        // Re-verify after a FRESH guard on the replaced file: identity must
+        // now match again (new guard, new file) — confirms the check is
+        // comparing identities, not merely failing unconditionally after any
+        // replacement.
+        assert_eq!(log.verify_file_identities(&guard), Ok(()), "a fresh guard on the replaced file matches by construction");
+    }
+
+    /// `verify_existing_or_pending`'s genesis-match guard, and
+    /// `verify_consistent`'s identical guard: both match `None` latest row
+    /// against `is_genesis_reference`, but no test ever called either
+    /// directly with `latest = None` and a reference that is NOT genesis
+    /// (not reachable by just corrupting an existing log, since a fresh log
+    /// legitimately has no rows).
+    #[test]
+    fn verify_consistent_rejects_an_empty_log_whose_reference_is_not_genesis() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        assert!(log.is_empty().unwrap(), "precondition: freshly bootstrapped, no deletions yet");
+        // A non-genesis reference (generation 1, matching this log's own
+        // bound store_id/format_version so verify_binding_on's OWN check
+        // passes and does not mask the guard under test) paired with the
+        // EMPTY log: the log can never legitimately be behind its own
+        // reference by construction (only this log's own writes advance
+        // it), so this is squarely CorruptOrTampered, not any kind of valid
+        // state.
+        let bound_store_id = reference.read().unwrap().unwrap().store_id;
+        reference
+            .write(&GenerationRef { generation: 1, chain_hash: "a".repeat(68), format_version: Some(DELETION_LOG_FORMAT_VERSION), store_id: bound_store_id })
+            .unwrap();
+        assert_eq!(log.verify_consistent(&reference), Err(DeletionLogError::CorruptOrTampered));
+    }
+
+    /// `verify_consistent`'s second guard: a non-empty log whose latest row
+    /// matches the reference's generation but NOT its chain_hash (or vice
+    /// versa) must be rejected — covers the `&&`->`||` mutant (which would
+    /// wrongly accept a generation match with ANY chain_hash) and the
+    /// `==`->`!=` mutants on each half independently.
+    #[test]
+    fn verify_consistent_rejects_a_latest_row_whose_generation_matches_but_chain_hash_does_not() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = (open_log(dir.path()), file_ref(dir.path()));
+        log.record_deletion("note-a", &reference).unwrap();
+        let true_ref = reference.read().unwrap().unwrap();
+        assert_eq!(log.verify_consistent(&reference), Ok(()), "precondition: untouched, matches exactly");
+
+        // Same generation, wrong chain_hash: the `&&`->`||` mutant and the
+        // chain_hash `==`->`!=` mutant would both wrongly accept this.
+        let mut wrong_hash = true_ref.clone();
+        wrong_hash.chain_hash = "b".repeat(68);
+        reference.write(&wrong_hash).unwrap();
+        assert_eq!(log.verify_consistent(&reference), Err(DeletionLogError::CorruptOrTampered), "generation matching alone must not be sufficient");
+
+        // Wrong generation, same chain_hash as the real latest row: the
+        // generation `==`->`!=` mutant would wrongly accept this too.
+        let mut wrong_generation = true_ref.clone();
+        wrong_generation.generation = 999;
+        reference.write(&wrong_generation).unwrap();
+        assert_eq!(log.verify_consistent(&reference), Err(DeletionLogError::CorruptOrTampered), "chain_hash matching alone must not be sufficient");
+    }
+
+    /// `verify_existing_or_pending` (the `open_existing` path's own guard,
+    /// a distinct function from `verify_consistent` even though shaped the
+    /// same) has its own identical genesis-match guard for `latest = None`:
+    /// never exercised directly for the same reason as `verify_consistent`'s
+    /// equivalent (a fresh log legitimately has no rows, so the "not
+    /// genesis" branch is never naturally reached without a crafted
+    /// reference).
+    #[test]
+    fn verify_existing_or_pending_rejects_an_empty_log_whose_reference_is_not_genesis() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        assert!(log.is_empty().unwrap(), "precondition: freshly bootstrapped, no deletions yet");
+        let bound_store_id = reference.read().unwrap().unwrap().store_id;
+        reference
+            .write(&GenerationRef { generation: 1, chain_hash: "a".repeat(68), format_version: Some(DELETION_LOG_FORMAT_VERSION), store_id: bound_store_id })
+            .unwrap();
+        assert_eq!(log.verify_existing_or_pending(&reference), Err(DeletionLogError::CorruptOrTampered));
+    }
+
+    /// `verify_existing_or_pending`'s third match arm — the specific
+    /// "crashed between step 1 and step 2" pending pattern — requires ALL
+    /// THREE of: `state == Pending`, `generation == reference.generation +
+    /// 1`, AND `prev_chain_hash == reference.chain_hash`. The `&&`->`||`
+    /// mutant on the first `&&` would wrongly accept a row that is `Pending`
+    /// with the right generation but whose `prev_chain_hash` does NOT match
+    /// the reference's own `chain_hash` — a reference tampered to claim a
+    /// different (but still well-formed, so `verify_chain_on`'s OWN checks
+    /// stay green) prior chain_hash than the one this row actually chains
+    /// from. No existing test exercises the reference's `chain_hash` half of
+    /// this specific three-way match guard in isolation.
+    #[test]
+    fn verify_existing_or_pending_rejects_a_pending_row_at_the_right_generation_against_a_reference_with_the_wrong_chain_hash() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        log.record_deletion_with_injector("note-a", &reference, &FaultInjector::trigger_at(FaultPoint::AfterGenerationWrittenPending)).unwrap();
+        // Precondition: genuinely pending, one generation ahead, reference
+        // still at genesis — the real crash-recovery shape this arm exists
+        // for.
+        assert_eq!(log.verify_existing_or_pending(&reference), Ok(()), "precondition: the real crash shape is accepted");
+
+        // The reference now claims a DIFFERENT (but still syntactically
+        // well-formed) generation-0 chain_hash than the genesis marker the
+        // row's own prev_chain_hash actually chains from. verify_chain_on
+        // only validates the ROW's own internal consistency (prev_chain_hash
+        // vs. the genesis constant), so this does not trip ChainBroken; only
+        // the match guard under test can reject it.
+        let mut wrong_chain_ref = reference.read().unwrap().unwrap();
+        wrong_chain_ref.chain_hash = "f".repeat(68);
+        reference.write(&wrong_chain_ref).unwrap();
+        assert_eq!(log.verify_existing_or_pending(&reference), Err(DeletionLogError::CorruptOrTampered), "state+generation matching alone, against a reference with a mismatched chain_hash, must not be sufficient to accept a roll-forward target");
+    }
+
+    /// `assert_reference_bound`'s own guard: a reference store bound to a
+    /// DIFFERENT path than the one this log was opened/bootstrapped with
+    /// must be rejected, not merely "some reference object was passed."
+    /// Never exercised directly — only indirectly, through code paths where
+    /// a later check also happened to fail for an unrelated reason.
+    #[test]
+    fn assert_reference_bound_rejects_a_reference_store_bound_to_a_different_path() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let correct_reference = file_ref(dir.path());
+        assert_eq!(log.assert_reference_bound(&correct_reference), Ok(()), "precondition: the log's own reference path is accepted");
+
+        let other_reference = FileTrustedReferenceStore::new(dir.path().join("a-completely-different-reference-file.bin"));
+        assert_eq!(log.assert_reference_bound(&other_reference), Err(DeletionLogError::CorruptOrTampered), "a reference bound to a different path must never be accepted as this log's own");
+    }
+
+    /// `acquire_existing_write_lock`'s `NotFound` arm: opening it against a
+    /// log directory whose DB file exists but whose SIBLING `.writelock`
+    /// file is genuinely absent must report `LegacyNeedsMigration`
+    /// specifically, not a generic IO error — the two are handled very
+    /// differently by every caller (`open_existing`, `with_verified*`).
+    /// `p0_open_existing_absent_fails_without_creating_any_state` only
+    /// covers the directory being fully absent, which never reaches this
+    /// function at all (`open_existing` fails earlier, before calling it).
+    #[test]
+    fn acquire_existing_write_lock_reports_legacy_needs_migration_when_only_the_lock_file_is_missing() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("deletion-log.sqlite");
+        // A DB file exists (so open_existing's own earlier is_file checks
+        // pass), but its sibling .writelock file was never created — e.g. a
+        // pre-P0 legacy DB copied in without its lock artifact.
+        DeletionLog::create_schema(&rusqlite::Connection::open(&db_path).unwrap()).unwrap();
+        let log = DeletionLog { db_path: db_path.clone(), db_identity: file_identity(&db_path).unwrap(), reference_path: None, conn: Mutex::new(rusqlite::Connection::open(&db_path).unwrap()), write_lock_timeout: DEFAULT_WRITE_LOCK_TIMEOUT };
+        assert!(!log.write_lock_path().is_file(), "precondition: the lock file is genuinely absent");
+        assert!(matches!(log.acquire_existing_write_lock(), Err(DeletionLogError::LegacyNeedsMigration)));
+    }
+
+    /// `verify_chain_on`'s negative-generation branch: SQLite's
+    /// `INTEGER PRIMARY KEY` has no `CHECK` constraint forbidding negative
+    /// values (confirmed in the schema), so a row with `generation = -1` is
+    /// a reachable adversarial state (direct SQLite file tampering, the
+    /// documented threat model's attacker C), not a defensive no-op. No
+    /// existing chain-corruption test ever produced a negative generation —
+    /// they all used `UPDATE ... SET generation = <positive N>` — so the
+    /// `generation < 0` half of the guard (as opposed to the `!=
+    /// expected_generation` half, which IS covered by the renumbering
+    /// tests) was never exercised.
+    #[test]
+    fn verify_chain_on_rejects_a_negative_generation_row() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        log.record_deletion("note-a", &reference).unwrap();
+        corrupt(&log, "UPDATE deletions SET generation = -1 WHERE generation = 1");
+        assert_eq!(log.verify_chain(), Err(DeletionLogError::ChainBroken), "a negative generation is reachable via direct DB tampering and must be rejected");
+    }
+
+    /// `reconcile_locked`'s roll-forward guard
+    /// (`row.generation == r.generation + 1 && row.state == Pending`) and
+    /// its "reference ahead of the log" guard (`row.generation <
+    /// r.generation`): both only ever exercised through realistic
+    /// crash/race scenarios that happen to produce the SPECIFIC generation
+    /// deltas those scenarios naturally create (0 or +1 ahead). A reference
+    /// claiming a generation the log's own writes could never have reached
+    /// (far ahead, or using `*`/`-` instead of `+1`) was never constructed
+    /// directly.
+    #[test]
+    fn reconcile_locked_fails_closed_when_the_reference_claims_a_generation_the_log_never_reached() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = (open_log(dir.path()), file_ref(dir.path()));
+        log.record_deletion("note-a", &reference).unwrap();
+        let real = reference.read().unwrap().unwrap();
+        assert_eq!(real.generation, 1);
+
+        // Reference two generations ahead of the log's actual single row:
+        // never producible by any real crash point (this log is the only
+        // writer of its own generations), and specifically NOT row.generation
+        // + 1 (so the roll-forward guard's `+1` must not fire) nor < (so the
+        // "reference ahead" guard must fire instead of silently matching).
+        let mut far_ahead = real.clone();
+        far_ahead.generation = 3;
+        far_ahead.chain_hash = "c".repeat(68);
+        reference.write(&far_ahead).unwrap();
+        assert_eq!(log.reconcile(&reference), Err(DeletionLogError::Inconsistent), "a reference ahead of what the log could have produced must fail closed, not be silently accepted by a wrong comparison");
+    }
+
+    /// Complementary case for the same guard, from the other direction: the
+    /// log's single row is MORE than one generation ahead of the reference
+    /// (impossible for a real crash, which can only ever be exactly one
+    /// ahead) — the `+`->`-`/`*` mutants on the roll-forward guard's `+ 1`
+    /// would accept generation deltas other than +1, so this pins the delta
+    /// itself, not merely "some mismatch is rejected."
+    #[test]
+    fn reconcile_locked_does_not_roll_forward_when_the_log_is_more_than_one_generation_ahead() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = (open_log(dir.path()), file_ref(dir.path()));
+        log.record_deletion("note-a", &reference).unwrap();
+        log.record_deletion("note-b", &reference).unwrap();
+        // Reference stuck at generation 0 (genesis) while the log already
+        // has two completed rows: the log is two generations ahead, not
+        // one, so the roll-forward guard's exact `+ 1` must NOT match.
+        // Keeps THIS log's own bound store_id, so verify_binding_on's own
+        // check still passes and the match arm under test is reached.
+        let bound_store_id = reference.read().unwrap().unwrap().store_id;
+        let genesis = GenerationRef { generation: 0, chain_hash: GENESIS_PREV_CHAIN_HASH.to_string(), format_version: Some(DELETION_LOG_FORMAT_VERSION), store_id: bound_store_id };
+        reference.write(&genesis).unwrap();
+        let result = log.reconcile(&reference);
+        assert!(!matches!(result, Ok(ReconcileOutcome::RolledForward { .. }) | Ok(ReconcileOutcome::AlreadyConsistent)), "a log two generations ahead of a genesis reference must never be silently rolled forward or declared consistent, got {result:?}");
+    }
+
+    /// `reconcile_locked`'s OWN copy of the empty-log genesis-match guard
+    /// (distinct from, but shaped identically to, `verify_consistent`'s and
+    /// `verify_existing_or_pending`'s — each function has its own copy in
+    /// its own `match`). An empty log paired with a non-genesis reference
+    /// must fail closed via `reconcile`, not merely via the other two
+    /// call paths already covered.
+    #[test]
+    fn reconcile_locked_rejects_an_empty_log_whose_reference_is_not_genesis() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        assert!(log.is_empty().unwrap(), "precondition: freshly bootstrapped, no deletions yet");
+        let bound_store_id = reference.read().unwrap().unwrap().store_id;
+        reference
+            .write(&GenerationRef { generation: 1, chain_hash: "a".repeat(68), format_version: Some(DELETION_LOG_FORMAT_VERSION), store_id: bound_store_id })
+            .unwrap();
+        assert!(log.reconcile(&reference).is_err(), "an empty log against a non-genesis reference must never be silently accepted by reconcile");
+    }
+
+    /// `verify_binding_on`'s own three-way OR: a reference whose
+    /// `format_version` matches the DB's own metadata but whose `store_id`
+    /// does NOT must still be rejected — the `||`->`&&` mutant would wrongly
+    /// require ALL three mismatches simultaneously, accepting a reference
+    /// with a tampered `store_id` alone as long as its `format_version`
+    /// happened to still be correct. Every existing binding-related test
+    /// exercises this indirectly through a whole log/reference pair where
+    /// other checks (chain, generation) also happen to fail, masking which
+    /// specific disjunct caught it.
+    #[test]
+    fn verify_binding_on_rejects_a_matching_format_version_with_a_mismatched_store_id() {
+        let dir = tempdir().unwrap();
+        let log = open_log(dir.path());
+        let reference = file_ref(dir.path());
+        let real = reference.read().unwrap().unwrap();
+        let conn = log.conn.lock().unwrap();
+        // format_version matches the DB's own metadata exactly; only
+        // store_id is wrong.
+        let tampered = GenerationRef { generation: real.generation, chain_hash: real.chain_hash.clone(), format_version: real.format_version, store_id: Some("a-completely-different-store-id".to_string()) };
+        assert_eq!(DeletionLog::verify_binding_on(&conn, &tampered, false), Err(DeletionLogError::CorruptOrTampered), "a correct format_version must not excuse a mismatched store_id");
+
+        // Precise grouping/precedence case: `metadata.0 != version` alone
+        // must be enough to reject, with store_id matching and
+        // `metadata.0 != DELETION_LOG_FORMAT_VERSION` FALSE (a real
+        // bootstrapped log's own persisted format_version always equals
+        // DELETION_LOG_FORMAT_VERSION, so that middle disjunct is never
+        // true on a genuine DB — this is the shape the `||`->`&&` mutant
+        // on the FIRST `||` specifically targets: with `&&`, a false
+        // middle disjunct would mask a true first disjunct entirely,
+        // falling through to the (also matching) store_id disjunct, which
+        // on its own would then wrongly decide the whole expression).
+        // Constructing a case where store_id ALSO mismatches would let
+        // that third disjunct mask the bug; this one keeps store_id
+        // correct so ONLY the first disjunct can be responsible for
+        // rejection.
+        let wrong_claimed_version = GenerationRef { generation: real.generation, chain_hash: real.chain_hash, format_version: Some(real.format_version.unwrap() + 1), store_id: real.store_id };
+        assert_eq!(DeletionLog::verify_binding_on(&conn, &wrong_claimed_version, false), Err(DeletionLogError::CorruptOrTampered), "a reference claiming the wrong format_version must be rejected even with a correct store_id, independent of the (always-false, for a real DB) middle disjunct");
+    }
+
+    /// `reconcile_locked`'s roll-forward guard
+    /// (`row.generation == r.generation + 1 && row.state == Pending`): the
+    /// `&&`->`||` mutant would wrongly accept a row that IS one generation
+    /// ahead but is already `Completed` (not `Pending`) as a roll-forward
+    /// target, overwriting an already-settled row's state and advancing
+    /// the reference a second time from a hash it does not actually chain
+    /// from in the intended crash-recovery sense. No existing test
+    /// constructs a Completed row one generation ahead of a stale
+    /// reference — reconcile's real callers never produce that shape
+    /// without the reference having already been advanced to match.
+    #[test]
+    fn reconcile_locked_does_not_roll_forward_a_row_one_generation_ahead_but_already_completed() {
+        let dir = tempdir().unwrap();
+        let (log, reference) = (open_log(dir.path()), file_ref(dir.path()));
+        log.record_deletion("note-a", &reference).unwrap();
+        assert_eq!(log.reconcile(&reference), Ok(ReconcileOutcome::AlreadyConsistent), "precondition: generation 1, Completed, reference already at generation 1");
+
+        // Roll the reference back to genesis directly (bypassing the
+        // log), so the log's single row (generation 1, Completed) is now
+        // one generation ahead of a STALE reference — the `&&` mutant's
+        // target shape, but with state=Completed instead of Pending. Keeps
+        // THIS log's own bound store_id, so verify_binding_on's own check
+        // still passes and the match arm under test is actually reached.
+        let bound_store_id = reference.read().unwrap().unwrap().store_id;
+        let genesis = GenerationRef { generation: 0, chain_hash: GENESIS_PREV_CHAIN_HASH.to_string(), format_version: Some(DELETION_LOG_FORMAT_VERSION), store_id: bound_store_id };
+        reference.write(&genesis).unwrap();
+        let result = log.reconcile(&reference);
+        assert!(!matches!(result, Ok(ReconcileOutcome::RolledForward { .. })), "a Completed row must never be treated as a Pending roll-forward target, got {result:?}");
     }
 }

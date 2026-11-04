@@ -728,6 +728,59 @@ mod tests {
         assert!(vault.read_note(&id("note-b")).is_ok());
     }
 
+    /// P0 mutation-testing triage: targets `DeletionLog::is_deleted_verified_locked`
+    /// directly, pinning its two outcomes against `restore.rs`'s own call site
+    /// (line ~522) rather than relying on an end-to-end assertion that
+    /// happens to also be satisfied by an earlier, unrelated check.
+    /// `RestoreBeforeDeletionRecheck` fires strictly BEFORE the write lock is
+    /// acquired and `is_deleted_verified_locked` runs — note-a is NOT deleted
+    /// at that point, by construction (no check anywhere has run yet that
+    /// could have seen a deletion). The deletion is made visible in the
+    /// paused window, strictly between that point and the locked recheck, so
+    /// only `is_deleted_verified_locked` itself can be what catches it. A
+    /// mutant replacing its body with `Ok(false)` must fail this test: the
+    /// note would then wrongly be promoted (and its destination record and
+    /// live ciphertext would exist). note-b is deliberately left untouched
+    /// through the same paused window, as the complementary case
+    /// demonstrating a non-deleted note still promotes normally through the
+    /// same call site — ruling out a hypothetical `Ok(true)`-shaped mutant
+    /// (always report deleted) by construction, not merely by omission.
+    #[test]
+    fn is_deleted_verified_locked_is_what_excludes_a_note_deleted_strictly_before_its_own_recheck() {
+        let f = fixture(&[("note-a", "sensitive", "RACED SECRET A"), ("note-b", "internal", "plain b\n")]);
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        // Fires once per note, strictly before that note's write-lock
+        // acquisition and is_deleted_verified_locked call.
+        let injector = FaultInjector::pause_at_each(vec![FaultPoint::RestoreBeforeDeletionRecheck, FaultPoint::RestoreBeforeDeletionRecheck], paused_tx, resume_rx);
+        let outcome = std::thread::scope(|scope| {
+            let restore = {
+                let f = &f;
+                scope.spawn(move || f.restore(&injector))
+            };
+            // note-a's pause: not deleted yet (nothing has run that could
+            // have deleted it); make the deletion visible now, strictly
+            // before is_deleted_verified_locked's own locked recheck runs.
+            assert_eq!(paused_rx.recv().unwrap(), FaultPoint::RestoreBeforeDeletionRecheck);
+            assert!(f.live_log.with_verified_not_deleted(&f.live_ref, "note-a", || Ok(())).unwrap().is_some(), "precondition: not deleted before this recheck");
+            f.delete("note-a");
+            resume_tx.send(()).unwrap();
+            // note-b's pause: deliberately left alone, to prove a note NOT
+            // deleted at this exact window still promotes normally through
+            // the same call site.
+            assert_eq!(paused_rx.recv().unwrap(), FaultPoint::RestoreBeforeDeletionRecheck);
+            drop(resume_tx);
+            restore.join().unwrap()
+        });
+        let (vault, outcome) = outcome.expect("the restore itself succeeds for note-b");
+        assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()], "is_deleted_verified_locked must catch the deletion made visible strictly before its own recheck");
+        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()], "a note NOT deleted at the same window must still promote normally through the same call site");
+        f.assert_nothing_of("note-a");
+        assert!(matches!(vault.read_note(&id("note-a")), Err(StorageError::NotFound { .. })));
+        assert!(matches!(f.pii_store.get_unless_deleted("note-a"), Err(PiiStoreError::Deleted { .. })));
+        assert!(vault.read_note(&id("note-b")).is_ok());
+    }
+
     /// Required tests 2 and 4. While the promotion holds the deletion-log
     /// write lock for note-a, a deletion of note-b (through the SAME log
     /// instance, or through a second, independently-opened handle on the

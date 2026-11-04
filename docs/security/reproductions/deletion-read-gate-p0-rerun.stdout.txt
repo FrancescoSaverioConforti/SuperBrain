@@ -1,0 +1,11 @@
+before_missing_log_rejected=true
+authentic_reference_still_exists=true
+after_missing_log_result=Err(DeletionLogUnavailable { note_id: "note-a", reason: "deletion log is corrupt, tampered with, or has lost required coordination state" })
+after_missing_log_returns_plaintext=false
+no_implicit_recreation_confirmed=true
+missing_reference_other_note_result=Err(DeletionLogUnavailable { note_id: "note-b", reason: "deletion log is corrupt, tampered with, or has lost required coordination state" })
+missing_reference_other_note_returns_plaintext=false
+tampered_chain_reopen_err=Some(ChainBroken)
+tampered_chain_detectable_at_reopen=true
+tampered_chain_deleted_note_result=Err(DeletionLogUnavailable { note_id: "note-a", reason: "deletion log hash chain is broken" })
+tampered_chain_deleted_note_returns_plaintext=false

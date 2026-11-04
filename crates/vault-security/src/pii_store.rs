@@ -857,10 +857,11 @@ mod tests {
         store.commit_staged("note-a", op).unwrap();
         store.stage("note-b", b"untouched", op).unwrap();
         store.commit_staged("note-b", op).unwrap();
+        store.bootstrap_deletion_log().unwrap();
         assert_eq!(store.get_unless_deleted("note-a").unwrap(), b"REAL CONTENT", "not deleted yet: served normally");
 
-        let log = crate::deletion_log::DeletionLog::open(&store.deletion_log_path()).unwrap();
-        let reference = crate::deletion_log::FileTrustedReferenceStore::new(dir.path().join("trusted-reference.bin"));
+        let log = store.open_deletion_log().unwrap();
+        let reference = crate::deletion_log::DpapiTrustedReferenceStore::new(store.deletion_log_reference_path());
         log.record_deletion("note-a", &reference).unwrap();
 
         assert!(
