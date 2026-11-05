@@ -1,0 +1,11 @@
+[package]
+name = "codegraph-domain"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain B2 code-graph domain types and ingestion seam (scaffold)."
+
+[dependencies]
+thiserror = "1"
