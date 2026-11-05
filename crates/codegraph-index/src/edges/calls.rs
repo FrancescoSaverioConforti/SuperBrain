@@ -51,7 +51,8 @@
 use codegraph_domain::{Confidence, EdgeKind};
 
 use super::resolution::{heuristic_evidence, resolved_evidence, Edge, EdgeResolutionError, TargetLookup};
-use crate::parse::{CSharpParser, CppParser, JavaScriptParser, Language, LanguageParser, PythonParser, RustParser, TsxParser, TypeScriptParser};
+pub(crate) use crate::parse::parser_for;
+use crate::parse::Language;
 use crate::snapshot::SymbolSnapshot;
 
 /// Resolves `Calls` edges from every snapshot in `snapshots` to every
@@ -134,34 +135,6 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
     }
 
     Ok(edges)
-}
-
-/// Resolves which `LanguageParser` to re-parse `file`'s owning symbol's
-/// signature text with. Returns `None` for a `FileIdentity` this module
-/// cannot map to a supported language via its own file-extension-free
-/// signal — in practice, every snapshot this resolver receives SHOULD
-/// have an unambiguous language from its own extraction pipeline, but
-/// `SymbolSnapshot` does not currently carry `codegraph_index::parse::Language`
-/// directly (only `codegraph_domain::SymbolKind`, which does not name a
-/// language). This resolver infers the language from the file's
-/// extension as a pragmatic stand-in — a genuine, if narrow, gap: a
-/// future task could close this more robustly by having `SymbolSnapshot`
-/// carry its source `Language` directly (see Task 7's own closing report
-/// for this noted as a candidate for real-repository-validation-driven
-/// follow-up, not implemented speculatively here).
-pub(super) fn parser_for(file: &codegraph_domain::FileIdentity) -> Option<&'static dyn LanguageParser> {
-    let path = file.relative_path();
-    let extension = path.rsplit('.').next()?;
-    match extension {
-        "rs" => Some(&RustParser),
-        "py" => Some(&PythonParser),
-        "cs" => Some(&CSharpParser),
-        "cpp" | "cc" | "cxx" | "hpp" | "h" => Some(&CppParser),
-        "js" | "mjs" | "cjs" => Some(&JavaScriptParser),
-        "ts" => Some(&TypeScriptParser),
-        "tsx" | "jsx" => Some(&TsxParser),
-        _ => None,
-    }
 }
 
 /// Every callee name found anywhere inside `tree`'s root, by walking for

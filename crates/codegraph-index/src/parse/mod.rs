@@ -162,6 +162,32 @@ define_language_parser!(HtmlParser, Language::Html, tree_sitter_html::LANGUAGE);
 define_language_parser!(CssParser, Language::Css, tree_sitter_css::LANGUAGE);
 define_language_parser!(RustParser, Language::Rust, tree_sitter_rust::LANGUAGE);
 
+/// Infers which [`LanguageParser`] applies to `file`, by file extension —
+/// the one canonical place this inference lives. Originally added
+/// (Task 7) as a `pub(super)` helper private to `edges::calls`; moved
+/// here (Task 9) once a second caller (the incremental indexer) needed
+/// the same dispatch, rather than duplicating it a second time.
+/// `SymbolSnapshot`/`FileIdentity` do not carry a validated
+/// [`Language`] value directly, so this remains a pragmatic,
+/// extension-based stand-in — a genuine, if narrow, gap noted since
+/// Task 7's closing report as a real-repository-validation-driven
+/// candidate for a future task (carrying `Language` on `FileIdentity`
+/// or `SymbolSnapshot` directly), not fixed here.
+pub fn parser_for(file: &codegraph_domain::FileIdentity) -> Option<&'static dyn LanguageParser> {
+    let path = file.relative_path();
+    let extension = path.rsplit('.').next()?;
+    match extension {
+        "rs" => Some(&RustParser),
+        "py" => Some(&PythonParser),
+        "cs" => Some(&CSharpParser),
+        "cpp" | "cc" | "cxx" | "hpp" | "h" => Some(&CppParser),
+        "js" | "mjs" | "cjs" => Some(&JavaScriptParser),
+        "ts" => Some(&TypeScriptParser),
+        "tsx" | "jsx" => Some(&TsxParser),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
