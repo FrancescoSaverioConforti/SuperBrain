@@ -14,6 +14,7 @@
 //! allowlist/registry, or exposed API yet.
 
 pub mod allowlist;
+pub mod edges;
 pub mod extract;
 pub mod lineage;
 pub mod local_git_source;
