@@ -209,6 +209,9 @@ name = "codegraph-index"
 version = "0.1.0"
 dependencies = [
  "codegraph-domain",
+ "git2",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

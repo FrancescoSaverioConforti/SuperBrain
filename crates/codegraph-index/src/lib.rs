@@ -1,10 +1,17 @@
-//! B2 Task 0/1 scaffold: proves `codegraph-index` can depend on and drive
-//! `codegraph-domain::RepositorySource` — now using Task 1's validated
-//! `RepositoryId`/`CommitHash`/`FileIdentity` types exclusively, with no
-//! raw-`&str` path left over from Task 0's initial scaffold — without
-//! depending on tree-sitter, git2, `storage` or `api`. No parsing,
-//! extraction, graph or persistence logic exists yet — those are Tasks 3
-//! onward.
+//! B2 Task 0/1/2: `codegraph-index` drives `codegraph_domain::RepositorySource`
+//! using Task 1's validated `RepositoryId`/`CommitHash`/`FileIdentity` types
+//! exclusively (no raw-`&str` path), and Task 2 adds the first real
+//! implementor (`LocalGitRepositorySource`, backed by `git2`) plus the
+//! filesystem capability boundary it is gated by (`RepositoryAllowlist`).
+//! Still no tree-sitter dependency, no parsing/extraction/graph logic, no
+//! persistence beyond the in-memory allowlist/registry, and no exposed
+//! API — those are Task 3 onward.
+
+pub mod allowlist;
+pub mod local_git_source;
+
+pub use allowlist::{AllowlistError, AllowlistedRoot, RepositoryAllowlist};
+pub use local_git_source::LocalGitRepositorySource;
 
 #[cfg(test)]
 mod seam_reachability {

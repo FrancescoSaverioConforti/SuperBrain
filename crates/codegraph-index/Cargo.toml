@@ -9,3 +9,15 @@ description = "SuperBrain B2 code-graph indexing (scaffold)."
 
 [dependencies]
 codegraph-domain = { path = "../codegraph-domain" }
+# Plain SHA-1 object format only, matching every other crate's `git2`
+# dependency in this workspace (`storage`, `index`, `api`) — the
+# `unstable-sha256` cargo feature is not enabled anywhere here. See
+# `local_git_source.rs`'s module doc comment for what that means for
+# `CommitHash`'s 64-hex-char (SHA-256) branch.
+git2 = "0.21"
+thiserror = "1"
+
+[dev-dependencies]
+# Test-only: unique temp-directory names for allowlist/filesystem fixtures,
+# so parallel test runs never collide on the same path.
+uuid = { version = "1", features = ["v4"] }
