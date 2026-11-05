@@ -213,6 +213,50 @@ fn main() {
     }
     println!("full_index_elapsed: {full_index_elapsed:?}");
 
+    // --- Manual sampling aid: dump a deterministic sample of Calls
+    // edges (resolved + heuristic) with enough context for a human to
+    // judge correctness by reading the real source — not computed as
+    // a metric itself, purely a fixed, reproducible sample selection.
+    {
+        let mut sample: Vec<&codegraph_index::edges::Edge> = calls_edges.iter().collect();
+        sample.sort_by(|a, b| a.evidence.note().cmp(b.evidence.note()));
+        println!("\n--- Manual call-quality sample (first 20 by evidence note, deterministic) ---");
+        for edge in sample.iter().take(20) {
+            let from = snapshots.iter().find(|s| s.id() == edge.from);
+            let to = snapshots.iter().find(|s| s.id() == edge.to);
+            println!(
+                "{:?} [{:?}/{:?}] -> {:?} [{:?}] :: {}",
+                from.map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())),
+                edge.kind,
+                edge.evidence.method(),
+                to.map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())),
+                edge.evidence.method(),
+                edge.evidence.note()
+            );
+        }
+    }
+
+    // --- Imports gap measurement: count real import statements across
+    // the Python files that actually contributed a promoted snapshot,
+    // vs. how many Imports edges were produced — a direct empirical
+    // check of the Task 7 finding.
+    {
+        let mut total_import_statements = 0usize;
+        for relative_path in &files {
+            if !relative_path.ends_with(".py") {
+                continue;
+            }
+            let file = codegraph_domain::FileIdentity::parse(repo_id, commit_b.clone(), relative_path).unwrap();
+            if let Ok(bytes) = source.read_file(&file) {
+                let text = String::from_utf8_lossy(&bytes);
+                total_import_statements += text.lines().filter(|l| l.trim_start().starts_with("import ") || l.trim_start().starts_with("from ")).count();
+            }
+        }
+        println!("\n--- Imports gap measurement ---");
+        println!("total_import_statements_in_python_files (line-based count, MEASURED): {total_import_statements}");
+        println!("imports_edges_produced (MEASURED): {}", imports_edges.len());
+    }
+
     // --- G. Performance observation: approximate RSS (best-effort, Windows) ---
     print_approx_memory();
 
@@ -246,6 +290,92 @@ fn main() {
     println!("observe_commit(B) final snapshot_count: {}", outcome_b.graph.snapshot_count());
     println!("observe_commit(B) final edge_count: {}", outcome_b.graph.edge_count());
     println!("observe_commit(B) final lineage_edge_count: {}", outcome_b.graph.lineage_edge_count());
+
+    // --- Deep-learning usefulness Q&A, answered using ONLY the real
+    // CodeGraph built above (observe_commit(B)'s final graph) ---
+    {
+        let graph = &outcome_b.graph;
+        println!("\n--- Deep-learning usefulness Q&A (word_language_model, commit B) ---");
+
+        let find_by_name = |name: &str| -> Vec<&codegraph_index::snapshot::SymbolSnapshot> { graph.all_snapshots().into_iter().filter(|s| s.name().as_str() == name).collect() };
+
+        let transformer_model = find_by_name("TransformerModel");
+        let current_transformer_model = transformer_model.iter().find(|s| graph.lineage_from(s.id()).is_empty());
+        println!(
+            "Q1 'What is the main model class?' -> TransformerModel snapshots found: {} (current+historical; disambiguated below)",
+            transformer_model.len()
+        );
+
+        if let Some(model) = current_transformer_model {
+            let extends = graph.outgoing_edges(model.id(), Some(EdgeKind::Extends));
+            println!(
+                "Q2 'What does the CURRENT TransformerModel extend?' -> {} Extends edge(s): {:?}",
+                extends.len(),
+                extends.iter().map(|e| e.to).collect::<Vec<_>>()
+            );
+        }
+
+        let forward_candidates = find_by_name("forward");
+        println!("Q3 'What composes the forward path?' -> {} snapshot(s) named 'forward' in the whole pool (ambiguous by name alone across 97 files)", forward_candidates.len());
+        // Narrow to the CURRENT one inside word_language_model/model.py
+        // specifically — never the historical (pre-edit) one. The
+        // current snapshot is never the `from` of an outgoing lineage
+        // edge (nothing supersedes it); the historical one always is.
+        // `all_snapshots()`'s deterministic byte-order sort gives no
+        // guarantee about which of the two same-named, same-path
+        // snapshots a naive `.find()` would hit first — this disambig-
+        // uation step exists specifically because of that, and is
+        // itself a concrete illustration of the documented residual
+        // limitation from Task 9/B2-ID-002 (CodeGraph has no current-
+        // vs-historical distinction of its own).
+        let model_py_forward_candidates: Vec<_> = forward_candidates.iter().filter(|s| s.file().relative_path() == "word_language_model/model.py").collect();
+        let current_forward = model_py_forward_candidates.iter().find(|s| graph.lineage_from(s.id()).is_empty());
+        println!(
+            "  (word_language_model/model.py has {} 'forward' snapshot(s) in the final graph: current+historical combined)",
+            model_py_forward_candidates.len()
+        );
+        if let Some(forward) = current_forward {
+            let callees = graph.callees_of(forward.id());
+            let callee_names: Vec<String> = callees.iter().filter_map(|id| graph.snapshot(*id)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+            println!("  CURRENT word_language_model/model.py::forward calls: {callee_names:?}");
+        } else {
+            println!("  CURRENT word_language_model/model.py::forward NOT FOUND (unexpected)");
+        }
+
+        println!("Q4 'Who calls the model?' -> searching train.py/main.py callers of TransformerModel/RNNModel constructors:");
+        for model_name in ["TransformerModel", "RNNModel"] {
+            if let Some(model) = find_by_name(model_name).first() {
+                let callers = graph.callers_of(model.id());
+                let caller_names: Vec<String> = callers.iter().filter_map(|id| graph.snapshot(*id)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+                println!("  callers of {model_name}: {caller_names:?}");
+            }
+        }
+
+        println!("Q5 'Which tests are linked?' -> word_language_model has no test file in this repo; TestsFor edges in the whole corpus: {}", tests_for_edges.len());
+
+        // Diagnostic: is `_generate_square_subsequent_mask` (a REAL
+        // same-class method `forward` calls) promoted as its own
+        // snapshot at all? If not found, that is itself a pipeline
+        // observation worth recording, not an edge-resolution bug.
+        let gssm = find_by_name("_generate_square_subsequent_mask");
+        println!(
+            "Diagnostic: '_generate_square_subsequent_mask' snapshots found: {} (in files: {:?})",
+            gssm.len(),
+            gssm.iter().map(|s| s.file().relative_path()).collect::<Vec<_>>()
+        );
+
+        if let Some(forward) = current_forward {
+            println!("Q6 'If I modify forward, what is impacted?' -> incoming edges to the CURRENT forward (who is affected if its signature/behavior changes):");
+            let incoming = graph.incoming_edges(forward.id(), None);
+            for edge in &incoming {
+                let from_name = graph.snapshot(edge.from).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str()));
+                println!("    {:?} [{:?}]", from_name, edge.kind);
+            }
+            if incoming.is_empty() {
+                println!("    (none found — forward is only called externally from outside this pipeline's extracted pool, e.g. PyTorch's own nn.Module.__call__ machinery, which this resolver cannot see)");
+            }
+        }
+    }
 
     println!("\n=== done ===");
 }

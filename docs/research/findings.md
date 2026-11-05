@@ -1,7 +1,10 @@
 # B2 Project Findings Index
 
-See [`POLICY.md`](POLICY.md) for the policy this index implements. Each
-row links to the full finding file under `findings/`.
+See [`POLICY.md`](POLICY.md) for the policy this index implements, and
+[`EVALUATION_POLICY.md`](EVALUATION_POLICY.md) for how evaluations
+(like [B2-EVAL-001](evaluations/B2-EVAL-001.md), which discovered both
+findings below) are recorded. Each row links to the full finding file
+under `findings/`.
 
 | ID | Problem | Root cause | Impact | Solution | Validation | References |
 |---|---|---|---|---|---|---|
