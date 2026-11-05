@@ -60,6 +60,60 @@ pub(crate) fn parse_record(bytes: &[u8], note_id: &NoteId) -> Result<VaultRecord
     })
 }
 
+/// Every way [`split_record`] can fail to turn raw record bytes into parsed
+/// metadata plus body.
+#[derive(Debug, thiserror::Error)]
+pub enum SplitRecordError {
+    /// `record_bytes` is not valid UTF-8, so it cannot even be split into
+    /// frontmatter/body text. Mirrors this module's own `parse_record` UTF-8
+    /// check on the same raw-bytes-from-disk shape.
+    #[error("record is not valid utf-8")]
+    InvalidUtf8,
+    /// The frontmatter half failed `domain::parse_frontmatter`.
+    #[error("invalid frontmatter: {0}")]
+    Schema(#[from] domain::ValidationError),
+}
+
+/// Splits raw record bytes — the same shape [`VaultRecord::content`] holds
+/// (minus the version header, which callers of `split_record` are not
+/// expected to carry), and the same shape a `storage::Indexer`'s
+/// `mark_current(note_id, version, record_bytes: &[u8])` callback receives —
+/// into already-parsed [`domain::NoteMetadata`] plus the extracted body.
+///
+/// This is an additive, read-side parsing helper: it calls the existing
+/// private `crate::propose::frontmatter_of` / `crate::propose::body_of`
+/// splitters and `domain::parse_frontmatter` internally rather than
+/// duplicating their delimiter-finding logic, so a caller outside this
+/// crate (e.g. `index`'s real indexer wiring) never has to reimplement CRLF
+/// handling or YAML block-scalar-dash edge cases to go from raw bytes to a
+/// `(NoteMetadata, body)` pair — it stays in sync with `storage`'s own
+/// notion of where a body starts by construction, not by convention.
+///
+/// `body` is `None` for a bare-frontmatter record with no body at all (the
+/// same case `body_of` reports as `""`); `Some(body)` otherwise, including
+/// `Some(String::new())` if a closing delimiter is immediately followed by
+/// nothing. Callers that treat `None` and `Some("")` identically (as
+/// `index::Document::new` does) do not need to special-case which one they
+/// get.
+///
+/// Deliberately placed in `vault.rs`, not `propose.rs`: it is a pure
+/// read-side parser with no write-path involvement, and `propose.rs` is
+/// guarded (see `tests/integration.rs`'s
+/// `storage_exposes_exactly_one_public_write_function`) to expose exactly
+/// one public function, `propose_and_commit` — the single sanctioned write
+/// entry point. `split_record` never touches the vault, the journal, or any
+/// write primitive.
+pub fn split_record(record_bytes: &[u8]) -> Result<(domain::NoteMetadata, Option<String>), SplitRecordError> {
+    let text = std::str::from_utf8(record_bytes).map_err(|_| SplitRecordError::InvalidUtf8)?;
+
+    let metadata = domain::parse_frontmatter(crate::propose::frontmatter_of(text))?;
+
+    let body = crate::propose::body_of(text);
+    let body = if body.is_empty() { None } else { Some(body.to_string()) };
+
+    Ok((metadata, body))
+}
+
 /// A monotonically increasing per-note version number, used for optimistic
 /// concurrency: a write must present the version it believes is current, and
 /// is rejected with an explicit [`StorageError::Conflict`] if that belief is
@@ -409,12 +463,73 @@ fn committed_version(row: &crate::journal::OperationRow) -> Result<Version, Stor
     })
 }
 
-/// The index step of the write pipeline (Task 6). Pre-B1 the only
-/// implementation is [`NullIndexer`]; a real indexer arrives in phase B1.
-pub(crate) trait Indexer: Send + Sync {
+/// The index step of the write pipeline (Task 6), and (as of B1 Task 1) the
+/// integration seam `index`'s real indexer implements from *outside* this
+/// crate.
+///
+/// # B1 Task 1 design note: why this trait is `pub`
+///
+/// B1 needs a way for the `index` crate to supply a real indexer to `Vault`
+/// without `storage` growing a second public trait that only mirrors this
+/// one. Two shapes were available:
+///
+/// 1. Make `Indexer` itself `pub`, so `index` implements it directly.
+/// 2. Keep `Indexer` `pub(crate)` and add a second, genuinely public trait
+///    (defined in `storage`, implemented by `index`) that `Vault` adapts
+///    internally into a `Box<dyn Indexer>`.
+///
+/// This went with (1). Reasoning:
+///
+/// - `storage`'s existing public-surface discipline (the crate doc comment's
+///   "Public write surface" section) narrows the *write* path to exactly one
+///   function, `propose_and_commit`, because writes are where an un-gated
+///   caller could corrupt the vault's optimistic-concurrency and journal
+///   invariants. The read/index side carries no equivalent risk: `Indexer` is
+///   purely an output seam (`Vault` calls out to it; nothing calls back in),
+///   two methods, already narrowly scoped, and for the foreseeable future has
+///   exactly one real implementor (`index`'s indexer type). A second trait
+///   that repeats this one method-for-method would be duplication with no
+///   behavioral difference — `Vault` would just adapt it to the first trait
+///   internally, so the "seam" would really be the second trait's shape, not
+///   `Indexer`'s, and B1's actual integration risk (whether `mark_current`'s
+///   data is sufficient, see below) would be identical either way.
+/// - Widening `Indexer` from `pub(crate)` to `pub` does not touch any of the
+///   ~300+ existing call sites across `storage`'s own tests or
+///   `vault-security`'s integration tests: none of them name `Indexer` by
+///   type (they go through `Vault::open_with_default_indexer` /
+///   `Vault::open_with_pii_store`, which hardcode `NullIndexer` internally,
+///   or construct a `Box<dyn Indexer>` value already inside this crate, e.g.
+///   `CountingIndexer` in this module's own tests). Widening visibility alone
+///   changes no signature any existing caller depends on.
+/// - `NullIndexer` and `Vault::index_state_for` stay `pub(crate)`: nothing
+///   outside this crate needs to construct `NullIndexer` by name (the public
+///   constructors already default to it), and `index_state_for` has no
+///   non-test caller yet (phase B1 proper, not Task 1).
+pub trait Indexer: Send + Sync {
     /// Called once a write has reached `GitCommitted`, to let the index record
     /// that `note_id` is now at `version`.
-    fn mark_current(&self, note_id: &str, version: u64);
+    ///
+    /// `record_bytes` is the exact on-disk record buffer (version header +
+    /// `RECORD_SEPARATOR` + raw note content, see [`serialize_record`]) this
+    /// write just committed — the same bytes `write_record_unchecked`
+    /// verified against `new_hash` moments earlier, passed directly rather
+    /// than re-read from disk or re-derived through a callback. **No
+    /// implementation may call back into `Vault::read_note` (or any other
+    /// `Vault` method) from inside this call**: every call site in `vault.rs`
+    /// invokes `mark_current` while already holding `note_id`'s per-note
+    /// lock, and `read_note` acquires that same lock — a callback would
+    /// self-deadlock. An implementation that needs structured fields (e.g.
+    /// `domain::NoteMetadata`) parses `record_bytes` itself (via
+    /// `domain::parse_frontmatter` over the content half of the buffer,
+    /// after locating `RECORD_SEPARATOR`), on its own error-handling policy
+    /// for content that fails to parse — `storage` does not parse frontmatter
+    /// on this path (`write_record_unchecked` happily writes arbitrary
+    /// content; see its own tests, which write plain strings like `"v1"`)
+    /// and must not be made to, so passing `NoteMetadata` instead of raw
+    /// bytes was rejected: it would force a new fallible parse step into the
+    /// write pipeline for a policy question (what to do with unparseable
+    /// content) that belongs to the indexer, not to `storage`.
+    fn mark_current(&self, note_id: &str, version: u64, record_bytes: &[u8]);
 
     /// The index's own verdict on whether it reflects `note_id`'s current
     /// content. This is an index-freshness claim, separate from the journal's
@@ -428,7 +543,7 @@ pub(crate) trait Indexer: Send + Sync {
 pub(crate) struct NullIndexer;
 
 impl Indexer for NullIndexer {
-    fn mark_current(&self, _note_id: &str, _version: u64) {}
+    fn mark_current(&self, _note_id: &str, _version: u64, _record_bytes: &[u8]) {}
 
     fn state_for(&self, _note_id: &str) -> IndexState {
         IndexState::Stale
@@ -571,6 +686,41 @@ impl Vault {
         Self::open_reconciled(root, journal_path, Box::new(NullIndexer), Some(pii_store), &FaultInjector::none())
     }
 
+    /// [`Vault::open_with_default_indexer`], but with a caller-supplied
+    /// [`Indexer`] (B1 Task 1) instead of the hardcoded [`NullIndexer`]. This
+    /// is the constructor `index`'s real indexer type is handed through: a
+    /// caller builds its indexer, boxes it, and opens the vault with it
+    /// directly — there is no separate registration step and no way to open
+    /// a `Vault` and attach an indexer to it afterward.
+    ///
+    /// Added alongside, rather than in place of, `open_with_default_indexer`
+    /// and `open_with_pii_store` specifically so neither existing
+    /// constructor's signature changes: both of them, and every one of
+    /// `storage`'s ~300+ existing tests and all of `vault-security`'s
+    /// integration tests that call them, are unaffected by B1.
+    ///
+    /// No `PiiStore` is available to this constructor's recovery pass; see
+    /// [`Vault::open_with_pii_store_and_indexer`] for the sibling that has
+    /// one.
+    pub fn open_with_indexer(root: PathBuf, journal_path: &Path, indexer: Box<dyn Indexer>) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, indexer, None, &FaultInjector::none())
+    }
+
+    /// [`Vault::open_with_pii_store`], but with a caller-supplied [`Indexer`]
+    /// (B1 Task 1) instead of the hardcoded [`NullIndexer`]. The production
+    /// constructor for a caller that writes `Sensitive` notes AND wants a
+    /// real index, e.g. `index`'s rebuild/live-update path once it also
+    /// needs the deletion-log-aware recovery pass `open_with_pii_store`
+    /// already provides.
+    pub fn open_with_pii_store_and_indexer(
+        root: PathBuf,
+        journal_path: &Path,
+        pii_store: &PiiStore,
+        indexer: Box<dyn Indexer>,
+    ) -> Result<Self, StorageError> {
+        Self::open_reconciled(root, journal_path, indexer, Some(pii_store), &FaultInjector::none())
+    }
+
     /// Test-only sibling of [`Vault::open_with_default_indexer`] (also uses
     /// [`NullIndexer`]) that threads `injector` into the internal `reconcile`
     /// call instead of `FaultInjector::none()`. This lets a test interrupt
@@ -612,8 +762,9 @@ impl Vault {
         // journal's reconcile does for an unrecoverable operation. Runs first
         // so a half-finished deletion is completed before anything else.
         if let Some(store) = pii_store {
-            let log = DeletionLog::open(&store.deletion_log_path()).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(store.deletion_log_reference_path());
+            let log = DeletionLog::open_existing(&store.deletion_log_path(), &trusted_ref)
+                .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
             log.reconcile(&trusted_ref).map_err(|e| StorageError::DeletionLog(e.to_string()))?;
         }
 
@@ -706,8 +857,22 @@ impl Vault {
         let note_lock = self.note_lock(note_id);
         let _guard = note_lock.lock().unwrap();
         let record = self.read_note_locked(note_id)?;
-        refuse_read_if_deleted(self.deletion_log_path.as_deref(), note_id, &record)?;
-        Ok(record)
+        let Some(path) = self.deletion_log_path.as_deref() else {
+            refuse_read_if_deleted(None, note_id, &record)?;
+            return Ok(record);
+        };
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+            path.with_file_name("deletion-log-reference.dpapi"),
+        );
+        let log = DeletionLog::open_existing(path, &trusted_ref)
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+        match log
+            .with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(record))
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?
+        {
+            None => Err(StorageError::Deleted { note_id: note_id.as_str().to_string() }),
+            Some(record) => Ok(record),
+        }
     }
 
     /// The body of `read_note`, run while the caller already holds the
@@ -741,6 +906,92 @@ impl Vault {
             });
         }
         parse_record(&bytes, note_id)
+    }
+
+    /// Every currently-live note id in this vault: a cold-start enumeration
+    /// for a full index rebuild (B1 Task 1), and for any future admin
+    /// tooling that needs "every note that exists right now" (B2's
+    /// code-graph indexing will need the identical list).
+    ///
+    /// # B1 Task 1 design note: why this lives on `Vault`, not in `index`
+    ///
+    /// Two shapes were available for the cold-start enumeration `index`'s
+    /// rebuild needs:
+    ///
+    /// 1. A bare directory walk over `*.record` files, done inside the
+    ///    `index` crate itself, skipping `.record.tmp-*` temp files, the
+    ///    `.before-images` directory and `.pii-store` by name.
+    /// 2. This method: `storage` does the walk internally and also consults
+    ///    the deletion log, so "what counts as a current note id" has
+    ///    exactly one owner.
+    ///
+    /// Went with (2). A bare walk from `index` would have to duplicate
+    /// `storage`'s private knowledge of the on-disk layout (the `.record`
+    /// suffix, the temp-file naming `atomic_write` uses, the
+    /// `.before-images` and `.pii-store` sibling directories — none of
+    /// which are part of any public contract) and would still miss deleted
+    /// notes: a tombstoned note's `.record` file is NOT removed from disk
+    /// (deletion works through the deletion log, not file removal — see
+    /// `vault_security::DeletionLog`), so a bare walk would resurrect every
+    /// deleted note into the index on every rebuild. Only `storage` already
+    /// has both pieces of knowledge (the layout, and the deletion log's
+    /// location), so only `storage` can answer "is this id still live"
+    /// correctly. B2's code-graph indexing needs the exact same list, so
+    /// this is written once here rather than once per future consumer.
+    ///
+    /// # Concurrency
+    ///
+    /// This performs a plain directory read (no per-note lock) followed by
+    /// zero or more [`vault_security::DeletionLog::is_deleted`] calls (which
+    /// have their own, independent locking, unrelated to `Vault`'s per-note
+    /// locks). It never calls [`Vault::read_note`] or acquires any per-note
+    /// lock itself, so a caller that goes on to call `read_note` for each
+    /// returned id (exactly what a rebuild does) introduces no new deadlock
+    /// risk: it is simply one call to `list_note_ids` followed by N
+    /// independent, already-safe concurrent-reader calls to `read_note`,
+    /// each taking and releasing its own per-note lock in turn, exactly as
+    /// any other caller of `read_note` does. The one race this does NOT
+    /// close (and does not need to, for a cold-start rebuild): a note
+    /// written or deleted concurrently with this call may or may not appear
+    /// in the result, the same "approximately current" guarantee a plain
+    /// `ls` of a live directory always has. A rebuild that wants a stronger
+    /// guarantee re-checks each note's state (e.g. via `current_version` or
+    /// `read_note`'s own `StorageError::Deleted`/`StorageError::NotFound`)
+    /// when it actually reads it, which it already must do regardless.
+    pub fn list_note_ids(&self) -> Result<Vec<NoteId>, StorageError> {
+        let deletion_log = self
+            .deletion_log_path
+            .as_deref()
+            .map(|path| {
+                let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+                    path.with_file_name("deletion-log-reference.dpapi"),
+                );
+                DeletionLog::open_existing(path, &trusted_ref).map(|log| (log, trusted_ref))
+            })
+            .transpose()
+            .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
+
+        let enumerate = |is_deleted: &dyn Fn(&str) -> Result<bool, vault_security::DeletionLogError>| {
+            let mut ids = Vec::new();
+            for entry in std::fs::read_dir(&self.root).map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))? {
+                let entry = entry.map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))?;
+                if !entry.file_type().map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))?.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else { continue };
+                let Some(candidate) = name.strip_suffix(".record") else { continue };
+                let Ok(note_id) = NoteId::parse(candidate) else { continue };
+                if is_deleted(note_id.as_str())? { continue; }
+                ids.push(note_id);
+            }
+            Ok(ids)
+        };
+        match deletion_log {
+            Some((log, trusted_ref)) => log.with_verified_lookup(&trusted_ref, enumerate)
+                .map_err(|e| StorageError::DeletionLog(e.to_string())),
+            None => enumerate(&|_| Ok(false)).map_err(|e| StorageError::DeletionLog(e.to_string())),
+        }
     }
 
     /// Returns (creating if absent) the `Arc<Mutex<()>>` for `note_id`,
@@ -1102,7 +1353,9 @@ impl Vault {
         injector.check(FaultPoint::AfterGitCommittedBeforeIndex).map_err(interrupted)?;
 
         // Step 7b (Task 6): the index step, GitCommitted -> IndexCurrent.
-        self.mark_index_current(note_id, operation_id, new_version)?;
+        // `buffer` is the exact bytes just written and hash-verified above
+        // (step 5); passed directly, per `Indexer::mark_current`'s contract.
+        self.mark_index_current(note_id, operation_id, new_version, &buffer)?;
 
         // Step 8: the per-note lock is released when `_guard` drops at the
         // end of this scope.
@@ -1273,7 +1526,8 @@ impl Vault {
             Some(deletion) => {
                 let already_deleted = deletion
                     .log
-                    .is_deleted(note_id.as_str())
+                    .with_verified_not_deleted(deletion.trusted_ref, note_id.as_str(), || Ok(()))
+                    .map(|value| value.is_none())
                     .map_err(|e| StorageError::DeletionLog(e.to_string()))?;
                 if !already_deleted {
                     deletion
@@ -1395,8 +1649,15 @@ impl Vault {
         self.commit_to_git(note_id, &record_path, operation_id, new_version, ScanDepth::Bounded(500), None, Some(pii_store))?;
         injector.check(FaultPoint::AfterGitCommittedBeforeIndex).map_err(interrupted)?;
 
-        // Step 10: the index step.
-        self.mark_index_current(note_id, operation_id, new_version)?;
+        // Step 10: the index step. `buffer` here is the POINTER record (see
+        // step 3's comment above): this is deliberate, not a gap. The
+        // plaintext never reaches `storage`'s index step at all — the whole
+        // point of the pointer scheme is that sensitive content never leaves
+        // `PiiStore`'s encrypted boundary through this path. An indexer that
+        // wants to index sensitive content does so through its own,
+        // separately-audited path (tracked under [n2io]), not through this
+        // hook.
+        self.mark_index_current(note_id, operation_id, new_version, &buffer)?;
 
         Ok(new_version)
     }
@@ -1482,7 +1743,16 @@ impl Vault {
                 return Err(StorageError::OperationInProgress { operation_id });
             }
         }
-        self.mark_index_current(&note_id, operation_id, version)?;
+        // The row is now GitCommitted for THIS operation, so `record_path`
+        // holds its own committed bytes (the `JournalCommitted` branch above
+        // only reaches here once `commit_to_git` has committed this exact
+        // operation's content; the already-`GitCommitted` branch never
+        // changed what's on disk). Read directly under the per-note lock
+        // `_guard` already holds — never through `Vault::read_note`, which
+        // would try to re-acquire that same lock (see `Indexer::mark_current`'s
+        // contract).
+        let record_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        self.mark_index_current(&note_id, operation_id, version, &record_bytes)?;
         Ok(version)
     }
 
@@ -1578,16 +1848,16 @@ impl Vault {
             for row in earlier.iter().filter(|row| row.operation_id != operation_id) {
                 // Unbounded: an earlier operation is not just-written, so a
                 // bounded miss could not prove it has no commit yet.
-                if self.commit_one_locked(note_id, record_path, row.operation_id, ScanDepth::Unbounded, Some(row))? {
+                if let Some(own_bytes) = self.commit_one_locked(note_id, record_path, row.operation_id, ScanDepth::Unbounded, Some(row))? {
                     delete_before_image(&self.root, note_id, row.operation_id)?;
                     if let Some(store) = pii_store {
                         store.delete_before_image(note_id.as_str(), row.operation_id).map_err(pii_store_err)?;
                     }
-                    self.mark_index_current(note_id, row.operation_id, committed_version(row)?)?;
+                    self.mark_index_current(note_id, row.operation_id, committed_version(row)?, &own_bytes)?;
                 }
             }
 
-            if !self.commit_one_locked(note_id, record_path, operation_id, scan, own_content_of)? {
+            if self.commit_one_locked(note_id, record_path, operation_id, scan, own_content_of)?.is_none() {
                 return Err(StorageError::GitPending { note_id: note_id.as_str().to_string() });
             }
             // _git_guard drops here, releasing git_lock.
@@ -1600,10 +1870,14 @@ impl Vault {
     }
 
     /// One operation's JournalCommitted -> GitCommitted step. The caller must
-    /// hold the note's per-note lock and `git_lock`. Returns `Ok(false)`,
+    /// hold the note's per-note lock and `git_lock`. Returns `Ok(None)`,
     /// committing nothing, when `own_content_of` is given and that row's own
-    /// bytes can no longer be recovered; `Ok(true)` once the row is
-    /// `GitCommitted` with its Oid recorded on the same journal write.
+    /// bytes can no longer be recovered; `Ok(Some(bytes))` once the row is
+    /// `GitCommitted` with its Oid recorded on the same journal write, where
+    /// `bytes` are this operation's own record content at the version it
+    /// committed (recovered via `own_content` when `own_content_of` is
+    /// given, so a caller needing them for the index step — B1 Task 1 —
+    /// never has to re-derive what this function already resolved).
     fn commit_one_locked(
         &self,
         note_id: &NoteId,
@@ -1611,30 +1885,45 @@ impl Vault {
         operation_id: Uuid,
         scan: ScanDepth,
         own_content_of: Option<&crate::journal::OperationRow>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<Vec<u8>>, StorageError> {
         let existing_oid = find_commit_for_operation(&self.journal.lock().unwrap(), &self.root, operation_id, scan)
             .map_err(|e| git_err(note_id, e))?;
 
-        let git_oid = match (existing_oid, own_content_of) {
-            (Some(oid), _) => oid,
-            (None, None) => commit_operation(&self.root, operation_id, note_id.as_str(), record_path)
-                .map_err(|e| git_err(note_id, e))?,
-            (None, Some(row)) => {
+        // Resolve this operation's own content bytes whenever `own_content_of`
+        // names a row to recover them for (both the "commit already exists"
+        // and "needs a fresh commit" cases): the row may not be the one
+        // `record_path` currently holds (a successor may have overwritten
+        // it), so only `own_content`'s own-bytes-or-successor's-before-image
+        // logic can answer this, not a direct `record_path` read.
+        let own_bytes = match (existing_oid, own_content_of) {
+            (_, Some(row)) => {
                 let contents = own_content(&self.root, &self.journal.lock().unwrap(), row, note_id, record_path)
                     .map_err(|e| reconcile_err(note_id, e))?;
                 let Some(contents) = contents else {
-                    return Ok(false);
+                    return Ok(None);
                 };
-                commit_operation_contents(&self.root, operation_id, note_id.as_str(), record_path, &contents)
-                    .map_err(|e| git_err(note_id, e))?
+                Some(contents)
             }
+            (_, None) => None,
+        };
+
+        let git_oid = match (existing_oid, &own_bytes) {
+            (Some(oid), _) => oid,
+            (None, None) => commit_operation(&self.root, operation_id, note_id.as_str(), record_path)
+                .map_err(|e| git_err(note_id, e))?,
+            (None, Some(contents)) => commit_operation_contents(&self.root, operation_id, note_id.as_str(), record_path, contents)
+                .map_err(|e| git_err(note_id, e))?,
         };
         self.journal
             .lock()
             .unwrap()
             .advance(operation_id, WriteState::GitCommitted, AdvanceFields::git_oid(git_oid))
             .map_err(journal_err)?;
-        Ok(true)
+        let result_bytes = match own_bytes {
+            Some(contents) => contents,
+            None => std::fs::read(record_path).map_err(StorageError::Io)?,
+        };
+        Ok(Some(result_bytes))
     }
 
     /// Final whole-branch review, I2: refuses a non-tombstone write to a note
@@ -1648,8 +1937,12 @@ impl Vault {
     /// this call's own journal row is advanced to `Failed`, as for a
     /// `Conflict`.
     fn refuse_if_deleted(&self, pii_store: &PiiStore, note_id: &NoteId, operation_id: Uuid) -> Result<(), StorageError> {
-        let deleted = DeletionLog::open(&pii_store.deletion_log_path())
-            .and_then(|log| log.is_deleted(note_id.as_str()))
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+        let deleted = DeletionLog::open_existing(&pii_store.deletion_log_path(), &trusted_ref)
+            .and_then(|log| {
+                log.with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(()))
+                    .map(|value| value.is_none())
+            })
             .map_err(|e| StorageError::DeletionLog(e.to_string()));
         let refusal = match deleted {
             Ok(false) => return Ok(()),
@@ -1664,8 +1957,14 @@ impl Vault {
     /// is the indexer's hook (a no-op for `NullIndexer`). The journal advance
     /// records only that this pipeline step completed. It is NOT an
     /// index-freshness claim; that is `index_state_for`'s job.
-    fn mark_index_current(&self, note_id: &NoteId, operation_id: Uuid, version: Version) -> Result<(), StorageError> {
-        self.indexer.mark_current(note_id.as_str(), version.0);
+    ///
+    /// `record_bytes` must be the exact bytes of `note_id`'s record at
+    /// `version` (see [`Indexer::mark_current`]'s contract: no callback into
+    /// `Vault::read_note`, ever). Every call site below passes bytes it
+    /// already has in hand under the per-note lock it already holds, never
+    /// bytes freshly read through a public `Vault` method.
+    fn mark_index_current(&self, note_id: &NoteId, operation_id: Uuid, version: Version, record_bytes: &[u8]) -> Result<(), StorageError> {
+        self.indexer.mark_current(note_id.as_str(), version.0, record_bytes);
         self.journal
             .lock()
             .unwrap()
@@ -1780,7 +2079,13 @@ fn refuse_read_if_deleted(deletion_log_path: Option<&Path>, note_id: &NoteId, re
             note_id.as_str()
         )));
     };
-    match DeletionLog::open(path).and_then(|log| log.is_deleted(note_id.as_str())) {
+    let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(
+        path.with_file_name("deletion-log-reference.dpapi"),
+    );
+    match DeletionLog::open_existing(path, &trusted_ref).and_then(|log| {
+        log.with_verified_not_deleted(&trusted_ref, note_id.as_str(), || Ok(()))
+            .map(|value| value.is_none())
+    }) {
         Ok(false) => Ok(()),
         Ok(true) => Err(StorageError::Deleted { note_id: note_id.as_str().to_string() }),
         Err(e) => Err(StorageError::DeletionLog(e.to_string())),
@@ -1938,6 +2243,51 @@ pub(crate) fn read_before_image(
 mod tests {
     use super::*;
 
+    const FULL_NOTE: &str = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---\n# Body\nsome prose here\n";
+
+    #[test]
+    fn split_record_round_trips_a_full_notes_raw_bytes() {
+        let (metadata, body) = split_record(FULL_NOTE.as_bytes()).expect("valid frontmatter must parse");
+
+        // Matches what frontmatter_of + domain::parse_frontmatter would have
+        // produced separately.
+        let expected_metadata =
+            domain::parse_frontmatter(crate::propose::frontmatter_of(FULL_NOTE)).expect("same parse");
+        assert_eq!(metadata.id, expected_metadata.id);
+        assert_eq!(metadata.schema_version, expected_metadata.schema_version);
+        assert_eq!(metadata.project, expected_metadata.project);
+
+        // Matches what body_of would have produced separately.
+        let expected_body = crate::propose::body_of(FULL_NOTE);
+        assert_eq!(body.as_deref(), Some(expected_body));
+        assert_eq!(body, Some("# Body\nsome prose here\n".to_string()));
+    }
+
+    #[test]
+    fn split_record_reports_none_body_for_bare_frontmatter_with_no_body() {
+        let note = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---";
+
+        let (_, body) = split_record(note.as_bytes()).expect("valid frontmatter must parse");
+
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn split_record_rejects_invalid_utf8() {
+        let invalid = [0xFF, 0xFE, 0xFD];
+
+        let result = split_record(&invalid);
+
+        assert!(matches!(result, Err(SplitRecordError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn split_record_surfaces_schema_errors() {
+        let result = split_record(b"not: frontmatter");
+
+        assert!(matches!(result, Err(SplitRecordError::Schema(_))));
+    }
+
     fn unique_test_dir() -> PathBuf {
         // A per-process counter on top of the timestamp: parallel tests can read
         // the same clock value, which made two tests share one directory.
@@ -1999,6 +2349,36 @@ mod tests {
         }
     }
 
+    // --- B1 Task 1 (RED, per the task-1 brief's Step 1): `NullIndexer`'s
+    // behavior must survive `Indexer::mark_current`'s signature change
+    // (adding `record_bytes: &[u8]`) unchanged, for any caller that still
+    // wants a null indexer (e.g. a test fixture indifferent to indexing).
+    // This test is written against the NEW signature and must pass both
+    // before and after the signature change goes in — it is the regression
+    // guard, not a demonstration of new behavior.
+
+    #[test]
+    fn null_indexer_mark_current_remains_a_true_no_op_under_the_new_record_bytes_signature() {
+        let indexer = NullIndexer;
+        // Varied inputs, including an empty buffer and one that looks
+        // nothing like a real record: a true no-op must not care what
+        // `record_bytes` contains, and must not panic on any of them.
+        indexer.mark_current("note-a", 0, b"");
+        indexer.mark_current("note-a", 1, b"1\n---\nsome content");
+        indexer.mark_current("", 0, b"");
+        indexer.mark_current("freshly-written-note", 42, &[0xFF; 4096]);
+        // The no-op claim is only meaningful if it is externally observable:
+        // state_for must still report Stale for every note touched above,
+        // proving mark_current recorded nothing that could flip it.
+        for note_id in ["note-a", "", "freshly-written-note"] {
+            assert_eq!(
+                indexer.state_for(note_id),
+                IndexState::Stale,
+                "NullIndexer::mark_current must still be a true no-op after the record_bytes parameter was added"
+            );
+        }
+    }
+
     #[test]
     fn write_record_unchecked_reaches_index_current_pipeline_state_but_index_state_for_stays_stale() {
         let (vault, _repo_dir) = open_test_vault_with_git_repo_and_default_indexer();
@@ -2008,6 +2388,83 @@ mod tests {
         let row = vault.journal_row_for_test(op).unwrap();
         assert_eq!(row.state, WriteState::IndexCurrent, "the write pipeline has nothing further to do");
         assert_eq!(vault.index_state_for(&id), IndexState::Stale, "but the index itself is honestly reported as not current — no indexer exists yet");
+    }
+
+    // --- B1 Task 1: Vault::list_note_ids (cold-start enumeration seam) ---
+
+    #[test]
+    fn list_note_ids_returns_every_written_note_and_nothing_else() {
+        let (vault, _repo_dir) = open_test_vault_with_git_repo_and_default_indexer();
+        for name in ["note-a", "note-b", "note-c"] {
+            let id = NoteId::parse(name).unwrap();
+            vault.write_record_unchecked(&id, "content", Version(0), Uuid::new_v4()).unwrap();
+        }
+        let mut ids: Vec<String> = vault.list_note_ids().unwrap().into_iter().map(|id| id.as_str().to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["note-a".to_string(), "note-b".to_string(), "note-c".to_string()]);
+    }
+
+    #[test]
+    fn list_note_ids_skips_temp_files_and_the_before_images_directory() {
+        let (vault, repo_dir) = open_test_vault_with_git_repo_and_default_indexer();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "content", Version(0), Uuid::new_v4()).unwrap();
+
+        // A leftover temp file (as atomic_write would name one mid-write)
+        // must never be mistaken for a real note id.
+        std::fs::write(repo_dir.join("note-a.record.tmp-1234-5678"), b"partial").unwrap();
+        // The before-image directory holds `.record`-suffixed files too
+        // (`before_image_path`'s `<id>-<op>.record` naming), but is itself a
+        // directory, not a file, so the `is_file()` check already excludes
+        // it as a whole without needing to name it specially; this also
+        // plants a file-shaped entry one level down to confirm the walk
+        // never descends into it.
+        std::fs::create_dir_all(repo_dir.join(".before-images")).unwrap();
+        std::fs::write(repo_dir.join(".before-images").join(format!("note-a-{}.record", Uuid::new_v4())), b"before").unwrap();
+
+        let ids: Vec<String> = vault.list_note_ids().unwrap().into_iter().map(|id| id.as_str().to_string()).collect();
+        assert_eq!(ids, vec!["note-a".to_string()], "only the one real note, no temp file and nothing from .before-images");
+    }
+
+    #[test]
+    fn list_note_ids_without_a_deletion_log_returns_every_record_on_disk() {
+        // open_with_default_indexer has no deletion log to consult, so
+        // list_note_ids cannot filter anything out — every `.record` file
+        // on disk is reported, exactly as a vault with no PiiStore has no
+        // way to know whether any of them has been "deleted" via the log.
+        let (vault, _repo_dir) = open_test_vault_with_git_repo_and_default_indexer();
+        let id = NoteId::parse("note-a").unwrap();
+        vault.write_record_unchecked(&id, "content", Version(0), Uuid::new_v4()).unwrap();
+        assert_eq!(vault.list_note_ids().unwrap().into_iter().map(|id| id.as_str().to_string()).collect::<Vec<_>>(), vec!["note-a".to_string()]);
+    }
+
+    #[test]
+    fn list_note_ids_excludes_a_note_the_deletion_log_records_as_deleted() {
+        let root = crate::git::test_support::init_test_repo();
+        let journal_path = unique_test_dir().join("journal.sqlite");
+        let pii_root = root.join(".pii-store");
+        let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii_store.bootstrap_deletion_log().unwrap();
+
+        let live_id = NoteId::parse("note-live").unwrap();
+        let deleted_id = NoteId::parse("note-deleted").unwrap();
+        {
+            let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+            vault.write_record_unchecked(&live_id, "content", Version(0), Uuid::new_v4()).unwrap();
+            vault.write_record_unchecked(&deleted_id, "content", Version(0), Uuid::new_v4()).unwrap();
+        }
+
+        // Record the deletion directly against the log beside the PiiStore,
+        // exactly where `Vault::open_with_pii_store` looks for it — no need
+        // to drive a full tombstone write through the sensitive pipeline
+        // just to prove list_note_ids consults this log.
+        let log = pii_store.open_deletion_log().unwrap();
+        let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+        log.record_deletion(deleted_id.as_str(), &trusted_ref).unwrap();
+
+        let vault = Vault::open_with_pii_store(root.clone(), &journal_path, &pii_store).unwrap();
+        let ids: Vec<String> = vault.list_note_ids().unwrap().into_iter().map(|id| id.as_str().to_string()).collect();
+        assert_eq!(ids, vec!["note-live".to_string()], "the deleted note's .record file is still on disk, but list_note_ids must not report it as live");
     }
 
     // --- Task 5: JournalCommitted -> GitCommitted chain extension ---
@@ -2787,7 +3244,7 @@ mod tests {
     }
 
     impl Indexer for CountingIndexer {
-        fn mark_current(&self, note_id: &str, version: u64) {
+        fn mark_current(&self, note_id: &str, version: u64, _record_bytes: &[u8]) {
             self.calls.lock().unwrap().push((note_id.to_string(), version));
         }
 
@@ -4153,7 +4610,9 @@ mod tests {
 
         fn open_pii_store(vault_root: &Path) -> PiiStore {
             let pii_root = vault_root.join(".pii-store");
-            PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap()
+            let store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+            store.bootstrap_deletion_log().unwrap();
+            store
         }
 
         fn pointer_content_for(note_id: &str) -> String {
@@ -4662,8 +5121,7 @@ mod tests {
             // recorded via PendingDeletion, interrupted at
             // AfterJournalCommittedBeforeGit — the before-image (the real,
             // now-deleted content) exists at this exact point.
-            let deletion_log_path = pii_store.root().join("deletion-log.sqlite");
-            let deletion_log = vault_security::DeletionLog::open(&deletion_log_path).unwrap();
+            let deletion_log = pii_store.open_deletion_log().unwrap();
             let trusted_ref_path = pii_store.root().join("deletion-log-reference.dpapi");
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(trusted_ref_path);
             let op2 = Uuid::new_v4();
@@ -4686,7 +5144,10 @@ mod tests {
                     pii_store.has_before_image("note-tombstone-cleanup", op2),
                     "the before-image (the real, now-deleted content) must exist at this crash point"
                 );
-                assert!(deletion_log.is_deleted("note-tombstone-cleanup").unwrap(), "the deletion must already be logged");
+                assert!(deletion_log
+                    .with_verified_not_deleted(&trusted_ref, "note-tombstone-cleanup", || Ok(()))
+                    .unwrap()
+                    .is_none(), "the deletion must already be logged");
             }
 
             let reopened = Vault::open_with_pii_store(root, &journal_path, &pii_store).unwrap();
@@ -4736,7 +5197,7 @@ mod tests {
                 );
                 assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))));
             }
-            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            let log = pii_store.open_deletion_log().unwrap();
             log.record_deletion("note-live-gap", &vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()))
                 .unwrap();
 
@@ -4764,7 +5225,7 @@ mod tests {
                     .write_sensitive_record_unchecked(&id, &pointer_content, b"REAL SECRET", Version(0), Uuid::new_v4(), &pii_store, None)
                     .unwrap();
             }
-            let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+            let log = pii_store.open_deletion_log().unwrap();
             let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
             let op = Uuid::new_v4();
             {
@@ -4820,7 +5281,7 @@ mod tests {
                         );
                         assert!(matches!(result, Err(StorageError::Interrupted(p)) if p == point), "{point:?}/{update}");
                     }
-                    let log = vault_security::DeletionLog::open(&pii_store.deletion_log_path()).unwrap();
+                    let log = pii_store.open_deletion_log().unwrap();
                     log.record_deletion(
                         "note-live-plain",
                         &vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path()),

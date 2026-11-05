@@ -1,0 +1,2 @@
+crates/policy/src/read.rs:23:9: replace ReadPolicy::allows -> bool with true
+crates/policy/src/read.rs:23:9: replace ReadPolicy::allows -> bool with false

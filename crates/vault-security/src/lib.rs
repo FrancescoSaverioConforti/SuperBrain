@@ -15,7 +15,7 @@ pub use backup::{
 };
 pub use deletion_log::{
     DeletionLog, DeletionLogError, DeletionLogState, DeletionLogWriteGuard, DeletionReceipt, DpapiTrustedReferenceStore,
-    GenerationRef, ReconcileOutcome, TrustedReferenceStore,
+    GenerationRef, LegacyNoDeletionAttestation, MigrationReceipt, ReconcileOutcome, TrustedReferenceStore,
 };
 pub use keys::{KeyError, KeySource, MasterKey, StoreFingerprint};
 pub use pii_store::{unavailable_reason_for, PiiPointer, PiiStore, PiiStoreError, StagedPii};

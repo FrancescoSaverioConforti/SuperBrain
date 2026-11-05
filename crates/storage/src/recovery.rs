@@ -261,12 +261,24 @@ fn resolve(
                 let version = row
                     .new_version
                     .ok_or_else(|| inconsistent(op, "GitCommitted row has no new_version"))?;
+                let note_id = parse_note_id(row)?;
+                // B1 Task 1: resolve this row's own record bytes for
+                // `Indexer::mark_current`'s now-mandatory `record_bytes`
+                // parameter, BEFORE the before-image delete below — the
+                // delete may remove the one place `own_content` could still
+                // recover them from (a successor's before-image) if
+                // `record_path` itself no longer matches. No callback into
+                // `Vault::read_note`: this runs during `Vault::open`'s
+                // startup reconciliation, before any `Vault` value exists.
+                let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
+                let record_bytes = own_content(root, journal, row, &note_id, &record_path)?
+                    .ok_or_else(|| inconsistent(op, "GitCommitted row has no recoverable own content for the index step"))?;
                 // Item 1(c): a row resumed from GitCommitted (a crash after
                 // the advance, before the before-image deletes) gets the
                 // same cleanup as one that just arrived from row 3. A no-op
                 // repeat for the latter.
-                delete_before_images_at_git_committed(root, pii_store, &parse_note_id(row)?, row)?;
-                indexer.mark_current(&row.note_id, version);
+                delete_before_images_at_git_committed(root, pii_store, &note_id, row)?;
+                indexer.mark_current(&row.note_id, version, &record_bytes);
                 journal.advance(op, WriteState::IndexCurrent, AdvanceFields::none())?;
                 return Ok(Outcome::Completed);
             }
@@ -463,18 +475,36 @@ fn pii_is_consistent(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, r
 /// real, deleted ciphertext from its before-image, undoing the purge C5
 /// requires. Forwarding it exposes nothing (its plaintext is empty) and
 /// completes that purge. See [`is_tombstone_row`] for how one is recognised.
-fn note_is_deleted(pii_store: Option<&PiiStore>, note_id: &NoteId, op: Uuid, row: &OperationRow) -> Result<bool, ReconcileError> {
+/// Advances only while the verified deletion-log guard remains held. Recovery
+/// must not turn a detached lookup into a later forward decision.
+fn advance_journal_committed_if_not_deleted(
+    journal: &Journal,
+    pii_store: Option<&PiiStore>,
+    note_id: &NoteId,
+    op: Uuid,
+    row: &OperationRow,
+) -> Result<bool, ReconcileError> {
     if is_tombstone_row(row) {
-        return Ok(false);
+        journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
+        return Ok(true);
     }
     let store = match (row.pii_content_hash.as_deref(), pii_store) {
         (_, Some(store)) => store,
-        (None, None) => return Ok(false),
+        (None, None) => {
+            journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
+            return Ok(true);
+        }
         (Some(_), None) => require_pii_store(pii_store, op)?,
     };
-    vault_security::DeletionLog::open(&store.deletion_log_path())
-        .and_then(|log| log.is_deleted(note_id.as_str()))
-        .map_err(|e| inconsistent(op, format!("cannot consult the deletion log before forwarding a row: {e}")))
+    let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(store.deletion_log_reference_path());
+    let advanced = vault_security::DeletionLog::open_existing(&store.deletion_log_path(), &trusted_ref)
+        .and_then(|log| log.with_verified_not_deleted(&trusted_ref, note_id.as_str(), || {
+            journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())
+                .map_err(|e| vault_security::DeletionLogError::Io(e.to_string()))?;
+            Ok(())
+        }))
+        .map_err(|e| inconsistent(op, format!("cannot consult the deletion log before forwarding a row: {e}")))?;
+    Ok(advanced.is_some())
 }
 
 /// Whether `row` gets the tombstone exemption from [`note_is_deleted`].
@@ -753,8 +783,8 @@ fn fix_content_persisted(
         // alike, from the live write path or from a restore's promotion; a
         // row resumed from IntentRecorded whose rename landed reaches it
         // too, through `fix_intent_recorded`'s hand-over.
-        if pii_is_consistent(pii_store, &note_id, op, row)? && !note_is_deleted(pii_store, &note_id, op, row)? {
-            journal.advance(op, WriteState::JournalCommitted, AdvanceFields::none())?;
+        if pii_is_consistent(pii_store, &note_id, op, row)?
+            && advance_journal_committed_if_not_deleted(journal, pii_store, &note_id, op, row)? {
             return Ok(WriteState::JournalCommitted);
         }
     }
@@ -1928,6 +1958,7 @@ mod tests {
         let journal_path = unique_test_dir().join("journal.sqlite");
         let pii_root = unique_test_dir();
         let pii_store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii_store.bootstrap_deletion_log().unwrap();
         let id = NoteId::parse("note-a").unwrap();
 
         // v1 fully committed: a real pointer record plus real PiiStore ciphertext.

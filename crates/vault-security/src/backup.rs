@@ -173,6 +173,9 @@ pub enum BackupError {
     #[error("backup content hash verification failed")]
     HashMismatch,
 
+    #[error("legacy backup has no authenticated deletion-log genesis; administrative import is required")]
+    LegacyNeedsMigration,
+
     /// Either of [`restore`]'s two deletion-log checks failed for a reason
     /// the deletion log itself names (corrupt/tampered/missing reference,
     /// stale generation, etc.) — distinct from [`BackupError::DeletedSinceBackup`],
@@ -548,6 +551,9 @@ fn collect_pii_files(pii_store: &PiiStore) -> Result<BTreeMap<String, Vec<u8>>, 
 /// module.
 fn serialize_snapshot(reference: &GenerationRef, vault_files: &BTreeMap<String, Vec<u8>>, pii_files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(b"DLR1");
+    buf.extend_from_slice(&reference.format_version.unwrap_or(0).to_le_bytes());
+    write_len_prefixed_u32(&mut buf, reference.store_id.as_deref().unwrap_or_default().as_bytes());
     buf.extend_from_slice(&reference.generation.to_le_bytes());
     write_len_prefixed_u32(&mut buf, reference.chain_hash.as_bytes());
 
@@ -578,11 +584,25 @@ struct Snapshot {
 /// does not even parse can never have been the one the manifest hashed).
 fn deserialize_snapshot(bytes: &[u8]) -> Option<Snapshot> {
     let mut offset = 0usize;
+    let (format_version, store_id) = if bytes.starts_with(b"DLR1") {
+        offset += 4;
+        let version = read_u32(bytes, &mut offset)?;
+        let store_id_len = read_u32(bytes, &mut offset)? as usize;
+        let store_id = std::str::from_utf8(read_bytes(bytes, &mut offset, store_id_len)?).ok()?.to_string();
+        (version, store_id)
+    } else {
+        (0, String::new())
+    };
     let generation = u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?);
     offset += 8;
     let chain_hash_len = read_u32(bytes, &mut offset)? as usize;
     let chain_hash = std::str::from_utf8(read_bytes(bytes, &mut offset, chain_hash_len)?).ok()?.to_string();
-    let reference = GenerationRef { generation, chain_hash };
+    let reference = GenerationRef {
+        generation,
+        chain_hash,
+        format_version: (format_version != 0).then_some(format_version),
+        store_id: (!store_id.is_empty()).then_some(store_id),
+    };
 
     let vault_count = read_u32(bytes, &mut offset)?;
     let mut vault_files = BTreeMap::new();
@@ -616,10 +636,6 @@ fn deserialize_snapshot(bytes: &[u8]) -> Option<Snapshot> {
 /// [`crate::deletion_log::GENESIS_PREV_CHAIN_HASH`]) is never a value a real
 /// deletion can produce (the first real deletion is always generation 1),
 /// so this sentinel can never collide with genuine backup content.
-fn no_deletions_ever_reference() -> GenerationRef {
-    GenerationRef { generation: 0, chain_hash: "0".repeat(64) }
-}
-
 /// Encrypts a snapshot of the Markdown vault at `vault_root`, `pii_store`'s
 /// live ciphertext files, and a [`GenerationRef`] snapshot of
 /// `deletion_log`'s current trusted reference, and writes the result via
@@ -660,7 +676,7 @@ pub fn backup(
 pub(crate) fn backup_with_reference(
     vault_root: &Path,
     pii_store: &PiiStore,
-    _deletion_log: &DeletionLog,
+    deletion_log: &DeletionLog,
     master_key: &MasterKey,
     target: &dyn BackupTarget,
     trusted_ref: &dyn TrustedReferenceStore,
@@ -671,10 +687,17 @@ pub(crate) fn backup_with_reference(
     // reference (corrupt, tampered) DOES propagate: backup must not
     // silently embed a fabricated reference over a reference that exists
     // but cannot be trusted.
-    let reference = trusted_ref.read().map_err(BackupError::DeletionLogRejected)?.unwrap_or_else(no_deletions_ever_reference);
-
-    let vault_files = collect_vault_files(vault_root)?;
-    let pii_files = collect_pii_files(pii_store)?;
+    let (reference, vault_files, pii_files) = deletion_log
+        .with_verified(trusted_ref, |reference| {
+            Ok((
+                reference.clone(),
+                collect_vault_files(vault_root),
+                collect_pii_files(pii_store),
+            ))
+        })
+        .map_err(BackupError::DeletionLogRejected)?;
+    let vault_files = vault_files?;
+    let pii_files = pii_files?;
 
     let plaintext_snapshot = serialize_snapshot(&reference, &vault_files, &pii_files);
     let hash = content_hash(&plaintext_snapshot);
@@ -744,6 +767,9 @@ pub fn restore(
     let recomputed_hash = content_hash(&plaintext_snapshot);
 
     let snapshot = deserialize_snapshot(&plaintext_snapshot).ok_or(BackupError::HashMismatch)?;
+    if snapshot.reference.generation == 0 && snapshot.reference.format_version.is_none() {
+        return Err(BackupError::LegacyNeedsMigration);
+    }
 
     // Both checks (module docs) run before anything is written.
     //
@@ -814,12 +840,6 @@ pub fn restore(
     // error-labeling convenience, not a safety decision); and
     // `deleted_since_backup` (below, after check 1), which is the ONLY list
     // ever used to decide what gets excluded from the write.
-    let pre_check_1_deleted_hint: Vec<String> = candidate_note_ids
-        .iter()
-        .filter(|note_id| live_deletion_log.is_deleted(note_id).unwrap_or(false))
-        .cloned()
-        .collect();
-
     // Check 1: the backup's OWN embedded reference snapshot against the
     // LIVE trusted reference. Any error here (corrupt, tampered, missing
     // reference, or a genuinely stale generation) fails closed as
@@ -874,23 +894,13 @@ pub fn restore(
     // obsoleto" case — and only at the BACKUP's own snapshot level, never
     // at the live log's own level — is now handled by exclusion instead of
     // outright refusal.
-    let check_1 = (|| -> Result<(), DeletionLogError> {
-        let live_reference_for_check1 = live_trusted_ref.read()?;
-        let live_log_is_empty = live_deletion_log.is_empty()?;
-        let both_sides_have_never_seen_a_deletion =
-            snapshot.reference == no_deletions_ever_reference() && live_reference_for_check1.is_none() && live_log_is_empty;
-        if both_sides_have_never_seen_a_deletion {
-            return Ok(());
-        }
-        live_deletion_log.verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref)
-    })();
+    let check_1 = live_deletion_log
+        .verify_safe_to_expose_after_restore(&snapshot.reference, live_trusted_ref);
     if let Err(e) = check_1 {
         if matches!(e, DeletionLogError::BackupReferenceStale { .. }) {
             // The live log/reference pair is trustworthy (reconcile
             // already proved it); only this backup's own snapshot is
             // older. Fall through to exclusion.
-        } else if !pre_check_1_deleted_hint.is_empty() {
-            return Err(BackupError::DeletedSinceBackup { note_ids: pre_check_1_deleted_hint });
         } else {
             return Err(BackupError::DeletionLogRejected(e));
         }
@@ -906,14 +916,15 @@ pub fn restore(
     // deletion-log write lock right before its pointer rename (see this
     // function's doc comment), which is what closes the window between here
     // and the write.
-    let mut deleted_since_backup = Vec::new();
-    for note_id in &candidate_note_ids {
-        // Any error here (I/O failure reading the log) must fail closed:
-        // never treat "couldn't check" as "not deleted."
-        if live_deletion_log.is_deleted(note_id).map_err(BackupError::DeletionLogRejected)? {
-            deleted_since_backup.push(note_id.clone());
-        }
-    }
+    let deleted_since_backup = live_deletion_log
+        .with_verified_lookup(live_trusted_ref, |is_deleted| {
+            let mut deleted = Vec::new();
+            for note_id in &candidate_note_ids {
+                if is_deleted(note_id)? { deleted.push(note_id.clone()); }
+            }
+            Ok(deleted)
+        })
+        .map_err(BackupError::DeletionLogRejected)?;
 
     // Both checks passed: stage every surviving note, dropping every
     // deleted one. Nothing is written here; see the doc comment.
@@ -954,6 +965,7 @@ mod tests {
     use super::*;
     use crate::deletion_log::{FaultInjector, FaultPoint, FileTrustedReferenceStore};
     use crate::keys::MasterKey;
+    use std::time::Duration;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -973,8 +985,8 @@ mod tests {
     }
 
     fn open_deletion_log_and_ref(dir: &Path) -> (DeletionLog, FileTrustedReferenceStore) {
-        let log = DeletionLog::open(&dir.join("deletion-log.sqlite")).unwrap();
         let reference = FileTrustedReferenceStore::new(dir.join("trusted-reference.bin"));
+        let log = DeletionLog::bootstrap_new(&dir.join("deletion-log.sqlite"), &reference).unwrap();
         (log, reference)
     }
 
@@ -1149,8 +1161,39 @@ mod tests {
         assert!(!restored_pii_root.join("note-a.pii").exists(), "the deleted note's ciphertext must never reappear");
     }
 
+    // Guarantees `resume_tx` is sent (or at least dropped) no matter how the
+    // scope body around a paused `record_deletion_with_injector` call exits
+    // — including via a failed `assert!` unwinding through it. Without this,
+    // a panic between the pause being observed and the real resume send
+    // leaves the deleter thread parked forever on `resume_rx.recv()` inside
+    // `record_deletion_with_injector`, holding `log`'s write lock for its
+    // whole span; `thread::scope` then blocks joining that thread before it
+    // can propagate the panic, turning a normal test failure into a hang.
+    // `Sender::send` on a channel whose matching `Receiver::recv` is called
+    // after the sender side (here, via `Drop`) already fired is harmless:
+    // `check()` only does `let _ = pause.resume.recv();`, so a dropped
+    // sender (recv() returning Err) unblocks it exactly like a real resume
+    // signal would.
+    struct ResumeGuard(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ResumeGuard {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Concurrency/lock-exclusion property. While `record_deletion` is
+    /// paused mid-protocol — holding the deletion log's cross-process write
+    /// lock for its whole span, by the P0 design (C5) — a concurrent
+    /// `backup_with_reference` must NOT obtain a verified view of the log.
+    /// It must fail closed with `WriteLockUnavailable`, and must not write
+    /// any blob to the backup target. This is the new design's locking
+    /// invariant working as intended, not a bug: `with_verified` takes the
+    /// same write lock a writer holds for its whole span, so the two can
+    /// never interleave.
     #[test]
-    fn a_backup_taken_while_a_deletion_is_still_pending_and_then_restored_does_not_expose_the_note_that_deletion_targets(
+    fn a_backup_attempted_while_a_deletion_is_paused_mid_protocol_is_rejected_not_served(
     ) {
         let dir = tempdir().unwrap();
         let vault_root = dir.path().join("vault");
@@ -1166,9 +1209,15 @@ mod tests {
         let master_key = fresh_master_key(dir.path());
         let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
 
+        // A second handle on the same log file, used only by the backup
+        // attempt: its own write-lock timeout is shortened so the test does
+        // not wait out the production 30s default to observe the rejection.
+        let mut backup_log = DeletionLog::open(log.db_path()).unwrap();
+        backup_log.set_write_lock_timeout(Duration::from_millis(200));
+
         // Pause record_deletion exactly at AfterGenerationWrittenPending:
         // the log row exists and is Pending, the trusted reference has NOT
-        // been updated yet.
+        // been updated yet. The write lock is held for the whole pause.
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let injector = FaultInjector::pause_at(FaultPoint::AfterGenerationWrittenPending, paused_tx, resume_rx);
@@ -1180,58 +1229,108 @@ mod tests {
                 let reference_for_thread = FileTrustedReferenceStore::new(deleter_reference_path.clone());
                 deleter_log.record_deletion_with_injector("note-a", &reference_for_thread, &injector).unwrap()
             });
+            let mut resume_guard = ResumeGuard(Some(resume_tx));
 
-            // Wait until record_deletion is paused mid-protocol.
+            // Wait until record_deletion is paused mid-protocol, still
+            // holding the write lock.
             paused_rx.recv().unwrap();
 
-            // While paused: the log row is Pending (note-a already reads as
-            // deleted), but the trusted reference has NOT been updated. The
-            // deleter thread is parked INSIDE record_deletion_with_injector
-            // holding `log`'s own in-process connection mutex for the whole
-            // pause (by design, mirroring storage::fault's pause_at), so
-            // this check opens a SEPARATE DeletionLog connection onto the
-            // same SQLite file rather than calling `log.is_deleted` here,
-            // which would deadlock against that held mutex.
-            let concurrent_reader = DeletionLog::open(log.db_path()).unwrap();
-            assert!(concurrent_reader.is_deleted("note-a").unwrap(), "is_deleted must already be true inside the pending window");
-            assert!(reference.read().unwrap().is_none(), "the trusted reference must not be updated yet, mid-pause");
-
-            // Run backup() against this same vault WHILE paused.
-            let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
-            assert_eq!(manifest.generation, 0, "the backup's own snapshot predates the pending deletion's reference update");
+            // A verified backup attempted against the SAME log file while
+            // that lock is held must be rejected, not served a partial or
+            // stale-but-plausible view.
+            let result = backup_with_reference(&vault_root, &pii_store, &backup_log, &master_key, &target, &reference);
+            assert!(
+                matches!(
+                    result,
+                    Err(BackupError::DeletionLogRejected(DeletionLogError::WriteLockUnavailable { timeout_ms: 200 }))
+                ),
+                "backup attempted during a paused deletion's locked span must fail closed with WriteLockUnavailable, got {result:?}"
+            );
+            assert!(target.is_empty().unwrap(), "a rejected backup attempt must not write any blob to the target");
 
             // Resume and let record_deletion complete normally.
-            resume_tx.send(()).unwrap();
+            resume_guard.0.take().unwrap().send(()).unwrap();
+            let receipt = handle.join().unwrap();
+            assert_eq!(receipt.generation, 1);
+        });
+    }
+
+    /// Correctness property, run strictly AFTER the pending deletion has
+    /// completed and released the write lock (no overlap with a held lock —
+    /// see `a_backup_attempted_while_a_deletion_is_paused_mid_protocol_is_rejected_not_served`
+    /// for that exclusion property). A backup taken once the deletion is
+    /// fully committed must reflect the updated reference, and restoring
+    /// from it must never expose the deleted note.
+    #[test]
+    fn a_backup_taken_after_a_pending_deletion_completes_uses_the_updated_reference_and_restore_excludes_the_note(
+    ) {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        write_file(&vault_root.join("note-a.record"), b"0\n---\npii://note-a");
+
+        let pii_store = open_pii_store(dir.path());
+        let op = Uuid::new_v4();
+        pii_store.stage("note-a", b"sensitive content", op).unwrap();
+        pii_store.commit_staged("note-a", op).unwrap();
+
+        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let master_key = fresh_master_key(dir.path());
+        let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Pause and resume record_deletion exactly as in the exclusion test,
+        // but this time only to confirm the SAME paused-then-resumed
+        // protocol it exercises completes cleanly before backup ever runs —
+        // no backup attempt happens while the lock is held.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let injector = FaultInjector::pause_at(FaultPoint::AfterGenerationWrittenPending, paused_tx, resume_rx);
+
+        let deleter_log = &log;
+        let deleter_reference_path = dir.path().join("trusted-reference.bin");
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let reference_for_thread = FileTrustedReferenceStore::new(deleter_reference_path.clone());
+                deleter_log.record_deletion_with_injector("note-a", &reference_for_thread, &injector).unwrap()
+            });
+            let mut resume_guard = ResumeGuard(Some(resume_tx));
+
+            paused_rx.recv().unwrap();
+            // While paused: the log row is Pending (note-a already reads as
+            // deleted), but the trusted reference has NOT advanced past
+            // authenticated genesis yet. `bootstrap_new`'s authenticated
+            // genesis reference (generation 0) exists from the start under
+            // the P0 design, so the pre-deletion state is `Some(genesis)`,
+            // not `None`.
+            let concurrent_reader = DeletionLog::open(log.db_path()).unwrap();
+            assert!(concurrent_reader.is_deleted("note-a").unwrap(), "is_deleted must already be true inside the pending window");
+            let mid_pause = reference.read().unwrap().expect("authenticated genesis reference must already exist");
+            assert!(DeletionLog::is_genesis_reference(&mid_pause), "the reference must still be the untouched authenticated genesis, mid-pause");
+            assert_eq!(mid_pause.generation, 0, "the pending deletion must not have advanced the reference's generation yet");
+
+            resume_guard.0.take().unwrap().send(()).unwrap();
             let receipt = handle.join().unwrap();
             assert_eq!(receipt.generation, 1);
         });
 
-        // Now the live trusted reference is fully updated (generation 1).
+        // The live trusted reference is now fully updated (generation 1),
+        // and the write lock has been released.
         let live = reference.read().unwrap().unwrap();
         assert_eq!(live.generation, 1);
 
-        // Restore from the backup taken mid-pending-window against the NOW
-        // fully-updated live trusted ref.
+        // Backup now, strictly after completion: it must use the updated
+        // reference, not a stale genesis snapshot.
+        let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(manifest.generation, 1, "a backup taken after completion must reflect the updated reference");
+
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
         let result = restore_and_materialize(&target, &master_key, &destination, &log, &reference, &restored_pii_root);
-        // Post-N1 follow-up: check 2 (the specific per-note cross-check)
-        // still runs before check 1 and still names note-a explicitly, via
-        // `RestoreOutcome::excluded_deleted_note_ids` on a NOW-SUCCESSFUL
-        // restore rather than `Err(DeletedSinceBackup)` refusing the whole
-        // operation. `is_deleted`'s "pending window is already
-        // non-consultable" rule (C5 line 409) still holds exactly as it did
-        // before this fix: the live log already reports note-a deleted at
-        // the moment restore's check 2 runs, regardless of whether
-        // record_deletion's step 2/3 had completed yet when the backup
-        // itself was taken — only the OUTCOME for the backup's OTHER,
-        // unaffected notes (there are none in this backup) has changed.
         let outcome = result.expect("the restore must succeed; note-a is excluded, not a reason to refuse everything");
         assert_eq!(outcome.excluded_deleted_note_ids, vec!["note-a".to_string()]);
         assert!(outcome.restored_note_ids.is_empty(), "this backup held only note-a");
         assert!(!destination.join("note-a.record").exists(), "note-a must never be exposed");
         assert!(!restored_pii_root.join("note-a.pii").exists(), "note-a's ciphertext must never be exposed");
-        // note-a must not be readable/present in any form.
         if destination.exists() {
             for path in all_files_under(&destination) {
                 assert!(!path.to_string_lossy().contains("note-a"), "note-a must not appear in the restored output at all");
@@ -1429,7 +1528,7 @@ pii://note-a");
     }
 
     #[test]
-    fn sentinel_exception_still_fires_when_the_live_log_is_genuinely_empty_and_the_reference_is_absent() {
+    fn authenticated_genesis_backup_restores_when_no_deletion_has_occurred() {
         // IMPORTANT item 1 (part b): confirm the "genuinely never deleted"
         // case still works after the fix — reference absent AND log
         // genuinely empty must still take the sentinel exception and succeed.
@@ -1445,7 +1544,8 @@ pii://note-a");
 
         backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
         assert!(log.is_empty().unwrap(), "no deletion has ever been recorded");
-        assert!(reference.read().unwrap().is_none());
+        let genesis = reference.read().unwrap().expect("authenticated genesis reference");
+        assert_eq!(genesis.generation, 0);
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
@@ -1454,13 +1554,25 @@ pii://note-a");
     }
 
     #[test]
-    fn restoring_from_a_sentinel_backup_while_the_deletion_is_still_pending_is_rejected_not_silently_succeeded(
+    fn restoring_from_a_pre_deletion_backup_while_a_deletion_is_still_pending_waits_then_excludes_not_silently_succeeded(
     ) {
-        // IMPORTANT item 3: restore from a sentinel-embedding backup taken
-        // WHILE a deletion is still mid-pending (live reference still None,
-        // log has a Pending row) — WITHOUT resuming the deletion first. This
-        // is distinct from the existing pending-then-resumed-then-restore
-        // test: here restore() runs against the STILL-PAUSED state.
+        // IMPORTANT item 3: restore from a backup taken BEFORE a deletion
+        // started, attempted WHILE that deletion is still mid-pending (live
+        // reference still at authenticated genesis, log has a Pending row)
+        // — WITHOUT resuming the deletion first. This is distinct from the
+        // existing pending-then-resumed-then-restore test: here restore()
+        // runs concurrently against the STILL-PAUSED state.
+        //
+        // The backup itself can no longer be taken WHILE paused: under the
+        // P0 write-lock design, `backup_with_reference` takes the same
+        // cross-process lock `record_deletion` holds for its whole span, so
+        // attempting a backup during the pause is rejected outright (see
+        // `a_backup_attempted_while_a_deletion_is_paused_mid_protocol_is_rejected_not_served`).
+        // This test instead takes its (pre-deletion, genesis-embedding)
+        // backup first, then pauses the deletion and restores concurrently
+        // — preserving the original property under test: a restore racing
+        // a still-in-flight deletion must never expose the note the
+        // deletion targets.
         let dir = tempdir().unwrap();
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root).unwrap();
@@ -1474,6 +1586,15 @@ pii://note-a");
         let (log, reference) = open_deletion_log_and_ref(dir.path());
         let master_key = fresh_master_key(dir.path());
         let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
+
+        // Taken BEFORE any deletion starts: the live reference is still the
+        // untouched authenticated genesis, so this backup embeds genesis
+        // (generation 0), exactly the "sentinel-equivalent" pre-deletion
+        // snapshot the original test intended.
+        let pre_deletion_reference = reference.read().unwrap().expect("authenticated genesis reference must already exist");
+        assert!(DeletionLog::is_genesis_reference(&pre_deletion_reference), "precondition: no deletion has happened yet");
+        let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
+        assert_eq!(manifest.generation, 0, "the backup taken before any deletion must embed genesis");
 
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -1491,56 +1612,47 @@ pii://note-a");
                 let reference_for_thread = FileTrustedReferenceStore::new(deleter_reference_path.clone());
                 deleter_log.record_deletion_with_injector("note-a", &reference_for_thread, &injector).unwrap()
             });
+            let mut resume_guard = ResumeGuard(Some(resume_tx));
 
             paused_rx.recv().unwrap();
 
+            // While paused: the log row is Pending (note-a already reads as
+            // deleted), but the trusted reference has NOT advanced past
+            // authenticated genesis yet. Uses a SEPARATE DeletionLog
+            // connection onto the same SQLite file: `log` itself is held by
+            // the deleter thread's blocked call for the whole pause (by
+            // design), so calling `is_empty`/`is_deleted` through `log`
+            // directly here would deadlock against that held mutex.
             let concurrent_reader = DeletionLog::open(log.db_path()).unwrap();
             assert!(concurrent_reader.is_deleted("note-a").unwrap(), "is_deleted must already be true inside the pending window");
-            assert!(reference.read().unwrap().is_none(), "the trusted reference must not be updated yet, mid-pause");
+            let mid_pause = reference.read().unwrap().expect("authenticated genesis reference must already exist");
+            assert!(DeletionLog::is_genesis_reference(&mid_pause), "the reference must still be the untouched authenticated genesis, mid-pause");
             assert!(!concurrent_reader.is_empty().unwrap(), "the log has a Pending row, so it is NOT empty, even mid-pause");
 
-            let manifest = backup_with_reference(&vault_root, &pii_store, &log, &master_key, &target, &reference).unwrap();
-            assert_eq!(manifest.generation, 0, "the backup's own snapshot predates the pending deletion's reference update, so it embeds the sentinel");
-
-            // Restore WHILE STILL PAUSED, against the still-pending state —
-            // the live reference is still None and the log still has the
-            // Pending row for note-a. Post-N1 follow-up: `check_1`'s
-            // `reconcile` call safely rolls this forward (generation 1,
-            // still Pending, no reference yet, is exactly `reconcile`'s own
-            // "first-ever deletion crashed mid-protocol" roll-forward case
-            // — the same completion a live `Vault::open` would perform),
-            // after which the backup's sentinel-embedding snapshot is
-            // `BackupReferenceStale` against the now-rolled-forward live
-            // reference. The note is still never exposed — caught by check
-            // 2's `is_deleted` (true for any row state) and excluded — but
-            // the restore as a whole now succeeds, reporting the exclusion
-            // explicitly rather than refusing everything.
-            //
-            // Uses a SEPARATE DeletionLog connection onto the same SQLite
-            // file, exactly like `concurrent_reader` above: `log` itself is
-            // held by the deleter thread's blocked call for the whole pause
-            // (by design), so calling `is_empty`/`is_deleted` through `log`
-            // directly here would deadlock against that held mutex.
-            //
-            // F2 (independent review of 41005c6): that roll-forward is no
-            // longer performed UNDER the still-running deletion. `reconcile`
-            // now takes the deletion log's write lock, which the paused
-            // `record_deletion` holds, so the restore started here waits
-            // (writing nothing) until the deletion completes, and then
-            // finds the log/reference pair already consistent. The outcome
-            // is the same: note-a excluded, nothing exposed.
+            // Restore WHILE STILL PAUSED, racing the still-pending deletion.
+            // F2 (independent review of 41005c6): `reconcile` takes the
+            // deletion log's write lock, which the paused `record_deletion`
+            // holds for its whole span, so the restore started here waits
+            // (writing nothing) until the deletion completes, and then finds
+            // the log/reference pair already consistent (generation 1,
+            // ahead of this backup's embedded genesis). The outcome: note-a
+            // excluded via check 2's `is_deleted`, nothing exposed, restore
+            // succeeds rather than refusing everything.
             let restore = {
                 let (target, master_key, destination, reader, reference, restored_pii_root) =
                     (&target, &master_key, &destination, &restore_time_reader, &reference, &restored_pii_root);
                 scope.spawn(move || restore_and_materialize(target, master_key, destination, reader, reference, restored_pii_root))
             };
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let restore_waited = !restore.is_finished() && reference.read().unwrap().is_none();
+            let restore_waited = !restore.is_finished()
+                && reference.read().unwrap().as_ref().is_some_and(DeletionLog::is_genesis_reference);
 
             // Resume BEFORE asserting: a failed assertion here must fail the
             // test, not leave the deleter thread parked forever and hang the
-            // scope (which `cargo mutants` reports as a timeout, not a kill).
-            resume_tx.send(()).unwrap();
+            // scope (which `cargo mutants` reports as a timeout, not a
+            // kill). `ResumeGuard` sends on drop too, so this also covers
+            // any assertion above panicking before reaching here.
+            resume_guard.0.take().unwrap().send(()).unwrap();
             let receipt = handle.join().unwrap();
             assert_eq!(receipt.generation, 1);
             let result = restore.join().unwrap();
@@ -1765,11 +1877,9 @@ pii://note-a");
     }
 
     /// Reviewer-found race (post-N1 follow-up to the post-N1 follow-up):
-    /// `TrustedReferenceStore` wrapper that records a deletion on its FIRST
-    /// `read()` call — which is the very first thing check 1 does inside
-    /// `verify_safe_to_expose_after_restore`/`reconcile`. This simulates a
-    /// deletion landing in the gap between check 2's note-id lookups and
-    /// check 1's own read of the live reference.
+    /// `TrustedReferenceStore` wrapper that attempts a deletion on its FIRST
+    /// `read()` call — which is the first reference access performed while
+    /// check 1 owns the verified deletion-log lock.
     struct DeleteOnFirstRead<'a> {
         inner: &'a dyn TrustedReferenceStore,
         log: &'a DeletionLog,
@@ -1778,9 +1888,13 @@ pii://note-a");
     }
 
     impl<'a> TrustedReferenceStore for DeleteOnFirstRead<'a> {
+        fn bound_path(&self) -> Option<&Path> { self.inner.bound_path() }
         fn read(&self) -> Result<Option<GenerationRef>, DeletionLogError> {
             if !self.fired.replace(true) {
-                self.log.record_deletion(self.note_id_to_delete, self.inner).unwrap();
+                // The writer must not re-enter the verified section. It waits
+                // for the bounded lock and propagates its fail-closed error;
+                // treating this as a harmless read would reopen the race.
+                self.log.record_deletion(self.note_id_to_delete, self.inner)?;
             }
             self.inner.read()
         }
@@ -1789,18 +1903,12 @@ pii://note-a");
         }
     }
 
-    /// Reviewer-found race, now fixed: a deletion landing in the window
-    /// between check 2's ORIGINAL note-id lookups and check 1's own read of
-    /// the live reference must still be caught. Before this fix,
-    /// `deleted_since_backup` was computed once, before check 1 ran; a
-    /// deletion racing in after that computation but before (or during)
-    /// check 1 was invisible to it, and — once staleness alone stopped
-    /// unconditionally blocking the whole restore — nothing else caught it,
-    /// so the raced note was written out already deleted. Fixed by
-    /// recomputing the exclusion list AFTER check 1 has resolved, as the
-    /// very last read of the live log before anything is written.
+    /// A deletion attempt made while check 1 holds its verified lock cannot
+    /// re-enter the log. It must fail closed rather than allow the restore to
+    /// expose a raced note. The post-check-1 lookup takes the same lock, and
+    /// storage performs the final per-note checked promotion.
     #[test]
-    fn a_deletion_racing_in_between_check_2_and_check_1_is_still_caught_not_resurrected() {
+    fn a_deletion_racing_during_verified_check_fails_closed_not_resurrected() {
         let dir = tempdir().unwrap();
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root).unwrap();
@@ -1812,7 +1920,8 @@ pii://note-a");
         pii_store.stage("note-a", b"RACED SECRET MUST NOT RESURFACE", op).unwrap();
         pii_store.commit_staged("note-a", op).unwrap();
 
-        let (log, reference) = open_deletion_log_and_ref(dir.path());
+        let (mut log, reference) = open_deletion_log_and_ref(dir.path());
+        log.set_write_lock_timeout(Duration::from_millis(100));
         let master_key = fresh_master_key(dir.path());
         let target = FilesystemBackupTarget::new(dir.path().join("backup-target"));
 
@@ -1828,9 +1937,8 @@ pii://note-a");
         // fall-through path, not the sentinel exception.
         log.record_deletion("note-unrelated", &reference).unwrap();
 
-        // note-a's deletion races in on check 1's FIRST read of the live
-        // reference — after check 2's original lookups would have already
-        // run, in the pre-fix code.
+        // The attempted deletion is made on check 1's first reference read,
+        // while check 1 owns the verified lock.
         let racer = DeleteOnFirstRead {
             inner: &reference,
             log: &log,
@@ -1840,16 +1948,15 @@ pii://note-a");
 
         let destination = dir.path().join("restored");
         let restored_pii_root = dir.path().join("restored-pii-store");
-        let outcome = restore_and_materialize(&target, &master_key, &destination, &log, &racer, &restored_pii_root)
-            .expect("the restore itself must still succeed for note-b");
-        assert_eq!(
-            outcome.excluded_deleted_note_ids,
-            vec!["note-a".to_string()],
-            "note-a's race-landed deletion must still be excluded, not resurrected"
+        assert!(matches!(
+            restore_and_materialize(&target, &master_key, &destination, &log, &racer, &restored_pii_root),
+            Err(BackupError::DeletionLogRejected(DeletionLogError::WriteLockUnavailable { timeout_ms: 100 }))
+        ));
+        assert!(!destination.exists(), "a raced note must never be written");
+        assert!(
+            !restored_pii_root.join("note-a.pii").exists(),
+            "a raced note's ciphertext must never be written"
         );
-        assert_eq!(outcome.restored_note_ids, vec!["note-b".to_string()]);
-        assert!(!destination.join("note-a.record").exists(), "the raced note must never be written");
-        assert!(!restored_pii_root.join("note-a.pii").exists(), "the raced note's ciphertext must never be written");
     }
 
     /// Post-N1 follow-up, requirement 5 ("ripristino effettivo tramite API

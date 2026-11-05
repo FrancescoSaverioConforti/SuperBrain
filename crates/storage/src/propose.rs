@@ -323,9 +323,9 @@ fn commit_sensitive(
     let deletion_log;
     let trusted_ref;
     let deletion = if is_deletion {
-        deletion_log = vault_security::DeletionLog::open(&pii_store.deletion_log_path())
-            .map_err(|e| ProposeError::Storage(StorageError::DeletionLog(e.to_string())))?;
         trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+        deletion_log = vault_security::DeletionLog::open_existing(&pii_store.deletion_log_path(), &trusted_ref)
+            .map_err(|e| ProposeError::Storage(StorageError::DeletionLog(e.to_string())))?;
         Some(PendingDeletion { log: &deletion_log, trusted_ref: &trusted_ref })
     } else {
         None

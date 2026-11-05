@@ -1,0 +1,24 @@
+crates/index/src/indexer_impl.rs:46:5: replace strip_version_header -> Option<&[u8]> with None
+crates/index/src/indexer_impl.rs:46:5: replace strip_version_header -> Option<&[u8]> with Some(Vec::leak(vec![0]))
+crates/index/src/indexer_impl.rs:46:5: replace strip_version_header -> Option<&[u8]> with Some(Vec::leak(Vec::new()))
+crates/index/src/indexer_impl.rs:46:5: replace strip_version_header -> Option<&[u8]> with Some(Vec::leak(vec![1]))
+crates/index/src/indexer_impl.rs:92:9: replace <impl Indexer for SkeletonIndexer>::mark_current with ()
+crates/index/src/indexer_impl.rs:183:9: replace RealIndexer::observe_version -> bool with true
+crates/index/src/indexer_impl.rs:183:9: replace RealIndexer::observe_version -> bool with false
+crates/index/src/indexer_impl.rs:185:20: replace < with == in RealIndexer::observe_version
+crates/index/src/indexer_impl.rs:185:20: replace < with > in RealIndexer::observe_version
+crates/index/src/indexer_impl.rs:203:9: replace RealIndexer::bm25_ranked -> Vec<(NoteId, f64)> with vec![]
+crates/index/src/indexer_impl.rs:185:20: replace < with <= in RealIndexer::observe_version
+crates/index/src/indexer_impl.rs:209:9: replace RealIndexer::candidate_ids -> Vec<NoteId> with vec![]
+crates/index/src/indexer_impl.rs:235:45: replace || with && in RealIndexer::index_document
+crates/index/src/indexer_impl.rs:225:9: replace RealIndexer::index_document with ()
+crates/index/src/indexer_impl.rs:235:20: replace != with == in RealIndexer::index_document
+crates/index/src/indexer_impl.rs:235:60: replace != with == in RealIndexer::index_document
+crates/index/src/indexer_impl.rs:271:9: replace RealIndexer::apply_live with ()
+crates/index/src/indexer_impl.rs:274:12: delete ! in RealIndexer::apply_live
+crates/index/src/indexer_impl.rs:295:39: replace != with == in RealIndexer::apply_live
+crates/index/src/indexer_impl.rs:340:9: replace <impl Indexer for RealIndexer>::mark_current with ()
+crates/index/src/indexer_impl.rs:354:20: replace match guard note .published .as_ref() .is_some_and(|p| p.version == note.expected_version) with true in <impl Indexer for RealIndexer>::state_for
+crates/index/src/indexer_impl.rs:354:20: replace match guard note .published .as_ref() .is_some_and(|p| p.version == note.expected_version) with false in <impl Indexer for RealIndexer>::state_for
+crates/index/src/indexer_impl.rs:405:5: replace rebuild_index -> Result<(), storage::StorageError> with Ok(())
+crates/index/src/indexer_impl.rs:414:12: delete ! in rebuild_index

@@ -104,7 +104,7 @@ mod vault;
 pub use note_id::{NoteId, NoteIdError};
 pub use propose::{propose_and_commit, CommitOutcome, CommitResult, ProposeError, SENSITIVE_TOMBSTONE_BODY};
 pub use restore::{restore_vault_from_backup, RestoreError};
-pub use vault::{StorageError, Vault, VaultRecord, Version};
+pub use vault::{split_record, Indexer, SplitRecordError, StorageError, Vault, VaultRecord, Version};
 
 #[test]
 fn crate_builds() { assert!(true); }

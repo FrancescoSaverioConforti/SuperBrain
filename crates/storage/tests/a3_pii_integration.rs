@@ -58,7 +58,9 @@ fn open_vault_and_pii_store(root: PathBuf) -> (Vault, PiiStore) {
 
 fn open_pii_store(vault_root: &std::path::Path) -> PiiStore {
     let pii_root = vault_root.join(".pii-store");
-    PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap()
+    let store = PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+    store.bootstrap_deletion_log().unwrap();
+    store
 }
 
 fn sensitive_yaml(id: &str) -> String {
@@ -262,9 +264,9 @@ fn a_properly_deleted_sensitive_note_goes_through_the_deletion_log_and_is_not_fl
         .expect("a tombstone write must succeed");
     assert!(matches!(result, CommitResult::Committed(_)), "got {result:?}");
 
-    let deletion_log_path = pii_store.root().join("deletion-log.sqlite");
-    let deletion_log = vault_security::DeletionLog::open(&deletion_log_path).unwrap();
-    assert!(deletion_log.is_deleted("note-proper-delete").unwrap(), "the deletion log must record this deletion");
+    let deletion_log = pii_store.open_deletion_log().unwrap();
+    let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
+    assert!(deletion_log.with_verified_not_deleted(&trusted_ref, "note-proper-delete", || Ok(())).unwrap().is_none(), "the deletion log must record this deletion");
 
     // The pointer note STILL exists (now pointing at empty tombstone
     // content), so this note id is a "known pointer" from the vault's point
@@ -399,7 +401,6 @@ fn write_pending_deletion_row(db_path: &std::path::Path, generation: u64, prev_c
     hasher.update(generation.to_string().as_bytes());
     hasher.update(note_id.as_bytes());
     let chain_hash: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    drop(vault_security::DeletionLog::open(db_path).unwrap()); // creates the schema
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
         "INSERT INTO deletions (generation, note_id, prev_chain_hash, chain_hash, state) VALUES (?1, ?2, ?3, ?4, 'pending')",
@@ -427,7 +428,8 @@ fn open_with_pii_store_rolls_a_crashed_pending_deletion_forward() {
     let db_path = pii_store.deletion_log_path();
     let chain_hash = write_pending_deletion_row(&db_path, 1, &"0".repeat(64), "note-crashed");
     let reference = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
-    assert!(reference.read().unwrap().is_none(), "precondition: step 2 never ran");
+    let genesis = reference.read().unwrap().expect("precondition: explicit bootstrap wrote genesis");
+    assert_eq!(genesis.generation, 0, "precondition: step 2 never advanced the authenticated genesis reference");
 
     let _vault = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store)
         .expect("a single pending first deletion is the one roll-forward case and must not block opening");
@@ -449,7 +451,12 @@ fn open_with_pii_store_fails_closed_on_an_unexplained_deletion_log_mismatch() {
     let root = unique_test_dir();
     let pii_store = open_pii_store(&root);
     vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path())
-        .write(&vault_security::GenerationRef { generation: 5, chain_hash: "f".repeat(64) })
+        .write(&vault_security::GenerationRef {
+            generation: 5,
+            chain_hash: "f".repeat(64),
+            format_version: None,
+            store_id: None,
+        })
         .unwrap();
     let result = Vault::open_with_pii_store(root, &unique_test_dir().join("journal.sqlite"), &pii_store);
     assert!(matches!(result, Err(StorageError::DeletionLog(_))), "got {:?}", result.err());
@@ -496,10 +503,10 @@ fn a_tombstone_write_with_a_stale_expected_version_is_rejected_and_never_recorde
     // deleted. Before the fix, DeletionLog::record_deletion ran BEFORE the
     // version check, so this exact call would have marked the note deleted
     // in the log while its real content stayed fully live.
-    let deletion_log_path = pii_store.root().join("deletion-log.sqlite");
-    let deletion_log = vault_security::DeletionLog::open(&deletion_log_path).unwrap();
+    let deletion_log = pii_store.open_deletion_log().unwrap();
+    let trusted_ref = vault_security::DpapiTrustedReferenceStore::new(pii_store.deletion_log_reference_path());
     assert!(
-        !deletion_log.is_deleted("note-stale-tombstone").unwrap(),
+        deletion_log.with_verified_not_deleted(&trusted_ref, "note-stale-tombstone", || Ok(())).unwrap().is_some(),
         "a rejected (stale-version) tombstone must NEVER be recorded in the deletion log"
     );
 }
