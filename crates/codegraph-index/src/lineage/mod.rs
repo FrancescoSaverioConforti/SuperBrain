@@ -272,6 +272,8 @@ mod tests {
             SymbolKind::Function,
             "some_earlier_genesis",
             "fn some_earlier_genesis() {}",
+            0,
+            29,
         ));
 
         let prev = vec![prev_snapshot];

@@ -155,7 +155,7 @@ mod tests {
         let repo = registry.register(RepositoryRoot::parse(repo_root).unwrap());
         let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
         let file = FileIdentity::parse(repo, commit, relative_path).unwrap();
-        SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo", "fn foo()")
+        SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo", "fn foo()", 0, 8)
     }
 
     #[test]

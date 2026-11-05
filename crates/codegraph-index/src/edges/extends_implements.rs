@@ -53,6 +53,18 @@ pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Ed
             continue;
         };
 
+        // B2-ID-002 scope audit: the same base/interface name appearing
+        // more than once in one declaration's base/heritage list (a
+        // syntactically odd but parseable shape, e.g. `class C(A, A)`)
+        // must collapse to ONE edge per `(to, kind)`, never one per
+        // occurrence — confirmed present here too by a dedicated
+        // regression test, the same occurrence-vs-relation mismatch
+        // `resolve_calls` had. Every edge this resolver produces is
+        // `StaticAnalysis` (an ambiguous/unresolved base produces no
+        // edge at all), so there is no evidence-strength tie-break to
+        // make here either.
+        let mut seen_targets: std::collections::HashSet<(codegraph_domain::SymbolSnapshotId, EdgeKind)> = std::collections::HashSet::new();
+
         for (base_name, syntactic_kind) in base_names_in(&tree) {
             let candidates = lookup.find_by_name(&base_name, snapshot.id());
             if candidates.len() != 1 {
@@ -68,6 +80,9 @@ pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Ed
             }
             let target = candidates[0];
             let kind = edge_kind_for(syntactic_kind, target.kind());
+            if !seen_targets.insert((target.id(), kind)) {
+                continue;
+            }
             let evidence = resolved_evidence(&format!(
                 "{:?} base/heritage clause names {base_name:?}, resolved to exactly one candidate of kind {:?}",
                 tree.language(),
@@ -552,6 +567,23 @@ mod tests {
         let targets: Vec<_> = edges.iter().map(|e| e.to).collect();
         assert!(targets.contains(&base_a.id()));
         assert!(targets.contains(&base_b.id()));
+    }
+
+    #[test]
+    fn b2_id_002_scope_audit_the_same_base_named_twice_does_not_produce_a_duplicate_edge() {
+        // Scope audit for B2-ID-002 (found in resolve_calls, also found
+        // in resolve_imports): checks whether resolve_extends_implements
+        // has the same occurrence-vs-relation mismatch. A syntactically
+        // odd but parseable `class C(A, A)` (the same base named twice)
+        // must collapse to ONE Extends edge, not two identical ones.
+        let base_a = test_snapshot("src/a.py", "A", "class_definition", "class A:\n    pass");
+        let derived = test_snapshot("src/c.py", "C", "class_definition", "class C(A, A):\n    pass");
+        let snapshots = vec![base_a.clone(), derived.clone()];
+
+        let edges = resolve_extends_implements(&snapshots).unwrap();
+
+        let to_a: Vec<_> = edges.iter().filter(|e| e.to == base_a.id()).collect();
+        assert_eq!(to_a.len(), 1, "the same base named twice must collapse to one edge, not duplicate (from,to,Extends)");
     }
 
     #[test]

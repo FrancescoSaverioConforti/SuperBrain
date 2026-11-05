@@ -80,9 +80,26 @@ pub fn resolve_imports(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeRe
             continue;
         };
 
+        // B2-ID-002 scope audit: a duplicated `use`/`import` statement
+        // naming the same already-resolved target twice (a real, if
+        // unusual, shape — a re-import or a copy-pasted duplicate) must
+        // collapse to ONE edge per `(from, to)`, never one per
+        // occurrence — the same occurrence-vs-relation mismatch
+        // `resolve_calls` had, confirmed present here too by a
+        // dedicated regression test. Unlike `resolve_calls`, every
+        // edge this resolver ever produces is `StaticAnalysis` (an
+        // ambiguous import produces no edge at all — see below), so
+        // there is no evidence-strength tie-break to make: any two
+        // occurrences resolving to the same target are interchangeable,
+        // and only the first one seen is kept.
+        let mut seen_targets: std::collections::HashSet<codegraph_domain::SymbolSnapshotId> = std::collections::HashSet::new();
+
         for (imported_name, module_path) in imported_names_in(&tree) {
             let candidates = lookup.find_by_name(&imported_name, snapshot.id());
             if candidates.len() == 1 {
+                if !seen_targets.insert(candidates[0].id()) {
+                    continue;
+                }
                 let evidence = resolved_evidence(&format!(
                     "import of {imported_name:?} from {module_path:?} resolves to exactly one candidate in the given snapshot pool"
                 ));
@@ -262,6 +279,25 @@ mod tests {
         let edges = resolve_imports(&snapshots).unwrap();
 
         assert!(edges.is_empty(), "importing an unknown module must produce no edge, not a fabricated one");
+    }
+
+    #[test]
+    fn b2_id_002_scope_audit_a_duplicate_import_of_the_same_name_does_not_produce_a_duplicate_edge() {
+        // Scope audit for B2-ID-002 (found in resolve_calls): checks
+        // whether resolve_imports has the same occurrence-vs-relation
+        // mismatch. Two SEPARATE `use` items both naming the same
+        // target (a real, if unusual, shape — e.g. a re-export or a
+        // copy-pasted duplicate import) must still collapse to ONE
+        // Imports edge, not panic insertion into CodeGraph with a
+        // DuplicateEdge once published.
+        let user = test_snapshot("src/lib.rs", "foo", "function_item", "use crate::helper::run;\nuse crate::helper::run;\nfn foo() {}");
+        let target = test_snapshot("src/helper.rs", "run", "function_item", "fn run() {}");
+        let snapshots = vec![user.clone(), target.clone()];
+
+        let edges = resolve_imports(&snapshots).unwrap();
+
+        let to_target: Vec<_> = edges.iter().filter(|e| e.from == user.id() && e.to == target.id()).collect();
+        assert_eq!(to_target.len(), 1, "a duplicated import of the same name must collapse to one edge, not duplicate (from,to,Imports)");
     }
 
     #[test]

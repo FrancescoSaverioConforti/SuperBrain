@@ -110,7 +110,7 @@ pub fn promote(candidate: &RawSymbolCandidate, file: FileIdentity) -> Result<Sym
         });
     }
 
-    let id = SymbolSnapshotId::derive(&file, kind, name.as_str(), signature.as_str());
+    let id = SymbolSnapshotId::derive(&file, kind, name.as_str(), signature.as_str(), candidate.span.start as u64, candidate.span.end as u64);
 
     Ok(SymbolSnapshot {
         id,
