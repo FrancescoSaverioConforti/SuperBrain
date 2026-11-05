@@ -1,4 +1,4 @@
-//! B2 Task 0/1/2/3/4/5: `codegraph-index` drives `codegraph_domain::RepositorySource`
+//! B2 Task 0/1/2/3/4/5/6: `codegraph-index` drives `codegraph_domain::RepositorySource`
 //! using Task 1's validated `RepositoryId`/`CommitHash`/`FileIdentity` types
 //! exclusively (no raw-`&str` path); Task 2 adds the first real
 //! implementor (`LocalGitRepositorySource`, backed by `git2`) plus the
@@ -8,12 +8,14 @@
 //! Task 4 adds raw symbol extraction (`extract` module) producing
 //! `RawSymbolCandidate` values only; Task 5 adds the Raw -> Validated
 //! promotion boundary (`snapshot` module), the only path from a
-//! `RawSymbolCandidate` to a validated `SymbolSnapshot`. No lineage,
-//! typed edges, graph storage, persistence beyond the in-memory
+//! `RawSymbolCandidate` to a validated `SymbolSnapshot`; Task 6 adds
+//! cross-commit lineage resolution (`lineage` module). No typed
+//! non-lineage edges, graph storage, persistence beyond the in-memory
 //! allowlist/registry, or exposed API yet.
 
 pub mod allowlist;
 pub mod extract;
+pub mod lineage;
 pub mod local_git_source;
 pub mod parse;
 pub mod snapshot;
