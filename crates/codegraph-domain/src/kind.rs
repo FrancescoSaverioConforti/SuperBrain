@@ -1,9 +1,21 @@
-//! B2 Task 1: closed symbol/edge kind enums. No "other"/catch-all variant
+//! B2 Task 1/5: closed symbol/edge kind enums. No "other"/catch-all variant
 //! on either enum: an unrecognized raw kind string must be a typed
 //! rejection at the promotion boundary (Task 5), never silently accepted
 //! into an ambiguous bucket — the same discipline `domain::Classification`
 //! uses by deliberately having no `Secret` variant (`schema.rs`'s comment:
 //! "classification: secret must never become a valid in-memory value").
+//!
+//! `SymbolKind` is an explicit MINIMUM BASELINE, not a final taxonomy —
+//! see `docs/superpowers/plans/2026-11-05-b2-code-graph.md` section 8b for
+//! the full rationale, the coverage-matrix process for proposing new
+//! variants, and the required real-repository validation pass before B2's
+//! final closure. `Module`/`Const`/`Macro` are kept even though Task 4's
+//! current nine extractors never produce a `RawSymbolCandidate` for any of
+//! them yet — removing a variant because nothing currently reaches it
+//! would be the same mistake as adding one on intuition, just in reverse.
+//! `MethodSignature`/`HtmlIdElement`/`CssRule`/`CssKeyframes` were added at
+//! Task 5 because Task 4's extractors DO produce candidates with those
+//! `kind_hint`s and no existing variant fit them.
 
 use thiserror::Error;
 
@@ -11,6 +23,13 @@ use thiserror::Error;
 pub enum SymbolKind {
     Function,
     Method,
+    /// A method declared without a body: a trait/interface method
+    /// signature (Rust's `function_signature_item`, TypeScript's
+    /// `method_signature`). Distinct from `Method` because a signature
+    /// has no implementation to analyze and a future caller (e.g. an
+    /// edge-resolution task) needs to tell the two apart rather than
+    /// treating a declaration as if it were a definition.
+    MethodSignature,
     Class,
     Struct,
     Enum,
@@ -18,6 +37,18 @@ pub enum SymbolKind {
     Module,
     Const,
     Macro,
+    /// An HTML element with an explicit, non-empty `id` attribute — the
+    /// only HTML construct Task 4 treats as a symbol (see
+    /// `codegraph-index::extract::html`'s module doc comment for the
+    /// full rationale: an anonymous or class-only element is never a
+    /// candidate).
+    HtmlIdElement,
+    /// A CSS rule set with a referenceable selector (id/class/tag,
+    /// including inside a composite selector) — see
+    /// `codegraph-index::extract::css`'s module doc comment.
+    CssRule,
+    /// A named `@keyframes <name>` CSS at-rule.
+    CssKeyframes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -27,14 +58,25 @@ pub struct UnrecognizedSymbolKind {
 }
 
 impl SymbolKind {
-    /// The only way to obtain a `SymbolKind` from a raw string (as produced
-    /// by a per-language tree-sitter extractor, Task 4). Exhaustive,
-    /// case-sensitive, lowercase-kebab-case names; anything else is a typed
-    /// rejection, never a default variant.
+    /// Parses `SymbolKind`'s own canonical lowercase-kebab-case string
+    /// form (`"function"`, `"method-signature"`, `"html-id-element"`, ...)
+    /// — NOT Task 4's raw tree-sitter `kind_hint` vocabulary
+    /// (`"function_item"`, `"class_declaration"`, `"element_with_id"`,
+    /// ...), which uses different per-language node-kind names that do
+    /// not match this canonical form at all. Task 1's original doc
+    /// comment on this method incorrectly assumed the two vocabularies
+    /// would coincide; Task 4's real extractors proved otherwise. The
+    /// actual `kind_hint -> SymbolKind` mapping Task 5 needs is
+    /// `codegraph_index::promote::map_kind_hint`, a separate,
+    /// language-aware, many-to-one mapping (several different raw node
+    /// kinds across languages collapse to the same `SymbolKind`) — this
+    /// method remains available for a canonical string this type's own
+    /// `Display`/round-trip might use, but is not that mapping.
     pub fn parse(raw: &str) -> Result<Self, UnrecognizedSymbolKind> {
         match raw {
             "function" => Ok(Self::Function),
             "method" => Ok(Self::Method),
+            "method-signature" => Ok(Self::MethodSignature),
             "class" => Ok(Self::Class),
             "struct" => Ok(Self::Struct),
             "enum" => Ok(Self::Enum),
@@ -42,6 +84,9 @@ impl SymbolKind {
             "module" => Ok(Self::Module),
             "const" => Ok(Self::Const),
             "macro" => Ok(Self::Macro),
+            "html-id-element" => Ok(Self::HtmlIdElement),
+            "css-rule" => Ok(Self::CssRule),
+            "css-keyframes" => Ok(Self::CssKeyframes),
             _ => Err(UnrecognizedSymbolKind { raw: raw.to_string() }),
         }
     }
@@ -88,6 +133,7 @@ mod tests {
         let cases = [
             ("function", SymbolKind::Function),
             ("method", SymbolKind::Method),
+            ("method-signature", SymbolKind::MethodSignature),
             ("class", SymbolKind::Class),
             ("struct", SymbolKind::Struct),
             ("enum", SymbolKind::Enum),
@@ -95,6 +141,9 @@ mod tests {
             ("module", SymbolKind::Module),
             ("const", SymbolKind::Const),
             ("macro", SymbolKind::Macro),
+            ("html-id-element", SymbolKind::HtmlIdElement),
+            ("css-rule", SymbolKind::CssRule),
+            ("css-keyframes", SymbolKind::CssKeyframes),
         ];
         for (raw, expected) in cases {
             assert_eq!(SymbolKind::parse(raw), Ok(expected));

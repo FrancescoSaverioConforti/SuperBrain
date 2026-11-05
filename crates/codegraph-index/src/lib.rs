@@ -1,4 +1,4 @@
-//! B2 Task 0/1/2/3/4: `codegraph-index` drives `codegraph_domain::RepositorySource`
+//! B2 Task 0/1/2/3/4/5: `codegraph-index` drives `codegraph_domain::RepositorySource`
 //! using Task 1's validated `RepositoryId`/`CommitHash`/`FileIdentity` types
 //! exclusively (no raw-`&str` path); Task 2 adds the first real
 //! implementor (`LocalGitRepositorySource`, backed by `git2`) plus the
@@ -6,14 +6,17 @@
 //! Task 3 adds a tree-sitter parsing abstraction (`parse` module) for
 //! Python, C#, C++, JavaScript, TypeScript, Tsx, HTML, CSS and Rust;
 //! Task 4 adds raw symbol extraction (`extract` module) producing
-//! `RawSymbolCandidate` values only. No `SymbolSnapshot`/`SymbolSnapshotId`/
-//! lineage/typed edges yet (Task 5+), no persistence beyond the
-//! in-memory allowlist/registry, and no exposed API.
+//! `RawSymbolCandidate` values only; Task 5 adds the Raw -> Validated
+//! promotion boundary (`snapshot` module), the only path from a
+//! `RawSymbolCandidate` to a validated `SymbolSnapshot`. No lineage,
+//! typed edges, graph storage, persistence beyond the in-memory
+//! allowlist/registry, or exposed API yet.
 
 pub mod allowlist;
 pub mod extract;
 pub mod local_git_source;
 pub mod parse;
+pub mod snapshot;
 
 pub use allowlist::{AllowlistError, AllowlistedRoot, RepositoryAllowlist};
 pub use local_git_source::LocalGitRepositorySource;
