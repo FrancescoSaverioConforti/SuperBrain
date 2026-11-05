@@ -9,13 +9,16 @@
 //! `RawSymbolCandidate` values only; Task 5 adds the Raw -> Validated
 //! promotion boundary (`snapshot` module), the only path from a
 //! `RawSymbolCandidate` to a validated `SymbolSnapshot`; Task 6 adds
-//! cross-commit lineage resolution (`lineage` module). No typed
-//! non-lineage edges, graph storage, persistence beyond the in-memory
-//! allowlist/registry, or exposed API yet.
+//! cross-commit lineage resolution (`lineage` module); Task 7 adds
+//! typed non-lineage edges (`edges` module); Task 8 adds the in-memory
+//! graph/query core (`graph` module). No persistence beyond the
+//! in-memory allowlist/registry, no exposed API, no MCP, no Task 9
+//! incremental indexing yet.
 
 pub mod allowlist;
 pub mod edges;
 pub mod extract;
+pub mod graph;
 pub mod lineage;
 pub mod local_git_source;
 pub mod parse;
