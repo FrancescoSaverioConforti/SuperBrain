@@ -16,6 +16,31 @@ codegraph-domain = { path = "../codegraph-domain" }
 # `CommitHash`'s 64-hex-char (SHA-256) branch.
 git2 = "0.21"
 thiserror = "1"
+# Core parsing engine. Every grammar crate below depends on
+# `tree-sitter-language ^0.1` as its only RUNTIME dependency (confirmed via
+# crates.io for all six: tree-sitter-rust, tree-sitter-python,
+# tree-sitter-c-sharp, tree-sitter-cpp, tree-sitter-javascript,
+# tree-sitter-typescript, tree-sitter-html, tree-sitter-css) — each
+# grammar's own `tree-sitter` dependency is a DEV-dependency only, used
+# for that grammar crate's own test suite, never propagated to a
+# consumer. `tree-sitter` itself also depends on `tree-sitter-language
+# ^0.1.9`. This is the stable, shared ABI boundary across all of them, so
+# there is no version conflict to resolve between this core crate and any
+# grammar below — see `parse/mod.rs`'s module doc comment.
+tree-sitter = "0.27"
+# `LanguageFn` (every grammar crate's exported constant type) lives here,
+# not re-exported publicly from `tree-sitter` 0.27 itself — this is the
+# shared ABI crate both `tree-sitter` and every grammar crate depend on
+# (see this module's doc comment).
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
 
 [dev-dependencies]
 # Test-only: unique temp-directory names for allowlist/filesystem fixtures,
