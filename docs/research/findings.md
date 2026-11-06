@@ -2,9 +2,10 @@
 
 See [`POLICY.md`](POLICY.md) for the policy this index implements, and
 [`EVALUATION_POLICY.md`](EVALUATION_POLICY.md) for how evaluations
-(like [B2-EVAL-001](evaluations/B2-EVAL-001.md), which discovered both
-findings below) are recorded. Each row links to the full finding file
-under `findings/`.
+(like [B2-EVAL-001](evaluations/B2-EVAL-001.md), which discovered the
+findings below, and [B2-EVAL-002](evaluations/B2-EVAL-002.md), the
+Task 9.5 before/after re-evaluation) are recorded. Each row links to
+the full finding file under `findings/`.
 
 | ID | Problem | Root cause | Impact | Solution | Validation | References |
 |---|---|---|---|---|---|---|

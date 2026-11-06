@@ -1,0 +1,171 @@
+   Compiling cfg-if v1.0.5
+   Compiling getrandom v0.4.3
+   Compiling find-msvc-tools v0.1.15
+   Compiling shlex v2.0.1
+   Compiling tree-sitter-language v0.1.9
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.3
+   Compiling pkg-config v0.3.34
+   Compiling proc-macro2 v1.0.107
+   Compiling vcpkg v0.2.15
+   Compiling typenum v1.20.1
+   Compiling zmij v1.0.23
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling serde_core v1.0.229
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.3
+   Compiling serde_json v1.0.154
+   Compiling libc v0.2.191
+   Compiling itoa v1.0.18
+   Compiling foldhash v0.2.0
+   Compiling subtle v2.6.1
+   Compiling rand_core v0.10.1
+   Compiling thiserror v1.0.69
+   Compiling regex-syntax v0.8.11
+   Compiling cpufeatures v0.2.17
+   Compiling generic-array v0.14.7
+   Compiling log v0.4.34
+   Compiling bitflags v2.13.2
+   Compiling jobserver v0.1.35
+   Compiling indexmap v2.14.2
+   Compiling aho-corasick v1.1.5
+   Compiling streaming-iterator v0.1.9
+   Compiling cc v1.10.0
+   Compiling uuid v1.29.0
+   Compiling syn v2.0.119
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling regex-automata v0.4.18
+   Compiling libz-sys v1.1.31
+   Compiling libgit2-sys v0.18.8+1.9.7
+   Compiling tree-sitter-c-sharp v0.23.5
+   Compiling tree-sitter-html v0.23.2
+   Compiling tree-sitter-javascript v0.25.0
+   Compiling tree-sitter-python v0.25.0
+   Compiling tree-sitter-css v0.25.0
+   Compiling tree-sitter-rust v0.24.2
+   Compiling tree-sitter-cpp v0.23.4
+   Compiling tree-sitter-typescript v0.23.2
+   Compiling regex v1.13.1
+   Compiling tree-sitter v0.27.1
+   Compiling thiserror-impl v1.0.69
+   Compiling codegraph-domain v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-eval-before\crates\codegraph-domain)
+   Compiling git2 v0.21.0
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-eval-before\crates\codegraph-index)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.74s
+     Running `target\debug\examples\b2_smoke_test.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/24f0d240-5134-42d4-91b7-9406b6ac49fa/scratchpad/b2-eval-001-reeval-v2/pytorch-examples' 20955149ad6ea97a4f403e5a56c95a39e568ccbe 001d493285083b54cacbc1334cb26338bdff2455`
+=== B2 real-repository smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\24f0d240-5134-42d4-91b7-9406b6ac49fa\scratchpad\b2-eval-001-reeval-v2\pytorch-examples
+commit_b: 001d493285083b54cacbc1334cb26338bdff2455
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 214
+files_supported_by_parser: 97
+files_parsed: 97
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 567
+extraction_rejections (oversized name/signature): 11
+snapshots_promoted: 567
+promotion_failures: 0
+python_files_with_at_least_one_import_statement: 86
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 98
+  Function: 462
+  Struct: 7
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 11934
+imports_edges: 0
+extends_implements_edges: 4
+tests_for_edges: 0
+  by_kind Calls: 11934
+  by_kind Extends: 4
+  by_resolution_method NameHeuristic: 11652
+  by_resolution_method StaticAnalysis: 286
+full_index_elapsed: 1.141497s
+
+--- Manual call-quality sample (first 20 by evidence note, deterministic) ---
+Some("distributed/rpc/batch/reinforce.py::run_worker") [Calls/StaticAnalysis] -> Some("distributed/rpc/rl/main.py::Agent") [StaticAnalysis] :: call to "Agent" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/rpc/rl/main.py::run_worker") [Calls/StaticAnalysis] -> Some("distributed/rpc/rl/main.py::Agent") [StaticAnalysis] :: call to "Agent" resolves to exactly one candidate in the given snapshot pool
+Some("imagenet/main.py::train") [Calls/StaticAnalysis] -> Some("imagenet/main.py::AverageMeter") [StaticAnalysis] :: call to "AverageMeter" resolves to exactly one candidate in the given snapshot pool
+Some("imagenet/main.py::validate") [Calls/StaticAnalysis] -> Some("imagenet/main.py::AverageMeter") [StaticAnalysis] :: call to "AverageMeter" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/rpc/batch/parameter_server.py::run_ps") [Calls/StaticAnalysis] -> Some("distributed/rpc/batch/parameter_server.py::BatchUpdateParameterServer") [StaticAnalysis] :: call to "BatchUpdateParameterServer" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/model.py::__init__") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/model.py::Block") [StaticAnalysis] :: call to "Block" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/main.py::get_train_objs") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/char_dataset.py::CharDataset") [StaticAnalysis] :: call to "CharDataset" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::__init__") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::__init__") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("cpp/custom-dataset/custom-dataset.cpp::main") [Calls/NameHeuristic] -> Some("cpp/transfer-learning/main.h::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/custom-dataset/custom-dataset.cpp::main") [Calls/NameHeuristic] -> Some("cpp/custom-dataset/custom-dataset.cpp::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/custom-dataset/custom-dataset.cpp::main") [Calls/NameHeuristic] -> Some("cpp/transfer-learning/main.h::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/custom-dataset/custom-dataset.cpp::main") [Calls/NameHeuristic] -> Some("cpp/custom-dataset/custom-dataset.cpp::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/transfer-learning/main.cpp::main") [Calls/NameHeuristic] -> Some("cpp/transfer-learning/main.h::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/transfer-learning/main.cpp::main") [Calls/NameHeuristic] -> Some("cpp/custom-dataset/custom-dataset.cpp::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/transfer-learning/main.cpp::main") [Calls/NameHeuristic] -> Some("cpp/transfer-learning/main.h::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("cpp/transfer-learning/main.cpp::main") [Calls/NameHeuristic] -> Some("cpp/custom-dataset/custom-dataset.cpp::CustomDataset") [NameHeuristic] :: call to "CustomDataset" is ambiguous among 4 same-named candidates in the given pool
+Some("distributed/minGPT-ddp/mingpt/main.py::main") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/char_dataset.py::DataConfig") [StaticAnalysis] :: call to "DataConfig" resolves to exactly one candidate in the given snapshot pool
+
+--- Imports gap measurement ---
+total_import_statements_in_python_files (line-based count, MEASURED): 589
+imports_edges_produced (MEASURED): 0
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test.exe","8300","Console","18","14.348 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: 20955149ad6ea97a4f403e5a56c95a39e568ccbe
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 567
+observe_commit(A) edge_count: 11938
+observe_commit(A) elapsed (full reindex): 1.1590657s
+changed_files (git diff A..B): ["word_language_model/model.py"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 1, files_reparsed: 1, snapshots_removed: 13, snapshots_added: 13, edges_rebuilt: 11951 }
+observe_commit(B) elapsed (incremental): 794.5736ms
+observe_commit(B) final snapshot_count: 580
+observe_commit(B) final edge_count: 11938
+observe_commit(B) final lineage_edge_count: 13
+
+--- Deep-learning usefulness Q&A (word_language_model, commit B) ---
+Q1 'What is the main model class?' -> TransformerModel snapshots found: 2 (current+historical; disambiguated below)
+Q2 'What does the CURRENT TransformerModel extend?' -> 0 Extends edge(s): []
+Q3 'What composes the forward path?' -> 68 snapshot(s) named 'forward' in the whole pool (ambiguous by name alone across 97 files)
+  (word_language_model/model.py has 6 'forward' snapshot(s) in the final graph: current+historical combined)
+  CURRENT word_language_model/model.py::forward calls: []
+Q4 'Who calls the model?' -> searching train.py/main.py callers of TransformerModel/RNNModel constructors:
+  callers of TransformerModel [word_language_model/model.py]: []
+  callers of TransformerModel [word_language_model/model.py]: []
+  callers of RNNModel [word_language_model/model.py]: []
+  callers of RNNModel [distributed/rpc/rnn/rnn.py]: ["distributed/rpc/rnn/main.py::_run_trainer"]
+  callers of RNNModel [word_language_model/model.py]: ["distributed/rpc/rnn/main.py::_run_trainer"]
+Q5 'Which tests are linked?' -> word_language_model has no test file in this repo; TestsFor edges in the whole corpus: 0
+Diagnostic: '_generate_square_subsequent_mask' snapshots found: 2 (in files: ["word_language_model/model.py", "word_language_model/model.py"])
+Q6 'If I modify forward, what is impacted?' -> incoming edges to the CURRENT forward (who is affected if its signature/behavior changes):
+    Some("legacy/snli/model.py::forward") [Calls]
+    Some("distributed/rpc/pipeline/main.py::forward") [Calls]
+    Some("cpp/distributed/dist-mnist.cpp::forward") [Calls]
+    Some("cpp/mnist/mnist.cpp::test") [Calls]
+    Some("cpp/transfer-learning/main.cpp::train") [Calls]
+    Some("cpp/transfer-learning/classify.cpp::print_probabilities") [Calls]
+    Some("distributed/rpc/ddp_rpc/main.py::HybridModel") [Calls]
+    Some("legacy/snli/model.py::Bottle") [Calls]
+    Some("distributed/rpc/pipeline/main.py::DistResNet50") [Calls]
+    Some("mnist_forward_forward/main.py::train") [Calls]
+    Some("cpp/distributed/dist-mnist.cpp::Model") [Calls]
+    Some("mnist_forward_forward/main.py::Layer") [Calls]
+    Some("cpp/mnist/mnist.cpp::train") [Calls]
+    Some("cpp/custom-dataset/custom-dataset.cpp::train") [Calls]
+    Some("cpp/mnist/mnist.cpp::forward") [Calls]
+    Some("cpp/custom-dataset/custom-dataset.cpp::test") [Calls]
+    Some("cpp/transfer-learning/main.cpp::test") [Calls]
+    Some("cpp/mnist/mnist.cpp::Net") [Calls]
+    Some("distributed/rpc/ddp_rpc/main.py::forward") [Calls]
+
+=== done ===

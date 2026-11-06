@@ -9,6 +9,14 @@
   [B2-ID-001](../findings/B2-ID-001.md) and
   [B2-ID-002](../findings/B2-ID-002.md); this record covers the
   re-evaluation performed AFTER both were fixed.
+- **Superseding/follow-up evaluation:** [B2-EVAL-002](B2-EVAL-002.md)
+  re-runs this exact same repository/commit pair against Task 9.5's
+  changes (SuperBrain commit `7c35741`), as an explicit before/after
+  comparison against the baseline this document establishes. Read it
+  alongside this document, not instead of it — this document's own
+  erratum blocks remain the authoritative record of what was corrected
+  and why; B2-EVAL-002 is a separate, later measurement, not a
+  replacement for this one.
 
 ## Repository / dataset
 
