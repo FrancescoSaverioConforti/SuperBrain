@@ -159,10 +159,10 @@ and a `forward` method).
 |---|---|---|
 | Q1. What is the main model class? | `TransformerModel` found (2 snapshots: 1 current, 1 historical from before the A→B edit — `CodeGraph` has no current-vs-historical distinction of its own, so disambiguating required checking `lineage_from(id).is_empty()` manually in this harness) | **Partially answerable** — the NAME is found immediately; distinguishing "the current one" requires extra, non-obvious graph-navigation logic a naive consumer would not know to apply |
 | Q2. What does it extend? | 0 `Extends` edges for the current `TransformerModel` | **Not answerable** — `TransformerModel` now extends `nn.Transformer`, a PyTorch stdlib class never present in this repository's own source, so `resolve_extends_implements` correctly finds no candidate and correctly produces no edge ("no edge beats a false edge" working as designed) — but the practical effect is the graph cannot tell a user what the model's real base class is when that base class is external |
-| Q3. What composes the forward path? | `CURRENT forward calls: ["cpp/custom-dataset/custom-dataset.cpp::size", "cpp/transfer-learning/main.h::size"]` | **Incorrect** — these are false positives (see below); the REAL calls `forward` makes (`self.input_emb`, `self.pos_encoder`, `self.encoder`, `self.decoder` — all `Field`/`Attribute` submodules) are invisible to this pipeline entirely, and the one real same-class method call (`self._generate_square_subsequent_mask(...)`) was also missed (see false negative below) |
+| Q3. What composes the forward path? | ORIGINAL (pre-fix): `CURRENT forward calls: ["cpp/custom-dataset/custom-dataset.cpp::size", "cpp/transfer-learning/main.h::size"]` | **ORIGINAL VERDICT, SUPERSEDED — see the [B2-ID-004](../findings/B2-ID-004.md) erratum above.** Original verdict was **Incorrect** (these were false positives; the REAL calls `forward` makes were invisible to this pipeline entirely). Fixed by Task 9.5's Priority 5(A): now correctly returns the 5 genuine `Field` calls (`input_emb`, `decoder`, `_generate_square_subsequent_mask`, `encoder`, `pos_encoder`), 0 false positives. (Separately, [B2-ID-003](../findings/B2-ID-003.md): the originally-reported miss on `self._generate_square_subsequent_mask(...)` was an evaluation-harness bug, not a real omission — see that erratum above.) |
 | Q4. Who calls the model? | `callers of TransformerModel: []`; `callers of RNNModel: ["distributed/rpc/rnn/main.py::_run_trainer"]` | **Partially answerable** — `RNNModel`'s one real cross-repo caller was found correctly (manually confirmed: `_run_trainer` does instantiate `RNNModel`); `TransformerModel` itself is only instantiated from `word_language_model/main.py`, which failed to resolve (see false negative below) |
 | Q5. Which tests are linked? | `TestsFor` edges in the whole 97-file corpus: 0 | **Correctly answerable as "none exist"** — `word_language_model` genuinely has no test file in this repository, and the corpus-wide 0 count is consistent with that; this is the one question where "the graph found nothing" is the CORRECT answer, not a gap |
-| Q6. If I modify `forward`, what is impacted? | 19 incoming edges found, ALL to unrelated `forward` methods in other files | **Incorrect** — every single one of the 19 is a false positive (see below); none is a real caller of THIS `forward` |
+| Q6. If I modify `forward`, what is impacted? | ORIGINAL (pre-fix): 19 incoming edges found, ALL to unrelated `forward` methods in other files | **ORIGINAL VERDICT, SUPERSEDED — see the [B2-ID-004](../findings/B2-ID-004.md) erratum above.** Original verdict was **Incorrect** (every one of the 19 was a false positive). Fixed by Task 9.5's Priority 5(A): now returns exactly 1 incoming edge, a `Contains` edge (the class containing its own method), 0 false-positive `Calls` edges. |
 
 **False positive, manually confirmed (Q3/Q6):** `forward`'s real body
 calls `self.src_mask.size(0)` (a PyTorch tensor method, not a project
@@ -178,9 +178,10 @@ do) but a real, Measured limitation of what that logic can achieve on
 a method name that happens to collide with an unrelated built-in/
 stdlib method name elsewhere in a large corpus.
 
-**False negative, manually confirmed:** `_generate_square_subsequent_mask`
-genuinely exists as 2 snapshots in `word_language_model/model.py` (one
-current, one historical) and IS a real method `forward` calls
+**False negative — ORIGINAL CLAIM, SUPERSEDED (see erratum immediately
+below):** `_generate_square_subsequent_mask` genuinely exists as 2
+snapshots in `word_language_model/model.py` (one current, one
+historical) and IS a real method `forward` calls
 (`self._generate_square_subsequent_mask(len(src)).to(device)`), but it
 never appears in `forward`'s resolved callees. Root cause (diagnosed,
 not yet fixed — explicitly out of this evaluation's scope per the
@@ -199,8 +200,50 @@ this evaluation per the explicit "do not implement fixes during the
 smoke test" instruction. Flagged as a candidate for a dedicated,
 focused investigation (see section I).
 
+> ## ERRATUM (Task 9.5, [B2-ID-003](../findings/B2-ID-003.md))
+>
+> **Previous claim:** the chained call
+> `self._generate_square_subsequent_mask(len(src)).to(device)` never
+> resolves to a `Calls` edge — a production-pipeline false negative
+> with an undiagnosed root cause.
+>
+> **Corrected claim:** the production pipeline resolves this chained
+> call CORRECTLY. The apparent false negative was caused by a bug in
+> THIS EVALUATION's own harness (`crates/codegraph-index/examples/b2_smoke_test.rs`),
+> which selected "the current `forward` snapshot in
+> `word_language_model/model.py`" by local name alone — ambiguous,
+> because that file has TWO classes (`RNNModel`, `TransformerModel`)
+> each with their own `forward` method, producing three simultaneously
+> "current" `forward`-named snapshots across one A→B update. The
+> harness sometimes selected `RNNModel.forward` (which genuinely does
+> not call `_generate_square_subsequent_mask`) instead of
+> `TransformerModel.forward` (which does), and reported the former's
+> empty callee list as if it were the latter's.
+>
+> **Cause of the previous (incorrect) result:** an evaluation-harness
+> subject-selection bug, not a product defect. Full root-cause analysis,
+> reproduction evidence (an isolated 2-snapshot case, a full-real-body
+> case, and 5 repeated real-corpus runs all confirming correct
+> resolution once the harness was fixed to disambiguate by the
+> symbol's actual `Contains`-parent class rather than by local name
+> alone), and the harness fix itself are recorded in
+> [B2-ID-003](../findings/B2-ID-003.md).
+>
+> **What this changes:** the Q3/Q6 table rows above, and the "19-for-19
+> false positive rate" discussion below, remain accurate for what they
+> actually measured (the common-name false-positive pattern on
+> `size()`/`forward` IS real and unaffected by this correction) — but
+> the specific claim that `_generate_square_subsequent_mask` was a
+> false negative is WITHDRAWN. The chained-call resolution mechanism
+> itself needed no fix. This correction does not retroactively validate
+> the original "Incorrect" verdict on Q3/Q6 as still being for the
+> reason originally stated — Q3/Q6 remain genuinely "Incorrect" rows
+> because of the common-name false positives alone, not because of any
+> chained-call issue.
+
 **19-for-19 false positive rate on Q6 is the single most important
-finding of this evaluation's manual analysis**: asking "what calls this
+finding of this evaluation's manual analysis — ORIGINAL CLAIM, NOW
+FIXED (see erratum immediately below).** asking "what calls this
 specific method" by following `incoming_edges` on a commonly-named
 method (`forward`, in a 97-file corpus where it appears dozens of
 times) returns overwhelmingly noise under the current heuristic-
@@ -209,6 +252,49 @@ unrelated same-named method elsewhere. This is Measured (the edges
 genuinely exist in the graph) and Manually validated (every one of the
 19 was read against real source and confirmed unrelated to this
 specific `TransformerModel.forward`).
+
+> ## ERRATUM (Task 9.5, Priority 5(A), [B2-ID-004](../findings/B2-ID-004.md))
+>
+> **Previous claim:** Q3 (`TransformerModel::forward`'s outgoing calls)
+> returned 2 confirmed false positives (two unrelated C++ `size()`
+> methods); Q6 (incoming callers of `forward`) returned 19 confirmed
+> false positives, described as "the single most important finding of
+> this evaluation's manual analysis." Both were attributed to
+> `resolve_calls`'s purely name-based matching, with the root cause
+> left undiagnosed in this evaluation (per its own "do not implement
+> fixes during the smoke test" scope).
+>
+> **Fix and corrected result:** Task 9.5's Priority 5(A) formally
+> root-caused both as one underlying defect (no receiver awareness, no
+> scope awareness) with two distinct manifestations, and fixed both —
+> see [B2-ID-004](../findings/B2-ID-004.md) for the full investigation,
+> solution, and validation. Re-running the exact same pipeline against
+> a freshly re-cloned copy of this evaluation's own repository/commit
+> (Measured): Q3's outgoing calls from `TransformerModel::forward`
+> are now `["word_language_model/model.py::input_emb",
+> "word_language_model/model.py::decoder",
+> "word_language_model/model.py::_generate_square_subsequent_mask",
+> "word_language_model/model.py::encoder",
+> "word_language_model/model.py::pos_encoder"]` — 0 false positives, and
+> this list now matches the forward-path composition a human reading
+> the source would report (the "REAL calls" this evaluation's own Q3
+> row named as invisible to the pipeline). Q6's incoming edges to the
+> current `forward` are now exactly 1 edge, a `Contains` edge (the
+> class containing its own method — a structural fact, not a spurious
+> `Calls` guess) — 0 false-positive `Calls` edges, down from 19.
+>
+> **What this changes:** the Q3/Q6 "Incorrect" verdicts in the table
+> below, and this section's "19-for-19" framing, describe the PRE-FIX
+> state only and must not be read as still describing the current
+> pipeline's behavior. **What this does NOT change:** this evaluation's
+> manual methodology (reading real source to confirm each edge) was
+> correct and is exactly what surfaced the defect in the first place —
+> the false positives were real defects in the pipeline at the time,
+> not evaluation-harness artifacts (unlike the separate, differently-
+> caused chained-call correction in the erratum above). This correction
+> does not retroactively validate the original claim as still current;
+> it records that the defect it correctly identified has since been
+> fixed, with evidence.
 
 ## F. Incremental A→B — MEASURED
 
@@ -297,14 +383,49 @@ first substantive `model.py` edit after the chosen A) was used as-is.
   `self.encoder`/`self.pos_encoder`/`self.input_emb`/`self.decoder`-
   style component is invisible to `get_code_context` or any future
   coding agent built on this graph today.
-- **`Imports` (MEASURED, confirms the Task 7 finding completely):** 589
-  real Python import statements counted (independent, line-based,
-  non-pipeline count) across the 86 Python files that have at least
-  one; **0 `Imports` edges produced**. 0% capture rate on real data.
-  Root cause already documented in Task 7/`imports.rs`'s own module
-  doc comment and reconfirmed empirically here: `signature_text` never
-  includes anything outside a symbol's own span, and a file-level
-  `import` statement is never inside any symbol's own span.
+- **`Imports` (MEASURED, confirms the Task 7 finding completely) —
+  ORIGINAL CLAIM, SUPERSEDED (see erratum below):** 589 real Python
+  import statements counted (independent, line-based, non-pipeline
+  count) across the 86 Python files that have at least one; **0
+  `Imports` edges produced**. 0% capture rate on real data. Root cause
+  already documented in Task 7/`imports.rs`'s own module doc comment
+  and reconfirmed empirically here: `signature_text` never includes
+  anything outside a symbol's own span, and a file-level `import`
+  statement is never inside any symbol's own span.
+
+> ## ERRATUM (Task 9.5, Priority 6, [B2-ID-005](../findings/B2-ID-005.md))
+>
+> **Previous claim:** 0 of 589 real import statements captured —
+> described as a 0% capture-rate GAP in the original symbol-to-symbol
+> `EdgeKind::Imports` design, with the fix deferred to a future
+> redesign.
+>
+> **Corrected claim:** the original design's granularity itself was
+> wrong (a file-level fact forced into a symbol-to-symbol edge shape),
+> not merely under-implemented — see
+> [B2-ID-005](../findings/B2-ID-005.md) for the full analysis. It was
+> REMOVED, not patched, and replaced with a separate file-level
+> `ImportFact` model wired into the real production pipeline
+> (`CodeGraphIndexer`). Re-running the exact same pipeline against a
+> freshly re-cloned copy of this evaluation's own repository/commit
+> (Measured, via the real indexer, not a manual resolver call): 691
+> real `ImportFact`s extracted (the 589 figure was itself a crude
+> per-LINE heuristic; the correct per-STATEMENT count is higher because
+> 52 real lines in this corpus import more than one comma-separated
+> name, each counted as its own fact) — 41 resolved `Internal`, 621
+> correctly left `External` (no invented target), 29 correctly left
+> `Ambiguous`. Incremental behavior confirmed: 687 of 691 raw statements
+> reused unchanged across a real 1-file-changed A→B update, with
+> resolution always recomputed from the full current pool (a
+> deliberate, documented correctness-first choice, not an oversight).
+>
+> **What this changes:** `EdgeKind::Imports` no longer exists at all —
+> any future reader of this evaluation looking for that edge kind in
+> the current codebase will not find it; this is intentional, not a
+> regression. The "0% capture rate" framing above describes the
+> PRE-REDESIGN state only.
+
+
 - **Scope-aware / qualified names:** confirmed directly relevant to
   B2-ID-001's own root cause — `init_weights` in two different classes
   in the same file is exactly the ambiguity a `QualifiedName` would
@@ -340,13 +461,15 @@ actually blocking real understanding:
    depth, zero of which are representable today. This is the single
    gap most directly blocking "explain the model's architecture" —
    exactly the use case B2 exists to serve for deep-learning code.
-2. **`Imports` redesign** — HIGH PRIORITY, 0% real-data capture
-   confirmed (not just suspected). The minimal redesign already
-   proposed in Task 7's own module doc comment (a file-level import
-   pre-pass independent of any one symbol's span, OR extending Task 4's
-   extraction boundary to capture a symbol's immediately-preceding
-   import context) remains the right shape; this evaluation adds no
-   new design insight beyond confirming the 0% number precisely.
+2. **RESOLVED by [B2-ID-005](../findings/B2-ID-005.md).** `Imports`
+   redesign — originally listed HIGH PRIORITY on a confirmed 0%
+   real-data capture rate. Task 9.5's Priority 6 confirmed the real
+   defect was the edge's own granularity (symbol-to-symbol, when an
+   import is a file-level fact), removed `EdgeKind::Imports` entirely,
+   and replaced it with a separate file-level `ImportFact` model wired
+   into the real production pipeline — see the erratum above for the
+   measured before/after (0/589 line-based → 691 real facts via the
+   actual indexer).
 3. **Scope-aware/qualified names** — MODERATE PRIORITY. Would resolve
    both B2-ID-001-adjacent identity confusion (addressed at the byte-
    span level already) and the Q1/Q3/Q6 false-positive/ambiguity
@@ -362,21 +485,23 @@ actually blocking real understanding:
    `self.encoder = TransformerEncoder(...)` would produce both a new
    `Field` snapshot AND an `Instantiates` edge from `__init__` to
    `TransformerEncoder`).
-5. **Method-name-collision-aware call resolution** — LOWER PRIORITY,
-   same root cause as #3 (scope-awareness) rather than a separate
-   gap — recorded as its own line here because its SYMPTOM (the Q6
-   19-false-positive result) was independently, severely confirmed by
-   this evaluation and deserves its own visibility even though the fix
-   is the same one as #3's.
-6. **Chained-call extraction gap (`self.foo(...).bar(...)`)** —
-   NEWLY OBSERVED, not previously documented. The confirmed false
-   negative on `_generate_square_subsequent_mask` suggests chained
-   calls may not be fully walked by `calls.rs`'s current logic. Root
-   cause not fully diagnosed in this evaluation (explicitly out of
-   scope to fix now) — flagged as a candidate for a dedicated,
-   focused root-cause investigation, potentially its own future
-   Project Finding if confirmed as a real extraction bug rather than
-   an artifact of this one call shape.
+5. **RESOLVED by [B2-ID-004](../findings/B2-ID-004.md).** Method-name-
+   collision-aware call resolution — originally listed as LOWER
+   PRIORITY, same root cause as #3 (scope-awareness) rather than a
+   separate gap. Task 9.5's Priority 5(A) fixed the two confirmed
+   manifestations of this gap directly (receiver-aware filtering for
+   `self`/`this`-qualified calls, scope-hierarchy narrowing for
+   unqualified ambiguous calls) — see the Q3/Q6 erratum above for the
+   measured before/after. Note this does NOT fully resolve #3 (full
+   qualified-name/scope-chain resolution, Priority 4, remains not yet
+   implemented as a product feature) — only the specific call-
+   resolution false positives this evaluation measured.
+6. **WITHDRAWN** — the originally-listed "chained-call extraction gap"
+   is RETRACTED per the erratum above and [B2-ID-003](../findings/B2-ID-003.md).
+   Task 9.5's dedicated root-cause investigation confirmed
+   `calls.rs`'s chained-call walk is correct; the apparent gap was an
+   evaluation-harness subject-selection bug, now fixed. No coverage
+   expansion is needed for chained calls.
 
 ## Independent review
 
@@ -440,7 +565,27 @@ project's own standing protocol.
   independent review pass (see below) before being accepted as final.
 - Memory measurement is Estimated only (coarse OS tool), not a real
   profiler reading.
-- The chained-call false negative's exact root cause (tree-sitter node
-  shape, or `find_by_name`/exclusion logic interaction) was NOT fully
-  traced to a specific line of code during this evaluation — recorded
-  as an open question, not a diagnosed-and-deferred one.
+- **RESOLVED by [B2-ID-003](../findings/B2-ID-003.md):** the chained-call
+  false negative's root cause (listed here, at the time of this
+  evaluation's original writing, as an open question) was fully traced
+  by Task 9.5's dedicated investigation — it was an evaluation-harness
+  subject-selection bug, not a pipeline defect. See the erratum above.
+- **RESOLVED by [B2-ID-004](../findings/B2-ID-004.md):** the Q3
+  receiver-qualified false positive and the Q6 19-for-19 common-name
+  false-positive rate (both listed here, at the time of this
+  evaluation's original writing, as confirmed but un-root-caused
+  defects) were formally root-caused and fixed by Task 9.5's Priority
+  5(A) — see the erratum above for the measured before/after. This fix
+  is itself recorded as an experimental configuration
+  (`docs/research/EXPERIMENTAL_POLICY.md`, CALL-RES-A1+A2+A3), not a
+  proven-final answer — it still awaits comparison against alternative
+  configurations once the multi-domain validation suite provides
+  sufficient ground truth.
+- **RESOLVED by [B2-ID-005](../findings/B2-ID-005.md):** the `Imports`
+  0% real-data capture (listed here, at the time of this evaluation's
+  original writing, as a confirmed gap awaiting a future redesign) was
+  formally root-caused (a granularity mismatch, not a fixable matching-
+  logic bug) and fixed by Task 9.5's Priority 6 — the old
+  `EdgeKind::Imports` was removed, replaced by a file-level `ImportFact`
+  model wired into the real production pipeline. See the erratum above
+  for the measured before/after.

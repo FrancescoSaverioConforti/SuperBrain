@@ -56,17 +56,36 @@ use thiserror::Error;
 
 use super::pipeline::{build_graph, index_files, PipelineError};
 use crate::graph::{CodeGraph, GraphError};
+use crate::imports::{resolve_raw_import_statements, ImportFact, RawImportStatement};
 use crate::snapshot::SymbolSnapshot;
 
 /// Internal, per-repository bookkeeping the indexer keeps alongside
 /// the published graph: which commit that graph reflects, so the next
 /// `observe_commit` call for the same repository can classify its own
 /// relationship to it (see [`classify_commit`]).
+///
+/// `raw_import_statements` and `import_facts` are kept SEPARATE
+/// (Task 9.5, Priority 6), mirroring the module-level split between
+/// local syntax extraction and global semantic resolution:
+/// `raw_import_statements` is reused across an incremental update for
+/// every UNTOUCHED file (re-extracting syntax that did not change would
+/// be pure waste), while `import_facts` is correctness-first RE-
+/// RESOLVED FROM SCRATCH, across the ENTIRE raw-statement set, on every
+/// single `observe_commit` call — a raw import's own text can be
+/// unchanged while its correct RESOLUTION changes (the target it names
+/// was renamed, moved, added, or removed elsewhere in the repository),
+/// so a resolved fact can never be safely assumed reusable just because
+/// its importing file was untouched. This is deliberately NOT yet an
+/// optimized incremental resolution (recorded as a residual limitation,
+/// not hidden) — it is documented, measured (see `IndexMetrics`), and
+/// chosen over the alternative of silently serving a stale resolution.
 #[derive(Debug)]
 struct RepositoryState {
     commit: CommitHash,
     graph: Arc<CodeGraph>,
     generation: u64,
+    raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
+    import_facts: Arc<Vec<ImportFact>>,
 }
 
 /// What [`CodeGraphIndexer::begin_observe`] (critical section 1)
@@ -77,6 +96,7 @@ struct RepositoryState {
 struct ObserveClaim {
     relationship: CommitRelationship,
     prior_graph: Option<Arc<CodeGraph>>,
+    prior_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
     generation: u64,
 }
 
@@ -147,6 +167,18 @@ pub struct IndexMetrics {
     /// this task recomputes the WHOLE edge set on every observe rather
     /// than a narrower "only edges touching changed snapshots" set).
     pub edges_rebuilt: usize,
+    /// Task 9.5, Priority 6: raw import statements newly (re-)extracted
+    /// this call — i.e. belonging to a file this call actually parsed,
+    /// never reused from a prior commit's untouched files.
+    pub raw_import_statements_extracted: usize,
+    /// Raw import statements CARRIED FORWARD unchanged from the prior
+    /// commit's untouched files, never re-extracted.
+    pub raw_import_statements_reused: usize,
+    /// Resolved `ImportFact`s in the newly-published state — ALWAYS
+    /// recomputed from the full raw-statement set on every call (see
+    /// `RepositoryState`'s own doc comment for why resolution is not
+    /// incrementally reused, unlike extraction).
+    pub import_facts_resolved: usize,
 }
 
 /// What a successful [`CodeGraphIndexer::observe_commit`] call returns.
@@ -161,6 +193,12 @@ pub struct IndexMetrics {
 pub struct ObserveOutcome {
     pub generation: u64,
     pub graph: Arc<CodeGraph>,
+    /// Task 9.5, Priority 6: the CURRENTLY published `ImportFact`s for
+    /// this repository — same atomicity/publication discipline as
+    /// `graph`: either this call's own freshly-resolved facts, or a
+    /// later generation's facts if this call lost the publish race,
+    /// never a partial/stale mix.
+    pub import_facts: Arc<Vec<ImportFact>>,
     pub metrics: IndexMetrics,
 }
 
@@ -311,20 +349,21 @@ impl CodeGraphIndexer {
             return Ok(ObserveOutcome {
                 generation: existing.generation,
                 graph: existing.graph.clone(),
+                import_facts: existing.import_facts.clone(),
                 metrics: IndexMetrics::default(),
             });
         }
 
-        let (new_graph, metrics) = match claim.relationship {
+        let (new_graph, new_raw_import_statements, import_facts, metrics) = match claim.relationship {
             CommitRelationship::NewRepository | CommitRelationship::HistoryRewriteOrUnknownAncestor => self.full_reindex(source, repository, new_commit)?,
             CommitRelationship::NormalAdvance => {
                 let prior_graph = claim.prior_graph.expect("NormalAdvance implies prior state exists");
-                self.incremental_reindex(source, repository, new_commit, &prior_graph, changed_files)?
+                self.incremental_reindex(source, repository, new_commit, &prior_graph, &claim.prior_raw_import_statements, changed_files)?
             }
             CommitRelationship::AlreadyObserved => unreachable!("handled above"),
         };
 
-        Ok(self.publish(repository, new_commit.clone(), claim.generation, new_graph, metrics))
+        Ok(self.publish(repository, new_commit.clone(), claim.generation, new_graph, new_raw_import_statements, import_facts, metrics))
     }
 
     /// Critical section 1: classify this call's relationship to the
@@ -333,11 +372,11 @@ impl CodeGraphIndexer {
     /// rebuild. Returns the prior graph (a cloned `Arc`, cheap) so the
     /// caller can build the incremental update outside the lock.
     fn begin_observe(&self, repository: RepositoryId, new_commit: &CommitHash, expected_prev_commit: Option<&CommitHash>) -> ObserveClaim {
-        let (relationship, prior_graph) = {
+        let (relationship, prior_graph, prior_raw_import_statements) = {
             let state = self.state.lock().unwrap();
             let prior = state.get(&repository);
             let relationship = classify_commit(prior, new_commit, expected_prev_commit);
-            (relationship, prior.map(|s| s.graph.clone()))
+            (relationship, prior.map(|s| s.graph.clone()), prior.map(|s| s.raw_import_statements.clone()).unwrap_or_default())
         };
         // Claimed from a counter entirely separate from `state`'s own
         // per-repository generations — see `next_generation`'s own doc
@@ -350,22 +389,39 @@ impl CodeGraphIndexer {
             *next += 1;
             claimed
         };
-        ObserveClaim { relationship, prior_graph, generation }
+        ObserveClaim {
+            relationship,
+            prior_graph,
+            prior_raw_import_statements,
+            generation,
+        }
     }
 
-    fn full_reindex(&self, source: &dyn RepositorySource, repository: RepositoryId, commit: &CommitHash) -> Result<(CodeGraph, IndexMetrics), ObserveError> {
+    #[allow(clippy::type_complexity)]
+    fn full_reindex(
+        &self,
+        source: &dyn RepositorySource,
+        repository: RepositoryId,
+        commit: &CommitHash,
+    ) -> Result<(CodeGraph, Vec<(codegraph_domain::FileIdentity, RawImportStatement)>, Vec<ImportFact>, IndexMetrics), ObserveError> {
         let files = source.list_files_at(repository, commit).map_err(|e| ObserveError::Pipeline(PipelineError::Source(e)))?;
         let no_known_lineage = |_: SymbolSnapshotId| None;
         let output = index_files(source, repository, commit, &files, &[], &no_known_lineage)?;
+
+        let import_facts = resolve_raw_import_statements(&output.raw_import_statements, &output.snapshots).map_err(PipelineError::from)?;
+
         let metrics = IndexMetrics {
             files_considered: files.len(),
             files_reparsed: files.len(),
             snapshots_removed: 0,
             snapshots_added: output.snapshots.len(),
             edges_rebuilt: output.lineage_edges.len() + output.typed_edges.len(),
+            raw_import_statements_extracted: output.raw_import_statements.len(),
+            raw_import_statements_reused: 0,
+            import_facts_resolved: import_facts.len(),
         };
         let graph = build_graph(output.snapshots, output.lineage_edges, output.typed_edges)?;
-        Ok((graph, metrics))
+        Ok((graph, output.raw_import_statements, import_facts, metrics))
     }
 
     /// Incremental update: re-parses/re-extracts/re-promotes ONLY
@@ -374,7 +430,7 @@ impl CodeGraphIndexer {
     /// RECOMPUTED FROM THE WHOLE RESULTING SNAPSHOT POOL (untouched +
     /// freshly rebuilt) rather than only from the changed snapshots —
     /// a deliberate, documented scope choice, not an oversight:
-    /// `resolve_calls`/`resolve_imports`/etc. resolve a callee NAME
+    /// `resolve_calls`/`resolve_extends_implements`/etc. resolve a callee NAME
     /// against the full candidate pool they are given, so a change
     /// confined to `changed_files` can still change which edges an
     /// UNCHANGED file's symbols resolve to (e.g. file B calls `encoder`
@@ -385,14 +441,16 @@ impl CodeGraphIndexer {
     /// under-invalidation; re-parsing is the expensive step this
     /// function actually scopes down to `changed_files` only (see
     /// `IndexMetrics::files_reparsed` vs. `files_considered`).
+    #[allow(clippy::type_complexity)]
     fn incremental_reindex(
         &self,
         source: &dyn RepositorySource,
         repository: RepositoryId,
         new_commit: &CommitHash,
         prior_graph: &CodeGraph,
+        prior_raw_import_statements: &[(codegraph_domain::FileIdentity, RawImportStatement)],
         changed_files: &[String],
-    ) -> Result<(CodeGraph, IndexMetrics), ObserveError> {
+    ) -> Result<(CodeGraph, Vec<(codegraph_domain::FileIdentity, RawImportStatement)>, Vec<ImportFact>, IndexMetrics), ObserveError> {
         let changed_set: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
 
         let untouched_snapshots: Vec<SymbolSnapshot> = prior_graph.all_snapshots().into_iter().filter(|s| !changed_set.contains(s.file().relative_path())).cloned().collect();
@@ -436,11 +494,7 @@ impl CodeGraphIndexer {
         let mut current_snapshots = untouched_snapshots;
         current_snapshots.extend(output.snapshots.clone());
 
-        let mut typed_edges = Vec::new();
-        typed_edges.extend(crate::edges::resolve_calls(&current_snapshots).map_err(PipelineError::from)?);
-        typed_edges.extend(crate::edges::resolve_imports(&current_snapshots).map_err(PipelineError::from)?);
-        typed_edges.extend(crate::edges::resolve_extends_implements(&current_snapshots).map_err(PipelineError::from)?);
-        typed_edges.extend(crate::edges::resolve_tests_for(&current_snapshots).map_err(PipelineError::from)?);
+        let typed_edges = crate::edges::resolve_all_typed_edges(&current_snapshots).map_err(PipelineError::from)?;
 
         // Lineage across the UNCHANGED portion is already final (it was
         // resolved and published by an earlier observe_commit call);
@@ -481,16 +535,43 @@ impl CodeGraphIndexer {
             }
         }
 
+        // Priority 6 incremental semantics: raw import statements are
+        // reused for every UNTOUCHED file (pure syntax that cannot have
+        // changed if the file itself did not), and freshly extracted
+        // for every file this call actually reparsed — `changed_set`
+        // already distinguishes these the exact same way snapshots do.
+        // Deleted files correctly drop out here too: `prior_raw_import_statements`
+        // is filtered by `changed_set`, so a deleted file's old raw
+        // statements are never carried forward (it IS in `changed_set`),
+        // and it produces no new ones either (`output.raw_import_statements`
+        // only contains files `index_files` actually parsed, which a
+        // deleted file never is).
+        let untouched_raw_import_statements: Vec<_> = prior_raw_import_statements.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
+        let untouched_raw_import_statements_len = untouched_raw_import_statements.len();
+        let mut raw_import_statements = untouched_raw_import_statements;
+        raw_import_statements.extend(output.raw_import_statements.clone());
+
+        // Resolution is ALWAYS recomputed from the full raw-statement
+        // set against the full current snapshot pool — never reused
+        // incrementally, even for untouched-file statements (see
+        // `RepositoryState`'s own doc comment for why: an untouched
+        // import's correct TARGET can still change when some OTHER
+        // file's symbol it names is renamed/moved/added/removed).
+        let import_facts = resolve_raw_import_statements(&raw_import_statements, &final_snapshots).map_err(PipelineError::from)?;
+
         let metrics = IndexMetrics {
             files_considered: changed_files.len(),
             files_reparsed: files_to_reparse.len(),
             snapshots_removed: prior_changed_snapshots.len(),
             snapshots_added: output.snapshots.len(),
             edges_rebuilt: lineage_edges.len() + typed_edges.len(),
+            raw_import_statements_extracted: output.raw_import_statements.len(),
+            raw_import_statements_reused: untouched_raw_import_statements_len,
+            import_facts_resolved: import_facts.len(),
         };
 
         let graph = build_graph(final_snapshots, lineage_edges, typed_edges)?;
-        Ok((graph, metrics))
+        Ok((graph, raw_import_statements, import_facts, metrics))
     }
 
     /// Critical section 2: publish `candidate_graph` for `repository`
@@ -498,21 +579,44 @@ impl CodeGraphIndexer {
     /// published for this repository in the meantime (see this
     /// module's doc comment) — in which case this call's own work is
     /// discarded and the actually-current state is returned instead.
-    fn publish(&self, repository: RepositoryId, commit: CommitHash, generation: u64, candidate_graph: CodeGraph, metrics: IndexMetrics) -> ObserveOutcome {
+    #[allow(clippy::too_many_arguments)]
+    fn publish(
+        &self,
+        repository: RepositoryId,
+        commit: CommitHash,
+        generation: u64,
+        candidate_graph: CodeGraph,
+        candidate_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
+        candidate_import_facts: Vec<ImportFact>,
+        metrics: IndexMetrics,
+    ) -> ObserveOutcome {
         let mut state = self.state.lock().unwrap();
         let current_generation = state.get(&repository).map(|s| s.generation).unwrap_or(0);
         if generation > current_generation {
             let graph = Arc::new(candidate_graph);
-            state.insert(repository, RepositoryState { commit, graph: graph.clone(), generation });
-            ObserveOutcome { generation, graph, metrics }
+            let import_facts = Arc::new(candidate_import_facts);
+            state.insert(
+                repository,
+                RepositoryState {
+                    commit,
+                    graph: graph.clone(),
+                    generation,
+                    raw_import_statements: candidate_raw_import_statements,
+                    import_facts: import_facts.clone(),
+                },
+            );
+            ObserveOutcome { generation, graph, import_facts, metrics }
         } else {
             // A later generation already published — this call's
-            // candidate is discarded. Return the ACTUAL current state,
-            // not this call's own (stale, never-published) graph.
+            // candidate (graph AND import state) is discarded. Return
+            // the ACTUAL current state, not this call's own (stale,
+            // never-published) data — the same atomicity guarantee
+            // `graph` already had now covers `import_facts` too.
             let existing = state.get(&repository).expect("current_generation > 0 implies prior state exists when generation <= current_generation");
             ObserveOutcome {
                 generation: existing.generation,
                 graph: existing.graph.clone(),
+                import_facts: existing.import_facts.clone(),
                 metrics,
             }
         }
@@ -598,7 +702,7 @@ mod tests {
         let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
         let indexer = CodeGraphIndexer::new();
 
-        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), IndexMetrics::default());
+        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), IndexMetrics::default());
         assert_eq!(first_outcome.generation, 5);
 
         // Attempt to publish AGAIN at the SAME generation (5, not 4) —
@@ -607,7 +711,7 @@ mod tests {
         let file = FileIdentity::parse(repo, commit.clone(), "src/lib.rs").unwrap();
         let candidate = RawSymbolCandidate::new("marker".to_string(), "function_item".to_string(), ByteSpan { start: 0, end: 3 }, "fn marker() {}".to_string()).unwrap();
         second_candidate.insert_snapshot(promote(&candidate, file).unwrap()).unwrap();
-        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, IndexMetrics::default());
+        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), IndexMetrics::default());
 
         assert_eq!(second_outcome.generation, 5, "the reported generation must still be 5 (the one already published)");
         assert_eq!(second_outcome.graph.snapshot_count(), 0, "an equal-generation publish must NOT overwrite the already-published graph with its own candidate");
@@ -631,6 +735,30 @@ mod tests {
         // reindex of a brand-new repository has zero lineage edges (no
         // `prev_snapshots` exist yet) and exactly one typed Calls edge.
         assert_eq!(outcome.metrics.edges_rebuilt, 1);
+    }
+
+    #[test]
+    fn the_generation_counter_strictly_increments_across_independent_observe_calls() {
+        // Direct, deterministic (non-concurrent) pin of `begin_observe`'s
+        // generation claim: mutating `*next += 1` to `*next *= 1` would
+        // leave the counter stuck at its initial value of 1 forever,
+        // so every call would claim the SAME generation. Two
+        // sequential, unrelated repositories (never racing, no
+        // barrier/channel involved) must still claim strictly
+        // increasing generation numbers.
+        let repo_a = test_repo();
+        let repo_b = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file_a = FileIdentity::parse(repo_a, commit.clone(), "src/lib.rs").unwrap();
+        let file_b = FileIdentity::parse(repo_b, commit.clone(), "src/lib.rs").unwrap();
+        let source = FakeSource::new().with_file(file_a, b"fn foo() {}\n").with_file(file_b, b"fn bar() {}\n");
+        let indexer = CodeGraphIndexer::new();
+
+        let outcome_a = indexer.observe_commit(&source, repo_a, &commit, None, &[]).unwrap();
+        let outcome_b = indexer.observe_commit(&source, repo_b, &commit, None, &[]).unwrap();
+
+        assert_eq!(outcome_a.generation, 1);
+        assert_eq!(outcome_b.generation, 2, "the second, independent observe_commit call must claim a strictly greater generation than the first");
     }
 
     #[test]
@@ -1012,6 +1140,24 @@ mod tests {
         // publish. No sleeps: a channel + barrier pair forces the
         // exact interleaving deterministically, mirroring B1's
         // `RealIndexer` concurrency tests.
+        //
+        // The hook gates on "the FIRST call to reach this point," via
+        // an atomic flag, rather than on a hardcoded `generation == 1`.
+        // Found during Task 9.5's closing mutation gate: gating on a
+        // specific generation NUMBER meant that a mutant breaking the
+        // generation counter itself (`*next += 1` -> `*next *= 1`,
+        // which leaves every claim stuck at generation 1 forever) made
+        // B's own call ALSO match `generation == 1` and enter the SAME
+        // 2-party barrier A was already waiting on — deadlocking the
+        // whole test binary (cargo-mutants reports this as a TIMEOUT,
+        // not a clean failure), which silently masked a real,
+        // independently-confirmed counter bug behind a hung test rather
+        // than surfacing it. Gating on "first call only" keeps this
+        // test's own synchronization correct regardless of what value
+        // the generation counter actually produces, so a broken counter
+        // now surfaces as this test's own clean, fast failure (or the
+        // separate, simpler `the_generation_counter_strictly_increments_across_independent_observe_calls`
+        // test's failure) instead of a hang.
         let repo = test_repo();
         let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
         let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
@@ -1024,8 +1170,9 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let barrier_for_hook = barrier.clone();
         let target_point = TestPoint::AfterGenerationClaimed;
-        indexer.set_test_hook(Arc::new(move |point, generation| {
-            if point == target_point && generation == 1 {
+        let first_call = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        indexer.set_test_hook(Arc::new(move |point, _generation| {
+            if point == target_point && first_call.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 arrived_tx.send(()).unwrap();
                 barrier_for_hook.wait();
             }
@@ -1117,5 +1264,255 @@ mod tests {
         assert_eq!(second.graph.callees_of(forward_pass_id).len(), 2, "forward_pass must still call encoder and classifier after the rename");
         let current_my_model_id = second.graph.all_snapshots().iter().find(|s| s.name().as_str() == "MyModel" && s.id() != my_model_id).unwrap().id();
         assert_eq!(second.graph.outgoing_edges(current_my_model_id, Some(EdgeKind::Extends)).len(), 1, "the current MyModel must still extend Module after an unrelated rename");
+    }
+
+    // --- Task 9.5, Priority 6: ImportFact production and incremental
+    // semantics wired into the real indexer. ---
+
+    #[test]
+    fn initial_index_extracts_import_facts() {
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file = FileIdentity::parse(repo, commit.clone(), "src/model.py").unwrap();
+        let source = FakeSource::new().with_file(file, b"import torch\nclass Model:\n    pass\n");
+        let indexer = CodeGraphIndexer::new();
+
+        let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        assert_eq!(outcome.import_facts.len(), 1);
+        assert_eq!(outcome.import_facts[0].module_path, "torch");
+        assert_eq!(outcome.metrics.raw_import_statements_extracted, 1);
+        assert_eq!(outcome.metrics.import_facts_resolved, 1);
+    }
+
+    #[test]
+    fn an_untouched_files_raw_import_statement_is_preserved_across_an_incremental_update() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let untouched_a = FileIdentity::parse(repo, commit_a.clone(), "src/untouched.py").unwrap();
+        let changed_a = FileIdentity::parse(repo, commit_a.clone(), "src/changed.py").unwrap();
+        let mut source = FakeSource::new().with_file(untouched_a, b"import torch\n").with_file(changed_a, b"x = 1\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.import_facts.len(), 1);
+
+        let untouched_b = FileIdentity::parse(repo, commit_b.clone(), "src/untouched.py").unwrap();
+        let changed_b = FileIdentity::parse(repo, commit_b.clone(), "src/changed.py").unwrap();
+        source = source.with_file(untouched_b, b"import torch\n").with_file(changed_b, b"x = 2\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/changed.py".to_string()]).unwrap();
+
+        assert_eq!(second.import_facts.len(), 1, "the untouched file's import must still be present");
+        assert_eq!(second.import_facts[0].module_path, "torch");
+        assert_eq!(second.metrics.raw_import_statements_reused, 1, "the untouched file's raw statement must be reused, not re-extracted");
+        assert_eq!(second.metrics.raw_import_statements_extracted, 0, "the changed file has no import statement of its own to extract");
+    }
+
+    #[test]
+    fn a_changed_files_import_statement_is_recomputed_not_reused() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let file_a = FileIdentity::parse(repo, commit_a.clone(), "src/model.py").unwrap();
+        let mut source = FakeSource::new().with_file(file_a, b"import torch\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.import_facts[0].module_path, "torch");
+
+        let file_b = FileIdentity::parse(repo, commit_b.clone(), "src/model.py").unwrap();
+        source = source.with_file(file_b, b"import numpy\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/model.py".to_string()]).unwrap();
+
+        assert_eq!(second.import_facts.len(), 1);
+        assert_eq!(second.import_facts[0].module_path, "numpy", "the changed file's import must be recomputed from its new content, not reused from the old one");
+        assert_eq!(second.metrics.raw_import_statements_extracted, 1);
+        assert_eq!(second.metrics.raw_import_statements_reused, 0);
+    }
+
+    #[test]
+    fn a_deleted_files_import_statement_is_removed() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let deleted_a = FileIdentity::parse(repo, commit_a.clone(), "src/deleted.py").unwrap();
+        let survivor_a = FileIdentity::parse(repo, commit_a.clone(), "src/survivor.py").unwrap();
+        let mut source = FakeSource::new().with_file(deleted_a, b"import torch\n").with_file(survivor_a, b"x = 1\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.import_facts.len(), 1);
+
+        // src/deleted.py no longer exists at commit B.
+        let survivor_b = FileIdentity::parse(repo, commit_b.clone(), "src/survivor.py").unwrap();
+        source = source.with_file(survivor_b, b"x = 2\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/deleted.py".to_string()]).unwrap();
+
+        assert!(second.import_facts.is_empty(), "the deleted file's import must be removed, not carried forward");
+    }
+
+    #[test]
+    fn a_new_files_import_statement_is_added() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let existing_a = FileIdentity::parse(repo, commit_a.clone(), "src/existing.py").unwrap();
+        let mut source = FakeSource::new().with_file(existing_a, b"x = 1\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert!(first.import_facts.is_empty());
+
+        let existing_b = FileIdentity::parse(repo, commit_b.clone(), "src/existing.py").unwrap();
+        let new_file_b = FileIdentity::parse(repo, commit_b.clone(), "src/new.py").unwrap();
+        source = source.with_file(existing_b, b"x = 1\n").with_file(new_file_b, b"import torch\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/new.py".to_string()]).unwrap();
+
+        assert_eq!(second.import_facts.len(), 1, "the new file's import must be added");
+        assert_eq!(second.import_facts[0].module_path, "torch");
+    }
+
+    #[test]
+    fn an_import_facts_resolution_changes_when_its_target_is_added_even_though_the_importing_file_is_untouched() {
+        // The exact scenario the correctness-first "always re-resolve"
+        // policy exists for: `importer.py`'s own `from mymodule import
+        // helper` is UNCHANGED text across A->B, but `helper` does not
+        // exist anywhere in the pool at commit A (External) and DOES
+        // exist at commit B (Internal) because a DIFFERENT, newly-added
+        // file defines it. `importer.py` itself is never reparsed.
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let importer_a = FileIdentity::parse(repo, commit_a.clone(), "src/importer.py").unwrap();
+        let mut source = FakeSource::new().with_file(importer_a, b"from mymodule import helper\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.import_facts[0].resolution, crate::imports::ImportResolution::External, "helper does not exist anywhere yet");
+
+        let importer_b = FileIdentity::parse(repo, commit_b.clone(), "src/importer.py").unwrap();
+        let mymodule_b = FileIdentity::parse(repo, commit_b.clone(), "src/mymodule.py").unwrap();
+        source = source.with_file(importer_b, b"from mymodule import helper\n").with_file(mymodule_b, b"def helper():\n    pass\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/mymodule.py".to_string()]).unwrap();
+
+        assert_eq!(second.metrics.raw_import_statements_reused, 1, "importer.py itself must not be reparsed");
+        assert!(
+            matches!(second.import_facts[0].resolution, crate::imports::ImportResolution::Internal(_)),
+            "the untouched import's resolution must update once its target becomes resolvable, even though importer.py itself was never reparsed: got {:?}",
+            second.import_facts[0].resolution
+        );
+    }
+
+    #[test]
+    fn a_failed_incremental_update_leaves_prior_import_facts_untouched() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let file_a = FileIdentity::parse(repo, commit_a.clone(), "src/model.py").unwrap();
+        let source = FakeSource::new().with_file(file_a, b"import torch\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.import_facts.len(), 1);
+
+        // commit_b names a changed file never registered with the fake
+        // source -> read_file fails -> the whole pipeline (including
+        // import resolution) must fail closed.
+        let result = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/missing.py".to_string()]);
+
+        assert!(result.is_err());
+        let current_outcome = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(current_outcome.import_facts.len(), 1, "the prior import facts must be completely untouched by a failed update");
+        assert_eq!(current_outcome.import_facts[0].module_path, "torch");
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_overwrite_newer_published_import_facts() {
+        // Mirrors `an_older_rebuild_can_never_overwrite_a_newer_published_state`,
+        // but asserts on `import_facts` specifically — the same
+        // publication-atomicity guarantee must cover import state, not
+        // only the graph.
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let file_a = FileIdentity::parse(repo, commit_a.clone(), "src/lib.py").unwrap();
+        let file_b = FileIdentity::parse(repo, commit_b.clone(), "src/lib.py").unwrap();
+        let source = Arc::new(FakeSource::new().with_file(file_a, b"import torch\n").with_file(file_b, b"import numpy\n"));
+        let indexer = Arc::new(CodeGraphIndexer::new());
+
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_for_hook = barrier.clone();
+        let target_point = TestPoint::AfterGenerationClaimed;
+        // First-call-only gate, not a hardcoded generation number — see
+        // `an_older_rebuild_can_never_overwrite_a_newer_published_state`'s
+        // own comment for why (Task 9.5's closing mutation gate found a
+        // hardcoded `generation == 1` check makes this harness deadlock,
+        // rather than fail cleanly, under a mutant that breaks the
+        // generation counter itself).
+        let first_call = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        indexer.set_test_hook(Arc::new(move |point, _generation| {
+            if point == target_point && first_call.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                arrived_tx.send(()).unwrap();
+                barrier_for_hook.wait();
+            }
+        }));
+
+        let worker_indexer = indexer.clone();
+        let worker_source = source.clone();
+        let worker = std::thread::spawn(move || worker_indexer.observe_commit(worker_source.as_ref(), repo, &commit_a, None, &[]));
+
+        arrived_rx.recv().unwrap();
+
+        let outcome_b = indexer.observe_commit(source.as_ref(), repo, &commit_b, None, &[]).unwrap();
+        assert_eq!(outcome_b.import_facts[0].module_path, "numpy");
+
+        barrier.wait();
+        let outcome_a = worker.join().unwrap().unwrap();
+
+        assert_eq!(outcome_a.import_facts[0].module_path, "numpy", "A's stale import facts must never win — it must report B's import facts instead");
+    }
+
+    #[test]
+    fn import_fact_resolution_is_deterministic_across_independent_runs() {
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let importer = FileIdentity::parse(repo, commit.clone(), "src/model.py").unwrap();
+        let target = FileIdentity::parse(repo, commit.clone(), "src/mymodule.py").unwrap();
+        let source = FakeSource::new().with_file(importer, b"from mymodule import helper\n").with_file(target, b"def helper():\n    pass\n");
+
+        let first_indexer = CodeGraphIndexer::new();
+        let first = first_indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        let second_indexer = CodeGraphIndexer::new();
+        let second = second_indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        assert_eq!(first.import_facts.len(), second.import_facts.len());
+        assert_eq!(first.import_facts[0].resolution, second.import_facts[0].resolution);
+    }
+
+    #[test]
+    fn no_legacy_imports_edge_kind_is_ever_produced() {
+        // EdgeKind::Imports was removed (B2-ID-005) — confirms the real
+        // indexer's own typed-edge output never contains anything the
+        // (now nonexistent) old variant would have produced; this is
+        // really a compile-time guarantee (the variant does not exist),
+        // but this test documents the intent at the call-site level too.
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file = FileIdentity::parse(repo, commit.clone(), "src/model.py").unwrap();
+        let source = FakeSource::new().with_file(file, b"import torch\nclass Model:\n    pass\n");
+        let indexer = CodeGraphIndexer::new();
+
+        let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        // Every EdgeKind the real EdgeKind enum has today is a valid
+        // match arm here; there is no `Imports` arm to even write.
+        for edge in outcome.graph.all_edges() {
+            assert!(matches!(
+                edge.kind,
+                EdgeKind::Calls | EdgeKind::Implements | EdgeKind::Extends | EdgeKind::References | EdgeKind::TestsFor | EdgeKind::RenamedTo | EdgeKind::Contains | EdgeKind::Instantiates
+            ));
+        }
     }
 }

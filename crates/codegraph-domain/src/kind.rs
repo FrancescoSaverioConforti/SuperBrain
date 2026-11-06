@@ -49,6 +49,21 @@ pub enum SymbolKind {
     CssRule,
     /// A named `@keyframes <name>` CSS at-rule.
     CssKeyframes,
+    /// Task 9.5, first expansion-set variant (see the plan's section 8b
+    /// roadmap): an explicit instance attribute/field assignment —
+    /// Python's `self.X = <expr>`, confirmed by a real-repository
+    /// validation pass (`docs/research/evaluations/B2-EVAL-001.md`) to
+    /// be a frequent, significant, stably-identified construct real
+    /// deep-learning code assigns submodules/components to (and plain
+    /// scalar/config state too — `Field` extraction does not require
+    /// the right-hand side to be a constructor call; see
+    /// `codegraph-index::extract::python`'s module doc comment for the
+    /// exact, conservative AST rule and what is deliberately excluded).
+    /// `self` here is Python-specific; other languages' own receiver/
+    /// `this`-equivalent semantics are a separate, future, evidence-
+    /// driven decision — `Field` is not assumed universal across
+    /// languages by this variant's existence alone.
+    Field,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -87,6 +102,7 @@ impl SymbolKind {
             "html-id-element" => Ok(Self::HtmlIdElement),
             "css-rule" => Ok(Self::CssRule),
             "css-keyframes" => Ok(Self::CssKeyframes),
+            "field" => Ok(Self::Field),
             _ => Err(UnrecognizedSymbolKind { raw: raw.to_string() }),
         }
     }
@@ -95,12 +111,43 @@ impl SymbolKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
     Calls,
-    Imports,
+    /// `Imports` was REMOVED (Task 9.5, Priority 6 — see
+    /// B2-ID-005): the original symbol-to-symbol design mismatched
+    /// real import semantics (a file/module-level fact, never a single
+    /// symbol's own) and was empirically confirmed to capture 0 of 589
+    /// real import statements in a real-repository evaluation. Its
+    /// replacement, `codegraph_index::imports::ImportFact`, is a
+    /// separate, file-level fact — deliberately NOT an `EdgeKind`
+    /// variant, since there is no symbol this fact can honestly be
+    /// "from" without reintroducing the same granularity mismatch. This
+    /// comment is kept (rather than silently renumbering the enum) so a
+    /// reader of old data/docs referencing "Imports" finds the reason
+    /// it is gone, not just its absence.
     Implements,
     Extends,
     References,
     TestsFor,
     RenamedTo,
+    /// Task 9.5: a structural containment relation — a class containing
+    /// a method or field, or a module/file containing a top-level
+    /// symbol. Always `StaticAnalysis`: containment is read directly
+    /// off the AST's own nesting, never a heuristic guess. Deliberately
+    /// NOT a catch-all — only class-contains-method, class-contains-
+    /// field, and module/file-contains-top-level-symbol are produced;
+    /// no other containment shape is invented to fit this one variant.
+    Contains,
+    /// Task 9.5: a field/attribute's right-hand side is a resolvable
+    /// constructor/call expression naming another known symbol —
+    /// `self.encoder = TransformerEncoder(...)` once `TransformerEncoder`
+    /// resolves to a snapshot in the given pool. Stricter than `Field`
+    /// extraction itself: not every `Field` has a corresponding
+    /// `Instantiates` edge (a scalar/config assignment like
+    /// `self.ninp = ninp` never does), and no edge is ever produced for
+    /// an external/unresolvable constructor (e.g. `nn.Linear`, a
+    /// third-party class never indexed in the given pool) — "no edge
+    /// beats a false edge" applies here exactly as it does for every
+    /// other edge kind in this project.
+    Instantiates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -113,12 +160,13 @@ impl EdgeKind {
     pub fn parse(raw: &str) -> Result<Self, UnrecognizedEdgeKind> {
         match raw {
             "calls" => Ok(Self::Calls),
-            "imports" => Ok(Self::Imports),
             "implements" => Ok(Self::Implements),
             "extends" => Ok(Self::Extends),
             "references" => Ok(Self::References),
             "tests_for" => Ok(Self::TestsFor),
             "renamed_to" => Ok(Self::RenamedTo),
+            "contains" => Ok(Self::Contains),
+            "instantiates" => Ok(Self::Instantiates),
             _ => Err(UnrecognizedEdgeKind { raw: raw.to_string() }),
         }
     }
@@ -144,6 +192,7 @@ mod tests {
             ("html-id-element", SymbolKind::HtmlIdElement),
             ("css-rule", SymbolKind::CssRule),
             ("css-keyframes", SymbolKind::CssKeyframes),
+            ("field", SymbolKind::Field),
         ];
         for (raw, expected) in cases {
             assert_eq!(SymbolKind::parse(raw), Ok(expected));
@@ -170,12 +219,13 @@ mod tests {
     fn every_edge_kind_variant_round_trips_through_its_canonical_string() {
         let cases = [
             ("calls", EdgeKind::Calls),
-            ("imports", EdgeKind::Imports),
             ("implements", EdgeKind::Implements),
             ("extends", EdgeKind::Extends),
             ("references", EdgeKind::References),
             ("tests_for", EdgeKind::TestsFor),
             ("renamed_to", EdgeKind::RenamedTo),
+            ("contains", EdgeKind::Contains),
+            ("instantiates", EdgeKind::Instantiates),
         ];
         for (raw, expected) in cases {
             assert_eq!(EdgeKind::parse(raw), Ok(expected));

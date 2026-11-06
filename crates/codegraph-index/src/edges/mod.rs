@@ -1,7 +1,26 @@
 //! B2 Task 7: typed, non-lineage edges between `SymbolSnapshot`s —
-//! `Calls`, `Imports`, `Implements`, `Extends`, `References`, `TestsFor`.
-//! No graph storage (Task 8), no persistence, no API, no MCP, no Task 9
+//! `Calls`, `Implements`, `Extends`, `References`, `TestsFor`. No graph
+//! storage (Task 8), no persistence, no API, no MCP, no Task 9
 //! incremental indexing.
+//!
+//! # `Imports` — removed, see B2-ID-005
+//!
+//! Task 7 originally added a symbol-to-symbol `EdgeKind::Imports`
+//! (`resolve_imports` in this module), resolved by re-parsing each
+//! `SymbolSnapshot`'s own `signature_text` for import-shaped nodes.
+//! Task 9.5's Priority 6 real-repository evaluation
+//! ([B2-EVAL-001](../../../../docs/research/evaluations/B2-EVAL-001.md))
+//! empirically confirmed this captured 0 of 589 real import statements
+//! in a 97-file corpus: an import statement is a FILE/module-level
+//! fact, written above the symbols it applies to, and never inside any
+//! one symbol's own byte span — so it was never present in the text
+//! this design re-parsed. The granularity itself (symbol-to-symbol)
+//! was the defect, not a fixable bug in the matching logic, so it was
+//! REMOVED rather than patched. See
+//! [B2-ID-005](../../../../docs/research/findings/B2-ID-005.md) for the
+//! full analysis and its replacement, `crate::imports::ImportFact` — a
+//! separate, file-level fact model, deliberately NOT expressed as a
+//! `SymbolSnapshot`-to-`SymbolSnapshot` `Edge` in this module.
 //!
 //! # The one rule that governs everything in this module
 //!
@@ -43,13 +62,37 @@
 //! same resolution logic finds it without any change to this module.
 
 mod calls;
+mod contains;
 mod extends_implements;
-mod imports;
+mod instantiates;
 mod resolution;
 mod tests_for;
 
 pub use calls::resolve_calls;
+pub use contains::resolve_contains;
 pub use extends_implements::resolve_extends_implements;
-pub use imports::resolve_imports;
+pub use instantiates::resolve_instantiates;
 pub use resolution::{Edge, EdgeResolutionError};
 pub use tests_for::resolve_tests_for;
+
+use crate::snapshot::SymbolSnapshot;
+
+/// Runs EVERY typed-edge resolver this module owns against the same
+/// snapshot pool, in one place. Task 9.5 introduced this after finding
+/// the 4-resolver call block independently duplicated between
+/// `incremental::pipeline::index_files` and
+/// `incremental::indexer::incremental_reindex` — a real risk that a
+/// future new resolver (like this task's own `Contains`/`Instantiates`)
+/// would be wired into one call site and silently omitted from the
+/// other, making the incremental path quietly diverge from a full
+/// reindex. Both call sites now go through this single function
+/// instead of their own independent lists.
+pub fn resolve_all_typed_edges(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeResolutionError> {
+    let mut edges = Vec::new();
+    edges.extend(resolve_calls(snapshots)?);
+    edges.extend(resolve_extends_implements(snapshots)?);
+    edges.extend(resolve_tests_for(snapshots)?);
+    edges.extend(resolve_contains(snapshots)?);
+    edges.extend(resolve_instantiates(snapshots)?);
+    Ok(edges)
+}

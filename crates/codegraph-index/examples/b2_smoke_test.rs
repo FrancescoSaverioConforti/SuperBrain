@@ -9,9 +9,11 @@
 //!
 //! No fixture-specific hacks: this uses exactly the public API
 //! (`LocalGitRepositorySource`, `extract_symbols_reporting_rejections`,
-//! `promote`, `resolve_lineage`, `resolve_calls`/`resolve_imports`/
-//! `resolve_extends_implements`/`resolve_tests_for`, `CodeGraph`,
-//! `CodeGraphIndexer`) that any other caller of this crate would use.
+//! `promote`, `resolve_lineage`, `resolve_calls`/
+//! `resolve_extends_implements`/`resolve_tests_for`,
+//! `imports::ImportFact` (via `CodeGraphIndexer::observe_commit`'s own
+//! output), `CodeGraph`, `CodeGraphIndexer`) that any other caller of
+//! this crate would use.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,8 +21,9 @@ use std::time::Instant;
 
 use codegraph_domain::{CommitHash, EdgeKind, RepositorySource, ResolutionMethod, SymbolKind};
 use codegraph_index::allowlist::RepositoryAllowlist;
-use codegraph_index::edges::{resolve_calls, resolve_extends_implements, resolve_imports, resolve_tests_for};
+use codegraph_index::edges::{resolve_calls, resolve_extends_implements, resolve_tests_for};
 use codegraph_index::extract::extract_symbols_reporting_rejections;
+use codegraph_index::imports::ImportResolution;
 use codegraph_index::incremental::CodeGraphIndexer;
 use codegraph_index::local_git_source::LocalGitRepositorySource;
 use codegraph_index::parse::parser_for;
@@ -141,16 +144,17 @@ fn main() {
     let lineage_edges = codegraph_index::lineage::resolve_lineage(&[], &snapshots, &no_known_lineage).expect("resolve_lineage at B (no prev)");
 
     let calls_edges = resolve_calls(&snapshots).expect("resolve_calls");
-    let imports_edges = resolve_imports(&snapshots).expect("resolve_imports");
     let extends_edges = resolve_extends_implements(&snapshots).expect("resolve_extends_implements");
     let tests_for_edges = resolve_tests_for(&snapshots).expect("resolve_tests_for");
+    let contains_edges = codegraph_index::edges::resolve_contains(&snapshots).expect("resolve_contains");
+    let instantiates_edges = codegraph_index::edges::resolve_instantiates(&snapshots).expect("resolve_instantiates");
 
     // Detect duplicate (from, to, kind) typed-edge triples within one
     // resolver's own output — the same shape CodeGraph::insert_edge
     // rejects, surfaced here as a report finding instead of a panic.
     {
         let mut seen: HashMap<(codegraph_domain::SymbolSnapshotId, codegraph_domain::SymbolSnapshotId, EdgeKind), usize> = HashMap::new();
-        for edge in calls_edges.iter().chain(imports_edges.iter()).chain(extends_edges.iter()).chain(tests_for_edges.iter()) {
+        for edge in calls_edges.iter().chain(extends_edges.iter()).chain(tests_for_edges.iter()).chain(contains_edges.iter()).chain(instantiates_edges.iter()) {
             *seen.entry((edge.from, edge.to, edge.kind)).or_insert(0) += 1;
         }
         let dups: Vec<_> = seen.into_iter().filter(|(_, count)| *count > 1).collect();
@@ -166,7 +170,7 @@ fn main() {
 
     let mut edge_kind_counts: HashMap<EdgeKind, usize> = HashMap::new();
     let mut resolution_method_counts: HashMap<ResolutionMethod, usize> = HashMap::new();
-    for edge in calls_edges.iter().chain(imports_edges.iter()).chain(extends_edges.iter()).chain(tests_for_edges.iter()) {
+    for edge in calls_edges.iter().chain(extends_edges.iter()).chain(tests_for_edges.iter()).chain(contains_edges.iter()).chain(instantiates_edges.iter()) {
         *edge_kind_counts.entry(edge.kind).or_insert(0) += 1;
         *resolution_method_counts.entry(edge.evidence.method()).or_insert(0) += 1;
     }
@@ -198,7 +202,6 @@ fn main() {
     println!("\n--- D. Edge quality ---");
     println!("lineage_edges (B alone, no prev): {}", lineage_edges.len());
     println!("calls_edges: {}", calls_edges.len());
-    println!("imports_edges: {}", imports_edges.len());
     println!("extends_implements_edges: {}", extends_edges.len());
     println!("tests_for_edges: {}", tests_for_edges.len());
     let mut edge_kind_counts_vec: Vec<_> = edge_kind_counts.into_iter().collect();
@@ -236,27 +239,25 @@ fn main() {
         }
     }
 
-    // --- Imports gap measurement: count real import statements across
-    // the Python files that actually contributed a promoted snapshot,
-    // vs. how many Imports edges were produced — a direct empirical
-    // check of the Task 7 finding.
-    {
-        let mut total_import_statements = 0usize;
-        for relative_path in &files {
-            if !relative_path.ends_with(".py") {
-                continue;
-            }
-            let file = codegraph_domain::FileIdentity::parse(repo_id, commit_b.clone(), relative_path).unwrap();
-            if let Ok(bytes) = source.read_file(&file) {
-                let text = String::from_utf8_lossy(&bytes);
-                total_import_statements += text.lines().filter(|l| l.trim_start().starts_with("import ") || l.trim_start().starts_with("from ")).count();
-            }
+    // --- Imports measurement (Task 9.5, Priority 6): deferred until
+    // AFTER `CodeGraphIndexer::observe_commit` runs below, so this
+    // measures the REAL production pipeline's own `import_facts`
+    // output (`outcome_b.import_facts`) — not a manually-reconstructed
+    // resolver call — per the explicit instruction that this
+    // re-evaluation must reflect what an actual caller of this crate
+    // receives. See that section for the numbers and their
+    // interpretation.
+    let mut total_import_statements_line_based = 0usize;
+    for relative_path in &files {
+        if !relative_path.ends_with(".py") {
+            continue;
         }
-        println!("\n--- Imports gap measurement ---");
-        println!("total_import_statements_in_python_files (line-based count, MEASURED): {total_import_statements}");
-        println!("imports_edges_produced (MEASURED): {}", imports_edges.len());
+        let file = codegraph_domain::FileIdentity::parse(repo_id, commit_b.clone(), relative_path).unwrap();
+        if let Ok(bytes) = source.read_file(&file) {
+            let text = String::from_utf8_lossy(&bytes);
+            total_import_statements_line_based += text.lines().filter(|l| l.trim_start().starts_with("import ") || l.trim_start().starts_with("from ")).count();
+        }
     }
-
     // --- G. Performance observation: approximate RSS (best-effort, Windows) ---
     print_approx_memory();
 
@@ -291,6 +292,49 @@ fn main() {
     println!("observe_commit(B) final edge_count: {}", outcome_b.graph.edge_count());
     println!("observe_commit(B) final lineage_edge_count: {}", outcome_b.graph.lineage_edge_count());
 
+    // --- Imports measurement (Task 9.5, Priority 6), using the REAL
+    // indexer's own `import_facts` output (`outcome_b.import_facts`),
+    // not a manually-reconstructed resolver call — this reflects
+    // exactly what an actual caller of `CodeGraphIndexer` receives.
+    // The ORIGINAL Task 7 `EdgeKind::Imports`/`resolve_imports` design
+    // (removed — see B2-ID-005) captured 0 of 589 real import
+    // statements in this exact corpus, because it only ever looked
+    // inside a symbol's own `signature_text`, never the file's own
+    // leading import statements. Per the Evidence-before-claims
+    // Experimental Policy, EXTRACTION COVERAGE (did we find the import
+    // statement at all) and RESOLUTION ACCURACY (did we correctly
+    // classify where it points) are measured and reported SEPARATELY,
+    // never collapsed into one generic "Imports coverage" number.
+    {
+        let python_import_facts = outcome_b.import_facts.iter().filter(|f| f.importing_file.relative_path().ends_with(".py")).count();
+        let internal_count = outcome_b.import_facts.iter().filter(|f| matches!(f.resolution, ImportResolution::Internal(_))).count();
+        let external_count = outcome_b.import_facts.iter().filter(|f| f.resolution == ImportResolution::External).count();
+        let ambiguous_count = outcome_b.import_facts.iter().filter(|f| f.resolution == ImportResolution::Ambiguous).count();
+        let alias_count = outcome_b.import_facts.iter().filter(|f| f.alias.is_some()).count();
+
+        println!("\n--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---");
+        println!("total_import_statements_in_python_files_at_commit_b (line-based count, MEASURED): {total_import_statements_line_based}");
+        println!("python_import_facts_extracted (MEASURED, ImportFact, file-level, Priority 6): {python_import_facts}");
+        println!(
+            "extraction_coverage: {python_import_facts}/{total_import_statements_line_based} ({:.1}%)",
+            if total_import_statements_line_based > 0 {
+                100.0 * python_import_facts as f64 / total_import_statements_line_based as f64
+            } else {
+                0.0
+            }
+        );
+        println!("total_import_facts_all_languages (MEASURED): {}", outcome_b.import_facts.len());
+        println!("  resolution_internal (MEASURED): {internal_count}");
+        println!("  resolution_external (MEASURED): {external_count}");
+        println!("  resolution_ambiguous (MEASURED): {ambiguous_count}");
+        println!("  aliases_captured (MEASURED): {alias_count}");
+        println!(
+            "  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): {}",
+            outcome_b.metrics.raw_import_statements_extracted
+        );
+        println!("  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): {}", outcome_b.metrics.raw_import_statements_reused);
+    }
+
     // --- Deep-learning usefulness Q&A, answered using ONLY the real
     // CodeGraph built above (observe_commit(B)'s final graph) ---
     {
@@ -298,6 +342,30 @@ fn main() {
         println!("\n--- Deep-learning usefulness Q&A (word_language_model, commit B) ---");
 
         let find_by_name = |name: &str| -> Vec<&codegraph_index::snapshot::SymbolSnapshot> { graph.all_snapshots().into_iter().filter(|s| s.name().as_str() == name).collect() };
+
+        // General, reusable, scope-aware lookup — NOT specific to
+        // PyTorch/this repository: finds the CURRENT (no outgoing
+        // lineage) snapshot named `member_name` that a `Contains` edge
+        // (Task 9.5, Priority 2) attributes to a class named
+        // `class_name`, among whatever classes/members happen to exist
+        // in the given graph. This is the fix for B2-ID-003: an
+        // earlier version of this harness picked "the current snapshot
+        // named X" by LOCAL NAME ALONE, which is ambiguous whenever
+        // more than one class in the same file (or anywhere in the
+        // pool) has a member with that name — exactly the real case
+        // here (`RNNModel.forward` and `TransformerModel.forward` are
+        // both named `forward`). Looking up via the member's actual
+        // `Contains` parent disambiguates correctly regardless of how
+        // many same-named members exist elsewhere, without hardcoding
+        // either class name anywhere in this function's own logic.
+        let find_current_member_of_class = |class_name: &str, member_name: &str| -> Option<&codegraph_index::snapshot::SymbolSnapshot> {
+            find_by_name(class_name)
+                .into_iter()
+                .filter(|class_snapshot| graph.lineage_from(class_snapshot.id()).is_empty())
+                .flat_map(|class_snapshot| graph.outgoing_edges(class_snapshot.id(), Some(EdgeKind::Contains)))
+                .filter_map(|edge| graph.snapshot(edge.to))
+                .find(|member| member.name().as_str() == member_name && graph.lineage_from(member.id()).is_empty())
+        };
 
         let transformer_model = find_by_name("TransformerModel");
         let current_transformer_model = transformer_model.iter().find(|s| graph.lineage_from(s.id()).is_empty());
@@ -317,29 +385,24 @@ fn main() {
 
         let forward_candidates = find_by_name("forward");
         println!("Q3 'What composes the forward path?' -> {} snapshot(s) named 'forward' in the whole pool (ambiguous by name alone across 97 files)", forward_candidates.len());
-        // Narrow to the CURRENT one inside word_language_model/model.py
-        // specifically — never the historical (pre-edit) one. The
-        // current snapshot is never the `from` of an outgoing lineage
-        // edge (nothing supersedes it); the historical one always is.
-        // `all_snapshots()`'s deterministic byte-order sort gives no
-        // guarantee about which of the two same-named, same-path
-        // snapshots a naive `.find()` would hit first — this disambig-
-        // uation step exists specifically because of that, and is
-        // itself a concrete illustration of the documented residual
-        // limitation from Task 9/B2-ID-002 (CodeGraph has no current-
-        // vs-historical distinction of its own).
-        let model_py_forward_candidates: Vec<_> = forward_candidates.iter().filter(|s| s.file().relative_path() == "word_language_model/model.py").collect();
-        let current_forward = model_py_forward_candidates.iter().find(|s| graph.lineage_from(s.id()).is_empty());
-        println!(
-            "  (word_language_model/model.py has {} 'forward' snapshot(s) in the final graph: current+historical combined)",
-            model_py_forward_candidates.len()
-        );
+        // B2-ID-003 fix: this harness used to pick "the current
+        // snapshot named forward in word_language_model/model.py" by
+        // LOCAL NAME + no-outgoing-lineage alone — ambiguous whenever
+        // more than one class in that file has a `forward` method
+        // (both `RNNModel` and `TransformerModel` do), and confirmed to
+        // have silently picked the WRONG one on some runs, producing a
+        // false negative this harness itself was responsible for, not
+        // the production pipeline. Fixed by looking up `forward`
+        // specifically as `TransformerModel`'s own `Contains` child —
+        // the general, scope-aware lookup defined above, not a
+        // PyTorch-specific special case.
+        let current_forward = find_current_member_of_class("TransformerModel", "forward");
         if let Some(forward) = current_forward {
             let callees = graph.callees_of(forward.id());
             let callee_names: Vec<String> = callees.iter().filter_map(|id| graph.snapshot(*id)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
-            println!("  CURRENT word_language_model/model.py::forward calls: {callee_names:?}");
+            println!("  CURRENT TransformerModel::forward calls: {callee_names:?}");
         } else {
-            println!("  CURRENT word_language_model/model.py::forward NOT FOUND (unexpected)");
+            println!("  CURRENT TransformerModel::forward NOT FOUND (unexpected)");
         }
 
         println!("Q4 'Who calls the model?' -> searching train.py/main.py callers of TransformerModel/RNNModel constructors:");
@@ -353,16 +416,17 @@ fn main() {
 
         println!("Q5 'Which tests are linked?' -> word_language_model has no test file in this repo; TestsFor edges in the whole corpus: {}", tests_for_edges.len());
 
-        // Diagnostic: is `_generate_square_subsequent_mask` (a REAL
-        // same-class method `forward` calls) promoted as its own
-        // snapshot at all? If not found, that is itself a pipeline
-        // observation worth recording, not an edge-resolution bug.
-        let gssm = find_by_name("_generate_square_subsequent_mask");
-        println!(
-            "Diagnostic: '_generate_square_subsequent_mask' snapshots found: {} (in files: {:?})",
-            gssm.len(),
-            gssm.iter().map(|s| s.file().relative_path()).collect::<Vec<_>>()
-        );
+        // Diagnostic: B2-ID-003 regression check — the chained call
+        // `self._generate_square_subsequent_mask(...).to(device)`
+        // inside TransformerModel::forward must resolve correctly once
+        // `forward` itself is looked up scope-aware (not by local name
+        // alone).
+        if let Some(gssm) = find_current_member_of_class("TransformerModel", "_generate_square_subsequent_mask") {
+            if let Some(forward) = current_forward {
+                let is_resolved = graph.callees_of(forward.id()).contains(&gssm.id());
+                println!("Diagnostic (B2-ID-003 regression check): TransformerModel::forward resolves its chained call to _generate_square_subsequent_mask: {is_resolved}");
+            }
+        }
 
         if let Some(forward) = current_forward {
             println!("Q6 'If I modify forward, what is impacted?' -> incoming edges to the CURRENT forward (who is affected if its signature/behavior changes):");

@@ -47,6 +47,7 @@ pub struct UnrecognizedKindHint {
 /// | `element_with_id` | HTML | `HtmlIdElement` |
 /// | `rule_set` | CSS | `CssRule` |
 /// | `keyframes_statement` | CSS | `CssKeyframes` |
+/// | `self_attribute_assignment` | Python | `Field` (Task 9.5; a synthetic `kind_hint`, like `element_with_id` — no single raw tree-sitter node kind names "an instance attribute assignment" on its own, since Python's grammar uses the same `assignment` node for every assignment statement; the Python extractor itself recognizes the specific `attribute`-on-the-left, `self`-receiver shape and labels it this way before it ever reaches this mapping) |
 ///
 /// Note on `trait_item -> Interface`: a Rust `trait` and a C# `interface`
 /// are not semantically identical (a trait can carry default method
@@ -76,6 +77,7 @@ pub fn map_kind_hint(kind_hint: &str) -> Result<SymbolKind, UnrecognizedKindHint
         "element_with_id" => Ok(SymbolKind::HtmlIdElement),
         "rule_set" => Ok(SymbolKind::CssRule),
         "keyframes_statement" => Ok(SymbolKind::CssKeyframes),
+        "self_attribute_assignment" => Ok(SymbolKind::Field),
         _ => Err(UnrecognizedKindHint {
             kind_hint: kind_hint.to_string(),
         }),
@@ -121,6 +123,8 @@ mod tests {
             // CSS
             "rule_set",
             "keyframes_statement",
+            // Python Field (Task 9.5)
+            "self_attribute_assignment",
         ];
         for kind_hint in all_real_kind_hints {
             assert!(map_kind_hint(kind_hint).is_ok(), "expected a mapping for real kind_hint {kind_hint:?}, got none");
@@ -174,6 +178,11 @@ mod tests {
     fn css_kind_hints_map_correctly() {
         assert_eq!(map_kind_hint("rule_set"), Ok(SymbolKind::CssRule));
         assert_eq!(map_kind_hint("keyframes_statement"), Ok(SymbolKind::CssKeyframes));
+    }
+
+    #[test]
+    fn python_field_kind_hint_maps_correctly() {
+        assert_eq!(map_kind_hint("self_attribute_assignment"), Ok(SymbolKind::Field));
     }
 
     #[test]

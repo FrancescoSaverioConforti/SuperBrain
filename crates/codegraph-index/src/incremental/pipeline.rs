@@ -12,9 +12,10 @@
 use codegraph_domain::{CommitHash, FileIdentity, RepositoryId, RepositorySource, SourceError, SymbolSnapshotId};
 use thiserror::Error;
 
-use crate::edges::{resolve_calls, resolve_extends_implements, resolve_imports, resolve_tests_for, Edge, EdgeResolutionError};
+use crate::edges::{resolve_all_typed_edges, Edge, EdgeResolutionError};
 use crate::extract::extract_symbols;
 use crate::graph::{CodeGraph, GraphError};
+use crate::imports::{extract_import_statements, ImportFactError, RawImportStatement};
 use crate::lineage::{resolve_lineage, LineageEdge, LineageResolutionError};
 use crate::parse::parser_for;
 use crate::snapshot::{promote, PromotionError, SymbolSnapshot};
@@ -31,6 +32,8 @@ pub enum PipelineError {
     EdgeResolution(#[from] EdgeResolutionError),
     #[error(transparent)]
     Graph(#[from] GraphError),
+    #[error(transparent)]
+    ImportResolution(#[from] ImportFactError),
 }
 
 /// Everything [`index_files`] produced for one commit, before any
@@ -45,6 +48,18 @@ pub struct PipelineOutput {
     pub snapshots: Vec<SymbolSnapshot>,
     pub lineage_edges: Vec<LineageEdge>,
     pub typed_edges: Vec<Edge>,
+    /// Task 9.5, Priority 6: raw (UNRESOLVED) import statements
+    /// extracted from exactly the files this call parsed, paired with
+    /// the `FileIdentity` that imports them. Deliberately raw, not
+    /// `ImportFact` — resolving an import against the full repository-
+    /// wide snapshot pool requires the pool `indexer.rs` assembles
+    /// AFTER this function returns (the same reason `typed_edges`
+    /// itself is resolved from the full current pool, not from
+    /// `relative_paths` alone); this function only has the files it
+    /// was actually asked to parse. See `imports` module's own doc
+    /// comment for why this split (local syntax extraction vs. global
+    /// semantic resolution) exists.
+    pub raw_import_statements: Vec<(FileIdentity, RawImportStatement)>,
 }
 
 /// Parses, extracts and promotes every file in `relative_paths` (all
@@ -77,6 +92,7 @@ pub fn index_files(
     known_lineage_of: &dyn Fn(SymbolSnapshotId) -> Option<codegraph_domain::SymbolLineageId>,
 ) -> Result<PipelineOutput, PipelineError> {
     let mut snapshots = Vec::new();
+    let mut raw_import_statements = Vec::new();
 
     for relative_path in relative_paths {
         let file = FileIdentity::parse(repository, commit.clone(), relative_path).map_err(|e| PipelineError::Source(SourceError::Other { reason: e.to_string() }))?;
@@ -101,20 +117,24 @@ pub fn index_files(
             // wrong (e.g. a kind-mapping gap) than one skippable file.
             snapshots.push(promote(&candidate, file.clone())?);
         }
+        // Priority 6: raw import extraction is pure syntax (no
+        // snapshot-pool dependency), so it runs here, scoped to exactly
+        // the files this call parsed — mirroring symbol extraction's
+        // own scope, never the full repository.
+        for statement in extract_import_statements(&tree) {
+            raw_import_statements.push((file.clone(), statement));
+        }
     }
 
     let lineage_edges = resolve_lineage(prev_snapshots, &snapshots, known_lineage_of)?;
 
-    let mut typed_edges = Vec::new();
-    typed_edges.extend(resolve_calls(&snapshots)?);
-    typed_edges.extend(resolve_imports(&snapshots)?);
-    typed_edges.extend(resolve_extends_implements(&snapshots)?);
-    typed_edges.extend(resolve_tests_for(&snapshots)?);
+    let typed_edges = resolve_all_typed_edges(&snapshots)?;
 
     Ok(PipelineOutput {
         snapshots,
         lineage_edges,
         typed_edges,
+        raw_import_statements,
     })
 }
 
@@ -208,8 +228,13 @@ mod tests {
         let output = index_files(&source, repo, &commit, &["src/model.py".to_string()], &[], &no_known_lineage).unwrap();
 
         assert_eq!(output.snapshots.len(), 3, "expected Module, MyModel, forward");
-        assert_eq!(output.typed_edges.len(), 1, "expected exactly one Extends edge");
-        assert_eq!(output.typed_edges[0].kind, codegraph_domain::EdgeKind::Extends);
+        // 2 typed edges, not 1: an Extends edge (MyModel extends
+        // Module) PLUS a Contains edge (MyModel contains forward,
+        // Task 9.5) — this is the whole point of resolve_all_typed_edges
+        // now running every resolver, not a regression.
+        assert_eq!(output.typed_edges.len(), 2, "expected one Extends edge and one Contains edge");
+        assert_eq!(output.typed_edges.iter().filter(|e| e.kind == codegraph_domain::EdgeKind::Extends).count(), 1);
+        assert_eq!(output.typed_edges.iter().filter(|e| e.kind == codegraph_domain::EdgeKind::Contains).count(), 1);
     }
 
     #[test]

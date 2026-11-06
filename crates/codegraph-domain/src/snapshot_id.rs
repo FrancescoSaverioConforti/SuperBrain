@@ -191,6 +191,8 @@ fn kind_discriminant(kind: SymbolKind) -> u8 {
         SymbolKind::HtmlIdElement => 10,
         SymbolKind::CssRule => 11,
         SymbolKind::CssKeyframes => 12,
+        // Added at Task 9.5. Existing discriminants above are UNCHANGED.
+        SymbolKind::Field => 13,
     }
 }
 

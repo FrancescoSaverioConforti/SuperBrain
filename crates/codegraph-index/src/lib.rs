@@ -19,6 +19,7 @@ pub mod allowlist;
 pub mod edges;
 pub mod extract;
 pub mod graph;
+pub mod imports;
 pub mod incremental;
 pub mod lineage;
 pub mod local_git_source;

@@ -109,8 +109,9 @@ impl CodeGraph {
         Ok(())
     }
 
-    /// Inserts `edge` (a typed, non-lineage edge: `Calls`, `Imports`,
-    /// `Implements`, `Extends`, `References`, `TestsFor`, `RenamedTo`).
+    /// Inserts `edge` (a typed, non-lineage edge: `Calls`,
+    /// `Implements`, `Extends`, `References`, `TestsFor`, `RenamedTo`,
+    /// `Contains`, `Instantiates`).
     /// Both endpoints must already be present; the same `(from, to,
     /// kind)` triple must not already exist; both endpoints must share a
     /// `RepositoryId`.
@@ -251,12 +252,13 @@ fn sort_edges_by_other_endpoint(edges: &mut [&Edge], direction: Direction) {
 pub(super) fn edge_kind_rank(kind: EdgeKind) -> u8 {
     match kind {
         EdgeKind::Calls => 0,
-        EdgeKind::Imports => 1,
-        EdgeKind::Implements => 2,
-        EdgeKind::Extends => 3,
-        EdgeKind::References => 4,
-        EdgeKind::TestsFor => 5,
-        EdgeKind::RenamedTo => 6,
+        EdgeKind::Implements => 1,
+        EdgeKind::Extends => 2,
+        EdgeKind::References => 3,
+        EdgeKind::TestsFor => 4,
+        EdgeKind::RenamedTo => 5,
+        EdgeKind::Contains => 6,
+        EdgeKind::Instantiates => 7,
     }
 }
 
@@ -807,12 +809,13 @@ mod tests {
         // though no sorting is involved.
         let kinds = [
             EdgeKind::Calls,
-            EdgeKind::Imports,
             EdgeKind::Implements,
             EdgeKind::Extends,
             EdgeKind::References,
             EdgeKind::TestsFor,
             EdgeKind::RenamedTo,
+            EdgeKind::Contains,
+            EdgeKind::Instantiates,
         ];
         let ranks: Vec<u8> = kinds.iter().map(|k| edge_kind_rank(*k)).collect();
         let mut unique_ranks = ranks.clone();
