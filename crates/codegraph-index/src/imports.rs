@@ -176,7 +176,14 @@ pub fn resolve_raw_import_statements(raw_statements: &[(FileIdentity, RawImportS
     Ok(facts)
 }
 
-fn reject_duplicate_ids(snapshots: &[SymbolSnapshot]) -> Result<(), ImportFactError> {
+/// `pub(crate)` so [`crate::impls`]'s own `ImplFactError::DuplicateSnapshotId`
+/// check can reuse this exact rejection logic rather than maintaining a
+/// second, separately-drifting duplicate-detection function — the two
+/// modules' error enums are structurally identical for the same reason
+/// (`ImplFact`/`ImportFact` both resolve against the same kind of
+/// `&[SymbolSnapshot]` candidate pool), so one shared implementation is
+/// the honest choice over a copy that could silently diverge.
+pub(crate) fn reject_duplicate_ids(snapshots: &[SymbolSnapshot]) -> Result<(), ImportFactError> {
     let mut seen = std::collections::HashSet::with_capacity(snapshots.len());
     for snapshot in snapshots {
         if !seen.insert(snapshot.id()) {
