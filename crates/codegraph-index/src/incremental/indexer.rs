@@ -56,6 +56,7 @@ use thiserror::Error;
 
 use super::pipeline::{build_graph, index_files, PipelineError};
 use crate::graph::{CodeGraph, GraphError};
+use crate::impls::{resolve_implements_from_impl_facts, resolve_raw_impl_statements, ImplFact, RawImplStatement};
 use crate::imports::{resolve_raw_import_statements, ImportFact, RawImportStatement};
 use crate::snapshot::SymbolSnapshot;
 
@@ -86,6 +87,11 @@ struct RepositoryState {
     generation: u64,
     raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
     import_facts: Arc<Vec<ImportFact>>,
+    /// B2-ID-008, Task 4: mirrors `raw_import_statements`/`import_facts`
+    /// exactly — same incremental-reuse-vs-always-recompute split, same
+    /// reason (see this struct's own doc comment above).
+    raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
+    impl_facts: Arc<Vec<ImplFact>>,
 }
 
 /// What [`CodeGraphIndexer::begin_observe`] (critical section 1)
@@ -97,6 +103,7 @@ struct ObserveClaim {
     relationship: CommitRelationship,
     prior_graph: Option<Arc<CodeGraph>>,
     prior_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
+    prior_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
     generation: u64,
 }
 
@@ -179,6 +186,18 @@ pub struct IndexMetrics {
     /// `RepositoryState`'s own doc comment for why resolution is not
     /// incrementally reused, unlike extraction).
     pub import_facts_resolved: usize,
+    /// B2-ID-008, Task 4: raw `impl` statements newly (re-)extracted
+    /// this call — mirrors `raw_import_statements_extracted` exactly.
+    pub raw_impl_statements_extracted: usize,
+    /// Raw `impl` statements CARRIED FORWARD unchanged from the prior
+    /// commit's untouched files, never re-extracted — mirrors
+    /// `raw_import_statements_reused` exactly.
+    pub raw_impl_statements_reused: usize,
+    /// Resolved `ImplFact`s in the newly-published state — ALWAYS
+    /// recomputed from the full raw-statement set on every call, for
+    /// the identical reason `import_facts_resolved` is — mirrors
+    /// `import_facts_resolved` exactly.
+    pub impl_facts_resolved: usize,
 }
 
 /// What a successful [`CodeGraphIndexer::observe_commit`] call returns.
@@ -199,6 +218,11 @@ pub struct ObserveOutcome {
     /// later generation's facts if this call lost the publish race,
     /// never a partial/stale mix.
     pub import_facts: Arc<Vec<ImportFact>>,
+    /// B2-ID-008, Task 4: the CURRENTLY published `ImplFact`s for this
+    /// repository — mirrors `import_facts` exactly (same atomicity:
+    /// either this call's own freshly-resolved facts, or a later
+    /// generation's facts if this call lost the publish race).
+    pub impl_facts: Arc<Vec<ImplFact>>,
     pub metrics: IndexMetrics,
 }
 
@@ -350,20 +374,39 @@ impl CodeGraphIndexer {
                 generation: existing.generation,
                 graph: existing.graph.clone(),
                 import_facts: existing.import_facts.clone(),
+                impl_facts: existing.impl_facts.clone(),
                 metrics: IndexMetrics::default(),
             });
         }
 
-        let (new_graph, new_raw_import_statements, import_facts, metrics) = match claim.relationship {
+        let (new_graph, new_raw_import_statements, import_facts, new_raw_impl_statements, impl_facts, metrics) = match claim.relationship {
             CommitRelationship::NewRepository | CommitRelationship::HistoryRewriteOrUnknownAncestor => self.full_reindex(source, repository, new_commit)?,
             CommitRelationship::NormalAdvance => {
                 let prior_graph = claim.prior_graph.expect("NormalAdvance implies prior state exists");
-                self.incremental_reindex(source, repository, new_commit, &prior_graph, &claim.prior_raw_import_statements, changed_files)?
+                self.incremental_reindex(
+                    source,
+                    repository,
+                    new_commit,
+                    &prior_graph,
+                    &claim.prior_raw_import_statements,
+                    &claim.prior_raw_impl_statements,
+                    changed_files,
+                )?
             }
             CommitRelationship::AlreadyObserved => unreachable!("handled above"),
         };
 
-        Ok(self.publish(repository, new_commit.clone(), claim.generation, new_graph, new_raw_import_statements, import_facts, metrics))
+        Ok(self.publish(
+            repository,
+            new_commit.clone(),
+            claim.generation,
+            new_graph,
+            new_raw_import_statements,
+            import_facts,
+            new_raw_impl_statements,
+            impl_facts,
+            metrics,
+        ))
     }
 
     /// Critical section 1: classify this call's relationship to the
@@ -372,11 +415,16 @@ impl CodeGraphIndexer {
     /// rebuild. Returns the prior graph (a cloned `Arc`, cheap) so the
     /// caller can build the incremental update outside the lock.
     fn begin_observe(&self, repository: RepositoryId, new_commit: &CommitHash, expected_prev_commit: Option<&CommitHash>) -> ObserveClaim {
-        let (relationship, prior_graph, prior_raw_import_statements) = {
+        let (relationship, prior_graph, prior_raw_import_statements, prior_raw_impl_statements) = {
             let state = self.state.lock().unwrap();
             let prior = state.get(&repository);
             let relationship = classify_commit(prior, new_commit, expected_prev_commit);
-            (relationship, prior.map(|s| s.graph.clone()), prior.map(|s| s.raw_import_statements.clone()).unwrap_or_default())
+            (
+                relationship,
+                prior.map(|s| s.graph.clone()),
+                prior.map(|s| s.raw_import_statements.clone()).unwrap_or_default(),
+                prior.map(|s| s.raw_impl_statements.clone()).unwrap_or_default(),
+            )
         };
         // Claimed from a counter entirely separate from `state`'s own
         // per-repository generations — see `next_generation`'s own doc
@@ -393,6 +441,7 @@ impl CodeGraphIndexer {
             relationship,
             prior_graph,
             prior_raw_import_statements,
+            prior_raw_impl_statements,
             generation,
         }
     }
@@ -403,25 +452,42 @@ impl CodeGraphIndexer {
         source: &dyn RepositorySource,
         repository: RepositoryId,
         commit: &CommitHash,
-    ) -> Result<(CodeGraph, Vec<(codegraph_domain::FileIdentity, RawImportStatement)>, Vec<ImportFact>, IndexMetrics), ObserveError> {
+    ) -> Result<
+        (
+            CodeGraph,
+            Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
+            Vec<ImportFact>,
+            Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
+            Vec<ImplFact>,
+            IndexMetrics,
+        ),
+        ObserveError,
+    > {
         let files = source.list_files_at(repository, commit).map_err(|e| ObserveError::Pipeline(PipelineError::Source(e)))?;
         let no_known_lineage = |_: SymbolSnapshotId| None;
         let output = index_files(source, repository, commit, &files, &[], &no_known_lineage)?;
 
         let import_facts = resolve_raw_import_statements(&output.raw_import_statements, &output.snapshots).map_err(PipelineError::from)?;
+        let impl_facts = resolve_raw_impl_statements(&output.raw_impl_statements, &output.snapshots).map_err(PipelineError::from)?;
+        let implements_edges = resolve_implements_from_impl_facts(&impl_facts);
 
         let metrics = IndexMetrics {
             files_considered: files.len(),
             files_reparsed: files.len(),
             snapshots_removed: 0,
             snapshots_added: output.snapshots.len(),
-            edges_rebuilt: output.lineage_edges.len() + output.typed_edges.len(),
+            edges_rebuilt: output.lineage_edges.len() + output.typed_edges.len() + implements_edges.len(),
             raw_import_statements_extracted: output.raw_import_statements.len(),
             raw_import_statements_reused: 0,
             import_facts_resolved: import_facts.len(),
+            raw_impl_statements_extracted: output.raw_impl_statements.len(),
+            raw_impl_statements_reused: 0,
+            impl_facts_resolved: impl_facts.len(),
         };
-        let graph = build_graph(output.snapshots, output.lineage_edges, output.typed_edges)?;
-        Ok((graph, output.raw_import_statements, import_facts, metrics))
+        let mut typed_edges = output.typed_edges;
+        typed_edges.extend(implements_edges);
+        let graph = build_graph(output.snapshots, output.lineage_edges, typed_edges)?;
+        Ok((graph, output.raw_import_statements, import_facts, output.raw_impl_statements, impl_facts, metrics))
     }
 
     /// Incremental update: re-parses/re-extracts/re-promotes ONLY
@@ -442,6 +508,7 @@ impl CodeGraphIndexer {
     /// function actually scopes down to `changed_files` only (see
     /// `IndexMetrics::files_reparsed` vs. `files_considered`).
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn incremental_reindex(
         &self,
         source: &dyn RepositorySource,
@@ -449,8 +516,19 @@ impl CodeGraphIndexer {
         new_commit: &CommitHash,
         prior_graph: &CodeGraph,
         prior_raw_import_statements: &[(codegraph_domain::FileIdentity, RawImportStatement)],
+        prior_raw_impl_statements: &[(codegraph_domain::FileIdentity, RawImplStatement)],
         changed_files: &[String],
-    ) -> Result<(CodeGraph, Vec<(codegraph_domain::FileIdentity, RawImportStatement)>, Vec<ImportFact>, IndexMetrics), ObserveError> {
+    ) -> Result<
+        (
+            CodeGraph,
+            Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
+            Vec<ImportFact>,
+            Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
+            Vec<ImplFact>,
+            IndexMetrics,
+        ),
+        ObserveError,
+    > {
         let changed_set: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
 
         let untouched_snapshots: Vec<SymbolSnapshot> = prior_graph.all_snapshots().into_iter().filter(|s| !changed_set.contains(s.file().relative_path())).cloned().collect();
@@ -494,7 +572,7 @@ impl CodeGraphIndexer {
         let mut current_snapshots = untouched_snapshots;
         current_snapshots.extend(output.snapshots.clone());
 
-        let typed_edges = crate::edges::resolve_all_typed_edges(&current_snapshots).map_err(PipelineError::from)?;
+        let mut typed_edges = crate::edges::resolve_all_typed_edges(&current_snapshots).map_err(PipelineError::from)?;
 
         // Lineage across the UNCHANGED portion is already final (it was
         // resolved and published by an earlier observe_commit call);
@@ -559,6 +637,27 @@ impl CodeGraphIndexer {
         // file's symbol it names is renamed/moved/added/removed).
         let import_facts = resolve_raw_import_statements(&raw_import_statements, &final_snapshots).map_err(PipelineError::from)?;
 
+        // B2-ID-008, Task 4: identical incremental semantics for raw
+        // impl statements — reused for every UNTOUCHED file, freshly
+        // extracted for every file this call actually reparsed. See
+        // the `raw_import_statements` block immediately above for why
+        // this mirrors it field-for-field.
+        let untouched_raw_impl_statements: Vec<_> = prior_raw_impl_statements.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
+        let untouched_raw_impl_statements_len = untouched_raw_impl_statements.len();
+        let mut raw_impl_statements = untouched_raw_impl_statements;
+        raw_impl_statements.extend(output.raw_impl_statements.clone());
+
+        // Resolution (including the derived `Implements` edges) is
+        // ALWAYS recomputed from the full raw-statement set against the
+        // full current snapshot pool — never reused incrementally, for
+        // the identical reason `import_facts`'s own resolution is (see
+        // `RepositoryState`'s own doc comment): an untouched impl's
+        // correct resolution can change when some OTHER file's symbol
+        // it names is added/renamed/removed/moved elsewhere.
+        let impl_facts = resolve_raw_impl_statements(&raw_impl_statements, &final_snapshots).map_err(PipelineError::from)?;
+        let implements_edges = resolve_implements_from_impl_facts(&impl_facts);
+        typed_edges.extend(implements_edges.clone());
+
         let metrics = IndexMetrics {
             files_considered: changed_files.len(),
             files_reparsed: files_to_reparse.len(),
@@ -568,10 +667,13 @@ impl CodeGraphIndexer {
             raw_import_statements_extracted: output.raw_import_statements.len(),
             raw_import_statements_reused: untouched_raw_import_statements_len,
             import_facts_resolved: import_facts.len(),
+            raw_impl_statements_extracted: output.raw_impl_statements.len(),
+            raw_impl_statements_reused: untouched_raw_impl_statements_len,
+            impl_facts_resolved: impl_facts.len(),
         };
 
         let graph = build_graph(final_snapshots, lineage_edges, typed_edges)?;
-        Ok((graph, raw_import_statements, import_facts, metrics))
+        Ok((graph, raw_import_statements, import_facts, raw_impl_statements, impl_facts, metrics))
     }
 
     /// Critical section 2: publish `candidate_graph` for `repository`
@@ -588,6 +690,8 @@ impl CodeGraphIndexer {
         candidate_graph: CodeGraph,
         candidate_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
         candidate_import_facts: Vec<ImportFact>,
+        candidate_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
+        candidate_impl_facts: Vec<ImplFact>,
         metrics: IndexMetrics,
     ) -> ObserveOutcome {
         let mut state = self.state.lock().unwrap();
@@ -595,6 +699,7 @@ impl CodeGraphIndexer {
         if generation > current_generation {
             let graph = Arc::new(candidate_graph);
             let import_facts = Arc::new(candidate_import_facts);
+            let impl_facts = Arc::new(candidate_impl_facts);
             state.insert(
                 repository,
                 RepositoryState {
@@ -603,20 +708,24 @@ impl CodeGraphIndexer {
                     generation,
                     raw_import_statements: candidate_raw_import_statements,
                     import_facts: import_facts.clone(),
+                    raw_impl_statements: candidate_raw_impl_statements,
+                    impl_facts: impl_facts.clone(),
                 },
             );
-            ObserveOutcome { generation, graph, import_facts, metrics }
+            ObserveOutcome { generation, graph, import_facts, impl_facts, metrics }
         } else {
             // A later generation already published — this call's
-            // candidate (graph AND import state) is discarded. Return
-            // the ACTUAL current state, not this call's own (stale,
-            // never-published) data — the same atomicity guarantee
-            // `graph` already had now covers `import_facts` too.
+            // candidate (graph AND import/impl state) is discarded.
+            // Return the ACTUAL current state, not this call's own
+            // (stale, never-published) data — the same atomicity
+            // guarantee `graph`/`import_facts` already had now covers
+            // `impl_facts` too.
             let existing = state.get(&repository).expect("current_generation > 0 implies prior state exists when generation <= current_generation");
             ObserveOutcome {
                 generation: existing.generation,
                 graph: existing.graph.clone(),
                 import_facts: existing.import_facts.clone(),
+                impl_facts: existing.impl_facts.clone(),
                 metrics,
             }
         }
@@ -702,7 +811,7 @@ mod tests {
         let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
         let indexer = CodeGraphIndexer::new();
 
-        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), IndexMetrics::default());
+        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
         assert_eq!(first_outcome.generation, 5);
 
         // Attempt to publish AGAIN at the SAME generation (5, not 4) —
@@ -711,7 +820,7 @@ mod tests {
         let file = FileIdentity::parse(repo, commit.clone(), "src/lib.rs").unwrap();
         let candidate = RawSymbolCandidate::new("marker".to_string(), "function_item".to_string(), ByteSpan { start: 0, end: 3 }, "fn marker() {}".to_string()).unwrap();
         second_candidate.insert_snapshot(promote(&candidate, file).unwrap()).unwrap();
-        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), IndexMetrics::default());
+        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
 
         assert_eq!(second_outcome.generation, 5, "the reported generation must still be 5 (the one already published)");
         assert_eq!(second_outcome.graph.snapshot_count(), 0, "an equal-generation publish must NOT overwrite the already-published graph with its own candidate");
@@ -1489,6 +1598,222 @@ mod tests {
 
         assert_eq!(first.import_facts.len(), second.import_facts.len());
         assert_eq!(first.import_facts[0].resolution, second.import_facts[0].resolution);
+    }
+
+    // --- B2-ID-008, Task 4: ImplFact production and incremental
+    // semantics wired into the real indexer, mirroring the ImportFact
+    // tests immediately above. ---
+
+    #[test]
+    fn an_untouched_files_raw_impl_statement_is_preserved_across_an_incremental_update() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let untouched_a = FileIdentity::parse(repo, commit_a.clone(), "src/untouched.rs").unwrap();
+        let changed_a = FileIdentity::parse(repo, commit_a.clone(), "src/changed.rs").unwrap();
+        let mut source = FakeSource::new()
+            .with_file(untouched_a, b"struct Type; impl Type { fn new() -> Self { Type } }\n")
+            .with_file(changed_a, b"fn marker() {}\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.impl_facts.len(), 1);
+
+        let untouched_b = FileIdentity::parse(repo, commit_b.clone(), "src/untouched.rs").unwrap();
+        let changed_b = FileIdentity::parse(repo, commit_b.clone(), "src/changed.rs").unwrap();
+        source = source
+            .with_file(untouched_b, b"struct Type; impl Type { fn new() -> Self { Type } }\n")
+            .with_file(changed_b, b"fn marker() { 1; }\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/changed.rs".to_string()]).unwrap();
+
+        assert_eq!(second.impl_facts.len(), 1, "the untouched file's impl must still be present");
+        assert_eq!(second.impl_facts[0].self_type_text, "Type");
+        assert_eq!(second.metrics.raw_impl_statements_reused, 1, "the untouched file's raw impl statement must be reused, not re-extracted");
+        assert_eq!(second.metrics.raw_impl_statements_extracted, 0, "the changed file has no impl block of its own to extract");
+    }
+
+    #[test]
+    fn an_impl_facts_resolution_changes_when_its_trait_target_is_added_even_though_the_impl_file_is_untouched() {
+        // The direct ImplFact analogue of
+        // `an_import_facts_resolution_changes_when_its_target_is_added_even_though_the_importing_file_is_untouched`:
+        // `circle.rs`'s own `impl Shape for Circle` is UNCHANGED text
+        // across A->B, but `Shape` does not exist anywhere in the pool
+        // at commit A (trait_resolution: Unresolved, no Implements
+        // edge) and DOES exist at commit B (Resolved, Implements edge)
+        // because a DIFFERENT, newly-added file defines it. circle.rs
+        // itself is never reparsed.
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let circle_a = FileIdentity::parse(repo, commit_a.clone(), "src/circle.rs").unwrap();
+        let mut source = FakeSource::new().with_file(circle_a, b"struct Circle; impl Shape for Circle { fn area(&self) {} }\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(
+            first.impl_facts[0].trait_resolution,
+            Some(crate::impls::ImplTargetResolution::Unresolved),
+            "Shape does not exist anywhere yet"
+        );
+        assert!(first.graph.all_edges().iter().all(|e| e.kind != EdgeKind::Implements), "no Implements edge yet");
+
+        let circle_b = FileIdentity::parse(repo, commit_b.clone(), "src/circle.rs").unwrap();
+        let shape_b = FileIdentity::parse(repo, commit_b.clone(), "src/shape.rs").unwrap();
+        source = source
+            .with_file(circle_b, b"struct Circle; impl Shape for Circle { fn area(&self) {} }\n")
+            .with_file(shape_b, b"trait Shape { fn area(&self); }\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/shape.rs".to_string()]).unwrap();
+
+        assert_eq!(second.metrics.raw_impl_statements_reused, 1, "circle.rs itself must not be reparsed");
+        assert!(
+            matches!(second.impl_facts[0].trait_resolution, Some(crate::impls::ImplTargetResolution::Resolved(_))),
+            "the untouched impl's trait resolution must update once Shape becomes resolvable, even though circle.rs itself was never reparsed: got {:?}",
+            second.impl_facts[0].trait_resolution
+        );
+        assert_eq!(
+            second.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
+            1,
+            "an Implements edge must now exist even though circle.rs was never reparsed"
+        );
+    }
+
+    #[test]
+    fn deleting_an_impl_block_removes_both_its_impl_fact_and_its_implements_edge() {
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let shape_a = FileIdentity::parse(repo, commit_a.clone(), "src/shape.rs").unwrap();
+        let circle_a = FileIdentity::parse(repo, commit_a.clone(), "src/circle.rs").unwrap();
+        let mut source = FakeSource::new()
+            .with_file(shape_a, b"trait Shape { fn area(&self); }\n")
+            .with_file(circle_a, b"struct Circle; impl Shape for Circle { fn area(&self) {} }\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(first.impl_facts.len(), 1);
+        assert_eq!(first.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(), 1);
+
+        // Commit B: circle.rs no longer has the impl block at all (the
+        // struct survives, the impl is removed).
+        let shape_b = FileIdentity::parse(repo, commit_b.clone(), "src/shape.rs").unwrap();
+        let circle_b = FileIdentity::parse(repo, commit_b.clone(), "src/circle.rs").unwrap();
+        source = source.with_file(shape_b, b"trait Shape { fn area(&self); }\n").with_file(circle_b, b"struct Circle;\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/circle.rs".to_string()]).unwrap();
+
+        assert!(second.impl_facts.is_empty(), "the removed impl block's ImplFact must be gone");
+        assert!(
+            second.graph.all_edges().iter().all(|e| e.kind != EdgeKind::Implements),
+            "the removed impl block's derived Implements edge must be gone"
+        );
+    }
+
+    #[test]
+    fn adding_a_new_impl_block_adds_both_an_impl_fact_and_an_implements_edge() {
+        // The impl block is added in a BRAND NEW file (never a file
+        // that already existed and is merely edited) — mirroring
+        // `a_new_files_import_statement_is_added`'s own shape exactly —
+        // so the self type's own snapshot id is unambiguous: it has no
+        // same-named predecessor snapshot from a prior commit that
+        // lineage resolution would otherwise retain in the pool
+        // alongside it (see `final_snapshots`'s own doc comment on
+        // historical lineage-source snapshots).
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let shape_a = FileIdentity::parse(repo, commit_a.clone(), "src/shape.rs").unwrap();
+        let mut source = FakeSource::new().with_file(shape_a, b"trait Shape { fn area(&self); }\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert!(first.impl_facts.is_empty());
+        assert!(first.graph.all_edges().iter().all(|e| e.kind != EdgeKind::Implements));
+
+        let shape_b = FileIdentity::parse(repo, commit_b.clone(), "src/shape.rs").unwrap();
+        let circle_b = FileIdentity::parse(repo, commit_b.clone(), "src/circle.rs").unwrap();
+        source = source
+            .with_file(shape_b, b"trait Shape { fn area(&self); }\n")
+            .with_file(circle_b, b"struct Circle; impl Shape for Circle { fn area(&self) {} }\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/circle.rs".to_string()]).unwrap();
+
+        assert_eq!(second.impl_facts.len(), 1, "the new impl block must be added");
+        assert_eq!(second.impl_facts[0].self_type_text, "Circle");
+        assert_eq!(second.impl_facts[0].trait_type_text, Some("Shape".to_string()));
+        assert_eq!(
+            second.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
+            1,
+            "the new impl block's Implements edge must be added since both targets resolve"
+        );
+    }
+
+    #[test]
+    fn a_full_reindex_also_correctly_populates_impl_facts_and_raw_impl_statements() {
+        // Confirms `full_reindex` (the new-repository / history-rewrite
+        // path) was not accidentally left out of the Task 4 wiring —
+        // an easy omission since `incremental_reindex` is the more
+        // complex, more carefully-tested path.
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file = FileIdentity::parse(repo, commit.clone(), "src/circle.rs").unwrap();
+        let source = FakeSource::new().with_file(file, b"trait Shape { fn area(&self); } struct Circle; impl Shape for Circle { fn area(&self) {} }\n");
+        let indexer = CodeGraphIndexer::new();
+
+        let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        assert_eq!(outcome.impl_facts.len(), 1);
+        assert_eq!(outcome.impl_facts[0].self_type_text, "Circle");
+        assert_eq!(outcome.impl_facts[0].trait_type_text, Some("Shape".to_string()));
+        assert_eq!(outcome.metrics.raw_impl_statements_extracted, 1);
+        assert_eq!(outcome.metrics.raw_impl_statements_reused, 0);
+        assert_eq!(outcome.metrics.impl_facts_resolved, 1);
+        assert_eq!(
+            outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
+            1,
+            "a full reindex must also produce the derived Implements edge"
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_overwrite_newer_published_impl_facts() {
+        // Mirrors `a_stale_generation_cannot_overwrite_newer_published_import_facts`
+        // — the same publication-atomicity guarantee must cover impl
+        // state, not only the graph/import state.
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let file_a = FileIdentity::parse(repo, commit_a.clone(), "src/lib.rs").unwrap();
+        let file_b = FileIdentity::parse(repo, commit_b.clone(), "src/lib.rs").unwrap();
+        let source = Arc::new(
+            FakeSource::new()
+                .with_file(file_a, b"struct Foo; impl Foo { fn new() -> Self { Foo } }\n")
+                .with_file(file_b, b"struct Bar; impl Bar { fn new() -> Self { Bar } }\n"),
+        );
+        let indexer = Arc::new(CodeGraphIndexer::new());
+
+        let (arrived_tx, arrived_rx) = mpsc::channel::<()>();
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_for_hook = barrier.clone();
+        let target_point = TestPoint::AfterGenerationClaimed;
+        let first_call = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        indexer.set_test_hook(Arc::new(move |point, _generation| {
+            if point == target_point && first_call.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                arrived_tx.send(()).unwrap();
+                barrier_for_hook.wait();
+            }
+        }));
+
+        let worker_indexer = indexer.clone();
+        let worker_source = source.clone();
+        let worker = std::thread::spawn(move || worker_indexer.observe_commit(worker_source.as_ref(), repo, &commit_a, None, &[]));
+
+        arrived_rx.recv().unwrap();
+
+        let outcome_b = indexer.observe_commit(source.as_ref(), repo, &commit_b, None, &[]).unwrap();
+        assert_eq!(outcome_b.impl_facts[0].self_type_text, "Bar");
+
+        barrier.wait();
+        let outcome_a = worker.join().unwrap().unwrap();
+
+        assert_eq!(outcome_a.impl_facts[0].self_type_text, "Bar", "A's stale impl facts must never win — it must report B's impl facts instead");
     }
 
     #[test]

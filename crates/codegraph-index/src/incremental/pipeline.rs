@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::edges::{resolve_all_typed_edges, Edge, EdgeResolutionError};
 use crate::extract::extract_symbols;
 use crate::graph::{CodeGraph, GraphError};
+use crate::impls::{extract_impl_statements, RawImplStatement};
 use crate::imports::{extract_import_statements, ImportFactError, RawImportStatement};
 use crate::lineage::{resolve_lineage, LineageEdge, LineageResolutionError};
 use crate::parse::parser_for;
@@ -34,6 +35,8 @@ pub enum PipelineError {
     Graph(#[from] GraphError),
     #[error(transparent)]
     ImportResolution(#[from] ImportFactError),
+    #[error(transparent)]
+    ImplResolution(#[from] crate::impls::ImplFactError),
 }
 
 /// Everything [`index_files`] produced for one commit, before any
@@ -60,6 +63,15 @@ pub struct PipelineOutput {
     /// comment for why this split (local syntax extraction vs. global
     /// semantic resolution) exists.
     pub raw_import_statements: Vec<(FileIdentity, RawImportStatement)>,
+    /// B2-ID-008, Task 4: raw (UNRESOLVED) `impl` blocks extracted from
+    /// exactly the files this call parsed, paired with the
+    /// `FileIdentity` that defines them. Mirrors
+    /// `raw_import_statements` exactly, for the identical reason: a raw
+    /// `impl` block's `self_type_text`/`trait_type_text` resolution
+    /// against the full repository-wide snapshot pool requires the pool
+    /// `indexer.rs` assembles AFTER this function returns — see
+    /// `impls` module's own doc comment.
+    pub raw_impl_statements: Vec<(FileIdentity, RawImplStatement)>,
 }
 
 /// Parses, extracts and promotes every file in `relative_paths` (all
@@ -93,6 +105,7 @@ pub fn index_files(
 ) -> Result<PipelineOutput, PipelineError> {
     let mut snapshots = Vec::new();
     let mut raw_import_statements = Vec::new();
+    let mut raw_impl_statements = Vec::new();
 
     for relative_path in relative_paths {
         let file = FileIdentity::parse(repository, commit.clone(), relative_path).map_err(|e| PipelineError::Source(SourceError::Other { reason: e.to_string() }))?;
@@ -124,6 +137,13 @@ pub fn index_files(
         for statement in extract_import_statements(&tree) {
             raw_import_statements.push((file.clone(), statement));
         }
+        // B2-ID-008, Task 4: raw impl extraction is likewise pure
+        // syntax (no snapshot-pool dependency), scoped to exactly the
+        // files this call parsed — mirroring import extraction's own
+        // scope immediately above.
+        for statement in extract_impl_statements(&tree) {
+            raw_impl_statements.push((file.clone(), statement));
+        }
     }
 
     let lineage_edges = resolve_lineage(prev_snapshots, &snapshots, known_lineage_of)?;
@@ -135,6 +155,7 @@ pub fn index_files(
         lineage_edges,
         typed_edges,
         raw_import_statements,
+        raw_impl_statements,
     })
 }
 
