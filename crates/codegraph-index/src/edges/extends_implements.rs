@@ -135,36 +135,42 @@ pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Ed
 
 /// Picks the final `EdgeKind` for one resolved base/interface name.
 /// `syntactic_kind` is `Some(kind)` when the SOURCE SYNTAX ITSELF
-/// already said which kind applies — Rust's `impl Trait for Type`
-/// (always `Implements`), Python's single base-class construct (always
-/// `Extends`), JavaScript's `extends` (always `Extends`), and
-/// TypeScript/Tsx's `extends` (`Extends`) vs. `implements`
-/// (`Implements`), each tagged at the point `base_names_in` collects
-/// them — see `collect_js_heritage`. It is `None` only for C#/C++, whose
-/// `base_list`/`base_class_clause` syntax does NOT distinguish a base
-/// class from an implemented interface at all; for those, and ONLY for
-/// those, this function falls back to the target's own already-resolved
-/// `SymbolKind` (`Interface` -> `Implements`, anything else ->
-/// `Extends`). A syntactic tag, when present, is NEVER overridden by the
-/// target's kind — the earlier version of this resolver incorrectly
-/// routed TypeScript/Tsx through the same kind-based fallback as C#/C++
-/// despite TS/Tsx's `implements` keyword being just as syntactically
-/// explicit as Rust's `for` clause; that was a real defect (TS/Tsx's own
-/// syntax was being ignored in favor of a lookup that could disagree
-/// with it), fixed here by threading the clause tag through instead of
-/// discarding it before this function runs.
+/// already said which kind applies — Python's single base-class
+/// construct (always `Extends`), JavaScript's `extends` (always
+/// `Extends`), and TypeScript/Tsx's `extends` (`Extends`) vs.
+/// `implements` (`Implements`), each tagged at the point `base_names_in`
+/// collects them — see `collect_js_heritage`. (Rust's own `impl Trait
+/// for Type` is NOT one of these languages: B2-ID-008 moved Rust's
+/// trait-implementation handling entirely into `impls.rs`'s `ImplFact`
+/// mechanism, so `base_names_in` never collects anything for
+/// `Language::Rust` at all — see that match arm's own comment below.)
+/// It is `None` only for C#/C++, whose `base_list`/`base_class_clause`
+/// syntax does NOT distinguish a base class from an implemented
+/// interface at all; for those, and ONLY for those, this function falls
+/// back to the target's own already-resolved `SymbolKind` (`Interface`
+/// -> `Implements`, anything else -> `Extends`). A syntactic tag, when
+/// present, is NEVER overridden by the target's kind — the earlier
+/// version of this resolver incorrectly routed TypeScript/Tsx through
+/// the same kind-based fallback as C#/C++ despite TS/Tsx's `implements`
+/// keyword being just as syntactically explicit as Python's/JS's own
+/// `extends`; that was a real defect (TS/Tsx's own syntax was being
+/// ignored in favor of a lookup that could disagree with it), fixed here
+/// by threading the clause tag through instead of discarding it before
+/// this function runs.
 fn edge_kind_for(syntactic_kind: Option<EdgeKind>, target_kind: SymbolKind) -> EdgeKind {
     syntactic_kind.unwrap_or_else(|| if target_kind == SymbolKind::Interface { EdgeKind::Implements } else { EdgeKind::Extends })
 }
 
-/// Every base-class/trait/interface name found in `tree`'s one
-/// construct (a `class_definition`/`impl_item`/`class_declaration`/
-/// `class_specifier` re-parsed standalone from a `SymbolSnapshot`'s own
-/// signature text — the same re-parse-the-signature approach `calls.rs`
-/// and `imports.rs` use), paired with the `EdgeKind` the SOURCE SYNTAX
-/// implies when the language's grammar makes that unambiguous, or
-/// `None` when it does not (C#/C++ only — see `edge_kind_for`'s doc
-/// comment for what happens then).
+/// Every base-class/interface name found in `tree`'s one construct (a
+/// `class_definition`/`class_declaration`/`class_specifier` re-parsed
+/// standalone from a `SymbolSnapshot`'s own signature text — the same
+/// re-parse-the-signature approach `calls.rs` and `imports.rs` use),
+/// paired with the `EdgeKind` the SOURCE SYNTAX implies when the
+/// language's grammar makes that unambiguous, or `None` when it does
+/// not (C#/C++ only — see `edge_kind_for`'s doc comment for what
+/// happens then). Rust's own `impl_item` is deliberately NOT one of the
+/// node kinds this function (or anything it dispatches to) ever
+/// collects from — see the `Language::Rust` match arm below.
 fn base_names_in(tree: &crate::parse::ParseTree) -> Vec<(String, Option<EdgeKind>)> {
     let mut names = Vec::new();
     match tree.language() {
@@ -329,8 +335,10 @@ fn collect_js_heritage(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Str
 /// TypeScript/Tsx's `class_heritage` can carry BOTH a plain `extends
 /// identifier` child AND a nested `implements_clause` on the same
 /// class. Unlike plain JS, this grammar's `implements` keyword is a
-/// real syntactic marker, just as explicit as Rust's `for` clause or
-/// Python's base-class list — so each name is tagged with the
+/// real syntactic marker, just as explicit as Python's base-class list
+/// (Rust's own trait-vs-type distinction is no longer this file's own
+/// concern at all — see the `Language::Rust` match arm's own comment in
+/// `base_names_in`) — so each name is tagged with the
 /// `EdgeKind` its OWN clause implies, never left to a target-kind
 /// fallback. This is the fix for a real defect: an earlier version of
 /// this resolver collected every heritage name into one undifferentiated
@@ -420,21 +428,6 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to, module.id());
         assert_eq!(edges[0].kind, EdgeKind::Extends);
-    }
-
-    #[test]
-    fn a_bare_inherent_rust_impl_with_no_for_clause_produces_no_edge() {
-        // `impl Circle { ... }` (no `for Trait`) is an inherent impl —
-        // it names no trait at all, and must not be mistaken for one.
-        // Pins the `has_for_clause` gate specifically.
-        let circle = test_snapshot("src/circle.rs", "Circle", "struct_item", "struct Circle;");
-        let inherent_impl = test_snapshot("src/circle.rs", "Circle", "struct_item", "impl Circle { fn area(&self) -> f64 { 1.0 } }");
-        let snapshots = vec![circle, inherent_impl.clone()];
-
-        let edges = resolve_extends_implements(&snapshots).unwrap();
-
-        let impl_edges: Vec<_> = edges.iter().filter(|e| e.from == inherent_impl.id()).collect();
-        assert!(impl_edges.is_empty(), "a bare inherent impl with no `for` clause must never produce an Implements edge");
     }
 
     #[test]

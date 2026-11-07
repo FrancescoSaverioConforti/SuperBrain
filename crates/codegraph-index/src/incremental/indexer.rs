@@ -605,7 +605,13 @@ impl CodeGraphIndexer {
         // this module's doc comment on `CodeGraph` having no "current
         // vs. historical" distinction yet). These historical snapshots
         // never participate in typed-edge resolution.
-        let mut final_snapshots = current_snapshots;
+        //
+        // `current_snapshots` itself is cloned here, not moved: C1's own
+        // fix (below, at `impl_facts`'s own resolution call) needs the
+        // CURRENT-only pool to still be available after this point,
+        // deliberately kept separate from `final_snapshots`'s broader
+        // (current + historical-lineage-source) pool.
+        let mut final_snapshots = current_snapshots.clone();
         let lineage_sources: Vec<SymbolSnapshot> = lineage_edges.iter().filter_map(|edge| prior_graph.snapshot(edge.from).cloned()).collect();
         for source_snapshot in lineage_sources {
             if !final_snapshots.iter().any(|s| s.id() == source_snapshot.id()) {
@@ -648,13 +654,38 @@ impl CodeGraphIndexer {
         raw_impl_statements.extend(output.raw_impl_statements.clone());
 
         // Resolution (including the derived `Implements` edges) is
-        // ALWAYS recomputed from the full raw-statement set against the
-        // full current snapshot pool — never reused incrementally, for
-        // the identical reason `import_facts`'s own resolution is (see
-        // `RepositoryState`'s own doc comment): an untouched impl's
-        // correct resolution can change when some OTHER file's symbol
-        // it names is added/renamed/removed/moved elsewhere.
-        let impl_facts = resolve_raw_impl_statements(&raw_impl_statements, &final_snapshots).map_err(PipelineError::from)?;
+        // ALWAYS recomputed from the full raw-statement set — never
+        // reused incrementally, for the identical reason `import_facts`'s
+        // own resolution is (see `RepositoryState`'s own doc comment): an
+        // untouched impl's correct resolution can change when some OTHER
+        // file's symbol it names is added/renamed/removed/moved
+        // elsewhere.
+        //
+        // C1 fix (final-review finding): resolved against
+        // `current_snapshots` (untouched + freshly rebuilt — the SAME
+        // pool `resolve_all_typed_edges`/`typed_edges` above already
+        // resolves against), NOT `final_snapshots`. `final_snapshots`
+        // deliberately ALSO contains historical, lineage-superseded
+        // snapshots from the prior commit (see its own doc comment a few
+        // lines above) purely so a `LineageEdge`'s `from` endpoint has
+        // somewhere to point in the stored graph — but an old, superseded
+        // snapshot can share its exact name with its own replacement
+        // (e.g. a trait/type's defining file gets an unrelated edit, so
+        // the trait/type's OLD snapshot gets an exact-match Hypothesized
+        // lineage edge and ends up sitting in `final_snapshots` under the
+        // SAME name as the new one). Resolving `impl_facts` against that
+        // pool made `resolve_target_by_name` see two same-named
+        // candidates and report `Ambiguous` instead of `Resolved`,
+        // silently dropping a real `Implements` edge on an ordinary,
+        // unrelated incremental edit. `current_snapshots` has no such
+        // duplicate-by-name risk for an unrenamed symbol: it is exactly
+        // "what currently exists," matching `typed_edges`'s own
+        // resolution pool exactly. Every `ImplTargetResolution::Resolved`
+        // id this produces is still guaranteed present in
+        // `final_snapshots` below (a superset of `current_snapshots`),
+        // so the derived `Implements` edges' endpoints are always valid
+        // once `build_graph` runs.
+        let impl_facts = resolve_raw_impl_statements(&raw_impl_statements, &current_snapshots).map_err(PipelineError::from)?;
         let implements_edges = resolve_implements_from_impl_facts(&impl_facts);
         typed_edges.extend(implements_edges.clone());
 
@@ -1742,6 +1773,129 @@ mod tests {
             second.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
             1,
             "the new impl block's Implements edge must be added since both targets resolve"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_edit_to_the_traits_own_defining_file_does_not_make_implements_resolution_ambiguous() {
+        // C1 (final-review Critical finding): `src/shape.rs` defines
+        // `trait Shape`; `src/circle.rs` has a real, UNTOUCHED
+        // `impl Shape for Circle`. At commit B, `src/shape.rs` gets a
+        // purely cosmetic edit (an added comment) that changes neither
+        // the trait's name nor its meaningful signature — but it IS a
+        // byte-for-byte change, so lineage resolution links the OLD
+        // (commit-A-rooted) `Shape` snapshot to the NEW (commit-B-rooted)
+        // one with an exact-match Hypothesized edge, and the OLD
+        // snapshot is retained in `final_snapshots` as that edge's `from`
+        // endpoint (see `final_snapshots`'s own doc comment). Before the
+        // C1 fix, `impl_facts` was resolved against `final_snapshots`,
+        // so `resolve_target_by_name("Shape", ...)` found BOTH the old
+        // and new `Shape` snapshots sharing the same name and returned
+        // `Ambiguous` — silently dropping the real `Implements` edge
+        // `src/circle.rs`'s own impl block already had at commit A, even
+        // though `src/circle.rs` itself was never touched. After the fix
+        // (resolving against `current_snapshots` instead), exactly one
+        // `Shape` snapshot is current at commit B, so resolution stays
+        // `Resolved` and the edge survives.
+        let repo = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let shape_a = FileIdentity::parse(repo, commit_a.clone(), "src/shape.rs").unwrap();
+        let circle_a = FileIdentity::parse(repo, commit_a.clone(), "src/circle.rs").unwrap();
+        let mut source = FakeSource::new()
+            .with_file(shape_a, b"trait Shape { fn area(&self) -> f64; }\n")
+            .with_file(circle_a, b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+        let indexer = CodeGraphIndexer::new();
+        let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+        assert_eq!(
+            first.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
+            1,
+            "the Implements edge must exist at commit A"
+        );
+
+        // Commit B: ONLY src/shape.rs changes, and only cosmetically (an
+        // added comment) — src/circle.rs is NOT in changed_files at all.
+        let shape_b = FileIdentity::parse(repo, commit_b.clone(), "src/shape.rs").unwrap();
+        let circle_b = FileIdentity::parse(repo, commit_b.clone(), "src/circle.rs").unwrap();
+        source = source
+            .with_file(shape_b, b"// a harmless comment\ntrait Shape { fn area(&self) -> f64; }\n")
+            .with_file(circle_b, b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+
+        let second = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/shape.rs".to_string()]).unwrap();
+
+        assert_eq!(second.metrics.raw_impl_statements_reused, 1, "src/circle.rs's own impl block must not be reparsed");
+        assert_eq!(second.impl_facts.len(), 1);
+        assert!(
+            matches!(second.impl_facts[0].trait_resolution, Some(crate::impls::ImplTargetResolution::Resolved(_))),
+            "the trait resolution must stay Resolved, not become Ambiguous, after an unrelated cosmetic edit to the trait's own defining file: got {:?}",
+            second.impl_facts[0].trait_resolution
+        );
+        assert_eq!(
+            second.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count(),
+            1,
+            "the Implements edge must SURVIVE the trait-defining file's own unrelated, cosmetic edit"
+        );
+    }
+
+    #[test]
+    fn incremental_reindex_of_a_commit_produces_the_same_implements_edges_as_a_full_reindex_of_that_same_commit() {
+        // C1's own second required test: incrementally observing A->B
+        // (where B's src/shape.rs gets a cosmetic edit, exactly like the
+        // test above) must produce the IDENTICAL `Implements` edge set
+        // as a FULL reindex that treats B as a brand-new repository —
+        // i.e. the incremental path's own historical-snapshot retention
+        // must never change the observable `ImplFact`/edge outcome
+        // relative to what a from-scratch index of the same commit
+        // would see.
+        let repo_incremental = test_repo();
+        let repo_full = test_repo();
+        let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+        let shape_a = FileIdentity::parse(repo_incremental, commit_a.clone(), "src/shape.rs").unwrap();
+        let circle_a = FileIdentity::parse(repo_incremental, commit_a.clone(), "src/circle.rs").unwrap();
+        let mut source = FakeSource::new()
+            .with_file(shape_a, b"trait Shape { fn area(&self) -> f64; }\n")
+            .with_file(circle_a, b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+        let indexer = CodeGraphIndexer::new();
+        indexer.observe_commit(&source, repo_incremental, &commit_a, None, &[]).unwrap();
+
+        let shape_b = FileIdentity::parse(repo_incremental, commit_b.clone(), "src/shape.rs").unwrap();
+        let circle_b = FileIdentity::parse(repo_incremental, commit_b.clone(), "src/circle.rs").unwrap();
+        source = source
+            .with_file(shape_b, b"// a harmless comment\ntrait Shape { fn area(&self) -> f64; }\n")
+            .with_file(circle_b, b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+
+        let incremental_outcome = indexer.observe_commit(&source, repo_incremental, &commit_b, Some(&commit_a), &["src/shape.rs".to_string()]).unwrap();
+
+        // A brand-new, SEPARATE indexer treats commit B as a full
+        // reindex of a never-before-seen repository, with ONLY B's own
+        // two files (never A's) — exactly what "a full reindex of this
+        // exact commit" means.
+        let shape_b_full = FileIdentity::parse(repo_full, commit_b.clone(), "src/shape.rs").unwrap();
+        let circle_b_full = FileIdentity::parse(repo_full, commit_b.clone(), "src/circle.rs").unwrap();
+        let full_source = FakeSource::new()
+            .with_file(shape_b_full, b"// a harmless comment\ntrait Shape { fn area(&self) -> f64; }\n")
+            .with_file(circle_b_full, b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+        let full_indexer = CodeGraphIndexer::new();
+        let full_outcome = full_indexer.observe_commit(&full_source, repo_full, &commit_b, None, &[]).unwrap();
+
+        let incremental_implements_count = incremental_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count();
+        let full_implements_count = full_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count();
+        assert_eq!(incremental_implements_count, 1, "the incremental path must produce exactly one Implements edge");
+        assert_eq!(
+            incremental_implements_count, full_implements_count,
+            "incrementally observing A->B must produce the SAME Implements edge count as a full reindex of B treated as a brand-new repository"
+        );
+
+        // Same trait/self-type resolution SHAPE too, not just the same
+        // count — both must resolve the trait to exactly one candidate,
+        // never Ambiguous, for the identical reason.
+        assert_eq!(incremental_outcome.impl_facts.len(), full_outcome.impl_facts.len());
+        let incremental_resolved_traits = incremental_outcome.impl_facts.iter().filter(|f| matches!(f.trait_resolution, Some(crate::impls::ImplTargetResolution::Resolved(_)))).count();
+        let full_resolved_traits = full_outcome.impl_facts.iter().filter(|f| matches!(f.trait_resolution, Some(crate::impls::ImplTargetResolution::Resolved(_)))).count();
+        assert_eq!(
+            incremental_resolved_traits, full_resolved_traits,
+            "the incremental path must resolve the same number of traits to Resolved as a full reindex of the identical commit"
         );
     }
 

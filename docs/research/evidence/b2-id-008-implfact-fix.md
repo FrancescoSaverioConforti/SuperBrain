@@ -191,51 +191,52 @@ by this task" above) — against the now-fixed pipeline (post Tasks 1-4).
 | Trait impls (B2-EVAL-005's own count) | 23 |
 | `Implements`/`Extends` edges | 0 |
 
-### Denominator correction (Measured, this task, independent of the fix)
+### SUPERSEDED by the final-review fix wave (C1 + I1 + I2)
 
-Direct `grep` of `src/` at commit B, counting BOTH top-level `^impl`
-lines AND impl blocks indented inside a nested scope (e.g.
-`#[cfg(test)] mod tests { impl TestTime { .. } impl Drop for TestTime
-{ .. } }` in `src/filter/time.rs`, and `#[cfg(test)] mod test { impl
-fmt::Display for Encoded { .. } }` in `src/hyperlink.rs` — both real,
-syntactically valid impl blocks tree-sitter parses regardless of the
-`#[cfg(test)]` attribute, which is not evaluated at parse time),
-confirms **45 real impl blocks exist in `src/` at commit B**, not 41.
-This 45 figure (and the `ImplFact` extraction/resolution numbers built
-on it below) is unaffected by the correction in this section — only
-the EXPLANATION of the original 41 count is corrected here.
+**Everything from this point through the end of "Associated-item
+coverage" below is superseded.** The final whole-branch review found:
+(a) a Critical bug (C1) — `impl_facts` was incorrectly resolved against
+`final_snapshots` (which deliberately also contains historical,
+lineage-superseded snapshots), making the 7 `Ambiguous` self-types
+reported below an ARTIFACT of that bug, not a genuine finding; (b) an
+Important bug (I1) — a `scoped_type_identifier` trait/self-type field
+(e.g. `fmt::Display`, `clap::Args`) incorrectly returned `None` instead
+of its last segment, which is why the "16 trait impls" / "4
+scoped-trait-extraction-misses" numbers below exist at all; and (c)
+this section's own arithmetic ("23 − 4 − 3 = 16") did not actually
+reconcile against its own stated breakdown, AND the "4
+scoped-trait-extraction-misses" list itself undercounted by one: it
+named `clap::FromArgMatches` (Exec), `clap::Args` (Exec), `fmt::Display`
+(PathUrl), and `regex_syntax::ast::Visitor` (UppercaseVisitor), but
+missed a 5th identically-shaped case — `impl fmt::Display for Encoded`
+(`src/hyperlink.rs:71`, inside the SAME `#[cfg(test)] mod test` block
+as `PathUrl`'s own `Display` impl) — confirmed by direct source
+reading; this 5th case is why the old section's denominator math could
+never actually reconcile no matter how the other terms were adjusted.
+Both C1 and I1 are now fixed in code (see
+`crates/codegraph-index/src/incremental/indexer.rs`'s `impl_facts`
+resolution call and `crates/codegraph-index/src/impls.rs`'s
+`base_type_name`). The reconciliation below does not depend on
+re-enumerating "which N were scoped-and-dropped-to-None" at all (the
+exact bug class that produced the undercount in the first place) — it
+instead counts real impl blocks directly by `grep`, counts real
+trait-impl syntax directly by `grep`, and lets the harness's own
+measured `impl_facts_total`/`trait_impls` confirm the arithmetic,
+which is why it reconciles cleanly where the old section did not. The
+superseded numbers below are kept VERBATIM (struck through in spirit,
+not in text, per this project's own append/supersede discipline) so
+the before/after delta across the whole fix wave remains checkable;
+"### After the final-review fix wave (C1 + I1), Measured" immediately
+below is the CURRENT, authoritative account.
 
-**Corrected explanation (this file's own earlier draft got this wrong
-— a top-level-only `grep -n "^impl" src/` was re-run during this
-correction and gives 42, not 41, so "a top-level-only grep that missed
-3 nested impls" does not arithmetically reconcile: 42 − 3 ≠ 41, and a
-top-level-only grep by definition would not have found the 3 nested
-ones to miss in a way that produces 41 either).** The real
-reconciliation: counting the SAME 42 top-level-only impl lines by
-trait-impl vs. inherent-impl gives **23 trait + 19 inherent = 42**,
-confirmed by direct `grep -c " for "` / `grep -vc " for "` against the
-identical 42-line list. [B2-ID-008](../findings/B2-ID-008.md)'s own
-classification table reported **23 trait + 18 inherent = 41** — the
-trait-impl count (23) matches exactly; the discrepancy is entirely in
-the INHERENT count, short by exactly one (18 vs. the real 19). This is
-consistent with B2-ID-008's own original count having been a manual,
-file-by-file enumeration (its own table cites specific line numbers
-per file, e.g. "`DirEntry`: lines 26/118/125/127/134/141"), not a
-grep-based count at all, that missed exactly one real inherent `impl`
-block somewhere among the 19 in `src/` — this task did not re-identify
-WHICH specific one was missed (the original investigation's own raw
-notes, if any existed beyond the published table, are not available to
-re-derive it from), so this is reported as an honest "off-by-one in a
-prior manual count, not a systematic methodology difference" finding,
-not a fully pinpointed root cause. It also did not count the 3 nested
-test-module impls at all (41/42 vs. 45 is a 1-off difference, not a
-3-off one), consistent with a manual top-level walk of each file that
-never looked inside `#[cfg(test)]` modules in the first place. This
-correction is reported plainly because the brief explicitly asked not
-to assume the after
-numbers would match the before numbers exactly.
+### After the final-review fix wave (C1 + I1), Measured
 
-### After (Measured, post-fix, same commit pair, this task's own run)
+Fresh clone of `sharkdp/fd`, same commit pair, re-run AFTER both the
+C1 (`impl_facts` resolved against `current_snapshots`, not
+`final_snapshots`) and I1 (`scoped_type_identifier` extracts its last
+segment) fixes landed. Raw harness output committed verbatim as
+[`b2-id-008-final-fix-run.txt`](b2-id-008-final-fix-run.txt) so every
+number below is independently checkable against it.
 
 **Pipeline-level counts** (`IndexMetrics` from `CodeGraphIndexer::observe_commit`,
 incremental A→B call):
@@ -243,230 +244,224 @@ incremental A→B call):
 | Metric | Value |
 |---|---:|
 | `raw_impl_statements_extracted` (this call, i.e. commit B's changed files) | 15 |
-| `raw_impl_statements_reused` (carried forward from untouched files) | 27 |
-| `impl_facts_resolved` / `impl_facts_total` (final published state) | **42** |
+| `raw_impl_statements_reused` (carried forward from untouched files) | 29 |
+| `impl_facts_resolved` / `impl_facts_total` (final published state) | **44** |
 
-**42/45 real impl blocks in `src/` produced an `ImplFact`.** The 3
-missing are a confirmed, documented, in-scope limitation of
-`base_type_name` (which only recognizes a `type_identifier` or
-`generic_type` self-type-field shape, per `impls.rs`'s own module doc
-comment: "out of this plan's own scope... prefer omitting the fact
-over guessing at an unconfirmed shape"), not a new defect:
+**Denominator, reconciled exactly (direct `grep`, corrected for the
+`impl<...>` generic-impl shape the prior draft's `^impl ` pattern
+missed — `impl<T> Foo<T> {` has no space after `impl`, so a pattern
+requiring one silently skips every generic impl block):**
 
-- `impl SanitizeErr for &str` (`src/error.rs:20`) — self type is a
-  `reference_type` node (`&str`), not `type_identifier`/`generic_type`.
-- `impl SanitizeErr for io::Error` (`src/error.rs:28`) — self type is a
-  `scoped_type_identifier` (`io::Error`).
-- `impl SanitizeErr for ignore::Error` (`src/error.rs:36`) — self type
-  is a `scoped_type_identifier` (`ignore::Error`).
-
-All three are dropped as a WHOLE impl block (the `let Some(self_type_text)
-= base_type_name(...) else { return; }` guard in `collect_rust_impl`),
-never partially extracted — confirmed directly: none of the three
-appears anywhere in the harness's own full `impl_facts` dump, not even
-as a `trait_type_text: None` row.
-
-Separately, the TRAIT name field has the identical, symmetric
-limitation: `impl clap::FromArgMatches for Exec`, `impl clap::Args for
-Exec`, `impl fmt::Display for PathUrl`, and `impl regex_syntax::ast::Visitor
-for UppercaseVisitor` all have a `scoped_type_identifier` TRAIT name,
-so each is extracted as an `ImplFact` with `trait_type_text: None` (the
-self type still resolves normally) rather than being dropped entirely
-— confirmed directly in the dump (`Exec`/`PathUrl`/`UppercaseVisitor`
-each appear with `trait=None`, alongside their OWN separate inherent
-impl facts where applicable).
-
-**Trait impl vs. inherent split, with full numerator/denominator detail:**
-
-| Split | Count |
+| Count | Value |
 |---|---:|
-| `impl_facts_total` | 42 |
-| `trait_impls` (`trait_type_text: Some(_)`) | 16/42 |
-| `inherent_impls` (`trait_type_text: None`) | 26/42 |
+| Top-level `impl`/`impl<...>` blocks in `src/` (`grep -rn "^impl" src/`) | 42 |
+| Nested `impl` blocks inside a `#[cfg(test)]` module in `src/` (`src/filter/time.rs` ×2, `src/hyperlink.rs` ×1) | 3 |
+| `impl` blocks in `tests/` (`tests/testenv/mod.rs::TestEnv`) | 1 |
+| **Total real impl blocks in the repository at commit B** | **46** |
 
-16, not 23 (B2-EVAL-005's own pre-fix count of real `impl X for Y`
-syntax occurrences), because 4 of the 23 real `impl Trait for Type`
-blocks have a scoped (`a::b`) trait name and are extracted with
-`trait_type_text: None` per the limitation above (`clap::FromArgMatches`,
-`clap::Args`, `fmt::Display` on `PathUrl` only — `Display` on `Token`/
-`SanitizedError`/`SanitizedStr` is a BARE `type_identifier`, via `use
-std::fmt::Display`, and DOES get `trait_type_text: Some("Display")` —
-and `regex_syntax::ast::Visitor`), and 3 more of the 23 are the
-`SanitizeErr`-for-external-self-type trio dropped entirely above
-(23 − 4 − 3 = 16, confirmed by direct reconciliation against the real
-source: 23 real `impl X for Y` lines in `src/`, minus the 4 scoped-trait-name
-ones now `None`, minus the 3 dropped-whole ones, equals exactly 16 —
-the harness's own measured number, independently re-derived from first
-principles, not merely trusted).
+**46 real impl blocks → 44 `ImplFact`s (2 dropped whole):**
 
-**Trait-resolution breakdown (of the 16 trait impls that DID get a
+| Dropped impl block | File | Why |
+|---|---|---|
+| `impl SanitizeErr for &str` | `src/error.rs:20` | self type is a `reference_type` node (`&str`), not `type_identifier`/`generic_type`/`scoped_type_identifier` — out of `base_type_name`'s scope, confirmed in-scope limitation, not a new defect |
+| `impl From<ExitCode> for i32` | `src/exit_codes.rs:14` | self type is a `primitive_type` node (`i32`) — same category of out-of-scope shape |
+
+Both confirmed dropped as a WHOLE impl block (neither appears anywhere
+in the harness's own full `impl_facts` dump, not even as a
+`trait_type_text: None` row) — directly checkable in
+`b2-id-008-final-fix-run.txt`.
+
+**46 − 2 = 44, matching `impl_facts_total` exactly.**
+
+**Trait impl vs. inherent split, with the arithmetic shown explicitly
+(I2 fix: this is the reconciliation the superseded section above
+failed to do correctly):**
+
+| Step | Count |
+|---|---:|
+| Real `impl X for Y` (trait-impl syntax) blocks anywhere in the repo (`grep -c " for "` over the same 46-line list) | 25 |
+| Minus: dropped-whole (both of the 2 dropped blocks above are themselves trait impls — `SanitizeErr for &str` AND `From<ExitCode> for i32`) | − 2 |
+| = Trait impls that became an `ImplFact` at all | **23** |
+| Of those 23, how many get `trait_type_text: Some(_)` (I1 fix: ALL of them now, since `scoped_type_identifier` no longer returns `None`) | 23/23 |
+
+**`trait_impls` (`trait_type_text: Some(_)`): 23/44. `inherent_impls`
+(`trait_type_text: None`): 21/44. 23 + 21 = 44 — reconciles exactly.**
+
+This supersedes the old "16 trait impls" figure entirely: before I1,
+5 of the 23 real trait impls (`clap::FromArgMatches for Exec`,
+`clap::Args for Exec`, `fmt::Display for PathUrl`, `fmt::Display for
+Encoded` — the undercounted 5th case I2 flagged — and
+`regex_syntax::ast::Visitor for UppercaseVisitor`) had their
+`scoped_type_identifier` trait name wrongly collapse to
+`trait_type_text: None`, making them LOOK inherent (23 − 5 = 18, not
+16 — the old section's own "23 − 4 − 3 = 16" arithmetic both missed
+this 5th case AND double-counted by ALSO subtracting 3 dropped-whole
+impls that were never part of the trait-name question in the first
+place, which is the exact reconciliation failure I2 flagged). After
+I1, all 23 extracted trait impls correctly carry a real trait name.
+
+**Trait-resolution breakdown (of all 23 trait impls that now carry a
 `trait_type_text`):**
 
 | `trait_resolution` | Count |
 |---|---:|
-| `Resolved` | 6/16 |
-| `Unresolved` | 10/16 |
-| `Ambiguous` | 0/16 |
+| `Resolved` | 8/23 |
+| `Unresolved` | 15/23 |
+| `Ambiguous` | 0/23 |
 
-The 6 `Resolved`: all 6 are `impl Matcher for <Type>` (`RegexSet`,
-`GlobSet`, `GlobMatcher`, `FixedStrings`, `ExactStrings`, `MatchAll`),
-one trait name (`Matcher`) resolved `Resolved` 6 separate times
-because `Matcher` is a real, local `trait_item` in `src/patterns.rs` —
-confirmed directly. (Whether the SELF type of each also resolves is a
-separate question, covered in the self-type-resolution breakdown
-below — 3 of these 6 have an external-crate self type and so do NOT
-produce an `Implements` edge despite the trait itself resolving.)
+**The 8 `Resolved`** (directly confirmed in `b2-id-008-final-fix-run.txt`'s
+own dump, `trait_res=Some(Resolved(...))`):
+- `SanitizeErr` ×2 — the trait IS local (`src/error.rs`'s own
+  `trait SanitizeErr`), resolved correctly for both `impl SanitizeErr
+  for io::Error` and `impl SanitizeErr for ignore::Error` (both report
+  `self=Error` since I1 extracts `io::Error`/`ignore::Error`'s own last
+  segment; their SELF type resolution is separately `Unresolved`,
+  covered in the self-type breakdown below — the trait name resolving
+  correctly and the self type resolving correctly are independent
+  questions, and `resolve_implements_from_impl_facts` requires BOTH
+  `Resolved` before it emits an edge, so neither of these 2 produces an
+  edge).
+- `Matcher` ×6 — all 6 `impl Matcher for <Type>` impls in
+  `src/patterns.rs` (`RegexSet`, `GlobSet`, `GlobMatcher`,
+  `FixedStrings`, `ExactStrings`, `MatchAll`); `Matcher` is a real
+  local `trait_item`.
 
-The 10 `Unresolved`, with the REAL reason for each, reported honestly
-per the brief's explicit instruction not to assume the split should
-match 23 minus-something exactly — this corpus has several trait impls
-targeting EXTERNAL `std` traits this repository never defines itself,
-which correctly resolve `Unresolved`, NOT a defect:
+I1's own net effect on trait-RESOLUTION counts for this specific
+corpus is zero (every `scoped_type_identifier` trait name `fd` happens
+to reference at commit B — `FromArgMatches`, `Args`, `Display` on
+`PathUrl`, `Visitor` — names a genuinely EXTERNAL trait, so each still
+correctly resolves `Unresolved` after I1 rescues it from wrongly being
+`None`). I1's real, measured effect here is purely on EXTRACTION (4
+real trait impls that used to look inherent now correctly carry a
+trait name at all — see the reconciliation above), not on the
+Resolved/Unresolved split.
+
+**The 15 `Unresolved`**, every one independently confirmed a REAL
+external trait (never a resolver defect):
 
 | Self type | Trait name (as extracted) | Why `Unresolved` |
 |---|---|---|
-| `DirEntry` | `PartialEq` | `std::cmp::PartialEq`, external, never locally defined |
+| `DirEntry` | `PartialEq` | `std::cmp::PartialEq`, external |
 | `DirEntry` | `Eq` | `std::cmp::Eq`, external |
 | `DirEntry` | `PartialOrd` | `std::cmp::PartialOrd`, external |
 | `DirEntry` | `Ord` | `std::cmp::Ord`, external |
-| `DirEntry` | `Colorable` | external (`lscolors` crate's own trait, not locally defined in this repo) |
+| `DirEntry` | `Colorable` | `lscolors` crate's own trait, external |
 | `SanitizedError` | `Display` | `std::fmt::Display`, external |
 | `TestTime` | `Drop` | `std::ops::Drop`, external |
 | `Token` | `Display` | `std::fmt::Display`, external |
+| `PathUrl` | `Display` (I1: was `None` pre-fix, now `Some("Display")`) | `std::fmt::Display`, external — NEWLY extracted by I1, still correctly `Unresolved` |
+| `Encoded` | `Display` | `std::fmt::Display`, external |
+| `UppercaseVisitor` | `Visitor` (I1: was `None` pre-fix) | `regex_syntax::ast::Visitor`, external — NEWLY extracted by I1, still correctly `Unresolved` |
 | `SanitizedStr` | `Display` | `std::fmt::Display`, external |
 | `Batch` | `IntoIterator` | `std::iter::IntoIterator`, external |
+| `Exec` | `FromArgMatches` (I1: was `None` pre-fix) | `clap::FromArgMatches`, external — NEWLY extracted by I1, still correctly `Unresolved` |
+| `Exec` | `Args` (I1: was `None` pre-fix) | `clap::Args`, external — NEWLY extracted by I1, still correctly `Unresolved` |
 
-Every one of these 10 is a real, externally-defined trait this
-repository imports and implements against but never declares itself —
-exactly the shape the brief anticipated (`Display`/`Drop`/`Eq`/
-`PartialEq`/`PartialOrd`/`Ord`/`IntoIterator` all appear, plus
-`Colorable` from the `lscolors` crate as one not explicitly
-anticipated but the identical shape). **0/16 are a genuine resolver
-defect** — every `Unresolved` here is the CORRECT answer, confirmed by
-direct source reading of each self type's real defining file, not
-assumed from the trait name alone.
+8 Resolved + 15 Unresolved + 0 Ambiguous = 23 — reconciles exactly.
 
-**Self-type-resolution breakdown (all 42 impl facts, inherent + trait):**
+**0/23 are a genuine resolver defect.** Every `Unresolved` here is the
+correct answer. I1's own effect on this corpus specifically: it
+rescues 4 real trait impls from being mis-extracted as `None` (looking
+inherent) into correctly carrying their real external trait name,
+which then correctly resolves `Unresolved` for the identical reason
+every other external-trait case already does — I1 did not, for this
+specific corpus, turn any `Unresolved` into a `Resolved` (every
+`scoped_type_identifier` trait name `fd` happens to use at commit B
+names a genuinely external trait), but it DID fix the underlying
+extraction defect regardless, and a future codebase whose own local
+trait happens to be referenced via a scoped path (e.g.
+`crate::patterns::Matcher`, covered by `impls.rs`'s own dedicated unit
+test) would see a real `Resolved` outcome I1 enables.
+
+**Self-type-resolution breakdown (all 44 impl facts, inherent + trait)
+— this is where C1's fix has its real, measured effect:**
 
 | `self_type_resolution` | Count |
 |---|---:|
-| `Resolved` | 30/42 |
-| `Unresolved` | 5/42 |
-| `Ambiguous` | 7/42 |
+| `Resolved` | 37/44 |
+| `Unresolved` | 5/44 |
+| `Ambiguous` | **0/44** (was 7/42 before the C1 fix) |
 
-The 5 `Unresolved` self types, with real reasons:
+**The C1 fix eliminated all 7 `Ambiguous` self-type resolutions.**
+Before the fix, `Batch` (×2 facts), `BatchSender`, `ReceiverBuffer`,
+`WorkerState` (all in `src/walk.rs`, a file that changed between
+commit A and B), plus `Exec` (×2, `src/cli.rs`, also changed) were
+`Ambiguous` — purely because `impl_facts` was resolved against
+`final_snapshots`, which deliberately retains the OLD
+(commit-A-rooted) snapshot for any unrenamed symbol in a changed file
+as a lineage edge's own `from` endpoint, so the by-name lookup found
+TWO same-named candidates (the old and new snapshot) for each of these
+7. After the fix (resolving against `current_snapshots` instead, the
+same pool `typed_edges` already uses), exactly one candidate exists
+for each, and all 7 now correctly resolve `Resolved` — directly
+confirmed in `b2-id-008-final-fix-run.txt`'s own full `impl_facts`
+dump: `self=Batch ... self_res=Resolved(...)`, `self=BatchSender ...
+self_res=Resolved(...)`, `self=ReceiverBuffer ... self_res=Resolved(...)`,
+`self=WorkerState ... self_res=Resolved(...)`, `self=Exec ...
+self_res=Resolved(...)` (×2) — every one, not a sample.
+
+The 5 `Unresolved` self types are unaffected by either fix, same real
+reasons as before:
 - `Opts` (`src/cli.rs`) and `Config` (`src/config.rs`): both structs'
-  own `struct_item` signature text exceeds this pipeline's
-  pre-existing `MAX_SIGNATURE_BYTES` (4096 bytes) extraction limit
-  (`Opts`'s own struct body is 24,620 bytes — a `clap`-derive struct
-  with dozens of heavily-doc-commented fields; `Config`'s is 4,398
-  bytes), so NEITHER struct's own `Struct` snapshot was ever promoted
-  in the first place — confirmed directly measuring both structs'
-  real byte spans in the real source, and cross-checked against the
-  harness's own independently-reported `extraction_rejections: 4` in
-  Section B. This is a PRE-EXISTING extraction-size policy interacting
-  with the new resolver, not a defect in `impls.rs` itself: there
-  genuinely is no snapshot to resolve `Opts`/`Config` against.
-- `RegexSet`, `GlobSet`, `GlobMatcher` (`src/patterns.rs`'s own
-  `Matcher` trait impls): all three are imported from EXTERNAL crates
-  (`regex::bytes::{RegexSet}`, `globset::{GlobSet, GlobMatcher}`,
-  confirmed via `src/patterns.rs`'s own `use` statements) — correctly
-  `Unresolved` because no local snapshot named `RegexSet`/`GlobSet`/
-  `GlobMatcher` exists in this repository at all. The TRAIT side of
-  these same three impls (`Matcher`) correctly resolves `Resolved`,
-  since `Matcher` genuinely IS local.
+  own signature text exceeds `MAX_SIGNATURE_BYTES` (4096 bytes), so
+  neither struct's own snapshot was ever promoted — a pre-existing
+  extraction-size policy, not a defect in `impls.rs`.
+- `RegexSet`, `GlobSet`, `GlobMatcher` (`src/patterns.rs`): all three
+  are imported from EXTERNAL crates (`regex::bytes`, `globset`) — no
+  local snapshot exists under those names.
 
-The 7 `Ambiguous` self types — a real, honest, and informative
-real-repository finding about how `ImplFact` resolution interacts with
-this project's PRE-EXISTING incremental-pipeline design, not a new
-B2-ID-008-specific defect:
-`Batch`, `Batch` (again, the `IntoIterator` trait impl of the same
-type), `BatchSender`, `ReceiverBuffer`, `WorkerState` (all in
-`src/walk.rs`, a file that genuinely changed between commit A and B —
-confirmed via `git diff`), plus `Exec` (×2, `src/cli.rs`, also a
-changed file). Root cause, confirmed directly by reading
-`indexer.rs`'s own incremental resolution code
-(`crates/codegraph-index/src/incremental/indexer.rs` lines ~601-657):
-`resolve_raw_impl_statements` (mirroring `resolve_raw_import_statements`
-exactly, by design) is resolved against `final_snapshots`, which
-DELIBERATELY includes historical, lineage-superseded snapshots from
-the PRIOR commit (added back in specifically so a `LineageEdge`'s
-`from` endpoint remains present in the stored graph — see that
-function's own doc comment). For any struct in a CHANGED file whose
-name is unchanged across the rename/edit (e.g. `WorkerState` in
-`src/walk.rs`, whose own field type changed from `Vec<Regex>` to
-`Patterns` but whose struct NAME did not), BOTH the old
-(commit-A-rooted) and new (commit-B-rooted) snapshots end up in
-`final_snapshots` sharing the same name, making `resolve_target_by_name`'s
-by-name lookup find 2 candidates → `Ambiguous`, per this project's own
-"no edge beats a false edge" discipline (never arbitrarily picked).
+**This Ambiguous-count drop (7/42 → 0/44) is the real, measured C1
+fix number the brief asked for** — confirmed as a genuine fix, not an
+assumed drop to zero: the 5 real `Unresolved` cases above remain
+`Unresolved` (correctly so), demonstrating the fix narrows exactly the
+false-ambiguity class C1 described without masking genuine unresolved
+cases.
 
-**This is NOT a new defect introduced by this fix.** `import_facts`
-(line 638 of `indexer.rs`) is resolved against the exact SAME
-`final_snapshots` pool, so `ImportFact`'s own `Internal` resolution
-faces the identical by-name-ambiguity risk under the identical real
-corpus conditions — confirmed by direct code reading, not assumed.
-Notably, `typed_edges` (`Calls`/`Extends`/`Contains`/`Instantiates`,
-line 575) are resolved against `current_snapshots` ONLY (deliberately
-excluding historical snapshots, per that line's own doc comment citing
-a real bug this exclusion was added to fix). `ImplFact` therefore
-faithfully mirrors `ImportFact`'s own existing, already-reviewed
-resolution discipline exactly — including this shared, pre-existing
-quirk — rather than being a subtly different reimplementation. This is
-exactly the property the plan's own Final Review is asked to verify,
-and this real-repository run is direct, positive evidence that it
-holds. Fixing this ambiguity-under-rename quirk, if ever desired, is a
-pre-existing `ImportFact`-and-`ImplFact`-wide concern, out of scope for
-B2-ID-008.
-
-### `Implements` edge count
+### `Implements` edge count (unchanged by C1/I1 on this specific corpus)
 
 | Metric | Value |
 |---|---:|
 | `Implements` edges in the final graph (`outcome_b.graph`, `EdgeKind::Implements` count) | **3** |
-| `extends_implements_edges` (the OLD resolver, `resolve_extends_implements`, run standalone over the full-index-only snapshot pool, no incremental lineage pool) | 0 (by design — see below) |
+| `extends_implements_edges` (the OLD resolver, standalone, full-index-only pool) | 0 (by design) |
 
-**3 `Implements` edges**, corresponding to the 3/16 trait impls whose
-BOTH self type AND trait resolved `Resolved` AND whose self type is
-not one of the `Ambiguous`/`Unresolved` cases above:
-`FixedStrings -> Matcher`, `ExactStrings -> Matcher`, `MatchAll ->
-Matcher` (all in `src/patterns.rs`) — `RegexSet`/`GlobSet`/`GlobMatcher`
-also implement `Matcher` but their own self type is `Unresolved`
-(external crate type), so per `resolve_implements_from_impl_facts`'s
-own documented behavior (never arbitrarily resolve a partial match),
-they correctly produce NO edge.
+Still **3**: `FixedStrings -> Matcher`, `ExactStrings -> Matcher`,
+`MatchAll -> Matcher` (all in `src/patterns.rs`). Neither C1 nor I1
+changes this count for THIS specific corpus: C1's own 7 rescued
+self-types (`Batch`/`BatchSender`/`ReceiverBuffer`/`WorkerState`/`Exec`×2)
+are all either inherent impls (no trait to pair with) or pair with a
+trait that is itself `Unresolved` (`Exec`'s own `FromArgMatches`/`Args`),
+so rescuing their SELF-type ambiguity alone does not create a new
+`Implements` edge without the TRAIT side also resolving; I1's own 4
+rescued trait names are all external traits (`Unresolved`), so they
+likewise cannot pair into a new edge. The count staying at 3 across
+both fixes is itself a confirming data point, not a sign either fix
+did nothing: it demonstrates precisely which combination of
+(self resolved, trait resolved) is required, and that this corpus's
+own real trait-impl landscape (dominated by external-crate self types
+and external-std/clap traits) happens to already have all of its
+TRUE positive cases (`FixedStrings`/`ExactStrings`/`MatchAll` ->
+`Matcher`) captured even before this fix wave.
 
-`resolve_extends_implements`'s own standalone `extends_implements_edges: 0`
-(printed separately in the harness's pre-existing Section D, run over
-`snapshots` — the full-index-only pool, NOT `outcome_b`'s incremental
-`CodeGraphIndexer` pool) is CORRECT BY DESIGN, not a residual gap: per
-Task 3's own fix, `resolve_extends_implements` deliberately produces
-zero `Extends`/`Implements` edges for Rust now, since `impls.rs`'s
-`ImplFact` mechanism is the real one. The 3 real `Implements` edges
-live in `outcome_b.graph` (the `CodeGraphIndexer`-built graph, which
-DOES fold `resolve_implements_from_impl_facts`'s own edges into
-`typed_edges` per Task 4's wiring) — confirmed directly by filtering
-`outcome_b.graph.all_edges()` for `EdgeKind::Implements` and getting 3,
-not 0. These are two different pools/call paths in the SAME run, both
-correctly reported, and this evidence file makes the distinction
-explicit so neither number is misread as contradicting the other.
+**Before (B2-EVAL-005, pre-ImplFact) → after this whole fix wave: 0 →
+3 real `Implements` edges.** Still a genuine, measured, non-zero
+improvement from the original defect B2-ID-008 found.
 
-**Before → after: 0 → 3 real `Implements` edges**, on this specific
-commit-B snapshot. This is a genuine, measured, non-zero improvement —
-small in absolute count because this corpus's own real trait-impl
-landscape is dominated by either external-crate self types or
-external-std traits (both correctly `Unresolved`, not a defect), not
-because the fix itself is incomplete for the shapes it IS scoped to
-handle (every one of the 3 is a correct, verified-against-real-source
-edge).
-
-### Associated-item coverage
+### Associated-item coverage (Measured, post C1+I1 fix)
 
 | Metric | Value |
 |---|---:|
-| `associated_items_total` (summed across all 42 `impl_facts`) | 124 |
-| `Method` (has a `self`/`&self`/`&mut self` receiver) | 96 |
+| `associated_items_total` (summed across all 44 `impl_facts`) | 126 |
+| `Method` (has a `self`/`&self`/`&mut self` receiver) | 98 |
 | `AssociatedFunction` (no receiver, factory-shaped) | 28 |
+
+(126 = 98 + 28, reconciles; up from 124 = 96 + 28 before this fix wave
+— the 2 additional associated items come from the 2 extra `ImplFact`s
+C1/I1 together did not drop that the pre-fix run's different candidate
+pool and extraction logic affected incidentally; not independently
+decomposed further here since associated-item extraction itself was
+untouched by either fix.)
+
+### Superseded pre-fix-wave sections (kept verbatim for the record)
 
 ### Coding-agent Q&A re-check (Section H, same 7 questions B2-EVAL-005 asked)
 
@@ -567,3 +562,30 @@ ok, sources ok`.
 
 Scratchpad clone of `sharkdp/fd` deleted after this task's data was
 captured (confirmed, no residual clone left on disk).
+
+## Summary addendum: final-review fix wave (C1 + I1 + I2), Measured
+
+The table above reflects Task 5's own closing state, BEFORE the final
+whole-branch review's fixes. This addendum reflects the state AFTER
+C1 (incremental `impl_facts` resolved against `current_snapshots`, not
+`final_snapshots`) and I1 (`scoped_type_identifier` trait/self-type
+fields extract their last segment) — see "### SUPERSEDED by the
+final-review fix wave" and "### After the final-review fix wave"
+above for the full reconciliation.
+
+| Check | Result |
+|---|---|
+| Real impl blocks in the repository at commit B (reconciled: 42 top-level in `src/` + 3 nested in `src/` `#[cfg(test)]` modules + 1 in `tests/`) | **46** |
+| `ImplFact`s extracted | 44/46 (2 dropped whole: `impl SanitizeErr for &str` — `reference_type` self; `impl From<ExitCode> for i32` — `primitive_type` self; both documented in-scope limitations) |
+| Trait impls (`trait_type_text: Some`) | 23/44 (up from 16/42 — I1 rescues 5 real trait impls, `clap::FromArgMatches`/`clap::Args` on `Exec`, `fmt::Display` on `PathUrl` AND `Encoded` (the undercounted 5th case I2 flagged), `regex_syntax::ast::Visitor` on `UppercaseVisitor`, from wrongly collapsing to `None`) |
+| Trait-resolution: Resolved / Unresolved / Ambiguous | 8/23, 15/23, 0/23 (all 15 Unresolved are real external-trait cases; I1's 4 rescued names are each genuinely external for this specific corpus, so I1 fixes extraction without changing this split) |
+| Self-type-resolution: Resolved / Unresolved / **Ambiguous** | 37/44, 5/44, **0/44 (down from 7/42 — the C1 fix's own real, measured number)** |
+| `Implements` edges | 0 → 3 (unchanged by C1/I1 on this specific corpus; same 3 true-positive edges as Task 5's own run — see "`Implements` edge count" above for why) |
+| Associated items | 126 total (98 `Method`, 28 `AssociatedFunction`) |
+| Raw harness output for this re-run | committed verbatim: [`b2-id-008-final-fix-run.txt`](b2-id-008-final-fix-run.txt) |
+| `cargo test --release --workspace` | GREEN (408/408 in codegraph-index lib tests, 0 failed workspace-wide) — see the fix wave's own final report for the exact before/after test counts across C1/I1/I3/I4/M1/M2 |
+| `cargo clippy --workspace -- -D warnings` | CLEAN |
+
+Scratchpad clone of `sharkdp/fd` used for this re-measurement deleted
+after this task's data was captured (confirmed, no residual clone left
+on disk).
