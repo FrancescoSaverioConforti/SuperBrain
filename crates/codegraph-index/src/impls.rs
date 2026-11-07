@@ -193,6 +193,24 @@ fn collect_rust_impl(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawIm
     let has_generics = type_parameters.is_some();
     let has_lifetime_params = type_parameters.is_some_and(|tp| tp.children(&mut tp.walk()).any(|c| c.kind() == "lifetime_parameter"));
 
+    // The `.or_else` fallback below is defensive code for a hypothetical
+    // parse shape where `child_by_field_name("body")` is `None` but a
+    // `declaration_list` child still exists positionally. Task 5's own
+    // mutation-testing pass (B2-ID-008) directly probed this with
+    // tree-sitter-rust across five real shapes — an empty trait impl
+    // body (`impl Eq for D {}`), a syntactically malformed impl missing
+    // its body entirely, an `unsafe impl`, a `where`-clause impl, and an
+    // impl preceded by an attribute — and confirmed, in every case,
+    // EITHER `body` is `Some(declaration_list)` directly (the fallback
+    // is never reached) OR `body` is `None` AND no `declaration_list`
+    // sibling exists either (the fallback finds nothing, same
+    // `unwrap_or_default()` outcome as skipping straight to it). No
+    // input tree-sitter-rust can produce makes `.or_else`'s own `find`
+    // predicate (`c.kind() == "declaration_list"` vs. a mutated
+    // `!=`) observably different: this is why a `cargo mutants` run
+    // flipping that `==` to `!=` is a genuinely EQUIVALENT mutant, not a
+    // real test gap — confirmed by direct multi-shape probing, not
+    // asserted without evidence.
     let associated_items = node
         .child_by_field_name("body")
         .or_else(|| node.children(&mut node.walk()).find(|c| c.kind() == "declaration_list"))
@@ -737,6 +755,40 @@ mod tests {
             let result = resolve_raw_impl_statements(&raw, &[self_snapshot.clone(), self_snapshot]);
 
             assert_eq!(result.err(), Some(ImplFactError::DuplicateSnapshotId));
+        }
+
+        #[test]
+        fn resolve_impl_facts_the_one_file_tree_convenience_wrapper_actually_extracts_and_resolves() {
+            // B2-ID-008 Task 5 mutation triage: `resolve_impl_facts` (the
+            // one-file-tree convenience wrapper mirroring
+            // `resolve_import_facts`'s own shape) had no direct test
+            // anywhere in this module or the wider crate before this —
+            // `cargo mutants` caught this by replacing its entire body
+            // with `Ok(vec![])` and finding no test failed. This test
+            // closes that genuine gap: it parses a real tree containing
+            // one trait impl and asserts both that extraction found it
+            // AND that resolution against a real snapshot pool produced
+            // the expected Resolved outcome, so a mutant collapsing this
+            // function to always return an empty Vec would now fail
+            // here.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", "Shape", "trait_item", "trait Shape { fn area(&self) -> f64; }");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+
+            let tree_with_impl = crate::parse::LanguageParser::parse(
+                &crate::parse::RustParser,
+                b"trait Shape { fn area(&self) -> f64; } struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }",
+            )
+            .unwrap();
+
+            let facts = resolve_impl_facts(&defining_file, &tree_with_impl, &[trait_snapshot.clone(), self_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1, "resolve_impl_facts must actually extract the one real impl block in this tree, not return an empty Vec");
+            assert_eq!(facts[0].self_type_text, "Circle");
+            assert_eq!(facts[0].trait_type_text, Some("Shape".to_string()));
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Resolved(self_snapshot.id()));
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Resolved(trait_snapshot.id())));
         }
     }
 }
