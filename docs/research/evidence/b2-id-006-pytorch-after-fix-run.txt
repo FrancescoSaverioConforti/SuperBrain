@@ -1,0 +1,102 @@
+    Finished `release` profile [optimized] target(s) in 0.38s
+     Running `target\release\examples\b2_smoke_test.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\b166a898-c3b1-4d55-a92f-26c7c011ba35\scratchpad\b2-id-006-repair\pytorch-examples' 20955149ad6ea97a4f403e5a56c95a39e568ccbe 001d493285083b54cacbc1334cb26338bdff2455`
+=== B2 real-repository smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\b166a898-c3b1-4d55-a92f-26c7c011ba35\scratchpad\b2-id-006-repair\pytorch-examples
+commit_b: 001d493285083b54cacbc1334cb26338bdff2455
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 214
+files_supported_by_parser: 97
+files_parsed: 97
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 943
+extraction_rejections (oversized name/signature): 11
+snapshots_promoted: 943
+promotion_failures: 0
+python_files_with_at_least_one_import_statement: 86
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 98
+  Field: 376
+  Function: 462
+  Struct: 7
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 535
+extends_implements_edges: 4
+tests_for_edges: 0
+  by_kind Calls: 535
+  by_kind Contains: 548
+  by_kind Extends: 4
+  by_kind Instantiates: 78
+  by_resolution_method NameHeuristic: 223
+  by_resolution_method StaticAnalysis: 942
+full_index_elapsed: 1.1429158s
+
+--- Manual call-quality sample (first 20 by evidence note, deterministic) ---
+Some("distributed/rpc/batch/reinforce.py::run_worker") [Calls/StaticAnalysis] -> Some("distributed/rpc/rl/main.py::Agent") [StaticAnalysis] :: call to "Agent" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/rpc/rl/main.py::run_worker") [Calls/StaticAnalysis] -> Some("distributed/rpc/rl/main.py::Agent") [StaticAnalysis] :: call to "Agent" resolves to exactly one candidate in the given snapshot pool
+Some("imagenet/main.py::train") [Calls/StaticAnalysis] -> Some("imagenet/main.py::AverageMeter") [StaticAnalysis] :: call to "AverageMeter" resolves to exactly one candidate in the given snapshot pool
+Some("imagenet/main.py::validate") [Calls/StaticAnalysis] -> Some("imagenet/main.py::AverageMeter") [StaticAnalysis] :: call to "AverageMeter" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/rpc/batch/parameter_server.py::run_ps") [Calls/StaticAnalysis] -> Some("distributed/rpc/batch/parameter_server.py::BatchUpdateParameterServer") [StaticAnalysis] :: call to "BatchUpdateParameterServer" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/model.py::__init__") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/model.py::Block") [StaticAnalysis] :: call to "Block" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/main.py::get_train_objs") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/char_dataset.py::CharDataset") [StaticAnalysis] :: call to "CharDataset" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::__init__") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("fast_neural_style/neural_style/transformer_net.py::__init__") [Calls/StaticAnalysis] -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer") [StaticAnalysis] :: call to "ConvLayer" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/main.py::main") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/char_dataset.py::DataConfig") [StaticAnalysis] :: call to "DataConfig" resolves to exactly one candidate in the given snapshot pool
+Some("super_resolution/data.py::get_training_set") [Calls/StaticAnalysis] -> Some("super_resolution/dataset.py::DatasetFromFolder") [StaticAnalysis] :: call to "DatasetFromFolder" resolves to exactly one candidate in the given snapshot pool
+Some("super_resolution/data.py::get_test_set") [Calls/StaticAnalysis] -> Some("super_resolution/dataset.py::DatasetFromFolder") [StaticAnalysis] :: call to "DatasetFromFolder" resolves to exactly one candidate in the given snapshot pool
+Some("word_language_model/data.py::__init__") [Calls/StaticAnalysis] -> Some("word_language_model/data.py::Dictionary") [StaticAnalysis] :: call to "Dictionary" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/rpc/pipeline/main.py::run_master") [Calls/StaticAnalysis] -> Some("distributed/rpc/pipeline/main.py::DistResNet50") [StaticAnalysis] :: call to "DistResNet50" resolves to exactly one candidate in the given snapshot pool
+Some("fx/native_interpreter/use_interpreter.py::lower_to_elementwise_interpreter") [Calls/StaticAnalysis] -> Some("fx/native_interpreter/interpreter.cpp::ElementwiseInterpreter") [StaticAnalysis] :: call to "ElementwiseInterpreter" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/model.py::__init__") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/model.py::EmbeddingStem") [StaticAnalysis] :: call to "EmbeddingStem" resolves to exactly one candidate in the given snapshot pool
+Some("legacy/snli/model.py::__init__") [Calls/StaticAnalysis] -> Some("legacy/snli/model.py::Encoder") [StaticAnalysis] :: call to "Encoder" resolves to exactly one candidate in the given snapshot pool
+Some("vision_transformer/main.py::__init__") [Calls/StaticAnalysis] -> Some("vision_transformer/main.py::EncoderBlock") [StaticAnalysis] :: call to "EncoderBlock" resolves to exactly one candidate in the given snapshot pool
+Some("distributed/minGPT-ddp/mingpt/main.py::main") [Calls/StaticAnalysis] -> Some("distributed/minGPT-ddp/mingpt/model.py::GPTConfig") [StaticAnalysis] :: call to "GPTConfig" resolves to exactly one candidate in the given snapshot pool
+Some("gcn/main.py::__init__") [Calls/StaticAnalysis] -> Some("gcn/main.py::GraphConv") [StaticAnalysis] :: call to "GraphConv" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test.exe","21176","Console","18","11.284 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: 20955149ad6ea97a4f403e5a56c95a39e568ccbe
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 944
+observe_commit(A) edge_count: 1166
+observe_commit(A) elapsed (full reindex): 495.3197ms
+changed_files (git diff A..B): ["word_language_model/model.py"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 1, files_reparsed: 1, snapshots_removed: 32, snapshots_added: 31, edges_rebuilt: 1196, raw_import_statements_extracted: 4, raw_import_statements_reused: 687, import_facts_resolved: 691 }
+observe_commit(B) elapsed (incremental): 191.7651ms
+observe_commit(B) final snapshot_count: 974
+observe_commit(B) final edge_count: 1165
+observe_commit(B) final lineage_edge_count: 31
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_import_statements_in_python_files_at_commit_b (line-based count, MEASURED): 589
+python_import_facts_extracted (MEASURED, ImportFact, file-level, Priority 6): 691
+extraction_coverage: 691/589 (117.3%)
+total_import_facts_all_languages (MEASURED): 691
+  resolution_internal (MEASURED): 41
+  resolution_external (MEASURED): 621
+  resolution_ambiguous (MEASURED): 29
+  aliases_captured (MEASURED): 155
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 4
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 687
+
+--- Deep-learning usefulness Q&A (word_language_model, commit B) ---
+Q1 'What is the main model class?' -> TransformerModel snapshots found: 2 (current+historical; disambiguated below)
+Q2 'What does the CURRENT TransformerModel extend?' -> 0 Extends edge(s): []
+Q3 'What composes the forward path?' -> 68 snapshot(s) named 'forward' in the whole pool (ambiguous by name alone across 97 files)
+  CURRENT TransformerModel::forward calls: ["word_language_model/model.py::pos_encoder", "word_language_model/model.py::input_emb", "word_language_model/model.py::decoder", "word_language_model/model.py::_generate_square_subsequent_mask", "word_language_model/model.py::encoder"]
+Q4 'Who calls the model?' -> searching train.py/main.py callers of TransformerModel/RNNModel constructors:
+  callers of TransformerModel: []
+  callers of RNNModel: []
+Q5 'Which tests are linked?' -> word_language_model has no test file in this repo; TestsFor edges in the whole corpus: 0
+Diagnostic (B2-ID-003 regression check): TransformerModel::forward resolves its chained call to _generate_square_subsequent_mask: true
+Q6 'If I modify forward, what is impacted?' -> incoming edges to the CURRENT forward (who is affected if its signature/behavior changes):
+    Some("word_language_model/model.py::TransformerModel") [Contains]
+
+=== done ===

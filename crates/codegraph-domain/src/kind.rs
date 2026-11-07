@@ -73,6 +73,124 @@ pub struct UnrecognizedSymbolKind {
 }
 
 impl SymbolKind {
+    /// B2-ID-006: whether a snapshot of this `SymbolKind` can itself be
+    /// the SOURCE of a `Calls` edge — i.e. whether its own captured
+    /// span represents a single, real, directly executable unit of
+    /// code, as opposed to a structural container whose span merely
+    /// CONTAINS other symbols' own executable bodies (and whose
+    /// `signature_text`, per every current extractor's design, is the
+    /// full span's text either way — see `codegraph-index::extract`'s
+    /// per-language modules).
+    ///
+    /// This is the caller-eligibility half of B2-ID-006's two-part fix
+    /// (see `codegraph-index::edges::calls`'s own module doc comment
+    /// for the other half, the nested-scope span boundary — NEITHER
+    /// part alone is sufficient; see that module's doc for why).
+    /// Centralized here, rather than scattered as an inline
+    /// `if kind != Class && ...` check inside `resolve_calls`, so the
+    /// classification is a single, named, independently testable
+    /// capability a reviewer can audit against this type's own real
+    /// variants, not a blacklist that silently misses a future variant.
+    ///
+    /// Classification (confirmed against every current extractor's
+    /// real behavior — `codegraph-index::extract`'s per-language
+    /// modules — during B2-ID-006's own investigation, not assumed
+    /// from variant names):
+    ///
+    /// - `Function`, `Method` → **true**. Every extractor's own
+    ///   `signature_text` for these IS the directly executable body
+    ///   (a Python/C++ `function_definition`, a Rust `function_item`, a
+    ///   C# `method_declaration`, a JS/TS `method_definition`/
+    ///   `arrow_function`/`function_declaration`). A nested function
+    ///   INSIDE another function's body is still correctly eligible by
+    ///   this predicate alone — distinguishing "outer" from "inner"
+    ///   when both are legitimately eligible is the OTHER half of the
+    ///   fix (the nested-scope boundary), not this predicate's job.
+    /// - `MethodSignature` → **false**. By construction, a trait/
+    ///   interface method SIGNATURE (Rust's `function_signature_item`,
+    ///   TypeScript's `method_signature`) has no body at all (confirmed
+    ///   by `extract/rust.rs`'s own doc comment: "a trait method
+    ///   declaration with no body, e.g. `fn req(&self);`") — it cannot
+    ///   syntactically contain a call expression, so this is a
+    ///   defensive, always-correct exclusion, not a behavior change for
+    ///   any real input.
+    /// - `Class`, `Struct`, `Interface` → **false**. Confirmed, for
+    ///   every language that produces these (`class_definition`/
+    ///   `class_declaration`/`class_specifier`; `struct_item`/
+    ///   `struct_specifier`; `trait_item`/`interface_declaration`),
+    ///   that `signature_text` is the FULL container body, including
+    ///   every nested method's own body — exactly the B2-ID-006 defect
+    ///   this predicate exists to close. A Rust trait's default method
+    ///   body belongs to the METHOD snapshot nested inside it (already
+    ///   `Function`/`Method`, already eligible on its own), never to
+    ///   the trait/`Interface` snapshot itself.
+    /// - `Enum` → **false**. Only Rust's `enum_item` produces this
+    ///   variant (confirmed: no other extractor maps anything to
+    ///   `Enum`); a Rust enum's own body is its variant list (optional
+    ///   associated data types, never executable statements) — there
+    ///   is no real construct this would ever need to treat as
+    ///   "caller-eligible," and excluding it defensively costs nothing.
+    /// - `Field` → **false**. Confirmed by direct synthetic
+    ///   reproduction during B2-ID-006's investigation: a `Field`
+    ///   (`self.x = <rhs>`, Python's `self_attribute_assignment`) can
+    ///   only ever occur inside a method body (`self` is only bound as
+    ///   a parameter inside one), so a `Field` snapshot's own span is
+    ///   ALWAYS nested inside its enclosing `Function`/`Method`
+    ///   snapshot's own span. Treating `Field` as caller-eligible would
+    ///   reproduce the exact B2-ID-006 defect one level deeper (a call
+    ///   in `self.x = f(g())` would be attributed to the `Field` AND
+    ///   to its enclosing method, both of which would still remain
+    ///   eligible) — the nested-scope boundary's own general nesting
+    ///   check does not need `Field` to be eligible for that call to be
+    ///   attributed correctly to the enclosing method, since the
+    ///   method is already `Function`/`Method`-eligible by the first
+    ///   two variants above.
+    /// - `Module`, `Const`, `Macro` → **false**. Confirmed (per this
+    ///   type's own module doc comment and `codegraph-index::snapshot::map_kind_hint`'s
+    ///   own exhaustive mapping table) that NO current extractor ever
+    ///   produces a candidate of any of these three kinds — there is no
+    ///   real `SymbolSnapshot` of these kinds for this predicate to be
+    ///   exercised against today. Decided conservatively (`false`) for
+    ///   exhaustiveness and forward-compatibility rather than left to
+    ///   guess later if a future extractor starts producing one: a
+    ///   `Module`/`File` would be the ultimate "structural container,
+    ///   never itself executable" case if ever implemented (consistent
+    ///   with `codegraph-index::edges::contains`'s own deferred
+    ///   Module/File design note); `Const`/`Macro` are deliberately NOT
+    ///   claimed as semantically decided by this method (a `const fn`
+    ///   body, if ever extracted as its own `Const`-kind candidate
+    ///   rather than folded into `Function`, or a Rust `macro_rules!`
+    ///   body, if ever made call-visible past the known `token_tree`
+    ///   opacity gap `edges::calls`'s own module doc already names,
+    ///   could reasonably need their own dedicated re-evaluation before
+    ///   either is ever flipped to `true` — not decided here, since no
+    ///   real data exists yet to decide it against).
+    /// - `HtmlIdElement`, `CssRule`, `CssKeyframes` → **false**. Already
+    ///   structurally non-executable for an unrelated reason (HTML/CSS
+    ///   have no call-expression concept at all), and already excluded
+    ///   from `resolve_calls`'s own call-site walk by language
+    ///   (`walk_for_calls`'s `Language::Html | Language::Css => false`
+    ///   branch) independent of this predicate — included here only
+    ///   for this method's own exhaustiveness, not because either
+    ///   exclusion depends on the other.
+    pub fn can_originate_calls(self) -> bool {
+        match self {
+            SymbolKind::Function | SymbolKind::Method => true,
+            SymbolKind::MethodSignature
+            | SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Interface
+            | SymbolKind::Module
+            | SymbolKind::Const
+            | SymbolKind::Macro
+            | SymbolKind::HtmlIdElement
+            | SymbolKind::CssRule
+            | SymbolKind::CssKeyframes
+            | SymbolKind::Field => false,
+        }
+    }
+
     /// Parses `SymbolKind`'s own canonical lowercase-kebab-case string
     /// form (`"function"`, `"method-signature"`, `"html-id-element"`, ...)
     /// — NOT Task 4's raw tree-sitter `kind_hint` vocabulary
@@ -175,6 +293,38 @@ impl EdgeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exactly_function_and_method_can_originate_calls() {
+        // B2-ID-006: exhaustive over every CURRENT variant, written as
+        // an explicit allow-list rather than negated from a blacklist,
+        // so a future new SymbolKind variant must be added to ONE of
+        // these two lists explicitly (the match in
+        // `can_originate_calls` itself is non-exhaustive-proof at
+        // compile time; this test is the explicit, readable
+        // human-facing statement of the same fact).
+        let eligible = [SymbolKind::Function, SymbolKind::Method];
+        let ineligible = [
+            SymbolKind::MethodSignature,
+            SymbolKind::Class,
+            SymbolKind::Struct,
+            SymbolKind::Enum,
+            SymbolKind::Interface,
+            SymbolKind::Module,
+            SymbolKind::Const,
+            SymbolKind::Macro,
+            SymbolKind::HtmlIdElement,
+            SymbolKind::CssRule,
+            SymbolKind::CssKeyframes,
+            SymbolKind::Field,
+        ];
+        for kind in eligible {
+            assert!(kind.can_originate_calls(), "{kind:?} must be caller-eligible");
+        }
+        for kind in ineligible {
+            assert!(!kind.can_originate_calls(), "{kind:?} must NOT be caller-eligible");
+        }
+    }
 
     #[test]
     fn every_symbol_kind_variant_round_trips_through_its_canonical_string() {

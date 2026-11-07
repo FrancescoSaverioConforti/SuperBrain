@@ -1,0 +1,26 @@
+B2-ID-007 fix — mutation testing, resolve_tests_for (separate campaign, per explicit instruction not to combine Calls/Extends-Implements/TestsFor scores)
+Command: cargo mutants --no-shuffle -p codegraph-index -f crates/codegraph-index/src/edges/tests_for.rs -- --release
+Date: 2026-11-06
+Status: FINAL closure evidence for B2-ID-007's resolve_tests_for fix.
+
+ INFO Waiting for lock on .../mutants.out/lock.json ...: Impossibile
+ accedere al file. Un altro processo ha bloccato una parte del file.
+ (os error 33)
+ -- transient: this campaign started while the separate
+    extends_implements.rs campaign was still running; cargo-mutants
+    correctly waited for the shared lock rather than corrupting state.
+    No effect on this campaign's own result.
+Found 20 mutants to test
+ok       Unmutated baseline in 20s build + 29s test
+ INFO Auto-set test timeout to 150s
+20 mutants tested in 3m: 19 caught, 1 unviable
+
+Result: 0 missed mutants. 19/20 caught, 1 unviable (standard
+cargo-mutants outcome for a mutant that fails to compile — not
+individually inspected, consistent with every prior mutation run in
+this project).
+
+Conclusion: 0 genuine missed correctness-relevant mutants across
+resolve_tests_for's own fix code (the new
+call_site_belongs_to_a_more_nested_snapshot function and the modified
+resolve_tests_for outer loop). Mutation-closed on the first run.

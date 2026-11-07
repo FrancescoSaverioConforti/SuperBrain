@@ -1,0 +1,31 @@
+B2-ID-006 fix — mutation testing run 1 (calls.rs, full file)
+Command: cargo mutants --no-shuffle -p codegraph-index -f crates/codegraph-index/src/edges/calls.rs -- --release
+Date: 2026-11-06
+Status: checkpoint evidence, preserved per explicit instruction not to discard
+(B2-ID-006 is NOT yet closed — a broader resolver-ownership audit, B2-ID-007,
+is being conducted before any fix is finalized; this run covers calls.rs
+as it stood at the point the audit was ordered, including the new
+B2-ID-006 fix code)
+
+Found 114 mutants to test
+ok       Unmutated baseline in 19s build + 28s test
+ INFO Auto-set test timeout to 144s
+MISSED   crates/codegraph-index/src/edges/calls.rs:291:40: replace < with <= in span_contains_position in 1s build + 5s test
+MISSED   crates/codegraph-index/src/edges/calls.rs:397:9: delete match arm 0 in narrow_by_scope in 1s build + 5s test
+114 mutants tested in 15m: 2 missed, 106 caught, 6 unviable
+
+Notes:
+- span_contains_position's `<` vs `<=` boundary (line 291) is NEW code
+  from this fix — a real gap: the missed mutant means no existing test
+  pins the exact end-exclusive boundary of ByteSpan containment at this
+  call site. Needs a dedicated boundary test (call site exactly AT a
+  candidate's span.end should NOT be considered contained) before this
+  fix can be considered mutation-closed.
+- narrow_by_scope's match arm 0 (line 397) is PRE-EXISTING code, not
+  touched by this fix — not this finding's responsibility to close,
+  but noted for completeness since it appeared in this same run's
+  output.
+- 6 unviable mutants: not yet individually inspected in this checkpoint
+  (standard cargo-mutants outcome for mutants that fail to compile) —
+  not a concern unless a future run's unviable count changes
+  unexpectedly.

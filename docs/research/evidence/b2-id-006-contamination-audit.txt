@@ -1,0 +1,84 @@
+B2-ID-006 contamination audit — raw preserved output
+Produced by: crates/codegraph-index/examples/b2_id_006_audit.rs
+Date: 2026-11-06
+
+=== Synthetic root-cause confirmation (4 minimal hand-written cases) ===
+
+=== Case: Python class, single method, single call (B2-EVAL-003 real shape) (src/repo.py) ===
+  raw_candidates: 3, rejections: 0
+    candidate: CommentsRepository [class_definition] span=ByteSpan { start: 1, end: 134 }
+    candidate: _get_comment_from_db_record [function_definition] span=ByteSpan { start: 31, end: 134 }
+    candidate: Comment [class_definition] span=ByteSpan { start: 137, end: 160 }
+  calls_edges: 2
+    Some("CommentsRepository[Class]") [StaticAnalysis] -> Some("Comment[Class]") :: call to "Comment" resolves to exactly one candidate in the given snapshot pool
+    Some("_get_comment_from_db_record[Function]") [StaticAnalysis] -> Some("Comment[Class]") :: call to "Comment" resolves to exactly one candidate in the given snapshot pool
+
+=== Case: Python nested function (outer defines inner; only inner calls target) (src/nested.py) ===
+  raw_candidates: 3, rejections: 0
+    candidate: outer [function_definition] span=ByteSpan { start: 1, end: 64 }
+    candidate: inner [function_definition] span=ByteSpan { start: 18, end: 47 }
+    candidate: target [function_definition] span=ByteSpan { start: 67, end: 89 }
+  calls_edges: 2
+    Some("outer[Function]") [StaticAnalysis] -> Some("target[Function]") :: call to "target" resolves to exactly one candidate in the given snapshot pool
+    Some("inner[Function]") [StaticAnalysis] -> Some("target[Function]") :: call to "target" resolves to exactly one candidate in the given snapshot pool
+
+=== Case: Rust trait with default method body calling a free function (src/trait_default.rs) ===
+  raw_candidates: 3, rejections: 0
+    candidate: Greeter [trait_item] span=ByteSpan { start: 1, end: 64 }
+    candidate: greet [function_item] span=ByteSpan { start: 21, end: 62 }
+    candidate: helper [function_item] span=ByteSpan { start: 66, end: 80 }
+  calls_edges: 2
+    Some("Greeter[Interface]") [StaticAnalysis] -> Some("helper[Function]") :: call to "helper" resolves to exactly one candidate in the given snapshot pool
+    Some("greet[Function]") [StaticAnalysis] -> Some("helper[Function]") :: call to "helper" resolves to exactly one candidate in the given snapshot pool
+
+=== Case: Python class, two sibling methods, both call the same target (src/siblings.py) ===
+  raw_candidates: 4, rejections: 0
+    candidate: Svc [class_definition] span=ByteSpan { start: 1, end: 80 }
+    candidate: a [function_definition] span=ByteSpan { start: 16, end: 45 }
+    candidate: b [function_definition] span=ByteSpan { start: 51, end: 80 }
+    candidate: target [function_definition] span=ByteSpan { start: 83, end: 105 }
+  calls_edges: 3
+    Some("Svc[Class]") [StaticAnalysis] -> Some("target[Function]") :: call to "target" resolves to exactly one candidate in the given snapshot pool
+    Some("a[Function]") [StaticAnalysis] -> Some("target[Function]") :: call to "target" resolves to exactly one candidate in the given snapshot pool
+    Some("b[Function]") [StaticAnalysis] -> Some("target[Function]") :: call to "target" resolves to exactly one candidate in the given snapshot pool
+
+=== Full-corpus contamination count: fastapi-realworld-example-app @ fa56dbac0cdc7014cc51608702e3d370d73249b3 (B2-EVAL-003 corpus) ===
+  total snapshots: 255
+  total Calls edges: 326
+  Calls edges by caller SymbolKind:
+    Class: 25
+    Field: 6
+    Function: 295
+  container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 25
+  of those, confirmed duplicate of a same-file edge to the same target from a different caller: 17
+  container-originated as % of total Calls edges: 7.7%
+
+=== Full-corpus contamination count: pytorch/examples @ 001d493285083b54cacbc1334cb26338bdff2455 (B2-EVAL-001/002 corpus, BEFORE-side commit per B2-EVAL-002's own naming) ===
+  total snapshots: 943
+  total Calls edges: 878
+  Calls edges by caller SymbolKind:
+    Class: 252
+    Field: 81
+    Function: 541
+    Struct: 4
+  container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 256
+  of those, confirmed duplicate of a same-file edge to the same target from a different caller: 227
+  container-originated as % of total Calls edges: 29.2%
+
+Note on "confirmed duplicate" methodology: an edge (container, to) is
+counted as a confirmed duplicate if there exists ANOTHER edge (other,
+to) to the SAME target, from a DIFFERENT snapshot in the SAME file as
+the container. This is a conservative same-file heuristic, not a
+byte-span-nesting proof for every single pair (the harness that
+produced this count did not re-verify byte-span containment per pair,
+only same-file + same-target + different-caller) — stated explicitly
+so this number is not overclaimed as more precise than it is. The
+remaining container-originated edges that are NOT "confirmed
+duplicates" by this conservative test (25-17=8 for the backend repo,
+256-227=29 for pytorch/examples) are still spurious as "the class/
+struct/interface is not a real caller" even when no same-file sibling
+edge happens to exist to pair them with (e.g. the real call is only
+found via the container's own re-parse and the "real" method-level
+attribution was never produced at all, or the matching method-level
+edge was deduplicated/suppressed by `per_target`'s own per-caller
+collapse before this harness's pairing check ran).

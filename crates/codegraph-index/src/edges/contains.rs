@@ -42,6 +42,23 @@
 //! Always `StaticAnalysis`: containment is read directly off the AST's
 //! own structure (via the span every extractor already produces), never
 //! a guess — there is no heuristic/ambiguous case for this edge kind.
+//!
+//! # Immune to the B2-ID-006/B2-ID-007 nested-scope-ownership defect family
+//!
+//! [B2-ID-006](../../../../docs/research/findings/B2-ID-006.md) and
+//! [B2-ID-007](../../../../docs/research/findings/B2-ID-007.md) found
+//! that `resolve_calls`/`resolve_extends_implements`/`resolve_tests_for`
+//! could attribute a relation transitively to an OUTER ancestor
+//! container, not only to the correct, nearest one — a failure mode
+//! this resolver's own design (see "How containment is determined"
+//! above) was already built to avoid: explicitly selecting the
+//! SMALLEST (innermost) containing `Class` candidate, not merely any
+//! containing one, is exactly the fix those two findings needed for
+//! `Calls`/`Extends`/`Implements`/`TestsFor`, already present here from
+//! this resolver's first version. Confirmed immune by a direct,
+//! real-parse reproduction during B2-ID-007's own resolver-ownership
+//! audit (`class Outer: class Inner: def method(self): pass` produces
+//! exactly `Inner -> method`, never a transitive `Outer -> method`).
 
 use codegraph_domain::{EdgeKind, SymbolKind};
 

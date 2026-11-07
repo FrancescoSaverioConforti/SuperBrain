@@ -1,0 +1,137 @@
+B2-ID-007 resolver-ownership audit — raw preserved diagnostic output
+All cases built from REAL extraction (extract_symbols_reporting_rejections
++ promote), not hand-written placeholder signature_text, run as
+temporary #[test] probes inside the real crate against the real
+resolvers, then removed from the working tree once their result was
+recorded here (not kept as permanent tests — these are audit probes,
+not regression tests; separate, permanent regression tests are added
+per the fix each affected resolver receives).
+Date: 2026-11-06
+
+=== Probe 1: resolve_extends_implements, Python nested class ===
+Source (src/nested_class.py):
+  class Base:
+      pass
+
+
+  class Outer:
+      class Inner(Base):
+          pass
+Result: 2 edges produced.
+  Edge 1: Inner -> Base [Extends, StaticAnalysis] (CORRECT)
+  Edge 2: Outer -> Base [Extends, StaticAnalysis] (SPURIOUS — Outer never
+          extends Base; only the nested Inner class does)
+Verdict: CONFIRMED AFFECTED.
+
+=== Probe 2: resolve_extends_implements, C# nested class ===
+Source (src/Nested.cs):
+  class Base {}
+
+  class Outer {
+      class Inner : Base {}
+  }
+Result: 2 edges produced.
+  Edge 1: Inner -> Base [Extends, StaticAnalysis] (CORRECT)
+  Edge 2: Outer -> Base [Extends, StaticAnalysis] (SPURIOUS)
+Verdict: CONFIRMED AFFECTED (cross-language — not Python-specific).
+Rust/C++/JS/TS collectors share the identical unconditional-recursion
+shape (confirmed by direct source reading of collect_rust_impl_trait,
+collect_cpp_base_clause, collect_js_heritage, collect_ts_heritage_tagged
+in extends_implements.rs — each checks the current node, then
+unconditionally recurses into every child with no boundary at a nested
+symbol's own declaration), but only Python and C# were empirically
+reproduced in this audit; Rust/C++/JS/TS are Inferred-affected by the
+identical code pattern, not yet separately reproduced per-language.
+
+=== Probe 3: resolve_instantiates, Python nested Field inside Class ===
+Source (src/outer_instantiates.py):
+  class Foo:
+      pass
+
+
+  class Outer:
+      def __init__(self):
+          self.x = Foo()
+Result: 1 edge produced.
+  Edge: x [Field] -> Foo [Class, Instantiates, StaticAnalysis] (CORRECT)
+  No Outer -> Foo edge produced.
+Verdict: NOT AFFECTED. Root cause: resolve_instantiates filters its
+outer loop to `field.kind() == SymbolKind::Field` only (instantiates.rs
+line 50: `if field.kind() != SymbolKind::Field { continue; }`) — a
+Class snapshot is never even considered as the "from" side, so the
+container-overreach pattern cannot occur here structurally, independent
+of any span-nesting check.
+
+=== Probe 4: resolve_tests_for, Python nested test-named class (benign case) ===
+Source (src/nested_tests.py):
+  def target():
+      pass
+
+
+  class TestSuite:
+      class TestInner:
+          def test_target(self):
+              target()
+Result: 1 edge produced.
+  Edge: test_target -> target [TestsFor, NameHeuristic] (CORRECT)
+  No TestSuite -> target edge.
+Verdict: not triggered in this specific case, but NOT structurally
+immune — see Probe 5, which shows the same resolver IS affected under
+a different real naming collision.
+
+=== Probe 5: resolve_tests_for, Python outer-name/nested-call collision (adversarial case) ===
+Source (src/collision.py):
+  def add():
+      pass
+
+
+  class test_add:
+      class Inner:
+          def helper(self):
+              add()
+Result: 1 edge produced.
+  Edge: test_add [Class] -> add [Function, TestsFor, NameHeuristic]
+  (SPURIOUS — test_add the CLASS never itself calls add(); only the
+  nested Inner.helper method does, and test_add's own re-parsed body
+  rediscovers that nested call because Inner's body is textually
+  contained in test_add's own signature_text)
+Verdict: CONFIRMED AFFECTED, but with a NARROWER real-world trigger
+condition than resolve_calls/resolve_extends_implements: this resolver
+only treats a snapshot as a caller-candidate if ITS OWN name matches
+the test_X/TestX naming convention AND its re-parsed body (whatever
+that body textually contains, including nested symbols' bodies)
+contains an actual call to the EXACT name that snapshot's own name
+implies. Probe 4 did not trigger this because "TestSuite" implies
+target name "Suite", which nothing in its nested body actually calls
+— that was accidental protection from the naming-convention gate, not
+a structural scope boundary. Probe 5 demonstrates the real trigger: an
+outer container is ITSELF named test_X/TestX (plausible in real code —
+a test class containing nested helper/fixture classes is a realistic
+pytest/unittest shape) AND something nested inside it happens to call
+a candidate matching that exact implied name X.
+
+=== Probe 6: resolve_contains, Python nested classes (immediate vs transitive) ===
+Source (src/nested_contains.py):
+  class Outer:
+      class Inner:
+          def method(self):
+              pass
+Result: 1 edge produced.
+  Edge: Inner [Class] -> method [Function, Contains, StaticAnalysis]
+  No Outer -> method edge.
+Verdict: NOT AFFECTED — already correctly designed. resolve_contains's
+own innermost-candidate selection (contains.rs, the `span_len(candidate_class)
+< span_len(current)` comparison inside its own inner loop) explicitly
+picks the SMALLEST (innermost) enclosing Class for each contained
+symbol, which structurally prevents a transitive/grandparent
+attribution by construction, independent of iteration order.
+
+=== Probe 7 (code reading only, not independently re-run as a probe):
+lineage resolver (lineage/resolver.rs) ===
+`signature()` is used ONLY as an opaque string for similarity
+scoring/exact-match comparison (lines ~204-205, ~245) — never re-parsed
+into an AST, never walked for nested call sites or declarations.
+Verdict: NOT APPLICABLE — this resolver has no AST-ownership semantics
+to misattribute in the first place; it is a structurally different
+kind of consumer of signature_text than every other resolver audited
+here.

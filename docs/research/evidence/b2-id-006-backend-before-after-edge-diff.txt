@@ -1,0 +1,64 @@
+6c6
+<   total Calls edges: 326
+---
+>   total Calls edges: 293
+8,10c8
+<     Class: 25
+<     Field: 6
+<     Function: 295
+---
+>     Function: 293
+19d16
+< Some("app/api/dependencies/authentication.py::RWAPIKeyHeader[Class]") -> Some("app/api/dependencies/authentication.py::__call__[Function]")
+117,118d113
+< Some("app/core/events.py::create_start_app_handler[Function]") -> Some("app/db/events.py::connect_to_db[Function]")
+< Some("app/core/events.py::create_stop_app_handler[Function]") -> Some("app/db/events.py::close_db_connection[Function]")
+121d115
+< Some("app/core/settings/app.py::AppSettings[Class]") -> Some("app/core/logging.py::InterceptHandler[Class]")
+145,146d138
+< Some("app/db/repositories/articles.py::_profiles_repo[Field]") -> Some("app/db/repositories/profiles.py::ProfilesRepository[Class]")
+< Some("app/db/repositories/articles.py::_tags_repo[Field]") -> Some("app/db/repositories/tags.py::TagsRepository[Class]")
+157,162d148
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/db/errors.py::EntityDoesNotExist[Class]")
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/db/repositories/comments.py::__init__[Function]")
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/db/repositories/comments.py::_get_comment_from_db_record[Function]")
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/db/repositories/profiles.py::ProfilesRepository[Class]")
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/db/repositories/profiles.py::get_profile_by_username[Function]")
+< Some("app/db/repositories/comments.py::CommentsRepository[Class]") -> Some("app/models/domain/comments.py::Comment[Class]")
+165d150
+< Some("app/db/repositories/comments.py::_profiles_repo[Field]") -> Some("app/db/repositories/profiles.py::ProfilesRepository[Class]")
+170,174d154
+< Some("app/db/repositories/profiles.py::ProfilesRepository[Class]") -> Some("app/db/repositories/profiles.py::__init__[Function]")
+< Some("app/db/repositories/profiles.py::ProfilesRepository[Class]") -> Some("app/db/repositories/profiles.py::is_user_following_for_another_user[Function]")
+< Some("app/db/repositories/profiles.py::ProfilesRepository[Class]") -> Some("app/db/repositories/users.py::UsersRepository[Class]")
+< Some("app/db/repositories/profiles.py::ProfilesRepository[Class]") -> Some("app/db/repositories/users.py::get_user_by_username[Function]")
+< Some("app/db/repositories/profiles.py::ProfilesRepository[Class]") -> Some("app/models/domain/profiles.py::Profile[Class]")
+176d155
+< Some("app/db/repositories/profiles.py::_users_repo[Field]") -> Some("app/db/repositories/users.py::UsersRepository[Class]")
+179d157
+< Some("app/db/repositories/tags.py::TagsRepository[Class]") -> Some("app/db/repositories/tags.py::get_all_tags[Function]")
+181,185d158
+< Some("app/db/repositories/users.py::UsersRepository[Class]") -> Some("app/db/errors.py::EntityDoesNotExist[Class]")
+< Some("app/db/repositories/users.py::UsersRepository[Class]") -> Some("app/db/repositories/users.py::get_user_by_email[Function]")
+< Some("app/db/repositories/users.py::UsersRepository[Class]") -> Some("app/db/repositories/users.py::get_user_by_username[Function]")
+< Some("app/db/repositories/users.py::UsersRepository[Class]") -> Some("app/models/domain/users.py::UserInDB[Class]")
+< Some("app/db/repositories/users.py::UsersRepository[Class]") -> Some("app/models/domain/users.py::change_password[Function]")
+198,200d170
+< Some("app/models/domain/users.py::UserInDB[Class]") -> Some("app/services/security.py::generate_salt[Function]")
+< Some("app/models/domain/users.py::UserInDB[Class]") -> Some("app/services/security.py::get_password_hash[Function]")
+< Some("app/models/domain/users.py::UserInDB[Class]") -> Some("app/services/security.py::verify_password[Function]")
+204,205d173
+< Some("app/models/domain/users.py::hashed_password[Field]") -> Some("app/services/security.py::get_password_hash[Function]")
+< Some("app/models/domain/users.py::salt[Field]") -> Some("app/services/security.py::generate_salt[Function]")
+222,224d189
+< Some("tests/fake_asyncpg_pool.py::FakeAsyncPGPool[Class]") -> Some("tests/fake_asyncpg_pool.py::FakePoolAcquireContent[Class]")
+< Some("tests/fake_asyncpg_pool.py::FakeAsyncPGPool[Class]") -> Some("tests/fake_asyncpg_pool.py::acquire[Function]")
+< Some("tests/fake_asyncpg_pool.py::FakeAsyncPGPool[Class]") -> Some("tests/fake_asyncpg_pool.py::close[Function]")
+339,341c304,306
+<   container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 25
+<   of those, confirmed duplicate of a same-file edge to the same target from a different caller: 17
+<   container-originated as % of total Calls edges: 7.7%
+---
+>   container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 0
+>   of those, confirmed duplicate of a same-file edge to the same target from a different caller: 0
+>   container-originated as % of total Calls edges: 0.0%

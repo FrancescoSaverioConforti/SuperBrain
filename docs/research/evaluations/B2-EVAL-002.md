@@ -47,6 +47,79 @@ Configuration IDs per `docs/research/EXPERIMENTAL_POLICY.md`. The BEFORE pipelin
 
 **Precision/recall is not computed as a single global number for either configuration.** Per the Evidence-before-claims Experimental Policy, no full corpus-wide ground truth exists (that would require manually verifying thousands of edges); precision is estimated from the 20-sample (Manually validated, N=20 only) and the two targeted false-positive/true-positive cases found across both evaluations. A global F1 is not computed, since recall's true denominator (every real call relationship in the corpus) is not independently known. This is recorded explicitly rather than presented as a global metric that does not exist.
 
+> ## ERRATUM (2026-11-06, [B2-ID-006](../findings/B2-ID-006.md))
+>
+> **Previous claim:** the AFTER-configuration (CALL-RES-A1+A2+A3) row
+> above reports **878** total `Calls` edges and **1,168**
+> `StaticAnalysis`-resolved edges (footnoted as including `Contains`/
+> `Instantiates`), measured against this evaluation's own harness run
+> at SuperBrain commit `7c35741`. The 20-sample manual precision check
+> (`20/20 correct`) validated TARGET correctness only — whether each
+> edge pointed at the right symbol — and did not separately check
+> CALLER correctness — whether the snapshot recorded as the caller was
+> itself a real, executable caller. Neither this evaluation nor
+> B2-EVAL-001 before it checked that second axis.
+>
+> **What B2-ID-006 found:** `resolve_calls` attributed a call site to
+> EVERY enclosing container snapshot whose span happened to contain it
+> (e.g. a `Class`, or an outer `Function` containing a nested one), not
+> only the nearest real executable caller — confirmed, on a full-corpus
+> contamination count run on this exact repository/commit AFTER this
+> evaluation was published, that **256 of the 878 `Calls` edges (29.2%)**
+> originated from a `Class`/`Struct`-kind snapshot, with a further
+> number originating from a `Field`/nested-`Function` nesting pattern
+> this specific count did not separately isolate until a later, more
+> precise re-run (see below).
+>
+> **Fix and corrected result (Measured, re-run via a freshly re-cloned
+> copy of this exact repository at this exact commit, with B2-ID-006's
+> fix applied, raw output preserved at
+> `docs/research/evidence/b2-id-006-pytorch-after-fix-run.txt`, full
+> before/after edge-level diff preserved at
+> `docs/research/evidence/b2-id-006-pytorch-before-after-edge-diff.txt`):**
+>
+> | Metric | This evaluation's original AFTER figure | Corrected (post-B2-ID-006-fix) |
+> |---|---:|---:|
+> | Total `Calls` edges | 878 | **535** |
+> | Container-originated (`Class`/`Struct`/`Interface`/`Enum` as caller) | not separately measured at the time | **0** (was 256, confirmed via the dedicated contamination-count tool) |
+> | `Field`-originated (structurally always nested inside its own method, confirmed never a real caller) | not separately measured at the time | **0** (was 81) |
+> | Nested-`Function`-in-`Function` spurious duplicates (e.g. `validate`'s outer function rediscovering `run_validate`'s own calls to `accuracy`/`display`/`update`) | not separately measured at the time, not previously known as a distinct case | **0** (was 6, confirmed via a full before/after edge-level diff, not merely a count) |
+> | `by_resolution_method StaticAnalysis` (all edge kinds, same corpus-wide tally this evaluation's own footnote describes) | 1,168 | 942 |
+> | `by_resolution_method NameHeuristic` | 340 | 223 |
+>
+> **Every one of the 343 removed edges (878 → 535) was confirmed, by a
+> full edge-level diff (not a sample), to be a spurious duplicate of a
+> real edge that remains present under its correct, more specific
+> caller** — zero new edges were introduced by the fix, and two
+> specific cases (`CommentsRepository`-shaped and `validate`/
+> `run_validate`-shaped) were independently traced against real source
+> to confirm the real, correct edge survived unchanged while only the
+> spurious ancestor-attributed duplicate was removed.
+>
+> **Impact on this evaluation's own Q3/Q4/Q6 (re-run, Measured,
+> identical to this evaluation's own original AFTER answers — see
+> `docs/research/evidence/b2-id-006-pytorch-after-fix-run.txt`):**
+> Q3's `TransformerModel::forward` callees, Q4's empty
+> `TransformerModel`/`RNNModel` caller lists, and Q6's single `Contains`
+> edge are **unchanged** — none of these three specific answers were
+> built from a container-originated edge, so none of them were
+> corrupted by this defect, and this fix introduces no change to them.
+> **No precision/recall conclusion in this evaluation's Section D is
+> invalidated** by this correction, for the same reason.
+>
+> **What this changes:** the `878`/`1,168`/`340` figures in the table
+> above describe a MEASURED state that included a now-confirmed,
+> now-fixed source of spurious edges, and must not be read as the
+> pipeline's current behavior. **What this does NOT change:** this
+> evaluation's own 20-sample manual check and its Q3/Q4/Q6 answers
+> remain valid as TARGET-correctness findings — they were never wrong
+> about which symbol an edge pointed at, only silent about a second,
+> independent axis (caller correctness) this evaluation did not think
+> to check at the time. This correction does not retroactively
+> invalidate the GO decision in Section J below; if anything, the
+> corrected numbers make the AFTER configuration's own precision case
+> stronger (fewer, more precisely-attributed edges), not weaker.
+
 ## C. Imports — extraction coverage vs. resolution accuracy, kept separate
 
 | Metric | Before (9c1d06f) | After (7c35741) |

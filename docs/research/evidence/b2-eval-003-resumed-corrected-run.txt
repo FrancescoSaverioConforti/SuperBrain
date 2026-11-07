@@ -1,0 +1,125 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 2.55s
+     Running `target\release\examples\b2_smoke_test_backend_api.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-003-resume\repo' c1f4042746c293af4bb70b351a858e52df2193f8 fa56dbac0cdc7014cc51608702e3d370d73249b3`
+=== B2-EVAL-003: Backend/API domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-003-resume\repo
+commit_b: fa56dbac0cdc7014cc51608702e3d370d73249b3
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 125
+files_supported_by_parser: 95
+files_parsed: 95
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 255
+extraction_rejections (oversized name/signature): 1
+snapshots_promoted: 255
+promotion_failures: 0
+python_files_with_at_least_one_import_statement: 69
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 58
+  Field: 12
+  Function: 185
+
+--- C2. Module/File -> top-level-symbol gap (Backend/API domain stress case) ---
+files_with_at_least_one_extracted_symbol: 67
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 196
+files_with_more_than_one_top_level_symbol (MEASURED): 39
+top 10 files by top-level-symbol count (file: count):
+  tests/test_api/test_routes/test_articles.py: 18
+  app/db/repositories/articles.py: 14
+  app/db/migrations/versions/fdf8821871d7_main_tables.py: 11
+  tests/conftest.py: 9
+  app/api/dependencies/authentication.py: 7
+  app/db/queries/tables.py: 7
+  tests/test_api/test_routes/test_profiles.py: 7
+  tests/test_api/test_routes/test_users.py: 7
+  app/models/schemas/articles.py: 6
+  app/api/routes/articles/articles_resource.py: 5
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 293
+extends_implements_edges: 42
+tests_for_edges: 0
+  by_kind Calls: 293
+  by_kind Contains: 45
+  by_kind Extends: 42
+  by_kind Instantiates: 6
+  by_resolution_method NameHeuristic: 2
+  by_resolution_method StaticAnalysis: 384
+full_index_elapsed: 200.98ms
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("app/db/repositories/articles.py::_get_article_from_db_record") [Calls/StaticAnalysis] -> Some("app/models/domain/articles.py::Article") [StaticAnalysis] :: call to "Article" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_common.py::get_articles_for_user_feed") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleForResponse") [StaticAnalysis] :: call to "ArticleForResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_common.py::mark_article_as_favorite") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_common.py::remove_article_from_favorites") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_resource.py::create_new_article") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_resource.py::retrieve_article_by_slug") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_resource.py::update_article_by_slug") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_user_can_create_article") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_not_existing_tags_will_be_created_without_duplication") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_user_can_retrieve_article_if_exists") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_user_can_update_article") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_user_can_change_favorite_state") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_articles.py::test_article_will_contain_only_attached_tags") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticleInResponse") [StaticAnalysis] :: call to "ArticleInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/dependencies/articles.py::get_articles_filters") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ArticlesFilters") [StaticAnalysis] :: call to "ArticlesFilters" resolves to exactly one candidate in the given snapshot pool
+Some("app/core/config.py::get_app_settings") [Calls/StaticAnalysis] -> Some("app/core/settings/base.py::BaseAppSettings") [StaticAnalysis] :: call to "BaseAppSettings" resolves to exactly one candidate in the given snapshot pool
+Some("app/db/repositories/comments.py::_get_comment_from_db_record") [Calls/StaticAnalysis] -> Some("app/models/domain/comments.py::Comment") [StaticAnalysis] :: call to "Comment" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/comments.py::create_comment_for_article") [Calls/StaticAnalysis] -> Some("app/models/schemas/comments.py::CommentInResponse") [StaticAnalysis] :: call to "CommentInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_comments.py::test_user_can_add_comment_for_article") [Calls/StaticAnalysis] -> Some("app/models/schemas/comments.py::CommentInResponse") [StaticAnalysis] :: call to "CommentInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_comments.py::test_user_can_delete_own_comment") [Calls/StaticAnalysis] -> Some("app/models/schemas/comments.py::CommentInResponse") [StaticAnalysis] :: call to "CommentInResponse" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_api/test_routes/test_comments.py::test_user_can_not_delete_not_authored_comment") [Calls/StaticAnalysis] -> Some("app/db/repositories/comments.py::CommentsRepository") [StaticAnalysis] :: call to "CommentsRepository" resolves to exactly one candidate in the given snapshot pool
+Some("app/db/repositories/articles.py::get_article_by_slug") [Calls/StaticAnalysis] -> Some("app/db/errors.py::EntityDoesNotExist") [StaticAnalysis] :: call to "EntityDoesNotExist" resolves to exactly one candidate in the given snapshot pool
+Some("app/db/repositories/comments.py::get_comment_by_id") [Calls/StaticAnalysis] -> Some("app/db/errors.py::EntityDoesNotExist") [StaticAnalysis] :: call to "EntityDoesNotExist" resolves to exactly one candidate in the given snapshot pool
+Some("app/db/repositories/users.py::get_user_by_email") [Calls/StaticAnalysis] -> Some("app/db/errors.py::EntityDoesNotExist") [StaticAnalysis] :: call to "EntityDoesNotExist" resolves to exactly one candidate in the given snapshot pool
+Some("app/db/repositories/users.py::get_user_by_username") [Calls/StaticAnalysis] -> Some("app/db/errors.py::EntityDoesNotExist") [StaticAnalysis] :: call to "EntityDoesNotExist" resolves to exactly one candidate in the given snapshot pool
+Some("tests/fake_asyncpg_pool.py::acquire") [Calls/StaticAnalysis] -> Some("tests/fake_asyncpg_pool.py::FakePoolAcquireContent") [StaticAnalysis] :: call to "FakePoolAcquireContent" resolves to exactly one candidate in the given snapshot pool
+Some("app/core/settings/app.py::configure_logging") [Calls/StaticAnalysis] -> Some("app/core/logging.py::InterceptHandler") [StaticAnalysis] :: call to "InterceptHandler" resolves to exactly one candidate in the given snapshot pool
+Some("app/services/jwt.py::create_jwt_token") [Calls/StaticAnalysis] -> Some("app/models/schemas/jwt.py::JWTMeta") [StaticAnalysis] :: call to "JWTMeta" resolves to exactly one candidate in the given snapshot pool
+Some("app/services/jwt.py::create_access_token_for_user") [Calls/StaticAnalysis] -> Some("app/models/schemas/jwt.py::JWTUser") [StaticAnalysis] :: call to "JWTUser" resolves to exactly one candidate in the given snapshot pool
+Some("app/services/jwt.py::get_username_from_token") [Calls/StaticAnalysis] -> Some("app/models/schemas/jwt.py::JWTUser") [StaticAnalysis] :: call to "JWTUser" resolves to exactly one candidate in the given snapshot pool
+Some("app/api/routes/articles/articles_common.py::get_articles_for_user_feed") [Calls/StaticAnalysis] -> Some("app/models/schemas/articles.py::ListOfArticlesInResponse") [StaticAnalysis] :: call to "ListOfArticlesInResponse" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_backend_api.exe","15152","Console","19","8.180 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: c1f4042746c293af4bb70b351a858e52df2193f8
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 242
+observe_commit(A) edge_count: 376
+observe_commit(A) elapsed (full reindex): 155.4553ms
+changed_files (git diff A..B): [".env.example", ".github/workflows/conduit.yml", ".github/workflows/deploy.yml", ".github/workflows/tests.yml", "README.rst", "app/api/dependencies/authentication.py", "app/api/routes/authentication.py", "app/api/routes/users.py", "app/core/config.py", "app/core/events.py", "app/core/settings/__init__.py", "app/core/settings/app.py", "app/core/settings/base.py", "app/core/settings/development.py", "app/core/settings/production.py", "app/core/settings/test.py", "app/db/events.py", "app/db/migrations/env.py", "app/main.py", "docker-compose.yml", "setup.cfg", "tests/conftest.py"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 22, files_reparsed: 22, snapshots_removed: 29, snapshots_added: 42, edges_rebuilt: 415, raw_import_statements_extracted: 124, raw_import_statements_reused: 365, import_facts_resolved: 489 }
+observe_commit(B) elapsed (incremental): 83.9899ms
+observe_commit(B) final snapshot_count: 284
+observe_commit(B) final edge_count: 386
+observe_commit(B) final lineage_edge_count: 29
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_import_statements_in_python_files_at_commit_b (line-based count, MEASURED): 381
+python_import_facts_extracted (MEASURED, ImportFact, file-level): 489
+extraction_coverage: 489/381 (128.3%)
+total_import_facts_all_languages (MEASURED): 489
+  resolution_internal (MEASURED): 192
+  resolution_external (MEASURED): 284
+  resolution_ambiguous (MEASURED): 13
+  aliases_captured (MEASURED): 6
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 124
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 365
+
+--- H. Backend/API usefulness Q&A (fastapi-realworld-example-app, commit B) ---
+Q1 'From which route does user registration start, and what does it call?' -> auth:register calls: ["app/models/schemas/users.py::UserInResponse", "app/services/authentication.py::check_username_is_taken", "app/services/jwt.py::create_access_token_for_user", "app/db/repositories/users.py::create_user", "app/services/authentication.py::check_email_is_taken", "app/api/dependencies/database.py::get_repository", "app/models/schemas/users.py::UserWithToken"]
+Q2 'What does the login route call, and does it reach the data layer?' -> auth:login calls: ["app/models/schemas/users.py::UserInResponse", "app/db/repositories/users.py::get_user_by_email", "app/services/jwt.py::create_access_token_for_user", "app/models/domain/users.py::check_password", "app/api/dependencies/database.py::get_repository", "app/models/schemas/users.py::UserWithToken"]
+Q3 'What does UsersRepository (the users data-layer component) extend?' -> ["app/db/repositories/base.py::BaseRepository"]
+Q4 'If I modify check_username_is_taken, which route handlers are impacted?' -> callers: ["app/api/routes/users.py::update_current_user", "app/api/routes/authentication.py::register"]
+Q5 'Does check_username_is_taken reach the database layer? Through which method?' -> calls: ["app/db/repositories/users.py::get_user_by_username"]
+Q6 'Which tests cover the users data layer or authentication routes?' -> total TestsFor edges in corpus: 0
+  TestsFor edges pointing at UsersRepository: []
+Q7 'Who depends on (calls) get_current_user_authorizer (the auth DI dependency)?' -> callers: ["app/api/routes/profiles.py::follow_for_user", "app/api/routes/comments.py::list_comments_for_article", "app/api/dependencies/comments.py::get_comment_by_id_from_path", "app/api/routes/articles/articles_resource.py::create_new_article", "app/api/routes/users.py::update_current_user", "app/api/dependencies/comments.py::check_comment_modification_permissions", "app/api/routes/articles/articles_common.py::get_articles_for_user_feed", "app/api/routes/users.py::retrieve_current_user", "app/api/dependencies/articles.py::get_article_by_slug_from_path", "app/api/routes/articles/articles_common.py::mark_article_as_favorite", "app/api/dependencies/articles.py::check_article_modification_permissions", "app/api/dependencies/profiles.py::get_profile_by_username_from_path", "app/api/routes/comments.py::create_comment_for_article", "app/api/routes/profiles.py::unsubscribe_from_user", "app/api/routes/articles/articles_common.py::remove_article_from_favorites", "app/api/routes/articles/articles_resource.py::list_articles"]
+
+=== done ===

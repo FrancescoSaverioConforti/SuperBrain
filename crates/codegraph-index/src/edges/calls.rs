@@ -67,6 +67,20 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
     let mut edges = Vec::new();
 
     for caller in lookup.snapshots() {
+        // B2-ID-006, mechanism 1 of 2 (caller eligibility): a snapshot
+        // whose own `SymbolKind` is a structural container (`Class`,
+        // `Struct`, `Interface`, ...) is never itself a real caller —
+        // see `SymbolKind::can_originate_calls`'s own doc comment for
+        // the full, per-variant justification. Skipping here, before
+        // ever re-parsing `caller.signature()`, is both correct (a
+        // container's own body is never itself "executed") and cheaper
+        // than walking its full body only to find nothing new once
+        // mechanism 2 below would otherwise exclude every call inside
+        // it anyway.
+        if !caller.kind().can_originate_calls() {
+            continue;
+        }
+
         let Some(parser) = parser_for(caller.file()) else {
             // This resolver only recognizes languages whose
             // FileIdentity-independent kind it can determine from the
@@ -96,6 +110,29 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
         let mut per_target: std::collections::HashMap<codegraph_domain::SymbolSnapshotId, Edge> = std::collections::HashMap::new();
 
         for call_site in call_sites_in_tree(&tree) {
+            // B2-ID-006, mechanism 2 of 2 (nested-scope boundary): this
+            // call site's ABSOLUTE file position is `caller`'s own span
+            // start plus the call's position within the re-parsed
+            // fragment (`caller.signature()`'s text starts exactly at
+            // `caller.span().start` — see `SymbolSnapshot::span`'s own
+            // doc comment). If some OTHER caller-eligible snapshot,
+            // strictly nested inside `caller`'s own span in the same
+            // file, ALSO strictly contains this absolute position, that
+            // nested snapshot — not `caller` — is this call site's real
+            // owner (it will itself be visited as its own `caller` in a
+            // later iteration of this same outer loop, and will
+            // correctly attribute this call site to itself there).
+            // Skipping it here is what prevents an outer Function/Class
+            // from rediscovering a call that genuinely belongs to a
+            // nested Function/Method — the SAME span-nesting fact
+            // `resolve_contains` already uses for `Contains` edges,
+            // reused here rather than inventing a second nesting
+            // mechanism or any synthetic scope name.
+            let absolute_call_site_position = caller.span().start + call_site.fragment_relative_start_byte;
+            if call_site_belongs_to_a_more_nested_caller(lookup.snapshots(), caller, absolute_call_site_position) {
+                continue;
+            }
+
             let callee_name = call_site.callee_name;
             let all_candidates = lookup.find_by_name(&callee_name, caller.id());
 
@@ -227,11 +264,38 @@ fn enclosing_class_of<'a>(snapshots: &'a [SymbolSnapshot], symbol: &SymbolSnapsh
     innermost
 }
 
-fn same_file(a: &SymbolSnapshot, b: &SymbolSnapshot) -> bool {
+/// B2-ID-006, mechanism 2 of 2: `true` if some snapshot OTHER than
+/// `caller` is (a) caller-eligible, (b) in the same file as `caller`,
+/// (c) strictly nested inside `caller`'s own span, and (d) itself
+/// strictly contains `absolute_call_site_position` — meaning THAT
+/// nested snapshot, not `caller`, is the call site's real nearest
+/// executable owner. When more than one such nested snapshot exists
+/// (a doubly-nested function, for instance), any one of them being
+/// found is sufficient to exclude `caller`: `caller` is never the
+/// nearest owner once ANY more deeply nested eligible snapshot also
+/// contains the position, regardless of how many levels of nesting
+/// separate them — the INNERMOST one will itself independently decide
+/// whether IT has an even-more-nested owner, in its own iteration of
+/// `resolve_calls`'s outer loop.
+fn call_site_belongs_to_a_more_nested_caller(snapshots: &[SymbolSnapshot], caller: &SymbolSnapshot, absolute_call_site_position: usize) -> bool {
+    snapshots.iter().any(|candidate| {
+        candidate.id() != caller.id()
+            && candidate.kind().can_originate_calls()
+            && same_file(candidate, caller)
+            && strictly_contains(caller, candidate)
+            && span_contains_position(candidate.span(), absolute_call_site_position)
+    })
+}
+
+pub(super) fn span_contains_position(span: crate::extract::ByteSpan, position: usize) -> bool {
+    span.start <= position && position < span.end
+}
+
+pub(super) fn same_file(a: &SymbolSnapshot, b: &SymbolSnapshot) -> bool {
     a.file().repository() == b.file().repository() && a.file().commit() == b.file().commit() && a.file().relative_path() == b.file().relative_path()
 }
 
-fn strictly_contains(outer: &SymbolSnapshot, inner: &SymbolSnapshot) -> bool {
+pub(super) fn strictly_contains(outer: &SymbolSnapshot, inner: &SymbolSnapshot) -> bool {
     let outer_span = outer.span();
     let inner_span = inner.span();
     outer_span.start <= inner_span.start && inner_span.end <= outer_span.end && (outer_span.start, outer_span.end) != (inner_span.start, inner_span.end)
@@ -397,6 +461,17 @@ pub(super) fn call_names_in_tree(tree: &crate::parse::ParseTree) -> Vec<String> 
 pub(super) struct CallSite {
     pub(super) callee_name: String,
     pub(super) self_receiver_field: Option<String>,
+    /// B2-ID-006: the call expression's own start byte, relative to the
+    /// re-parsed FRAGMENT text (`caller.signature()`'s own bytes, NOT
+    /// the whole file) — i.e. exactly `tree_sitter::Node::start_byte()`
+    /// on the fragment's own parse tree. `resolve_calls` converts this
+    /// to an absolute file position by adding `caller.span().start`
+    /// before comparing it against any other snapshot's own absolute
+    /// `ByteSpan`, since every `SymbolSnapshot::span()` is a whole-file
+    /// offset (see `extract::candidate::ByteSpan`'s own doc comment)
+    /// while this fragment-relative offset is only meaningful paired
+    /// with the specific `caller` it was produced from.
+    pub(super) fragment_relative_start_byte: usize,
 }
 
 pub(super) fn call_sites_in_tree(tree: &crate::parse::ParseTree) -> Vec<CallSite> {
@@ -417,7 +492,11 @@ fn walk_for_calls(node: tree_sitter::Node, source: &[u8], language: Language, ou
     if is_call_node {
         if let Some(callee_name) = callee_name(node, source) {
             let self_receiver_field = node.child(0).and_then(|callee| self_or_this_receiver_field_name(callee, source));
-            out.push(CallSite { callee_name, self_receiver_field });
+            out.push(CallSite {
+                callee_name,
+                self_receiver_field,
+                fragment_relative_start_byte: node.start_byte(),
+            });
         }
     }
     let mut cursor = node.walk();
@@ -1473,5 +1552,260 @@ mod tests {
         assert_eq!(span_len(&short), 5);
         assert_eq!(span_len(&long), 105);
         assert_ne!(span_len(&short), span_len(&long));
+    }
+
+    // B2-ID-006 regression tests. Every snapshot below is built from
+    // REAL extraction (`extract_symbols_reporting_rejections` + the
+    // real `promote`), not a hand-written placeholder `signature_text`
+    // — the whole point of this finding is that a placeholder body
+    // structurally cannot exercise this bug (see B2-ID-006's own
+    // "Observed" section), so these regression tests must not repeat
+    // that mistake.
+    mod b2_id_006_nested_scope_ownership {
+        use super::*;
+        use crate::extract::extract_symbols_reporting_rejections;
+        use crate::parse::parser_for;
+
+        /// Extracts and promotes every real candidate in `source`
+        /// (parsed as `path`'s own language), returning the resulting
+        /// snapshots. Mirrors exactly what the real production
+        /// pipeline does (parse -> extract -> promote), never
+        /// hand-constructing a `SymbolSnapshot` with an invented span
+        /// or placeholder signature text.
+        fn real_snapshots(repo: codegraph_domain::RepositoryId, path: &str, source: &str) -> Vec<SymbolSnapshot> {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = parser_for(&file).expect("a supported extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("the hand-written fixture source must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture source must not trigger any extraction rejection: {rejections:?}");
+            candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect()
+        }
+
+        fn find<'a>(snapshots: &'a [SymbolSnapshot], name: &str) -> &'a SymbolSnapshot {
+            snapshots.iter().find(|s| s.name().as_str() == name).unwrap_or_else(|| panic!("no snapshot named {name:?} among {:?}", snapshots.iter().map(|s| s.name().as_str()).collect::<Vec<_>>()))
+        }
+
+        fn callers_of<'a>(edges: &'a [Edge], target: &SymbolSnapshot, snapshots: &'a [SymbolSnapshot]) -> Vec<&'a str> {
+            let mut names: Vec<&str> = edges.iter().filter(|e| e.to == target.id()).filter_map(|e| snapshots.iter().find(|s| s.id() == e.from)).map(|s| s.name().as_str()).collect();
+            names.sort_unstable();
+            names
+        }
+
+        #[test]
+        fn python_class_single_method_single_call_is_owned_by_the_method_not_the_class() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/a.py",
+                "class A:\n    def f(self):\n        target()\n\n\ndef target():\n    pass\n",
+            );
+            let target = find(&snapshots, "target");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, target, &snapshots), vec!["f"], "exactly f -> target, never A -> target");
+        }
+
+        #[test]
+        fn python_class_two_sibling_methods_calling_the_same_target_produce_two_real_caller_edges_no_class_duplicate() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/svc.py",
+                "class Svc:\n    def a(self):\n        target()\n\n    def b(self):\n        target()\n\n\ndef target():\n    pass\n",
+            );
+            let target = find(&snapshots, "target");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, target, &snapshots), vec!["a", "b"], "both sibling methods own their own call; the class must not also appear");
+        }
+
+        #[test]
+        fn python_nested_function_call_is_owned_by_the_inner_function_not_the_outer() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/nested.py", "def outer():\n    def inner():\n        target()\n    return inner\n\n\ndef target():\n    pass\n");
+            let target = find(&snapshots, "target");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, target, &snapshots), vec!["inner"], "only inner calls target; outer must not also appear just because inner's span is nested inside it");
+        }
+
+        #[test]
+        fn python_outer_own_call_plus_nested_call_are_each_owned_by_their_real_caller() {
+            // outer calls `first` directly, in its OWN body, outside
+            // inner's span; inner (nested inside outer) calls `second`.
+            // Expected: outer -> first (real, outer's own direct call),
+            // inner -> second (real), and NEVER outer -> second (which
+            // would mean outer's own re-parsed body rediscovered a call
+            // that only textually exists because inner's body happens
+            // to be nested inside outer's span).
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/mixed.py",
+                "def outer():\n    first()\n\n    def inner():\n        second()\n    return inner\n\n\ndef first():\n    pass\n\n\ndef second():\n    pass\n",
+            );
+            let first = find(&snapshots, "first");
+            let second = find(&snapshots, "second");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, first, &snapshots), vec!["outer"], "outer's own direct call to first must still resolve");
+            assert_eq!(callers_of(&edges, second, &snapshots), vec!["inner"], "second is owned by inner alone, never also by outer");
+        }
+
+        #[test]
+        fn rust_outer_call_immediately_adjacent_to_a_nested_functions_closing_brace_still_resolves() {
+            // Pins the end-exclusive ByteSpan boundary
+            // (`span_contains_position`'s `position < span.end`, not
+            // `<=`) against the exact real byte-adjacency case where
+            // the two operators diverge: `fn outer(){fn inner(){}other();}`
+            // — `inner`'s own span is `[11, 23)` (ends exactly at its
+            // closing `}`), and `other()`'s call expression starts at
+            // EXACTLY byte 23 — i.e. `absolute_call_site_position ==
+            // inner.span().end` precisely, the one position where `<`
+            // and `<=` disagree. With the correct `<`, position 23 is
+            // NOT inside `inner`'s `[11, 23)` span, so `outer` (whose
+            // own `[0, 32)` span DOES legitimately contain position 23)
+            // keeps ownership of this call, exactly as it should: this
+            // is `outer`'s OWN direct call, not something `inner`
+            // contains. A `<=` mutant would wrongly treat position 23
+            // as still "inside" `inner`, incorrectly excluding `outer`
+            // from owning a call it genuinely makes.
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/zero_gap.rs", "fn outer(){fn inner(){}other();}\n\nfn other(){}\n");
+            let other = find(&snapshots, "other");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(
+                callers_of(&edges, other, &snapshots),
+                vec!["outer"],
+                "outer's own call to other, starting at the exact byte inner's span ends, must resolve to outer — the end-exclusive boundary must not misattribute it to inner or drop it"
+            );
+        }
+
+        #[test]
+        fn python_outer_own_call_immediately_after_a_nested_function_definition_still_resolves() {
+            // Pins the end-exclusive ByteSpan boundary
+            // (`span_contains_position`'s `position < span.end`, not
+            // `<=`) against a real adjacency case: `outer` defines
+            // `inner` FIRST, then immediately makes its OWN direct call
+            // (`after_inner()`) on the very next line, right after
+            // `inner`'s own span ends. If the nested-scope boundary
+            // check used `<=` instead of `<`, a call site landing
+            // exactly at (or the byte comparison treating as "still
+            // inside") `inner`'s own `span.end` could be wrongly
+            // excluded from `outer`'s own attribution, misattributing
+            // (or losing) a real call `outer` genuinely makes — the
+            // opposite failure mode from B2-ID-006's original
+            // over-attribution bug, but the same boundary this fix's
+            // own span check must get exactly right.
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/adjacent.py",
+                "def outer():\n    def inner():\n        pass\n    after_inner()\n\n\ndef after_inner():\n    pass\n",
+            );
+            let after_inner = find(&snapshots, "after_inner");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(
+                callers_of(&edges, after_inner, &snapshots),
+                vec!["outer"],
+                "outer's own direct call, immediately after inner's definition ends, must still resolve to outer — not be lost or misattributed at the inner/outer span boundary"
+            );
+        }
+
+        #[test]
+        fn python_doubly_nested_function_call_is_owned_by_the_innermost_function_only() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/deep.py",
+                "def outer():\n    def middle():\n        def inner():\n            target()\n        return inner\n    return middle\n\n\ndef target():\n    pass\n",
+            );
+            let target = find(&snapshots, "target");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, target, &snapshots), vec!["inner"], "neither outer nor middle must appear — only the innermost real caller");
+        }
+
+        #[test]
+        fn rust_trait_default_method_call_is_owned_by_the_method_not_the_trait() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/trait_default.rs", "trait Greeter {\n    fn greet(&self) {\n        helper();\n    }\n}\n\nfn helper() {}\n");
+            let helper = find(&snapshots, "helper");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, helper, &snapshots), vec!["greet"], "the default method owns its own call; the trait/Interface snapshot must not also appear");
+        }
+
+        #[test]
+        fn csharp_class_method_call_is_owned_by_the_method_not_the_class() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/A.cs", "class A {\n    void F() {\n        Target();\n    }\n}\n\nclass Target2 {\n    void Target() {}\n}\n");
+            // C#'s method_declaration requires a containing structure;
+            // the free-standing `Target()` call resolves by bare name
+            // against whatever same-named candidate exists in the pool
+            // — this test only asserts the CLASS `A` never appears as a
+            // caller for whichever edge(s) are produced, which is the
+            // one thing B2-ID-006 is actually about (not re-testing
+            // C#'s own name-resolution behavior here).
+            let edges = resolve_calls(&snapshots).unwrap();
+            let class_a = find(&snapshots, "A");
+            assert!(edges.iter().all(|e| e.from != class_a.id()), "the C# class snapshot must never be a Calls caller");
+        }
+
+        #[test]
+        fn cpp_class_method_call_is_owned_by_the_method_not_the_class() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/a.cpp", "void helper() {}\n\nclass A {\n    void f() {\n        helper();\n    }\n};\n");
+            let helper = find(&snapshots, "helper");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, helper, &snapshots), vec!["f"], "the C++ class must not also appear as a caller of helper");
+        }
+
+        #[test]
+        fn javascript_class_method_call_is_owned_by_the_method_not_the_class() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/a.js", "function helper() {}\n\nclass A {\n    f() {\n        helper();\n    }\n}\n");
+            let helper = find(&snapshots, "helper");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, helper, &snapshots), vec!["f"], "the JS class must not also appear as a caller of helper");
+        }
+
+        #[test]
+        fn method_signature_with_no_body_never_originates_a_call() {
+            // Rust trait method SIGNATURE (no body) alongside a real
+            // default method that DOES call something — confirms
+            // MethodSignature is excluded without needing a body to
+            // exclude it from (there is none to walk), and does not
+            // interfere with the real default method's own edge.
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(repo, "src/sig.rs", "trait T {\n    fn no_body(&self);\n\n    fn with_body(&self) {\n        helper();\n    }\n}\n\nfn helper() {}\n");
+            let helper = find(&snapshots, "helper");
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(callers_of(&edges, helper, &snapshots), vec!["with_body"], "only the real default method body owns the call");
+        }
+
+        #[test]
+        fn result_is_deterministic_regardless_of_input_snapshot_order() {
+            let repo = test_repo_calls();
+            let snapshots = real_snapshots(
+                repo,
+                "src/order.py",
+                "class Svc:\n    def a(self):\n        target()\n\n    def b(self):\n        target()\n\n\ndef target():\n    pass\n",
+            );
+            let target = find(&snapshots, "target");
+
+            let forward_edges = resolve_calls(&snapshots).unwrap();
+            let mut reversed = snapshots.clone();
+            reversed.reverse();
+            let reversed_edges = resolve_calls(&reversed).unwrap();
+
+            assert_eq!(callers_of(&forward_edges, target, &snapshots), callers_of(&reversed_edges, target, &reversed), "caller attribution must not depend on snapshot pool ordering");
+        }
     }
 }

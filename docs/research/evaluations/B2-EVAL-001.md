@@ -114,6 +114,27 @@ smaller amount of C++ (`Struct` from `struct` declarations).
 | By resolution method: `StaticAnalysis` | 286 |
 | By resolution method: `NameHeuristic` | 11,652 |
 
+> **ERRATUM pointer (2026-11-06, [B2-ID-006](../findings/B2-ID-006.md)):**
+> the `11,934` total and the `StaticAnalysis`/`NameHeuristic` split above
+> were measured at the CALL-RES-A0 configuration (Task 7, pre-Task-9.5),
+> which — like every later configuration up to and including Task 9.5's
+> own AFTER state — had no caller-eligibility/nested-scope-ownership
+> check, meaning a `Class` (and, once they existed, `Field`/nested-
+> `Function`) snapshot could be spuriously recorded as a caller here
+> too. This specific CALL-RES-A0 baseline was NOT independently
+> re-measured for this defect's exact magnitude (doing so would require
+> re-cloning and re-running a configuration this project no longer runs
+> in production); the full, precise before/after contamination
+> measurement exists for the CALL-RES-A1+A2+A3 configuration instead —
+> see the fuller erratum in
+> [B2-EVAL-002](B2-EVAL-002.md#b-calls--precisionrecallf1-by-configuration).
+> This evaluation's own 20-sample manual check below (Target
+> correctness) and this evaluation's own Q3/Q4/Q6 answers are unaffected
+> by this pointer, for the same reason given in B2-EVAL-002's own
+> erratum: this defect affects CALLER attribution, not which symbol an
+> edge's target names, and none of this evaluation's own manually
+> re-checked edges happened to be a container-originated one.
+
 **Manually validated sample (20 `Calls` edges, deterministically
 selected by sorting on evidence note text, each checked against the
 real source via `git show`):**

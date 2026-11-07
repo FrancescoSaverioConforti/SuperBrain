@@ -40,7 +40,7 @@
 
 use codegraph_domain::{Confidence, EdgeKind, ResolutionMethod};
 
-use super::calls::parser_for;
+use super::calls::{parser_for, same_file, span_contains_position, strictly_contains};
 use super::resolution::{heuristic_evidence, Edge, EdgeResolutionError, TargetLookup};
 use crate::snapshot::SymbolSnapshot;
 
@@ -60,14 +60,36 @@ pub fn resolve_tests_for(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, Edge
             continue;
         };
 
-        let called_names = super::calls::call_names_in_tree(&tree);
-        if !called_names.iter().any(|name| name == &implied_target_name) {
-            // The naming convention alone, with no actual call to the
-            // implied target found anywhere in this function's body,
-            // is not evidence this resolver accepts — a function named
-            // `test_add` that never calls anything named `add` is NOT
-            // linked, per the task's explicit "do not infer from naming
-            // alone" instruction.
+        // B2-ID-007: a call site found while re-parsing THIS snapshot's
+        // own `signature_text` genuinely belongs to it only if no OTHER
+        // snapshot, more deeply nested inside `snapshot`'s own span in
+        // the same file, ALSO contains that exact call site — the SAME
+        // nested-scope-ownership defect family B2-ID-006 found in
+        // `resolve_calls` (see that resolver's own module doc comment),
+        // here applied to `TestsFor`'s own "which test function's body
+        // really contains this call" question. Confirmed via a real
+        // reproduction during B2-ID-007's own audit: a container snapshot
+        // (e.g. a `Class` whose OWN name happens to match the test-
+        // naming convention, containing a nested class/method that
+        // genuinely calls the implied target) could otherwise claim a
+        // call site that only exists, textually, because the nested
+        // symbol's own body is nested inside this snapshot's re-parsed
+        // fragment.
+        let has_a_real_call_to_the_implied_target = super::calls::call_sites_in_tree(&tree).into_iter().any(|call_site| {
+            if call_site.callee_name != implied_target_name {
+                return false;
+            }
+            let absolute_call_site_position = snapshot.span().start + call_site.fragment_relative_start_byte;
+            !call_site_belongs_to_a_more_nested_snapshot(lookup.snapshots(), snapshot, absolute_call_site_position)
+        });
+        if !has_a_real_call_to_the_implied_target {
+            // Either no call to the implied target exists anywhere in
+            // this snapshot's own re-parsed body at all (the naming
+            // convention alone, per the task's explicit "do not infer
+            // from naming alone" instruction, is not sufficient), or
+            // every call matching the implied name actually belongs to
+            // a more deeply nested snapshot — in BOTH cases, this
+            // snapshot itself has no real claim to the relation.
             continue;
         }
 
@@ -92,6 +114,24 @@ pub fn resolve_tests_for(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, Edge
     }
 
     Ok(edges)
+}
+
+/// B2-ID-007: `true` if some snapshot OTHER than `snapshot`, in the
+/// SAME file, strictly nested inside `snapshot`'s own span, itself
+/// strictly contains `absolute_call_site_position` — meaning that
+/// nested snapshot, not `snapshot`, is this call site's real textual
+/// owner. Deliberately NOT restricted to `can_originate_calls()`-
+/// eligible kinds the way `resolve_calls`'s own equivalent check is:
+/// `TestsFor`'s own naming-convention gate (`test_naming_convention_target`)
+/// is what does the real filtering here (a `Class` nested inside
+/// another `Class` is excluded from EVER claiming the relation not
+/// because it is caller-ineligible in a `Calls` sense, but because
+/// `resolve_tests_for`'s own outer loop only matches a snapshot whose
+/// NAME fits the convention at all) — so this check only needs to ask
+/// "is some other, more specific snapshot the real nested owner of
+/// this exact byte position," independent of its own `SymbolKind`.
+fn call_site_belongs_to_a_more_nested_snapshot(snapshots: &[SymbolSnapshot], snapshot: &SymbolSnapshot, absolute_call_site_position: usize) -> bool {
+    snapshots.iter().any(|candidate| candidate.id() != snapshot.id() && same_file(candidate, snapshot) && strictly_contains(snapshot, candidate) && span_contains_position(candidate.span(), absolute_call_site_position))
 }
 
 /// If `name` matches a recognized test-naming convention, returns the
@@ -233,5 +273,81 @@ mod tests {
     fn a_bare_test_prefix_with_nothing_after_it_implies_no_target() {
         assert_eq!(test_naming_convention_target("test_"), None);
         assert_eq!(test_naming_convention_target("Test"), None);
+    }
+
+    // B2-ID-007 regression tests: a call site found only because a
+    // NESTED symbol's own body happens to be textually contained in an
+    // outer, test-naming-convention-matching snapshot's own re-parsed
+    // fragment must not be claimed by that outer snapshot. Every
+    // snapshot below is built from REAL extraction
+    // (`extract_symbols_reporting_rejections` + `promote`), not a
+    // hand-written placeholder `signature_text` — the real adversarial
+    // shape B2-ID-007's own audit found (`class test_add: class Inner:
+    // def helper(self): add()`) structurally requires real nested
+    // extraction to reproduce.
+    mod b2_id_007_nested_scope_ownership {
+        use super::*;
+        use crate::extract::extract_symbols_reporting_rejections;
+        use crate::parse::parser_for as real_parser_for;
+
+        fn real_snapshots(repo: codegraph_domain::RepositoryId, path: &str, source: &str) -> Vec<SymbolSnapshot> {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = real_parser_for(&file).expect("a supported extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("the hand-written fixture source must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture source must not trigger any extraction rejection: {rejections:?}");
+            candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect()
+        }
+
+        fn find<'a>(snapshots: &'a [SymbolSnapshot], name: &str) -> &'a SymbolSnapshot {
+            snapshots.iter().find(|s| s.name().as_str() == name).unwrap_or_else(|| panic!("no snapshot named {name:?} among {:?}", snapshots.iter().map(|s| s.name().as_str()).collect::<Vec<_>>()))
+        }
+
+        fn repo() -> codegraph_domain::RepositoryId {
+            let mut registry = RepositoryRegistry::new();
+            registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+        }
+
+        #[test]
+        fn outer_container_whose_own_name_matches_the_convention_does_not_claim_a_nested_methods_call() {
+            // The exact adversarial shape B2-ID-007's own audit found:
+            // the OUTER class is itself named `test_add` (implying
+            // target "add"), and a NESTED class's own method genuinely
+            // calls `add()` — before the fix, `test_add`'s own
+            // re-parsed body would wrongly rediscover that nested call
+            // and claim the TestsFor edge itself.
+            let snapshots = real_snapshots(repo(), "src/collision.py", "def add():\n    pass\n\n\nclass test_add:\n    class Inner:\n        def helper(self):\n            add()\n");
+            let add_fn = find(&snapshots, "add");
+            let edges = resolve_tests_for(&snapshots).unwrap();
+
+            assert!(edges.iter().all(|e| e.from != find(&snapshots, "test_add").id()), "the outer container 'test_add' must never claim the TestsFor edge");
+            // Neither must a false edge be invented for `Inner` or
+            // `helper` instead — `Inner`/`helper` do not themselves
+            // match the test-naming convention (their own names are
+            // not test_X/TestX-shaped), so correctly NO edge exists at
+            // all for this case — conservative behavior, not a missed
+            // opportunity, exactly per this module's own "do not infer
+            // from naming alone" discipline.
+            assert!(edges.is_empty(), "no snapshot here has BOTH a matching name AND genuinely owns the call, so no edge should exist at all");
+            let _ = add_fn;
+        }
+
+        #[test]
+        fn a_real_nested_test_function_still_correctly_claims_its_own_call() {
+            // Sanity check: once the OUTER container's own name does
+            // NOT match the convention, a genuinely nested test
+            // function (whose OWN name does match) must still resolve
+            // correctly — confirms the fix does not overcorrect into
+            // suppressing real, legitimate nested test functions.
+            let snapshots = real_snapshots(repo(), "src/nested_real_test.py", "def add():\n    pass\n\n\nclass Suite:\n    class Inner:\n        def test_add(self):\n            add()\n");
+            let add_fn = find(&snapshots, "add");
+            let test_add = find(&snapshots, "test_add");
+            let edges = resolve_tests_for(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "the genuinely nested test_add method must still correctly claim its own call");
+            assert_eq!(edges[0].from, test_add.id());
+            assert_eq!(edges[0].to, add_fn.id());
+        }
     }
 }

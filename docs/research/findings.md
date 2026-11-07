@@ -14,6 +14,9 @@ the full finding file under `findings/`.
 | [B2-ID-003](findings/B2-ID-003.md) | A chained-call "false negative" reported in B2-EVAL-001 turned out to be an evaluation-harness subject-selection bug, not a pipeline defect | Harness selected "the current snapshot named X" by local name alone, ambiguous once >1 class in a file shares a member name | Important — affected research validity of a published evaluation claim, not production correctness | Scope-aware harness lookup via `Contains` edges (`find_current_member_of_class`), reusing Task 9.5's own Priority 2 addition | Isolated + full-body + 5× real-corpus reproduction all confirm correct resolution once the harness is fixed; B2-EVAL-001 corrected with an explicit erratum, not a silent edit | No directly applicable authoritative source identified |
 | [B2-ID-004](findings/B2-ID-004.md) | `resolve_calls` matched receiver-qualified calls (`self.src_mask.size(0)`) and unqualified common-name calls (`forward`) purely by bare name, corpus-wide, producing confirmed cross-class/cross-language false positives (Q3) and a 19-for-19 false-positive rate on incoming callers (Q6) | No receiver awareness (the receiver segment was extracted then discarded) and no scope awareness (ambiguous candidates were never narrowed before being treated as equally plausible) | Important — the single most commonly-asked coding-agent question ("what does X call"/"who calls X" for a common name) was effectively unanswerable; 97.6% of B2-EVAL-001's original typed edges were `NameHeuristic` fan-out | Receiver-aware filtering for `self`/`this`-qualified calls (restrict to the caller's own class); scope-hierarchy narrowing (same class → same file) for unqualified ambiguous calls, with "no edge" replacing "N Hypothesized edges" once narrowing is exhausted — both recorded as an experimental configuration (CALL-RES-A1+A2+A3) per the new Evidence-before-claims Experimental Policy | 318 tests (up from 308) all passing, full workspace/clippy/deny clean; real-corpus re-run: Q3 false positives 2→0 (5 genuine Field calls found instead), Q6 false positives 19→0 | Standard class-hierarchy-analysis/receiver-type-pruning practice in static call-graph construction; no single paper cited for this project's own specific narrowing rule |
 | [B2-ID-005](findings/B2-ID-005.md) | The original symbol-to-symbol `EdgeKind::Imports`/`resolve_imports` captured 0 of 589 real import statements in a real 97-file corpus | Granularity mismatch: an import statement is a file/module-level fact, never honestly attributable to one arbitrarily-chosen symbol in that file, and Task 4's own `signature_text` extraction boundary never includes a file's leading import statements anyway | Important — a core, frequently-needed capability (knowing what a file imports/who imports a given module) was entirely non-functional on real data despite passing its own (artificial-fixture) unit tests | Removed `EdgeKind::Imports`/`resolve_imports` outright; replaced with a separate file-level `ImportFact` model (`codegraph_index::imports`), splitting local syntax extraction (incrementally reused) from global semantic resolution (always recomputed from the full current pool), wired into the real `CodeGraphIndexer` production pipeline with its own atomic-publication guarantee | 353 tests (up from 325) all passing, full workspace/clippy/deny clean; mutation testing closed (319 mutants tested across all Task 9.5 files, 275 caught, 41 unviable, 3 missed — all 3 confirmed and documented as equivalent mutants, 0 timeouts); real-corpus re-run via the real indexer: 589 line-based → 691 real `ImportFact`s extracted (41 internal, 621 external, 29 ambiguous, 155 aliases); incremental reuse confirmed (687/691 raw statements reused on a 1-file-changed update); independent review APPROVE | Standard compiler front-end practice (syntax extraction vs. semantic/symbol resolution as separate phases); no single paper cited for this project's own specific `ImportFact` design |
+| [B2-ID-006](findings/B2-ID-006.md) | `resolve_calls` attributes a call site to EVERY enclosing container snapshot whose span happens to contain it (e.g. a class), not only the nearest real executable caller (its method) — confirmed to generalize to nested functions and Rust trait default methods, not Class-specific | Every extractor sets a container's `signature_text` to its FULL body (nested calls included); `resolve_calls` has no "nearest enclosing executable scope" concept and no `SymbolKind` caller-eligibility filter | Important — measured 7.7% (25/326, B2-EVAL-003 backend corpus) to 29.2% (256/878, B2-EVAL-001/002's own `pytorch/examples` corpus) of all `Calls` edges are container-originated, most confirmed duplicates of a real method-level edge to the same target; corrupts aggregate edge/fan-out counts and any caller-kind-unaware "who calls X" query | **CLOSED — independent review APPROVE, no Critical/Important issues, no changes required** — a `SymbolKind::can_originate_calls` caller-eligibility filter plus a nested-scope span boundary in the call-site walk, reusing the same span-nesting fact `resolve_contains` already computes | 13 regression tests (Python/Rust/C#/C++/JS, all passing), 366/366 `codegraph-index` tests green, mutation testing CLOSED (107/114 caught, 6 unviable, 1 pre-existing equivalent mutant, 0 genuine gaps); contamination repair CLOSED on both corpora (`pytorch/examples` 878→535, backend corpus 326→293, zero new edges, Q3/Q4/Q6 unchanged); errata added to B2-EVAL-001/002 | Néron, Tolmach, Visser & Wachsmuth (2015), *A Theory of Name Resolution*, ESOP 2015 — scope graphs support attributing a construct to its nearest enclosing scope via an explicit relation, not raw span containment; cited as general support, not as this project's own algorithm |
+| [B2-ID-007](findings/B2-ID-007.md) | The SAME structural pattern found in B2-ID-006 (`resolve_calls`) also affects `resolve_extends_implements` (nested type declaration's base clause attributed to its outer container too) and `resolve_tests_for` (narrower trigger); `resolve_instantiates` and `resolve_contains` are confirmed NOT affected | Shared structural cause (unconditional recursion into nested AST nodes with no declaration boundary), but each relation needs its OWN ownership rule — `Extends`/`Implements` is owned by the specific declaration whose header names the base, not by "nearest executable scope" (B2-ID-006's own rule, meaningless for inheritance) | Important — confirmed on Python and C# (`Extends`), Python (`TestsFor`); `Extends` edges are always asserted as `StaticAnalysis`-certain, making a spurious one a more direct invariant violation than `Calls`'s own heuristic case | **CLOSED — independent review APPROVE, no Critical/Important issues, no changes required** — a parse-tree-local node-kind boundary for `Extends`/`Implements`; a cross-snapshot span check (not reusing `Calls`'s own eligibility filter) for `TestsFor` | 12 new regression tests (10 Extends/Implements across Python/C#/C++/JS/TS/Rust, 2 TestsFor including the exact adversarial collision case), 378/378 `codegraph-index` tests green, 0 regressions; mutation CLOSED separately for each resolver (Extends/Implements: 39 mutants, 0 missed; TestsFor: 20 mutants, 0 missed) | Same Néron et al. (2015) scope-graphs citation as B2-ID-006, extended with Sun et al. (2023), *ACER: An AST-based Call Graph Generator Framework*, arXiv:2308.15669, as context for AST-based relationship extraction generally — neither prescribes this project's own per-relation fix mechanisms |
+| [B2-ID-008](findings/B2-ID-008.md) | `resolve_extends_implements` produces ZERO `Extends`/`Implements` edges on any real Rust repository, despite real traits/impls existing and being individually extracted as symbols (`sharkdp/fd`: 2 traits, 41 impls, 0 edges produced) | `extract/rust.rs` never extracts `impl_item` as a `RawSymbolCandidate` at all, so no `SymbolSnapshot`'s own signature span ever contains one, and the resolver's own Rust-specific collector (`collect_rust_impl_trait`, otherwise correct) is structurally unreachable on real Rust source — genuinely dead code on the real-world path, not merely under-tested | Important — complete (100%), silent absence of the entire trait/impl relationship on Rust, independent of corpus; every trait/impl-focused coding-agent question ("which traits does X implement," "which types implement this trait") is Not answerable even though both endpoints exist as real graph symbols | **OPEN — design decision pending, not implemented.** Four alternatives presented (impl-as-its-own-SymbolKind node; impl-as-a-non-symbol ImplFact reusing the ImportFact pattern; file/module-level resolver with no new intermediate type; an evidence-driven hybrid) with explicit pros/cons, corpus-based classification (inherent vs. trait impls, generics, lifetimes, multi-impl-per-type), and a confirmed tree-sitter grammar fact (`impl_item`'s own named `trait`/`type` fields) relevant to whichever is chosen | N/A — no fix implemented yet; [B2-EVAL-005](evaluations/B2-EVAL-005.md) PAUSED pending this finding's resolution | rustc HIR's own `Impl` node (official compiler-internals documentation) models impl/trait/type as three distinct identities, supporting the impl-as-its-own-node alternative; `ferrograph`/`tldr-core` (real open-source Rust code-graph tools) independently confirm both design directions are used in practice; no peer-reviewed paper found specific to this exact design choice |
 
 ## Discussion: B2-ID-001
 
@@ -253,3 +256,259 @@ has no `Module`/`File` structural owner yet (queried directly by
 `FileIdentity`). A module PATH itself is not resolved to a real file,
 only the imported NAME is resolved against the snapshot pool. Not
 exposed through any persistence/API/MCP layer.
+
+## Discussion: B2-ID-006
+
+**Problem.** `resolve_calls` treats every given snapshot as an
+independent caller candidate and re-parses its full `signature_text`
+for call sites with no scope boundary — so a container snapshot
+(`Class`, `Interface`/trait, and in principle `Struct`/`Enum`) whose
+own text includes its members' bodies rediscovers every call inside
+every one of those members, attributing it a second time to the
+container itself.
+
+**Evidence.** B2-EVAL-003 (multi-codebase validation, Backend/API
+domain, `nsidnev/fastapi-realworld-example-app`) found a real call
+(`Comment(...)` inside `CommentsRepository._get_comment_from_db_record`)
+attributed to both the method (correct) and the class (spurious). A
+dedicated synthetic audit then confirmed the SAME duplication occurs
+for a plain nested Python function (outer/inner) and a Rust trait
+default method — proving the root cause is span-nesting generally, not
+Class or Python specifically. A full-corpus count found 25/326 (7.7%)
+container-originated `Calls` edges in the B2-EVAL-003 corpus and
+256/878 (29.2%) in `pytorch/examples` at the exact commit
+B2-EVAL-001/002 used — meaning a significant fraction of those two
+already-published evaluations' own aggregate `Calls`/`StaticAnalysis`
+counts are now known to include this contamination (their specific
+published Q&A answers were insulated by unrelated scope-aware lookup
+logic and are not themselves falsified; the raw counts are affected).
+
+**Root Cause.** Every extractor (`extract/python.rs`, `cpp.rs`,
+`csharp.rs`, `javascript.rs`, `rust.rs`) sets `signature_text` to the
+full node-text of a candidate's span, with no distinction between "this
+span IS the executable body" and "this span CONTAINS other symbols'
+own executable bodies." `resolve_calls` has no "nearest enclosing
+executable scope" concept to consult instead.
+
+**Alternatives.** An ad hoc `if kind == Class { skip }` special case
+was explicitly rejected — the synthetic audit proves it would leave the
+nested-function and Rust-trait cases completely unfixed. Changing what
+extraction captures for a container's `signature_text` globally was
+considered and left open as a real but larger-blast-radius alternative
+to fixing attribution specifically in `resolve_calls`. Leaving it
+undocumented as an inherent limitation was rejected given the measured
+magnitude (up to 29.2% of all `Calls` edges in an already-published
+corpus).
+
+**Solution.** Implemented and approved: a `SymbolKind::can_originate_calls`
+caller-eligibility predicate (`Function`/`Method` only; `Field`
+confirmed `false` by a concrete nested-scope reproduction; `Const`/
+`Macro` stay `false` by conservative default since neither is produced
+by any current extractor) combined with a nested-scope span boundary
+in the call-site walk, reusing the same span-nesting fact
+`resolve_contains` already computes for Class→Method, generalized to
+any nested snapshot-to-snapshot relationship rather than invented
+twice.
+
+**Experimental Validation.** Root cause confirmed via a minimal,
+placeholder-free synthetic reproduction (4 cases: Class/Method,
+nested Function, Rust trait default method, sibling methods sharing a
+target) plus a full-corpus contamination count on two independently
+re-cloned real repositories. The fix itself: 13 regression tests
+(Python/Rust/C#/C++/JS, all real-extraction-based, all passing), 366
+`codegraph-index` tests green, 0 regressions. Mutation testing CLOSED:
+107/114 caught, 6 unviable, 1 pre-existing equivalent mutant
+(`narrow_by_scope`, unrelated to this fix), 0 genuine gaps remaining.
+Contamination repair CLOSED via full before/after edge-level diffs
+(not samples) on both corpora: `pytorch/examples` 878→535 `Calls`
+edges, B2-EVAL-003's backend corpus 326→293 — every removed edge
+confirmed spurious, zero new edges introduced, Q3/Q4/Q6 answers
+unchanged. Raw output for every step preserved under
+`docs/research/evidence/b2-id-006-*`.
+
+**Literature Support.** No directly applicable authoritative source
+identified for this specific implementation defect. The violated
+principle — a call site's caller is determined by lexical scope (the
+nearest enclosing executable unit), not by arbitrary AST ancestor
+containment — is foundational static-analysis/compiler-construction
+material, not tied to one specific citation.
+
+**Remaining Limitations.** Measured directly on Python (real +
+synthetic) and Rust (synthetic only); C++/C#/JavaScript/TypeScript are
+Inferred-affected by the identical extraction pattern (confirmed by
+source reading) but not yet empirically reproduced per-language.
+**Update:** the fix design was approved and implemented (11 new
+regression tests across Python/Rust/C#/C++/JS, all passing; mutation
+testing 106/114 caught). `Field` caller-eligibility is now resolved
+(`false`, confirmed by a concrete nested-scope reproduction);
+`Const`/`Macro` remain `false` by conservative default since neither
+is produced by any current extractor. **This finding is NOT closed**:
+while verifying the fix, the same structural pattern was found in two
+more resolvers — see [B2-ID-007](findings/B2-ID-007.md) — and final
+closure (one missed-mutant boundary test, both corpora's contamination
+repair, the B2-EVAL-001/002 erratum) is deferred until B2-ID-007
+resolves. B2-EVAL-003 itself remains paused.
+
+## Discussion: B2-ID-007
+
+**Problem.** While verifying B2-ID-006's own fix, the identical
+structural pattern (re-parsing a snapshot's full `signature_text`,
+recursing unconditionally into every child node with no boundary at a
+nested symbol's own declaration) was found in `resolve_extends_implements`
+and `resolve_tests_for` too — prompting a systematic audit of every
+resolver that re-parses a snapshot's own source text, rather than
+assuming B2-ID-006's exact fix generalizes everywhere.
+
+**Evidence.** A real-parse reproduction confirmed a nested Python class's
+own base clause (`class Outer: class Inner(Base): ...`) produces BOTH
+`Inner -> Base` (correct) and `Outer -> Base` (spurious) in
+`resolve_extends_implements`; the same shape was independently
+reproduced in C#. `resolve_tests_for` was confirmed affected too, but
+with a narrower real-world trigger (an outer container must itself
+match the test-naming convention AND something nested inside it must
+call the exact implied target name). Two other resolvers,
+`resolve_instantiates` and `resolve_contains`, were independently
+confirmed NOT affected by direct reproduction, not assumed safe by
+analogy — `resolve_instantiates`'s own `SymbolKind::Field`-only filter
+structurally excludes any container from ever being a candidate "from"
+side; `resolve_contains` already selects the innermost (smallest-span)
+candidate by explicit design.
+
+**Root Cause.** A shared STRUCTURAL pattern producing a shared FAILURE
+MODE, but each affected relation needs a DIFFERENT ownership rule:
+`Calls` is owned by the nearest executable enclosing scope (B2-ID-006's
+own rule); `Extends`/`Implements` is owned by the specific type
+declaration whose own header syntax names the base (inheritance has no
+"executable scope" concept at all, so B2-ID-006's own mechanism cannot
+simply be reused verbatim); `TestsFor` is owned by the specific test
+function/method whose own body contains the real call, gated by this
+resolver's own separate naming-convention check.
+
+**Alternatives.** Assuming B2-ID-006's exact fix mechanism generalizes
+to every resolver was explicitly rejected — this audit's own findings
+disprove it directly (two resolvers need no fix at all; two more need
+a DIFFERENT ownership rule, not the same span-boundary check under a
+different name). Folding this into B2-ID-006 itself was rejected per
+explicit instruction, since the fix is not yet demonstrated identical.
+Fixing every affected resolver immediately, in the same pass as the
+audit, was rejected since the ownership rule for `Extends`/`Implements`
+and `TestsFor` has not yet been through its own design/approval step.
+
+**Solution.** **Not implemented — audit only, per explicit instruction.**
+Recommends separate, relation-specific fixes: a parse-tree-local,
+node-kind-based recursion boundary for `resolve_extends_implements`
+(stop recursing into a child that is itself a new type-declaration
+boundary); a cross-snapshot span check closer to B2-ID-006's own
+mechanism for `resolve_tests_for`. No fix chosen or implemented for
+either without further approval.
+
+**Experimental Validation.** Every classification in the resolver-
+ownership matrix (6 resolvers plus lineage) is backed by a real,
+reproducible probe — not reasoned by analogy — with raw output
+preserved at `docs/research/evidence/b2-id-007-resolver-ownership-audit.txt`.
+The NOT-affected classifications were independently, empirically
+checked, specifically because they were the ones most at risk of being
+wrongly assumed affected (or safe) by analogy alone.
+
+**Literature Support.** Néron, Tolmach, Visser & Wachsmuth (2015), the
+same scope-graphs citation as B2-ID-006, supports the general
+principle that ownership must be determined by an explicit lexical/
+semantic relation, not raw span containment. Sun et al. (2023), *ACER:
+An AST-based Call Graph Generator Framework* (arXiv:2308.15669), is
+cited as context confirming AST-based relationship extraction is an
+established, legitimate approach in the literature generally — relevant
+background for why these resolvers' own AST-re-parse design is
+reasonable even though it needs this family of ownership-boundary
+fixes. Neither source prescribes this project's own specific per-
+relation fix mechanisms.
+
+**Remaining Limitations.** `resolve_extends_implements`'s Rust/C++/JS/TS
+collectors are Inferred-affected (identical code pattern) but not yet
+empirically reproduced per-language — only Python and C# were actually
+run against real nested-declaration source. `resolve_tests_for`'s
+affected shape has not yet been assessed for real-world frequency. No
+fix is implemented for either affected resolver; B2-ID-006 itself also
+remains open pending this audit's resolution.
+
+## Discussion: B2-ID-008
+
+**Problem.** [B2-EVAL-005](evaluations/B2-EVAL-005.md) (Rust/systems
+domain, `sharkdp/fd`, MIT/Apache-2.0) measured `extends_implements_edges:
+0` against a real corpus containing 2 real traits (`Matcher`, 6
+implementors; `SanitizeErr`, 3 implementors) and 41 real `impl` blocks,
+all individually confirmed by direct source reading. This is the first
+B2 evaluation to exercise `resolve_extends_implements`'s own
+Rust-specific collector against genuine Rust `impl` syntax at all.
+
+**Root Cause.** `extract/rust.rs`'s symbol extractor never produces a
+`RawSymbolCandidate` for an `impl_item` node — only `struct_item`,
+`enum_item`, `trait_item`, `function_item`, `function_signature_item`
+are recognized. Since `resolve_extends_implements` only ever re-parses
+EXISTING snapshots' own signature text looking for an `impl_item`
+inside it, and Rust's grammar never nests an `impl` block inside a
+struct/enum/trait/function's own span, the resolver's own Rust
+collector (`collect_rust_impl_trait`) is structurally unreachable on
+any real Rust source — confirmed genuinely dead code on the real-world
+path, not merely thin test coverage. A direct tree-sitter probe
+further confirmed a SECOND, currently-latent defect inside that same
+dead code: it searches for the trait name via a positional
+`type_identifier` child instead of `impl_item`'s own named `trait`
+field, which would also silently fail to extract the implementing
+TYPE's name correctly for any generic impl (`impl<T> Trait for
+Generic<T>`, confirmed by probe to have `type` field kind
+`generic_type`, never matched by the existing positional search).
+
+**Impact.** Important — a complete (100%), silent, corpus-independent
+absence of the entire trait/impl relationship on Rust; this
+evaluation's own explicit priority questions ("which traits does this
+type implement," "which types implement this trait") are Not
+answerable despite both endpoints existing as real, correctly-extracted
+graph symbols. No prior B2 evaluation reported a Rust-specific
+`Extends`/`Implements` figure, so no erratum is owed to any prior
+publication — this is a newly surfaced gap. Not Critical: no crash, no
+corrupted/spurious edge (the resolver fails closed by accident of
+unreachability).
+
+**Solution.** **Not implemented — design decision pending, per explicit
+instruction.** Four alternatives presented with corpus-grounded
+pros/cons: (A) `impl` as its own first-class `SymbolKind` node
+(`ImplBlock`, with `Contains`/`Implements` edges to its methods and
+trait), aligned with rustc HIR's own `Impl` node model; (B) `impl` as a
+non-symbol `ImplFact`, reusing this project's own precedented
+`ImportFact` pattern from B2-ID-005; (C) a dedicated file/module-level
+resolver pass with no new intermediate symbol or fact type; (D) an
+unspecified evidence-driven hybrid, not ruled out. A corpus-based
+classification (18 inherent impls, 23 trait impls, 4 generic impls, 2
+with lifetime parameters, confirmed multiple impl blocks for the same
+type — `DirEntry`'s 6 separate blocks) and a direct grammar probe
+(`impl_item`'s own named `trait`/`type` fields) are recorded to ground
+whichever alternative is eventually chosen.
+
+**Experimental Validation.** Every classification (impl counts, trait-
+impl vs. inherent split, generics, lifetimes, multi-impl-per-type) is
+Measured directly against the real `sharkdp/fd` corpus at the exact
+commit this finding cites, not estimated. The grammar-field claim
+(`impl_item.trait`/`impl_item.type`) was confirmed via a direct,
+throwaway tree-sitter probe against this workspace's own
+`tree_sitter_rust` version, not assumed from documentation.
+
+**Literature Support.** rustc's own HIR (`rustc_hir::hir::Impl`,
+official compiler-internals documentation) models an impl block, its
+optional trait, and its implementing type as three distinct
+identities — supporting Alternative A as the model closest to the
+language's own semantic ground truth, without by itself mandating a
+full mirror of rustc's own field set. Two real, independently-published
+open-source Rust code-graph tools (`ferrograph`, a two-phase
+placeholder-edge approach closer to Alternative B; `tldr-core`, direct
+field-based extraction via the same `trait`/`type` fields this
+finding's own probe confirmed) show both design directions are used in
+practice elsewhere, cited as precedent evidence, not as an
+architecture to copy. No peer-reviewed paper specific to this exact
+design choice was found; rust-analyzer's own internal semantic model
+was sought but not found via search and is flagged honestly as an
+unestablished reference, not guessed at.
+
+**Remaining Limitations.** No fix is implemented or decided.
+[B2-EVAL-005](evaluations/B2-EVAL-005.md) remains PAUSED, with its
+already-collected pre-fix/partial metrics preserved and explicitly
+marked, pending a design decision on this finding.

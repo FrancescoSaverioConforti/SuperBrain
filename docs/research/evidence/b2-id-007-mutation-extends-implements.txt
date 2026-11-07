@@ -1,0 +1,22 @@
+B2-ID-007 fix — mutation testing, resolve_extends_implements (separate campaign, per explicit instruction not to combine Calls/Extends-Implements/TestsFor scores)
+Command: cargo mutants --no-shuffle -p codegraph-index -f crates/codegraph-index/src/edges/extends_implements.rs -- --release
+Date: 2026-11-06
+Status: FINAL closure evidence for B2-ID-007's resolve_extends_implements fix.
+
+Found 39 mutants to test
+ok       Unmutated baseline in 19s build + 30s test
+ INFO Auto-set test timeout to 151s
+39 mutants tested in 6m: 35 caught, 4 unviable
+
+Result: 0 missed mutants. 35/39 caught, 4 unviable (standard
+cargo-mutants outcome for mutants that fail to compile — not
+individually inspected, consistent with every prior mutation run in
+this project).
+
+Conclusion: 0 genuine missed correctness-relevant mutants across
+resolve_extends_implements's own fix code (the new
+for_each_node_not_inside_a_nested_boundary function and all six
+per-language collectors it was applied to). Mutation-closed on the
+first run — no gap-closing regression test was needed, unlike
+B2-ID-006's own calls.rs campaign (which needed one additional
+boundary test after its first run).

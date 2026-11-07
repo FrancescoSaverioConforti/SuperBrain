@@ -34,6 +34,29 @@
 //! constructor call is syntactically unambiguous evidence, not a
 //! heuristic guess — the same reasoning `resolve_calls` already applies
 //! to its own uniquely-resolved case.
+//!
+//! # Immune to the B2-ID-006/B2-ID-007 nested-scope-ownership defect family
+//!
+//! [B2-ID-006](../../../../docs/research/findings/B2-ID-006.md) and
+//! [B2-ID-007](../../../../docs/research/findings/B2-ID-007.md) found
+//! that `resolve_calls`/`resolve_extends_implements`/`resolve_tests_for`
+//! could attribute a relation to an ANCESTOR container snapshot (e.g. a
+//! `Class`) merely because that container's own re-parsed
+//! `signature_text` happens to textually contain a nested symbol's own
+//! relevant construct. This resolver's own outer loop
+//! (`if field.kind() != SymbolKind::Field { continue; }`, below) is
+//! structurally immune to that entire defect family: a `Class`/
+//! `Struct`/`Interface`/etc. snapshot is never even considered as a
+//! candidate "from" side here, independent of any span-nesting check —
+//! confirmed by a direct, real-parse reproduction during B2-ID-007's
+//! own resolver-ownership audit (`class Outer: def __init__(self):
+//! self.x = Foo()` produces exactly `x -> Foo`, never `Outer -> Foo`).
+//! This is not an accident of this resolver's current behavior; it
+//! follows directly from a `Field` (`self.X = <rhs>`) only ever
+//! existing inside a method body in the first place (`self` is only
+//! ever bound as a parameter inside one), so there is no ancestor
+//! container this resolver's own kind filter would ever need to
+//! exclude separately.
 
 use codegraph_domain::{EdgeKind, SymbolKind};
 
