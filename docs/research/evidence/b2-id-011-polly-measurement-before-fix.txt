@@ -1,0 +1,35 @@
+B2-ID-011 real-repo measurement (PRE-fix baseline)
+App-vNext/Polly, commit 1f232caf9672e515751ba2df76d82bfbbb62e016
+
+Produced by temporarily restoring crates/codegraph-index/src/edges/calls.rs
+to its HEAD (pre-B2-ID-011) content via `git show HEAD:...`, running the
+same probe_b2_id_011_measurement harness used for the post-fix run, then
+restoring the fix. No working-tree state was left in the pre-fix condition.
+
+=== B2-ID-011 real-repo measurement (pre-fix) ===
+total_invocation_expression_sites (raw-parse proxy, MEASURED): 26508
+generic_bare_call_sites (MEASURED): 166
+generic_receiver_qualified_call_sites (MEASURED): 4977
+non_generic_call_sites (MEASURED): 21365
+total_snapshots: 5190
+invocation_sites_within_caller_eligible_signatures_total (MEASURED): 29544
+  generic_bare: 181
+  generic_receiver_qualified: 5058
+  non_generic: 24305
+handle_generic_call_sites_within_signatures (MEASURED): 931
+total_calls_edges: 1882
+  by_resolution_method NameHeuristic: 399
+  by_resolution_method StaticAnalysis: 1483
+handle_snapshots_in_pool: 6
+calls_edges_targeting_any_handle_snapshot: 0
+
+Note: total_invocation_expression_sites, generic_bare_call_sites, and
+generic_receiver_qualified_call_sites are identical before/after by
+construction -- these are raw-parse-proxy counts over the whole file tree,
+independent of calls.rs's own extraction logic, and confirm the same
+4977/26508 (18.8%) + 166 figures reported by the earlier B2-EVAL-008
+measurement pass that discovered this finding, re-derived independently
+here rather than merely trusted.
+
+total_calls_edges: 1882 (pre-fix) -> 1928 (post-fix), delta +46.
+calls_edges_targeting_any_handle_snapshot: 0 (pre-fix) -> 1 (post-fix).

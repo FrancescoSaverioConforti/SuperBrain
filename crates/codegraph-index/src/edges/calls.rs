@@ -506,31 +506,135 @@ fn walk_for_calls(node: tree_sitter::Node, source: &[u8], language: Language, ou
 }
 
 /// `call_node`'s own first named child is the callee expression: an
-/// `identifier` for a simple call, or an `attribute`/`field_expression`/
+/// `identifier` for a simple call, a `generic_name`/`template_function`
+/// for a generic/template call with no receiver (`Foo<int>()` — see
+/// B2-ID-011 below), or an `attribute`/`field_expression`/
 /// `member_expression`/`member_access_expression`-shaped member access
-/// for a method call, whose own LAST `identifier`/`property_identifier`/
-/// `field_identifier` child is the method name actually being called
-/// (`self.encoder` -> `"encoder"`, not `"self"`). `member_access_expression`
-/// (C#'s own node kind for `this.srcMask.Size`, confirmed via a direct
+/// for a method call, whose own LAST
+/// `identifier`/`property_identifier`/`field_identifier`/`generic_name`/
+/// `template_method` child is the method name actually being called
+/// (`self.encoder` -> `"encoder"`, not `"self"`;
+/// `obj.Handle<TimeoutException>` -> `"Handle"`, not
+/// `"Handle<TimeoutException>"`). `member_access_expression` (C#'s own
+/// node kind for `this.srcMask.Size`, confirmed via a direct
 /// `tree-sitter-c-sharp` parse dump during Task 9.5's Priority 5(A)
 /// investigation) was previously missing from this match arm — every
 /// other language's equivalent node kind was already handled, so a C#
 /// receiver-qualified call silently extracted no callee name at all,
 /// confirmed as a real, pre-existing gap, not hypothetical.
+///
+/// # B2-ID-011: generic/template callees
+///
+/// Confirmed via direct grammar probe (not assumed): a generic/
+/// template method call's own callee name is wrapped one level deeper
+/// than the simple cases above, in BOTH shapes this function must
+/// handle, for BOTH languages that have this construct —
+///
+/// - bare (`Foo<int>()`): `invocation_expression`/`call_expression`'s
+///   own first child IS the wrapper node directly (C#'s
+///   `generic_name`, C++'s `template_function`), matched by the
+///   `"generic_name" | "template_function"` arm below;
+/// - receiver-qualified (`obj.Foo<int>()`, `this.Foo<int>()`,
+///   `foo.Bar.Baz<int>()`): the member-access callee's own LAST child
+///   is the wrapper node (C#'s `generic_name`, C++'s
+///   `template_method`) — never a bare `identifier`/
+///   `property_identifier`/`field_identifier` — so both wrapper kinds
+///   are added to the SAME filter the receiver-qualified arm already
+///   used, handled by `wrapped_callee_simple_name` below rather than
+///   returned as-is (which would wrongly yield the FULL text
+///   `"Handle<TimeoutException>"`, not the bare method name
+///   `"Handle"`).
+///
+/// Before this fix, NEITHER shape reached a matching arm at all, in
+/// either language: a bare generic/template call fell through
+/// `callee.kind()`'s `_ => None` arm (dropped before ever reaching
+/// `call_sites_in_tree`'s own output), and a receiver-qualified
+/// generic/template call's `.last()` filter never matched the wrapper
+/// kind, so it returned `None` from the empty iterator — both silently
+/// invisible to this resolver, not merely ambiguous. Measured on a
+/// real C# corpus (`App-vNext/Polly`): 4977 of 26508 (18.8%)
+/// receiver-qualified call sites and 166 bare call sites were generic
+/// and therefore entirely unseen before this fix. C++'s own
+/// `template_function`/`template_method` shapes were confirmed broken
+/// by the identical mechanism during this fix's own cross-language
+/// scope audit (not separately measured on a real C++ corpus — the
+/// grammar-level defect is structurally identical, confirmed via
+/// direct probe, which this project's own "grammar-first" discipline
+/// treats as sufficient confirmation without a separate corpus
+/// measurement for a fix this narrow).
+///
+/// A generic/template call that is itself the RECEIVER of a further
+/// call (`obj.Foo<int>().Next()`) needs no special handling here: the
+/// grammar represents the chain as the OUTER call's callee being a
+/// member-access node whose own first child is the INNER call
+/// (`obj.Foo<int>()`), not a wrapper node at all — `Next`'s own
+/// extraction already works via the pre-existing
+/// `identifier`/`property_identifier`/`field_identifier` filter, and
+/// the inner `Foo<int>()` call is found independently by
+/// `walk_for_calls`'s own unconditional recursion into every child,
+/// confirmed by a direct grammar probe before writing this fix.
+/// Likewise a generic/template call nested inside another call's own
+/// argument list (`Bar(Foo<int>())`) needs no special handling: both
+/// call nodes are visited independently by the same recursive walk.
+///
+/// # B2-ID-011 cross-language scope audit: C++ has the identical gap
+///
+/// Confirmed via direct grammar probe (not assumed to be "plausibly
+/// unaffected," as this finding's own discovery note originally
+/// guessed before this fix's own audit): C++ template calls share the
+/// EXACT same structural defect, one level of indirection C# does not
+/// have, under different node-kind names — a bare template call
+/// (`Foo<int>()`) wraps its callee in a `template_function` node
+/// (`call_expression`'s own first child), and a receiver-qualified
+/// template call (`obj.Foo<int>()`) wraps it in a `template_method`
+/// node as `field_expression`'s own last child — neither kind matched
+/// any existing arm before this fix, for the identical reason
+/// `generic_name` did not. Both are added to this function's own
+/// existing C#/C++ handling, via the SAME two helper functions this
+/// fix already introduced for C# (renamed to reflect both languages).
 fn callee_name(call_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let callee = call_node.child(0)?;
     match callee.kind() {
         "identifier" => Some(text_of(callee, source)),
+        "generic_name" | "template_function" => wrapped_callee_simple_name(callee, source),
         "attribute" | "field_expression" | "member_expression" | "member_access_expression" => {
             let mut cursor = callee.walk();
             let last_name_child = callee
                 .children(&mut cursor)
-                .filter(|c| matches!(c.kind(), "identifier" | "property_identifier" | "field_identifier"))
+                .filter(|c| matches!(c.kind(), "identifier" | "property_identifier" | "field_identifier" | "generic_name" | "template_method"))
                 .last()?;
-            Some(text_of(last_name_child, source))
+            if matches!(last_name_child.kind(), "generic_name" | "template_method") {
+                wrapped_callee_simple_name(last_name_child, source)
+            } else {
+                Some(text_of(last_name_child, source))
+            }
         }
         _ => None,
     }
+}
+
+/// Extracts a generic/template call's own bare method name from its
+/// wrapper node's first direct name-kind child —
+/// `identifier`/`field_identifier`, e.g. `"Handle"` for C#'s
+/// `Handle<TimeoutException>` (a `generic_name` node) or `"Foo"` for
+/// C++'s `Foo<int>`/`obj.Foo<int>` (a `template_function`/
+/// `template_method` node respectively). Confirmed via direct grammar
+/// probe for all three wrapper kinds: each has exactly TWO direct
+/// children — one name-kind node (the bare name) followed by one
+/// `type_argument_list`/`template_argument_list` (the `<...>` clause)
+/// — no competing same-kind sibling exists at this position (unlike
+/// `method_declaration`'s own return-type/name collision B2-ID-009
+/// fixed), so a positional "first matching-kind child" search is safe
+/// here, not the bug class that fix was scoped to. This function never
+/// inspects the type/template-argument list's own contents (how MANY
+/// generic arguments were passed, or what they are) — B2-ID-011 is an
+/// extraction-only fix; arity is deliberately not extracted or used
+/// here, per the task's own explicit scope (no type-aware or
+/// arity-aware target disambiguation is introduced by this function).
+fn wrapped_callee_simple_name(wrapper_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = wrapper_node.walk();
+    let name_child = wrapper_node.children(&mut cursor).find(|c| matches!(c.kind(), "identifier" | "field_identifier"))?;
+    Some(text_of(name_child, source))
 }
 
 /// `true` if `callee`'s node kind is one of the receiver-qualified
@@ -879,6 +983,228 @@ mod tests {
 
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to, callee.id());
+    }
+
+    // --- B2-ID-011: C#/C++ generic/template method call extraction ---
+    //
+    // `callee_name`/`wrapped_callee_simple_name` must extract the bare
+    // method name (never the full `Method<T>` text, the receiver, or
+    // a generic/template type argument) from a `generic_name`/
+    // `template_function`/`template_method`-wrapped call site, in
+    // both the bare and receiver-qualified shapes. Each test below
+    // checks BOTH layers: call-site EXTRACTION (`call_names_in_tree`,
+    // the raw text layer) and final EDGE generation (`resolve_calls`,
+    // which additionally requires resolution against a real candidate
+    // pool).
+    mod b2_id_011_generic_method_calls {
+        use super::*;
+        use crate::parse::{CSharpParser, CppParser, LanguageParser};
+
+        fn extracted_names(source: &[u8]) -> Vec<String> {
+            let tree = CSharpParser.parse(source).unwrap();
+            call_names_in_tree(&tree)
+        }
+
+        /// Case 1 (required): bare generic call, single type argument.
+        #[test]
+        fn bare_generic_call_extracts_the_bare_method_name() {
+            let names = extracted_names(b"class C { void M() { Foo<int>(); } }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+            assert!(!names.iter().any(|n| n.contains('<')), "the extracted name must never contain the generic clause: {names:?}");
+        }
+
+        /// Case 2 (required): bare generic call, multiple type arguments.
+        #[test]
+        fn bare_generic_call_with_multiple_type_arguments_extracts_the_bare_method_name() {
+            let names = extracted_names(b"class C { void M() { Foo<int, string>(); } }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+        }
+
+        /// Case 10 (required), receiver-qualified generic call.
+        #[test]
+        fn receiver_qualified_generic_call_extracts_the_bare_method_name_not_the_receiver() {
+            let names = extracted_names(b"class C { void M() { obj.Foo<int>(); } }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+            assert!(!names.contains(&"obj".to_string()), "must never extract the receiver's own name: {names:?}");
+        }
+
+        /// Case 3/4 (required): `obj.Foo<T>()` and `this.Foo<T>()`.
+        #[test]
+        fn this_qualified_generic_call_extracts_the_bare_method_name() {
+            let names = extracted_names(b"class C { void M() { this.Foo<int>(); } }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+        }
+
+        /// Case 5 (required): nested/qualified receiver (`foo.Bar.Method<T>()`).
+        #[test]
+        fn nested_qualified_receiver_generic_call_extracts_the_bare_method_name() {
+            let names = extracted_names(b"class C { void M() { foo.Bar.Baz<int>(); } }\n");
+            assert!(names.contains(&"Baz".to_string()), "expected \"Baz\" among {names:?}");
+            assert!(!names.contains(&"Bar".to_string()) || names.iter().filter(|n| n.as_str() == "Bar").count() == 0, "must not extract the intermediate receiver segment as a callee name");
+        }
+
+        /// Case 6 (required): a chained generic call -- the INNER
+        /// generic call and the OUTER non-generic call must both be
+        /// independently extracted (the grammar represents this as two
+        /// separate `invocation_expression` nodes, confirmed by direct
+        /// probe, not a single flattened chain).
+        #[test]
+        fn chained_generic_call_extracts_both_the_inner_generic_and_outer_call() {
+            let names = extracted_names(b"class C { void M() { obj.Foo<int>().Next(); } }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected the inner generic call's name \"Foo\" among {names:?}");
+            assert!(names.contains(&"Next".to_string()), "expected the outer call's name \"Next\" among {names:?}");
+        }
+
+        /// Case 7 (required): a generic call nested inside another
+        /// call's own argument list.
+        #[test]
+        fn generic_call_nested_inside_another_calls_argument_list_is_extracted() {
+            let names = extracted_names(b"class C { void M() { Bar(Foo<int>()); } }\n");
+            assert!(names.contains(&"Bar".to_string()), "expected the outer call's name \"Bar\" among {names:?}");
+            assert!(names.contains(&"Foo".to_string()), "expected the nested generic call's name \"Foo\" among {names:?}");
+        }
+
+        /// Case 9 (required), explicit restatement: bare generic call,
+        /// no receiver at all.
+        #[test]
+        fn bare_generic_call_with_no_receiver_is_extracted() {
+            let names = extracted_names(b"class C { void M() { Handle<int>(); } }\n");
+            assert!(names.contains(&"Handle".to_string()));
+        }
+
+        /// The real-repository motivating case: `policy.Handle<TimeoutException>(x)`.
+        #[test]
+        fn the_real_polly_handle_shape_extracts_handle_not_the_full_generic_text() {
+            let names = extracted_names(b"class C { void M() { policy.Handle<TimeoutException>(x); } }\n");
+            assert_eq!(names, vec!["Handle".to_string()]);
+        }
+
+        /// Case 11 (required): no regression on an ordinary
+        /// non-generic C# call -- must still extract/resolve exactly
+        /// as before this fix.
+        #[test]
+        fn ordinary_non_generic_csharp_call_is_unaffected() {
+            let names = extracted_names(b"class C { void M() { Helper(); obj.Helper2(); } }\n");
+            assert_eq!(names, vec!["Helper".to_string(), "Helper2".to_string()]);
+        }
+
+        /// Edge-generation layer: a bare generic call resolves to its
+        /// unique real target, exactly like any other resolved call.
+        #[test]
+        fn a_bare_generic_call_resolves_to_its_unique_target_and_produces_an_edge() {
+            let caller = test_snapshot("src/a.cs", "M", "method_declaration", "void M() { Handle<int>(); }");
+            let callee = test_snapshot("src/a.cs", "Handle", "method_declaration", "void Handle<T>() {}");
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "expected exactly one edge: {edges:?}");
+            assert_eq!(edges[0].from, caller.id());
+            assert_eq!(edges[0].to, callee.id());
+            assert_eq!(edges[0].kind, EdgeKind::Calls);
+            assert_eq!(edges[0].evidence.method(), codegraph_domain::ResolutionMethod::StaticAnalysis);
+        }
+
+        /// Edge-generation layer: a receiver-qualified generic call
+        /// resolves to its unique real target.
+        #[test]
+        fn a_receiver_qualified_generic_call_resolves_to_its_unique_target_and_produces_an_edge() {
+            let caller = test_snapshot("src/a.cs", "M", "method_declaration", "void M() { policy.Handle<int>(); }");
+            let callee = test_snapshot("src/a.cs", "Handle", "method_declaration", "void Handle<T>() {}");
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "expected exactly one edge: {edges:?}");
+            assert_eq!(edges[0].to, callee.id());
+        }
+
+        /// Case 8 (required): the SAME simple name shared by a generic
+        /// and a non-generic overload must extract/resolve to the SAME
+        /// bare name either way -- this fix does not, and must not,
+        /// attempt arity-aware disambiguation (that is explicitly out
+        /// of scope; the two overloads sharing one bare name produce
+        /// the SAME kind of ambiguity `resolve_calls` already handles
+        /// for any other same-named candidate pair, confirmed here by
+        /// asserting NameHeuristic/no-edge, never an arbitrary pick).
+        #[test]
+        fn generic_and_non_generic_overloads_sharing_one_bare_name_are_both_candidates_not_disambiguated_by_arity() {
+            let repo_for_test = {
+                let mut registry = RepositoryRegistry::new();
+                registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+            };
+            let caller = test_snapshot_in_repo(repo_for_test, "src/a.cs", "M", "method_declaration", "void M() { Handle<int>(); }");
+            let generic_overload = test_snapshot_in_repo(repo_for_test, "src/b.cs", "Handle", "method_declaration", "void Handle<T>() {}");
+            let non_generic_overload = test_snapshot_in_repo(repo_for_test, "src/c.cs", "Handle", "method_declaration", "void Handle() {}");
+            let snapshots = vec![caller.clone(), generic_overload.clone(), non_generic_overload.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            // Both share the bare name "Handle" and neither shares the
+            // caller's own file/class, so per CALL-RES-A1/A2 this is
+            // repo-wide ambiguity with no scope signal -- no edge,
+            // exactly the same outcome any other same-named pair would
+            // produce. This fix must not special-case generic arity to
+            // "fix" this ambiguity.
+            assert!(edges.is_empty(), "two same-named candidates (generic + non-generic) with no scope signal must produce no edge, not an arbitrary pick: got {edges:?}");
+        }
+
+        /// Determinism: repeated occurrences of the same resolved
+        /// generic call must still collapse to one edge (B2-ID-002's
+        /// own invariant, confirmed to still hold for this new callee
+        /// shape).
+        #[test]
+        fn a_generic_call_repeated_in_one_body_still_produces_one_edge() {
+            let caller = test_snapshot("src/a.cs", "M", "method_declaration", "void M() { Handle<int>(); Handle<int>(); }");
+            let callee = test_snapshot("src/a.cs", "Handle", "method_declaration", "void Handle<T>() {}");
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "two occurrences of the same generic call must collapse to one edge: got {edges:?}");
+        }
+
+        // --- Cross-language scope audit: C++ template calls share
+        // the identical structural defect under different node-kind
+        // names (`template_function`/`template_method`), confirmed
+        // during this fix's own grammar probe. ---
+
+        fn cpp_extracted_names(source: &[u8]) -> Vec<String> {
+            let tree = CppParser.parse(source).unwrap();
+            call_names_in_tree(&tree)
+        }
+
+        #[test]
+        fn cpp_bare_template_call_extracts_the_bare_function_name() {
+            let names = cpp_extracted_names(b"void M() { Foo<int>(); }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+            assert!(!names.iter().any(|n| n.contains('<')), "the extracted name must never contain the template clause: {names:?}");
+        }
+
+        #[test]
+        fn cpp_receiver_qualified_template_call_extracts_the_bare_method_name() {
+            let names = cpp_extracted_names(b"void M() { obj.Foo<int>(); }\n");
+            assert!(names.contains(&"Foo".to_string()), "expected \"Foo\" among {names:?}");
+            assert!(!names.contains(&"obj".to_string()), "must never extract the receiver's own name: {names:?}");
+        }
+
+        #[test]
+        fn cpp_ordinary_non_template_call_is_unaffected() {
+            let names = cpp_extracted_names(b"void M() { Helper(); obj.Helper2(); }\n");
+            assert_eq!(names, vec!["Helper".to_string(), "Helper2".to_string()]);
+        }
+
+        #[test]
+        fn a_cpp_bare_template_call_resolves_to_its_unique_target_and_produces_an_edge() {
+            let caller = test_snapshot("src/a.cpp", "M", "function_definition", "void M() { Handle<int>(); }");
+            let callee = test_snapshot("src/a.cpp", "Handle", "function_definition", "void Handle() {}");
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "expected exactly one edge: {edges:?}");
+            assert_eq!(edges[0].to, callee.id());
+        }
     }
 
     #[test]

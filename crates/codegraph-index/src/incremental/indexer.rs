@@ -2103,6 +2103,133 @@ mod tests {
         }
     }
 
+    /// B2-ID-011 regression tests: C# generic method call extraction,
+    /// validated through the REAL `CodeGraphIndexer` entry point (full
+    /// reindex, incremental advance) -- not just the lower-level
+    /// `resolve_calls` unit tests in `edges::calls`. Confirms full/
+    /// incremental parity on the new generic-callee extraction path,
+    /// and confirms this fix has zero effect on `Extends`/`Implements`
+    /// edges (B2-ID-010's own territory).
+    mod b2_id_011_csharp_generic_calls_through_the_real_indexer {
+        use super::*;
+
+        #[test]
+        fn full_reindex_resolves_a_bare_generic_call() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new().with_file(
+                FileIdentity::parse(repo, commit.clone(), "src/C.cs").unwrap(),
+                b"class C {\n    void M() { Handle<int>(); }\n    void Handle<T>() {}\n}\n",
+            );
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let handle = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Handle").unwrap();
+            let callers: Vec<_> = outcome.graph.incoming_edges(handle.id(), Some(EdgeKind::Calls)).to_vec();
+            assert_eq!(callers.len(), 1, "a bare generic call must resolve through the real indexer: got {callers:?}");
+        }
+
+        #[test]
+        fn full_reindex_resolves_a_receiver_qualified_generic_call() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new().with_file(
+                FileIdentity::parse(repo, commit.clone(), "src/C.cs").unwrap(),
+                b"class C {\n    void M(C policy) { policy.Handle<int>(); }\n    void Handle<T>() {}\n}\n",
+            );
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let handle = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Handle").unwrap();
+            let callers: Vec<_> = outcome.graph.incoming_edges(handle.id(), Some(EdgeKind::Calls)).to_vec();
+            assert_eq!(callers.len(), 1, "a receiver-qualified generic call must resolve through the real indexer: got {callers:?}");
+        }
+
+        #[test]
+        fn incremental_advance_resolves_a_generic_call_identically_to_a_full_reindex() {
+            let repo_incremental = test_repo();
+            let repo_full = test_repo();
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let source_a = FakeSource::new().with_file(
+                FileIdentity::parse(repo_incremental, commit_a.clone(), "src/Handle.cs").unwrap(),
+                b"class C {\n    void Handle<T>() {}\n}\n",
+            );
+            let indexer = CodeGraphIndexer::new();
+            indexer.observe_commit(&source_a, repo_incremental, &commit_a, None, &[]).unwrap();
+
+            // Commit B adds a NEW caller file -- Handle.cs itself is
+            // UNTOUCHED, exercising the real incremental reuse path for
+            // the unchanged snapshot pool while the new generic call
+            // site is freshly extracted.
+            let source_b = source_a
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/Handle.cs").unwrap(), b"class C {\n    void Handle<T>() {}\n}\n")
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/Caller.cs").unwrap(), b"class Caller {\n    void M(C c) { c.Handle<int>(); }\n}\n");
+            let incremental_outcome = indexer.observe_commit(&source_b, repo_incremental, &commit_b, Some(&commit_a), &["src/Caller.cs".to_string()]).unwrap();
+
+            let full_source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/Handle.cs").unwrap(), b"class C {\n    void Handle<T>() {}\n}\n")
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/Caller.cs").unwrap(), b"class Caller {\n    void M(C c) { c.Handle<int>(); }\n}\n");
+            let full_indexer = CodeGraphIndexer::new();
+            let full_outcome = full_indexer.observe_commit(&full_source, repo_full, &commit_b, None, &[]).unwrap();
+
+            let incremental_calls_count = incremental_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Calls).count();
+            let full_calls_count = full_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Calls).count();
+            assert_eq!(incremental_calls_count, 1, "the incremental path must resolve the new generic call site: got {incremental_calls_count}");
+            assert_eq!(incremental_calls_count, full_calls_count, "incremental must match a full reindex of the identical commit");
+        }
+
+        #[test]
+        fn generic_calls_fix_has_zero_effect_on_extends_implements_edges() {
+            // B2-ID-010's own territory must be completely unaffected:
+            // a partial-class Extends scenario combined with an
+            // unrelated generic call site must still produce exactly
+            // the Extends/Implements edges B2-ID-010 itself already
+            // validated, regardless of this fix.
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Base.cs").unwrap(), b"class Base {}\n")
+                .with_file(
+                    FileIdentity::parse(repo, commit.clone(), "src/Derived.cs").unwrap(),
+                    b"class Derived : Base {\n    void M() { Handle<int>(); }\n    void Handle<T>() {}\n}\n",
+                );
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let derived = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Derived").unwrap();
+            let extends = outcome.graph.outgoing_edges(derived.id(), Some(EdgeKind::Extends));
+            assert_eq!(extends.len(), 1, "an unrelated generic call site in the same file must not affect Extends resolution: got {extends:?}");
+
+            let handle = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Handle").unwrap();
+            let callers: Vec<_> = outcome.graph.incoming_edges(handle.id(), Some(EdgeKind::Calls)).to_vec();
+            assert_eq!(callers.len(), 1, "the generic call itself must still resolve correctly alongside the Extends edge: got {callers:?}");
+        }
+
+        #[test]
+        fn generic_calls_fix_never_changes_any_snapshot_identity() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new().with_file(
+                FileIdentity::parse(repo, commit.clone(), "src/C.cs").unwrap(),
+                b"class C {\n    void M() { Handle<int>(); }\n    void Handle<T>() {}\n}\n",
+            );
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let ids_before: std::collections::HashSet<_> = outcome.graph.all_snapshots().iter().map(|s| s.id()).collect();
+            // Re-running resolve_calls directly against the same pool
+            // must never alter any snapshot's own identity -- this fix
+            // only ever changes which Edge(s) are produced, never any
+            // SymbolSnapshotId.
+            let snapshots: Vec<_> = outcome.graph.all_snapshots().into_iter().cloned().collect();
+            let _ = crate::edges::resolve_calls(&snapshots).unwrap();
+            let ids_after: std::collections::HashSet<_> = snapshots.iter().map(|s| s.id()).collect();
+            assert_eq!(ids_before, ids_after, "resolve_calls must never mutate or change any snapshot's own identity");
+        }
+    }
+
     #[test]
     fn a_full_reindex_also_correctly_populates_impl_facts_and_raw_impl_statements() {
         // Confirms `full_reindex` (the new-repository / history-rewrite
