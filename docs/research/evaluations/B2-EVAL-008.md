@@ -34,8 +34,13 @@ separately evaluated this round.
 **External commits:** commit A `32064ed55ab47e05b590be0360c8c45ce3901a73`
 ("Lint PowerShell scripts #2504"), commit B
 `1f232caf9672e515751ba2df76d82bfbbb62e016` ("Improve Polly coverage
-#2505" — 18 real files changed across Bulkhead/Fallback/RateLimit/
-Registry/Retry/Timeout, 54 insertions/50 deletions).
+#2505" — **41 files changed, 886 insertions(+), 57 deletions(-)**,
+confirmed via `git diff --stat` directly against the clone during
+independent review; an earlier draft of this document understated
+this as "18 files, 54/50" — corrected here. Touches Bulkhead/
+Fallback/RateLimit/Registry/Retry/Timeout plus Caching/Utilities/
+test-helper files not captured by that shorter module list; the full
+41-file list is in the evidence file's own `changed_files` line).
 **Configuration:** the frozen baseline configuration, PLUS the two
 committed fixes (B2-ID-009, B2-ID-010). No other algorithm change.
 **Methodology:** drove the real production pipeline via
