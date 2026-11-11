@@ -1,0 +1,122 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 1.10s
+     Running `target\release\examples\b2_smoke_test_frontend_ts.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-004\repo' b88088b2e5d879fe6f049dce483fe0d1c319efc9 56e1aa36b97418cbcfc19cf2c40136093a496af7`
+=== B2-EVAL-004: Frontend/UI TypeScript domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-004\repo
+commit_b: 56e1aa36b97418cbcfc19cf2c40136093a496af7
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 71
+files_supported_by_parser: 36
+files_parsed: 36
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 52
+extraction_rejections (oversized name/signature): 6
+snapshots_promoted: 52
+promotion_failures: 0
+ts_tsx_files_with_at_least_one_import_statement: 28
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Function: 50
+  Method: 2
+
+--- C1. Potential-new-gap scan: constructs this pipeline does NOT promote as a symbol today ---
+  default_export: 26 (present in corpus, NOT promoted to any SymbolKind by the current extractor)
+  interface_declaration: 11 (present in corpus, NOT promoted to any SymbolKind by the current extractor)
+  jsx_element_reference (opening/self-closing tag): 313 (present in corpus, NOT promoted to any SymbolKind by the current extractor)
+  named_export: 9 (present in corpus, NOT promoted to any SymbolKind by the current extractor)
+  type_alias_declaration: 5 (present in corpus, NOT promoted to any SymbolKind by the current extractor)
+
+--- C2. Module/File -> top-level-symbol gap (Frontend/UI domain stress case) ---
+files_with_at_least_one_extracted_symbol: 25
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 36
+files_with_more_than_one_top_level_symbol (MEASURED): 6
+top 10 files by top-level-symbol count (file: count):
+  src/pages/TopicDetail/index.tsx: 4
+  src/components/TopicForm/index.tsx: 3
+  src/stores/auth.ts: 3
+  src/stores/topic.ts: 3
+  src/pages/Register/index.tsx: 2
+  src/pages/Settings/index.tsx: 2
+  src/components/Banner/index.tsx: 1
+  src/components/Header/index.tsx: 1
+  src/components/ListItem/index.tsx: 1
+  src/components/ListPage/index.tsx: 1
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 25
+extends_implements_edges: 0
+tests_for_edges: 0
+  by_kind Calls: 25
+  by_resolution_method NameHeuristic: 2
+  by_resolution_method StaticAnalysis: 23
+full_index_elapsed: 116.1593ms
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("src/components/TopicForm/index.tsx::handleVditorInit") [Calls/StaticAnalysis] -> Some("src/components/TopicForm/index.tsx::checkContentValidity") [StaticAnalysis] :: call to "checkContentValidity" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/TopicForm/index.tsx::blur") [Calls/StaticAnalysis] -> Some("src/components/TopicForm/index.tsx::checkContentValidity") [StaticAnalysis] :: call to "checkContentValidity" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/TopicForm/index.tsx::input") [Calls/StaticAnalysis] -> Some("src/components/TopicForm/index.tsx::checkContentValidity") [StaticAnalysis] :: call to "checkContentValidity" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/ListPage/index.tsx::ListPage") [Calls/StaticAnalysis] -> Some("src/stores/topic.ts::fetchTopicList") [StaticAnalysis] :: call to "fetchTopicList" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Login/index.tsx::Login") [Calls/NameHeuristic] -> Some("src/pages/Login/index.tsx::handleChange") [NameHeuristic] :: call to "handleChange" resolves to exactly one candidate once narrowed to the caller's own file
+Some("src/pages/TopicDetail/CommentForm/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/pages/TopicDetail/index.tsx::handleCommentSubmit") [StaticAnalysis] :: call to "handleCommentSubmit" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicDetail/CommentForm/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/pages/TopicDetail/index.tsx::handleToastShow") [StaticAnalysis] :: call to "handleToastShow" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicDetail/index.tsx::handleCommentSubmit") [Calls/StaticAnalysis] -> Some("src/pages/TopicDetail/index.tsx::handleToastShow") [StaticAnalysis] :: call to "handleToastShow" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicDetail/index.tsx::handleTopicQuery") [Calls/StaticAnalysis] -> Some("src/pages/TopicDetail/index.tsx::handleTopicPreview") [StaticAnalysis] :: call to "handleTopicPreview" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/TopicForm/index.tsx::handleVditorInit") [Calls/NameHeuristic] -> Some("src/components/TopicForm/index.tsx::handleTopicQuery") [NameHeuristic] :: call to "handleTopicQuery" resolves to exactly one candidate once narrowed to the caller's own file
+Some("src/components/ListItem/index.tsx::handleFavor") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Login/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Register/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Settings/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicDetail/index.tsx::handleCommentSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicInitiate/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicUpdate/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/utils/loading.ts::loadingDelay") [StaticAnalysis] :: call to "loadingDelay" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Login/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::login") [StaticAnalysis] :: call to "login" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Register/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::login") [StaticAnalysis] :: call to "login" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/Header/index.tsx::handleLogout") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::logout") [StaticAnalysis] :: call to "logout" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/TopicDetail/TopicBanner/index.tsx::handleGoToUpdate") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::logout") [StaticAnalysis] :: call to "logout" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/ListItem/index.tsx::handleFavor") [Calls/StaticAnalysis] -> Some("src/stores/topic.ts::removeTopicFromList") [StaticAnalysis] :: call to "removeTopicFromList" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/ListItem/index.tsx::handleFavor") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::update") [StaticAnalysis] :: call to "update" resolves to exactly one candidate in the given snapshot pool
+Some("src/pages/Settings/index.tsx::handleSubmit") [Calls/StaticAnalysis] -> Some("src/stores/auth.ts::update") [StaticAnalysis] :: call to "update" resolves to exactly one candidate in the given snapshot pool
+Some("src/components/ListItem/index.tsx::handleFavor") [Calls/StaticAnalysis] -> Some("src/stores/topic.ts::updateTopicList") [StaticAnalysis] :: call to "updateTopicList" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_frontend_ts.exe","22028","Console","19","9.628 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: b88088b2e5d879fe6f049dce483fe0d1c319efc9
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 53
+observe_commit(A) edge_count: 25
+observe_commit(A) elapsed (full reindex): 69.659ms
+changed_files (git diff A..B): ["README.md", "package.json", "pnpm-lock.yaml", "src/assets/stylesheets/form.less", "src/components/Header/index.tsx", "src/components/ListItem/index.tsx", "src/main.tsx", "src/pages/TagPage/index.tsx", "src/pages/Tags/index.less", "src/pages/Tags/index.tsx"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 10, files_reparsed: 10, snapshots_removed: 8, snapshots_added: 7, edges_rebuilt: 30, raw_import_statements_extracted: 49, raw_import_statements_reused: 176, import_facts_resolved: 225 }
+observe_commit(B) elapsed (incremental): 43.7929ms
+observe_commit(B) final snapshot_count: 57
+observe_commit(B) final edge_count: 25
+observe_commit(B) final lineage_edge_count: 5
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_import_statements_in_ts_tsx_files_at_commit_b (line-based count, MEASURED): 189
+ts_tsx_import_facts_extracted (MEASURED, ImportFact, file-level): 225
+extraction_coverage: 225/189 (119.0%)
+total_import_facts_all_languages (MEASURED): 225
+  resolution_internal (MEASURED): 7
+  resolution_external (MEASURED): 218
+  resolution_ambiguous (MEASURED): 0
+  aliases_captured (MEASURED): 66
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 49
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 176
+
+--- H. Frontend/UI usefulness Q&A (conduit-react, commit B) ---
+Q1 'Which component renders/contains ListView as a child?' -> ListPage calls/references: ["src/stores/topic.ts::fetchTopicList"]
+Q2 'useTopicListStore' NOT FOUND in src/stores/topic.ts (unexpected)
+Q3 'Where does Header get its active-link/auth state from?' -> Header calls: []
+Q4 'If I modify fetchTopicList, which components are impacted?' -> callers: ["src/components/ListPage/index.tsx::ListPage"] (fetchTopicList itself found as a promoted symbol: true)
+Q5 'What does ListView's handleClick event handler call?' -> calls: []
+Q6 'Which tests cover the ListItem component?' -> total TestsFor edges in corpus: 0
+Q7 'What does ListPage extend/implement?' -> [] (expected: empty -- ListPage is a functional component, not a class)
+
+=== done ===

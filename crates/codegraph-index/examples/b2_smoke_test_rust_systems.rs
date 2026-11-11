@@ -355,6 +355,38 @@ fn main() {
     println!("observe_commit(B) final edge_count: {}", outcome_b.graph.edge_count());
     println!("observe_commit(B) final lineage_edge_count: {}", outcome_b.graph.lineage_edge_count());
 
+    // B2-ID-008 C1 fix verification: confirm incremental A->B and a FULL
+    // reindex of commit B (treated as a brand-new repository, via a
+    // fresh CodeGraphIndexer) produce the SAME ImplFact-derived
+    // Implements edge count and the SAME trait_resolution Resolved
+    // count. This is the production-evaluation counterpart to the
+    // unit-level parity test the C1 fix wave already added -- this one
+    // runs the real harness against the real external repository
+    // rather than a synthetic fixture.
+    {
+        let fresh_indexer = CodeGraphIndexer::new();
+        let full_b_outcome = fresh_indexer.observe_commit(&source, repo_id, &commit_b, None, &[]).expect("full reindex of commit B as a new repository");
+        let incremental_implements = outcome_b.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count();
+        let full_implements = full_b_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count();
+        let incremental_trait_resolved = outcome_b
+            .impl_facts
+            .iter()
+            .filter(|f| matches!(f.trait_resolution, Some(codegraph_index::impls::ImplTargetResolution::Resolved(_))))
+            .count();
+        let full_trait_resolved = full_b_outcome
+            .impl_facts
+            .iter()
+            .filter(|f| matches!(f.trait_resolution, Some(codegraph_index::impls::ImplTargetResolution::Resolved(_))))
+            .count();
+        println!("\n--- B2-ID-008 C1 fix: incremental vs. full-reindex parity on commit B (production evaluation, not just unit tests) ---");
+        println!("incremental_implements_edges: {incremental_implements}");
+        println!("full_reindex_implements_edges: {full_implements}");
+        println!("parity (incremental == full): {}", incremental_implements == full_implements);
+        println!("incremental_trait_resolved: {incremental_trait_resolved}");
+        println!("full_reindex_trait_resolved: {full_trait_resolved}");
+        println!("trait_resolved_parity (incremental == full): {}", incremental_trait_resolved == full_trait_resolved);
+    }
+
     {
         let rust_import_facts = outcome_b.import_facts.iter().filter(|f| f.importing_file.relative_path().ends_with(".rs")).count();
         let internal_count = outcome_b.import_facts.iter().filter(|f| matches!(f.resolution, ImportResolution::Internal(_))).count();
@@ -401,6 +433,8 @@ fn main() {
         let total_impl_facts = impl_facts.len();
         let trait_impls: Vec<_> = impl_facts.iter().filter(|f| f.trait_type_text.is_some()).collect();
         let inherent_impls: Vec<_> = impl_facts.iter().filter(|f| f.trait_type_text.is_none()).collect();
+        let generic_impls = impl_facts.iter().filter(|f| f.has_generics).count();
+        let lifetime_impls = impl_facts.iter().filter(|f| f.has_lifetime_params).count();
 
         let trait_resolved = trait_impls.iter().filter(|f| matches!(f.trait_resolution, Some(ImplTargetResolution::Resolved(_)))).count();
         let trait_unresolved = trait_impls.iter().filter(|f| matches!(f.trait_resolution, Some(ImplTargetResolution::Unresolved))).count();
@@ -422,6 +456,8 @@ fn main() {
         println!("impl_facts_total (MEASURED, ObserveOutcome.impl_facts, final published state): {total_impl_facts}");
         println!("  trait_impls (trait_type_text: Some(_)): {}/{total_impl_facts}", trait_impls.len());
         println!("  inherent_impls (trait_type_text: None): {}/{total_impl_facts}", inherent_impls.len());
+        println!("  generic_impls (has_generics): {generic_impls}/{total_impl_facts}");
+        println!("  lifetime_impls (has_lifetime_params): {lifetime_impls}/{total_impl_facts}");
         println!(
             "  of the trait impls, trait_resolution breakdown: Resolved {}/{t}, Unresolved {}/{t}, Ambiguous {}/{t}",
             trait_resolved,
@@ -475,7 +511,7 @@ fn main() {
         // Q1: which traits does FixedStrings implement? Ground truth
         // (src/patterns.rs): `impl Matcher for FixedStrings`.
         if let Some(fixed_strings) = find_current_by_name_in_file("FixedStrings", "patterns.rs") {
-            let implements: Vec<String> = graph.outgoing_edges(fixed_strings.id(), Some(EdgeKind::Extends)).into_iter().filter_map(|e| graph.snapshot(e.to)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+            let implements: Vec<String> = graph.outgoing_edges(fixed_strings.id(), Some(EdgeKind::Implements)).into_iter().filter_map(|e| graph.snapshot(e.to)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
             println!("Q1 'Which trait(s) does FixedStrings implement?' -> {implements:?}");
         } else {
             println!("Q1 'FixedStrings' NOT FOUND in src/patterns.rs (unexpected)");
@@ -486,7 +522,7 @@ fn main() {
         // MatchAll -- six real impls, confirmed by direct source
         // reading.
         if let Some(matcher_trait) = find_current_by_name_in_file("Matcher", "patterns.rs") {
-            let implementors: Vec<String> = graph.incoming_edges(matcher_trait.id(), Some(EdgeKind::Extends)).into_iter().filter_map(|e| graph.snapshot(e.from)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+            let implementors: Vec<String> = graph.incoming_edges(matcher_trait.id(), Some(EdgeKind::Implements)).into_iter().filter_map(|e| graph.snapshot(e.from)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
             println!("Q2 'Which types implement the Matcher trait?' -> {implementors:?}");
         } else {
             println!("Q2 'Matcher' trait NOT FOUND in src/patterns.rs (unexpected)");
@@ -518,7 +554,7 @@ fn main() {
         // macro's own module, error.rs)? Ground truth: &str, io::Error,
         // ignore::Error -- three real impls.
         if let Some(sanitize_err_trait) = find_current_by_name_in_file("SanitizeErr", "error.rs") {
-            let implementors: Vec<String> = graph.incoming_edges(sanitize_err_trait.id(), Some(EdgeKind::Extends)).into_iter().filter_map(|e| graph.snapshot(e.from)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+            let implementors: Vec<String> = graph.incoming_edges(sanitize_err_trait.id(), Some(EdgeKind::Implements)).into_iter().filter_map(|e| graph.snapshot(e.from)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
             println!("Q5 'Which types implement the SanitizeErr trait?' -> {implementors:?}");
         } else {
             println!("Q5 'SanitizeErr' trait NOT FOUND in src/error.rs (unexpected)");

@@ -1,0 +1,201 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 3.88s
+     Running `target\release\examples\b2_smoke_test_rust_systems.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-005-resume\repo' b7a0a29d07c3d0e9e0a41155019acada08831a6c 23815624819c77ab665e19c8e6c28bddbcd96e1d`
+=== B2-EVAL-005: Rust/systems domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-005-resume\repo
+commit_b: 23815624819c77ab665e19c8e6c28bddbcd96e1d
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 61
+files_supported_by_parser: 25
+files_parsed: 25
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 426
+extraction_rejections (oversized name/signature): 4
+snapshots_promoted: 426
+promotion_failures: 0
+rust_files_with_at_least_one_use_statement: 24
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Enum: 15
+  Function: 384
+  Interface: 2
+  MethodSignature: 2
+  Struct: 23
+
+--- C1. Macro-opacity quantification (Rust/systems domain stress case) ---
+macro_invocation_nodes (MEASURED, real parse): 263
+token_tree_nodes (MEASURED, the opaque argument bodies of those invocations): 1167
+macro_rules_definitions (MEASURED): 7
+call_shaped_substrings_inside_token_trees (Inferred, conservative text-based proxy, NOT resolver-grade): 793
+note: these call-shaped substrings are, BY CONSTRUCTION, never visible to resolve_calls's own tree-sitter walk (a token_tree is never a call_expression node) -- this is the quantified form of the known gap documented in codegraph-index::edges::calls's own module doc comment, not a new finding about the resolver's correctness.
+
+--- C2. Module/File -> top-level-symbol gap (Rust/systems domain stress case) ---
+files_with_at_least_one_extracted_symbol: 24
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 423
+files_with_more_than_one_top_level_symbol (MEASURED): 23
+top 10 files by top-level-symbol count (file: count):
+  tests/tests.rs: 118
+  src/walk.rs: 34
+  src/exec/mod.rs: 33
+  tests/testenv/mod.rs: 26
+  src/dir_entry.rs: 22
+  src/cli.rs: 20
+  src/sanitize.rs: 17
+  src/patterns.rs: 16
+  src/filesystem.rs: 15
+  src/filter/time.rs: 14
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 356
+extends_implements_edges: 0
+tests_for_edges: 0
+  by_kind Calls: 356
+  by_resolution_method NameHeuristic: 12
+  by_resolution_method StaticAnalysis: 344
+full_index_elapsed: 184.8164ms
+
+--- D1. All Extends/Implements (trait-impl) edges, full set ---
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("src/patterns.rs::build_patterns") [Calls/StaticAnalysis] -> Some("src/patterns.rs::ExactStrings") [StaticAnalysis] :: call to "ExactStrings" resolves to exactly one candidate in the given snapshot pool
+Some("src/patterns.rs::build_patterns") [Calls/StaticAnalysis] -> Some("src/patterns.rs::FixedStrings") [StaticAnalysis] :: call to "FixedStrings" resolves to exactly one candidate in the given snapshot pool
+Some("src/error.rs::sanitize") [Calls/StaticAnalysis] -> Some("src/error.rs::SanitizedError") [StaticAnalysis] :: call to "SanitizedError" resolves to exactly one candidate in the given snapshot pool
+Some("src/error.rs::sanitize") [Calls/StaticAnalysis] -> Some("src/error.rs::SanitizedError") [StaticAnalysis] :: call to "SanitizedError" resolves to exactly one candidate in the given snapshot pool
+Some("src/filter/time.rs::new") [Calls/StaticAnalysis] -> Some("src/filter/time.rs::TestTime") [StaticAnalysis] :: call to "TestTime" resolves to exactly one candidate in the given snapshot pool
+Some("src/regex_helper.rs::pattern_has_uppercase_char") [Calls/StaticAnalysis] -> Some("src/regex_helper.rs::UppercaseVisitor") [StaticAnalysis] :: call to "UppercaseVisitor" resolves to exactly one candidate in the given snapshot pool
+Some("src/hyperlink.rs::new") [Calls/StaticAnalysis] -> Some("src/filesystem.rs::absolute_path") [StaticAnalysis] :: call to "absolute_path" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_multi_file_with_missing") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_sanitize_exec_error_msg") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_sanitize_recursive_link_msg") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_failure_with_error") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_failure") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_error") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_bad_pattern") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_max_results") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_number_parsing_errors") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_error_if_hidden_not_set_and_pattern_starts_with_dot") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_multi_file_with_missing") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_pattern_with_forward_slash_is_rejected") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_pattern_with_forward_slash_is_rejected") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_exec_batch") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_exec_batch_multi") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_quiet") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_list_details") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_simple") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_basic") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_empty_pattern") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_pattern_starts_with_dash") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_plus_extension") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_plus_type") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_rust_systems.exe","10336","Console","22","9.100 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: b7a0a29d07c3d0e9e0a41155019acada08831a6c
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 410
+observe_commit(A) edge_count: 338
+observe_commit(A) elapsed (full reindex): 144.4062ms
+changed_files (git diff A..B): ["CHANGELOG.md", "Cargo.lock", "Cargo.toml", "src/cli.rs", "src/config.rs", "src/filesystem.rs", "src/main.rs", "src/patterns.rs", "src/walk.rs", "tests/tests.rs"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 10, files_reparsed: 10, snapshots_removed: 204, snapshots_added: 220, edges_rebuilt: 560, raw_import_statements_extracted: 66, raw_import_statements_reused: 61, import_facts_resolved: 127, raw_impl_statements_extracted: 15, raw_impl_statements_reused: 29, impl_facts_resolved: 44 }
+observe_commit(B) elapsed (incremental): 578.3141ms
+observe_commit(B) final snapshot_count: 627
+observe_commit(B) final edge_count: 359
+observe_commit(B) final lineage_edge_count: 201
+
+--- B2-ID-008 C1 fix: incremental vs. full-reindex parity on commit B (production evaluation, not just unit tests) ---
+incremental_implements_edges: 3
+full_reindex_implements_edges: 3
+parity (incremental == full): true
+incremental_trait_resolved: 8
+full_reindex_trait_resolved: 8
+trait_resolved_parity (incremental == full): true
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_use_statements_in_rust_files_at_commit_b (line-based count, MEASURED): 193
+rust_import_facts_extracted (MEASURED, ImportFact, file-level): 127
+extraction_coverage: 127/193 (65.8%)
+total_import_facts_all_languages (MEASURED): 127
+  resolution_internal (MEASURED): 29
+  resolution_external (MEASURED): 89
+  resolution_ambiguous (MEASURED): 9
+  aliases_captured (MEASURED): 0
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 66
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 61
+
+--- B2-ID-008: ImplFact / Implements-edge measurement (via ObserveOutcome.impl_facts, the real fixed pipeline) ---
+raw_impl_statements_extracted_this_call (MEASURED, IndexMetrics): 15
+raw_impl_statements_reused_this_call (MEASURED, IndexMetrics): 29
+impl_facts_total (MEASURED, ObserveOutcome.impl_facts, final published state): 44
+  trait_impls (trait_type_text: Some(_)): 23/44
+  inherent_impls (trait_type_text: None): 21/44
+  generic_impls (has_generics): 4/44
+  lifetime_impls (has_lifetime_params): 2/44
+  of the trait impls, trait_resolution breakdown: Resolved 8/23, Unresolved 15/23, Ambiguous 0/23
+  self_type_resolution breakdown (all impl_facts, inherent + trait): Resolved 37/44, Unresolved 7/44, Ambiguous 0/44
+implements_edges_in_final_graph (MEASURED, EdgeKind::Implements count in outcome_b.graph): 3
+associated_items_total (MEASURED, summed across all impl_facts): 126
+  associated_items_method: 98
+  associated_items_associated_function: 28
+
+--- B2-ID-008 (cont.): full impl_facts dump (self_type, trait_type_text, resolution) ---
+  self=DirEntry trait=None self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=None file=src/dir_entry.rs
+  self=DirEntry trait=Some("PartialEq") self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=Some(Unresolved) file=src/dir_entry.rs
+  self=DirEntry trait=Some("Eq") self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=Some(Unresolved) file=src/dir_entry.rs
+  self=DirEntry trait=Some("PartialOrd") self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=Some(Unresolved) file=src/dir_entry.rs
+  self=DirEntry trait=Some("Ord") self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=Some(Unresolved) file=src/dir_entry.rs
+  self=DirEntry trait=Some("Colorable") self_res=Resolved(SymbolSnapshotId([84, 80, 50, 189, 46, 250, 179, 75, 33, 58, 214, 22, 19, 199, 44, 36, 159, 254, 97, 51, 102, 147, 89, 198, 108, 86, 37, 135, 236, 126, 46, 78])) trait_res=Some(Unresolved) file=src/dir_entry.rs
+  self=Error trait=Some("SanitizeErr") self_res=Unresolved trait_res=Some(Resolved(SymbolSnapshotId([106, 178, 130, 235, 14, 94, 161, 28, 67, 140, 206, 176, 12, 170, 8, 42, 211, 32, 255, 167, 55, 183, 93, 8, 125, 95, 48, 97, 67, 32, 222, 31]))) file=src/error.rs
+  self=Error trait=Some("SanitizeErr") self_res=Unresolved trait_res=Some(Resolved(SymbolSnapshotId([106, 178, 130, 235, 14, 94, 161, 28, 67, 140, 206, 176, 12, 170, 8, 42, 211, 32, 255, 167, 55, 183, 93, 8, 125, 95, 48, 97, 67, 32, 222, 31]))) file=src/error.rs
+  self=SanitizedError trait=Some("Display") self_res=Resolved(SymbolSnapshotId([169, 72, 179, 225, 80, 16, 32, 152, 7, 254, 224, 212, 107, 83, 146, 5, 71, 67, 240, 240, 129, 189, 12, 97, 238, 63, 68, 139, 55, 40, 244, 67])) trait_res=Some(Unresolved) file=src/error.rs
+  self=OutputBuffer trait=None self_res=Resolved(SymbolSnapshotId([20, 228, 123, 191, 80, 9, 149, 28, 51, 172, 241, 11, 160, 190, 22, 252, 107, 36, 173, 238, 170, 26, 48, 253, 219, 200, 88, 130, 174, 67, 135, 138])) trait_res=None file=src/exec/command.rs
+  self=CommandSet trait=None self_res=Resolved(SymbolSnapshotId([96, 246, 34, 26, 95, 48, 213, 57, 66, 119, 68, 236, 253, 28, 79, 157, 108, 220, 142, 212, 112, 41, 244, 136, 2, 4, 126, 8, 122, 153, 29, 205])) trait_res=None file=src/exec/mod.rs
+  self=CommandBuilder trait=None self_res=Resolved(SymbolSnapshotId([69, 97, 229, 234, 196, 199, 238, 16, 26, 142, 67, 70, 33, 147, 235, 190, 54, 219, 75, 207, 106, 6, 43, 182, 113, 141, 6, 143, 6, 159, 70, 26])) trait_res=None file=src/exec/mod.rs
+  self=CommandTemplate trait=None self_res=Resolved(SymbolSnapshotId([208, 182, 204, 212, 229, 112, 5, 43, 26, 252, 118, 48, 190, 143, 162, 85, 61, 167, 247, 23, 190, 44, 137, 32, 237, 94, 146, 99, 34, 225, 67, 73])) trait_res=None file=src/exec/mod.rs
+  self=ExitCode trait=None self_res=Resolved(SymbolSnapshotId([212, 232, 111, 149, 253, 107, 247, 94, 209, 168, 180, 62, 247, 141, 204, 251, 129, 6, 83, 249, 108, 220, 219, 3, 134, 252, 32, 128, 4, 219, 207, 215])) trait_res=None file=src/exit_codes.rs
+  self=FileTypes trait=None self_res=Resolved(SymbolSnapshotId([92, 63, 239, 161, 129, 76, 52, 161, 165, 84, 191, 98, 22, 69, 109, 126, 103, 173, 149, 93, 245, 16, 34, 234, 110, 127, 43, 213, 125, 31, 197, 80])) trait_res=None file=src/filetypes.rs
+  self=OwnerFilter trait=None self_res=Resolved(SymbolSnapshotId([152, 142, 251, 160, 60, 17, 238, 111, 199, 93, 133, 84, 160, 4, 19, 47, 175, 182, 145, 49, 23, 8, 243, 102, 67, 247, 197, 159, 132, 60, 82, 188])) trait_res=None file=src/filter/owner.rs
+  self=Check trait=None self_res=Resolved(SymbolSnapshotId([182, 232, 149, 190, 167, 41, 19, 102, 140, 233, 146, 186, 22, 229, 127, 61, 136, 114, 100, 245, 106, 52, 170, 191, 147, 12, 137, 137, 132, 128, 21, 9])) trait_res=None file=src/filter/owner.rs
+  self=SizeFilter trait=None self_res=Resolved(SymbolSnapshotId([225, 238, 94, 54, 27, 128, 71, 73, 23, 203, 154, 66, 219, 96, 93, 141, 3, 63, 221, 147, 165, 90, 40, 222, 153, 120, 193, 246, 250, 182, 179, 134])) trait_res=None file=src/filter/size.rs
+  self=TimeFilter trait=None self_res=Resolved(SymbolSnapshotId([251, 215, 223, 252, 209, 2, 86, 224, 33, 46, 89, 148, 183, 174, 118, 84, 122, 184, 138, 101, 186, 250, 82, 164, 214, 253, 20, 134, 16, 175, 67, 162])) trait_res=None file=src/filter/time.rs
+  self=TestTime trait=None self_res=Resolved(SymbolSnapshotId([79, 225, 224, 209, 8, 170, 152, 177, 98, 107, 227, 165, 214, 224, 23, 116, 44, 245, 114, 216, 214, 156, 14, 59, 73, 163, 4, 124, 73, 209, 99, 231])) trait_res=None file=src/filter/time.rs
+  self=TestTime trait=Some("Drop") self_res=Resolved(SymbolSnapshotId([79, 225, 224, 209, 8, 170, 152, 177, 98, 107, 227, 165, 214, 224, 23, 116, 44, 245, 114, 216, 214, 156, 14, 59, 73, 163, 4, 124, 73, 209, 99, 231])) trait_res=Some(Unresolved) file=src/filter/time.rs
+  self=Token trait=Some("Display") self_res=Resolved(SymbolSnapshotId([151, 39, 255, 204, 245, 235, 31, 11, 3, 61, 73, 236, 78, 170, 165, 27, 88, 238, 95, 216, 108, 201, 47, 146, 145, 10, 87, 50, 220, 5, 213, 51])) trait_res=Some(Unresolved) file=src/fmt/mod.rs
+  self=FormatTemplate trait=None self_res=Resolved(SymbolSnapshotId([184, 18, 200, 31, 58, 139, 229, 61, 205, 10, 57, 28, 41, 17, 169, 184, 198, 10, 5, 27, 104, 105, 142, 70, 29, 20, 113, 48, 209, 187, 7, 206])) trait_res=None file=src/fmt/mod.rs
+  self=PathUrl trait=None self_res=Resolved(SymbolSnapshotId([52, 127, 132, 175, 200, 144, 25, 95, 17, 193, 116, 208, 75, 246, 20, 183, 159, 154, 180, 194, 249, 81, 125, 8, 106, 170, 174, 115, 176, 122, 84, 64])) trait_res=None file=src/hyperlink.rs
+  self=PathUrl trait=Some("Display") self_res=Resolved(SymbolSnapshotId([52, 127, 132, 175, 200, 144, 25, 95, 17, 193, 116, 208, 75, 246, 20, 183, 159, 154, 180, 194, 249, 81, 125, 8, 106, 170, 174, 115, 176, 122, 84, 64])) trait_res=Some(Unresolved) file=src/hyperlink.rs
+  self=Encoded trait=Some("Display") self_res=Resolved(SymbolSnapshotId([30, 191, 2, 45, 52, 72, 225, 67, 135, 207, 89, 65, 32, 154, 231, 74, 4, 75, 5, 66, 157, 191, 106, 192, 132, 199, 223, 6, 39, 44, 244, 229])) trait_res=Some(Unresolved) file=src/hyperlink.rs
+  self=UppercaseVisitor trait=Some("Visitor") self_res=Resolved(SymbolSnapshotId([199, 173, 146, 147, 185, 162, 85, 145, 114, 59, 181, 42, 116, 79, 129, 69, 123, 150, 182, 216, 118, 87, 116, 185, 247, 160, 65, 98, 210, 81, 106, 16])) trait_res=Some(Unresolved) file=src/regex_helper.rs
+  self=SanitizedStr trait=Some("Display") self_res=Resolved(SymbolSnapshotId([28, 4, 182, 35, 61, 232, 156, 243, 196, 123, 199, 132, 72, 83, 55, 194, 128, 125, 248, 126, 53, 128, 218, 102, 120, 85, 166, 246, 58, 90, 190, 52])) trait_res=Some(Unresolved) file=src/sanitize.rs
+  self=TestEnv trait=None self_res=Resolved(SymbolSnapshotId([46, 190, 166, 180, 155, 55, 187, 56, 118, 221, 46, 16, 219, 150, 43, 44, 118, 231, 25, 95, 230, 118, 224, 78, 100, 15, 201, 249, 56, 125, 225, 1])) trait_res=None file=tests/testenv/mod.rs
+  self=Opts trait=None self_res=Unresolved trait_res=None file=src/cli.rs
+  self=Exec trait=Some("FromArgMatches") self_res=Resolved(SymbolSnapshotId([143, 255, 185, 145, 76, 42, 255, 246, 34, 119, 199, 184, 50, 5, 131, 181, 122, 216, 113, 41, 155, 163, 113, 22, 242, 28, 49, 100, 156, 215, 173, 40])) trait_res=Some(Unresolved) file=src/cli.rs
+  self=Exec trait=Some("Args") self_res=Resolved(SymbolSnapshotId([143, 255, 185, 145, 76, 42, 255, 246, 34, 119, 199, 184, 50, 5, 131, 181, 122, 216, 113, 41, 155, 163, 113, 22, 242, 28, 49, 100, 156, 215, 173, 40])) trait_res=Some(Unresolved) file=src/cli.rs
+  self=Config trait=None self_res=Unresolved trait_res=None file=src/config.rs
+  self=RegexSet trait=Some("Matcher") self_res=Unresolved trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=GlobSet trait=Some("Matcher") self_res=Unresolved trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=GlobMatcher trait=Some("Matcher") self_res=Unresolved trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=FixedStrings trait=Some("Matcher") self_res=Resolved(SymbolSnapshotId([207, 167, 0, 34, 75, 68, 187, 206, 240, 117, 159, 94, 219, 19, 137, 50, 97, 254, 54, 189, 245, 171, 177, 207, 55, 196, 103, 88, 52, 35, 45, 30])) trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=ExactStrings trait=Some("Matcher") self_res=Resolved(SymbolSnapshotId([253, 32, 73, 106, 122, 161, 69, 80, 97, 89, 14, 148, 82, 255, 172, 75, 121, 50, 87, 114, 125, 172, 111, 183, 49, 21, 212, 80, 51, 187, 214, 32])) trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=MatchAll trait=Some("Matcher") self_res=Resolved(SymbolSnapshotId([206, 128, 82, 201, 31, 90, 80, 95, 169, 144, 252, 162, 148, 109, 95, 199, 74, 59, 247, 247, 57, 9, 30, 194, 77, 151, 106, 188, 110, 14, 196, 51])) trait_res=Some(Resolved(SymbolSnapshotId([11, 246, 204, 232, 225, 33, 6, 26, 156, 51, 208, 145, 80, 89, 151, 242, 172, 103, 105, 122, 16, 250, 225, 209, 149, 58, 13, 177, 110, 244, 223, 1]))) file=src/patterns.rs
+  self=Batch trait=None self_res=Resolved(SymbolSnapshotId([187, 18, 131, 95, 216, 7, 147, 135, 235, 211, 57, 125, 182, 51, 184, 239, 82, 179, 195, 172, 223, 228, 28, 191, 214, 236, 41, 1, 187, 96, 212, 158])) trait_res=None file=src/walk.rs
+  self=Batch trait=Some("IntoIterator") self_res=Resolved(SymbolSnapshotId([187, 18, 131, 95, 216, 7, 147, 135, 235, 211, 57, 125, 182, 51, 184, 239, 82, 179, 195, 172, 223, 228, 28, 191, 214, 236, 41, 1, 187, 96, 212, 158])) trait_res=Some(Unresolved) file=src/walk.rs
+  self=BatchSender trait=None self_res=Resolved(SymbolSnapshotId([239, 198, 177, 253, 83, 153, 83, 30, 252, 21, 133, 8, 242, 188, 51, 93, 235, 176, 214, 20, 104, 122, 98, 216, 53, 248, 224, 190, 138, 118, 100, 90])) trait_res=None file=src/walk.rs
+  self=ReceiverBuffer trait=None self_res=Resolved(SymbolSnapshotId([90, 241, 4, 1, 8, 240, 139, 165, 197, 93, 138, 210, 148, 27, 18, 223, 39, 79, 9, 18, 221, 116, 242, 16, 53, 4, 217, 60, 53, 80, 230, 6])) trait_res=None file=src/walk.rs
+  self=WorkerState trait=None self_res=Resolved(SymbolSnapshotId([233, 172, 52, 220, 19, 211, 239, 80, 164, 105, 65, 185, 75, 128, 54, 31, 38, 74, 94, 54, 224, 227, 93, 230, 249, 79, 183, 131, 76, 48, 82, 74])) trait_res=None file=src/walk.rs
+
+--- H. Rust/systems usefulness Q&A (sharkdp/fd, commit B) ---
+Q1 'Which trait(s) does FixedStrings implement?' -> ["src/patterns.rs::Matcher"]
+Q2 'Which types implement the Matcher trait?' -> ["src/patterns.rs::MatchAll", "src/patterns.rs::FixedStrings", "src/patterns.rs::ExactStrings"]
+Q3 'GlobMatcher' NOT FOUND as a local snapshot (expected -- GlobMatcher is defined in the external `globset` crate, not in this repository's own source; this pipeline has no symbol for it to attach a Contains edge to)
+Q4 'If I modify build_patterns, which call sites are impacted?' -> callers: ["src/main.rs::run"]
+Q5 'Which types implement the SanitizeErr trait?' -> []
+Q6 'Which tests cover the patterns module?' -> total TestsFor edges in corpus: 0
+Q7 'What is the call flow from main() into the walk subsystem?' -> main() calls: ["src/exit_codes.rs::exit", "src/main.rs::run"]
+
+=== done ===
