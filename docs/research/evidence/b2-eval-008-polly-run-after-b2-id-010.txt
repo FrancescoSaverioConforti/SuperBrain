@@ -1,0 +1,179 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 3.10s
+     Running `target\release\examples\b2_smoke_test_csharp_cpp.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-008\repo' 32064ed55ab47e05b590be0360c8c45ce3901a73 1f232caf9672e515751ba2df76d82bfbbb62e016`
+=== B2-EVAL-008: C#/C++ domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-008\repo
+commit_b: 1f232caf9672e515751ba2df76d82bfbbb62e016
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 1015
+files_supported_by_parser: 792
+files_parsed: 792
+parse_failures: 0
+files_with_tree_has_error: 4
+raw_candidates_extracted: 5190
+extraction_rejections (oversized name/signature): 213
+  rejection_kind SignatureTooLong: 213
+  signature_too_long files (first 10): ["bench/Polly.Core.Benchmarks/Utils/Helper.MultipleStrategies.cs", "src/LegacySupport/DynamicDependencyAttribute.cs", "src/Polly.Core/CircuitBreaker/BrokenCircuitException.cs", "src/Polly.Core/CircuitBreaker/CircuitBreakerManualControl.cs", "src/Polly.Core/CircuitBreaker/CircuitBreakerResiliencePipelineBuilderExtensions.cs", "src/Polly.Core/CircuitBreaker/CircuitBreakerStrategyOptions.TResult.cs", "src/Polly.Core/CircuitBreaker/Controller/CircuitStateController.cs", "src/Polly.Core/Hedging/Controller/HedgingExecutionContext.cs", "src/Polly.Core/Hedging/Controller/TaskExecution.cs", "src/Polly.Core/PredicateBuilder.TResult.cs"]
+  signature_too_long frequency vs total candidates (MEASURED, Section A1 -- SignatureTooLong cross-language check): 213/5403 (3.94%)
+snapshots_promoted: 5190
+promotion_failures: 0
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 634
+  Interface: 35
+  Method: 4521
+
+--- C-prelim. Extraction-coverage gap, C#/C++ domain (raw-parse proxy, MEASURED) ---
+csharp_struct_decls (NOT walked by extract/csharp.rs today): 46
+csharp_enum_decls (NOT walked by extract/csharp.rs today): 15
+csharp_constructor_decls (NOT walked by extract/csharp.rs today): 379
+csharp_field_decls (NOT walked by extract/csharp.rs today): 730
+csharp_using_directives (file-level import-equivalent, MEASURED): 725
+csharp_namespace_decls (MEASURED): 781
+cpp_qualified_out_of_class_method_definitions (`Type::method(...)` shape; cpp.rs's own test suite already documents these as OMITTED, not misnamed -- re-measured here on real corpus, not assumed): 0
+
+--- C1. Inheritance/interface ground truth (C#/C++ domain priority) ---
+extends_implements_edges touching BulkheadPolicy/IBulkheadPolicy/Policy (MEASURED, 15 found):
+  Some("src/Polly/Timeout/TimeoutPolicy.cs::TimeoutPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/RateLimit/RateLimitPolicy.cs::RateLimitPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Utilities/Wrappers/ResiliencePipelineSyncPolicy.cs::ResiliencePipelineSyncPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/CircuitBreaker/CircuitBreakerPolicy.cs::CircuitBreakerPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/NoOp/NoOpPolicy.cs::NoOpPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Fallback/FallbackPolicy.cs::FallbackPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Bulkhead/BulkheadPolicy.cs::BulkheadPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("test/Polly.Specs/Helpers/Custom/AddBehaviourIfHandle/AddBehaviourIfHandlePolicy.cs::AddBehaviourIfHandlePolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Bulkhead/IBulkheadPolicy.cs::IBulkheadPolicy") -[Implements]-> Some("src/Polly/IsPolicy.cs::IsPolicy")
+  Some("src/Polly/Wrap/PolicyWrap.cs::PolicyWrap") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Policy.cs::Policy") -[Extends]-> Some("src/Polly/PolicyBase.ContextAndKeys.cs::PolicyBase")
+  Some("src/Polly/Caching/CachePolicy.cs::CachePolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("src/Polly/Bulkhead/IBulkheadPolicy.cs::IBulkheadPolicy") -[Implements]-> Some("src/Polly/Bulkhead/IBulkheadPolicy.cs::IBulkheadPolicy")
+  Some("src/Polly/Retry/RetryPolicy.cs::RetryPolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+  Some("test/Polly.Specs/Helpers/Custom/PreExecute/PreExecutePolicy.cs::PreExecutePolicy") -[Extends]-> Some("src/Polly/Policy.ContextAndKeys.cs::Policy")
+ground_truth (from direct source reading): `class BulkheadPolicy : Policy, IBulkheadPolicy` (base class + interface, one declaration), `interface IBulkheadPolicy : IsPolicy, IDisposable` (interface-to-interface, TWO bases), `class BulkheadPolicy<TResult> : Policy<TResult>, IBulkheadPolicy<TResult>` (generic variant, same shape).
+
+--- C2. Method-overload ground truth (C#/C++ domain priority) ---
+total snapshots named exactly "Handle" across the WHOLE corpus (MEASURED): 6
+Calls edges targeting any "Handle" snapshot (MEASURED): 0
+interpretation: if ANY edge above resolved via StaticAnalysis (not NameHeuristic), that call site had EXACTLY ONE candidate named "Handle" in the given pool for that resolve_calls invocation (per-signature-text re-parse scope) -- meaning the other 3 overloads were simply not visible to THAT resolution, not correctly disambiguated by type/arity. If NameHeuristic/Speculative, the ambiguity was honestly recorded instead of guessed. Neither path means overload-aware (CALL-RES-A5-style) resolution is happening; this section measures whether real overloads produce visible ambiguity or silent single-candidate luck, to ground the user's own research question on A4/A5 justification.
+
+--- C3. Callback/registration relationship recurrence check (cross-domain radar) ---
+fields_with_underscore_prefix_naming_convention (MEASURED, a proxy for Polly's private-delegate-field convention seen in BulkheadPolicy/_onBulkheadRejected and FallbackPolicy/_onFallback): 0
+note: this pipeline's SymbolKind::Field population and resolve_calls's own name-matching do not treat a delegate field differently from any other field or method name -- confirmed structurally: resolve_calls matches callee identifiers against snapshot NAMES, and a field name like "_onBulkheadRejected" never appears as a call-expression callee text at its OWN declaration site (only at its later invocation site inside a DIFFERENT method), so no edge kind in this pipeline represents 'this constructor parameter becomes this field, later invoked from that other method' -- the same class of gap B2-EVAL-007 named for pipx's parser.set_defaults(func=X)/args.func(...) pair, recurring here through a structurally different mechanism (field storage, not a dynamic dispatch table), confirming it is not CLI-framework-specific.
+total_calls_edges_in_corpus_for_context (MEASURED): 1882
+
+--- C4. Module/File -> top-level-symbol gap (C#/C++ domain, class-centric language) ---
+files_with_at_least_one_extracted_symbol: 722
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 3889
+files_with_more_than_one_top_level_symbol (MEASURED): 233
+percentage_of_files_with_multiple_top_level_symbols (MEASURED): 32.3%
+mean_top_level_symbols_per_file (MEASURED): 5.39
+median_top_level_symbols_per_file (MEASURED): 1
+top 15 files by top-level-symbol count (file: count):
+  test/Polly.Specs/CircuitBreaker/AdvancedCircuitBreakerAsyncSpecs.cs: 88
+  test/Polly.Specs/CircuitBreaker/AdvancedCircuitBreakerSpecs.cs: 81
+  test/Polly.Specs/Fallback/FallbackSpecs.cs: 65
+  test/Polly.Specs/Retry/WaitAndRetrySpecs.cs: 63
+  test/Polly.Specs/Timeout/TimeoutSpecs.cs: 63
+  test/Polly.Specs/Timeout/TimeoutAsyncSpecs.cs: 59
+  test/Polly.Specs/Timeout/TimeoutTResultAsyncSpecs.cs: 57
+  test/Polly.Specs/Timeout/TimeoutTResultSpecs.cs: 56
+  test/Polly.Specs/CircuitBreaker/CircuitBreakerSpecs.cs: 55
+  test/Polly.Specs/Retry/WaitAndRetryAsyncSpecs.cs: 55
+  test/Polly.Specs/CircuitBreaker/CircuitBreakerAsyncSpecs.cs: 54
+  test/Polly.Specs/CircuitBreaker/CircuitBreakerTResultAsyncSpecs.cs: 52
+  test/Polly.Specs/CircuitBreaker/CircuitBreakerTResultSpecs.cs: 52
+  src/Polly/Retry/AsyncRetrySyntax.cs: 50
+  src/Polly/Retry/AsyncRetryTResultSyntax.cs: 50
+note: in this class-centric corpus, EACH class is usually its own top-level symbol in its own file (1 class : 1 file convention) -- the Module/File gap's RELEVANCE here depends on whether that convention actually holds across this corpus, not assumed; see the measured percentage/mean/median above.
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 1882
+extends_implements_edges: 103
+tests_for_edges: 0
+  by_kind Calls: 1882
+  by_kind Contains: 1234
+  by_kind Extends: 81
+  by_kind Implements: 22
+  by_resolution_method NameHeuristic: 399
+  by_resolution_method StaticAnalysis: 2820
+full_index_elapsed: 4.1847224s
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("src/Polly.Core/Hedging/Controller/HedgingExecutionContext.cs::CreateExecutionInfoWhenNoExecution") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("src/Polly.Core/Hedging/HedgingResilienceStrategy.cs::ExecuteCoreAsync") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingControllerTests.cs::PrepareAsync") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_FinishedTask_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_ConcurrentExecution_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_SynchronousExecution_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_HedgedExecution_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_TwiceWhenSecondaryGeneratorNotRegistered_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::TryWaitForCompletedExecutionAsync_TwiceWhenSecondaryGeneratorRegistered_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::LoadExecutionAsync_MaxTasks_NoMoreTasksAdded") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::LoadExecutionAsync_NoMoreSecondaryTasks_AcceptFinishedOutcome") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::Complete_EnsureOriginalContextPreparedWithAcceptedOutcome") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::Complete_MultipleAcceptedTasks_ShouldNotThrow") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::Complete_EnsurePendingTasksCleaned") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/HedgingExecutionContextTests.cs::Complete_EnsureCleaned") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/TaskExecutionTests.cs::Cancel_Accepted_NoEffect") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/TaskExecutionTests.cs::AcceptOutcome_NotInitialized_Throws") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/Controller/TaskExecutionTests.cs::ResetAsync_Ok") [Calls/StaticAnalysis] -> Some("src/Polly.Core/Hedging/Controller/TaskExecution.cs::AcceptOutcome") [StaticAnalysis] :: call to "AcceptOutcome" resolves to exactly one candidate in the given snapshot pool
+Some("src/Snippets/Docs/Fallback.cs::Action") [Calls/StaticAnalysis] -> Some("src/Snippets/Docs/Fallback.cs::ActionCore") [StaticAnalysis] :: call to "ActionCore" resolves to exactly one candidate in the given snapshot pool
+Some("src/Polly.Core/Fallback/FallbackHandler.cs::GetFallbackOutcomeAsync") [Calls/StaticAnalysis] -> Some("src/Snippets/Docs/Hedging.cs::ActionGenerator") [StaticAnalysis] :: call to "ActionGenerator" resolves to exactly one candidate in the given snapshot pool
+Some("src/Polly.Core/Hedging/Controller/HedgingHandler.cs::GenerateAction") [Calls/StaticAnalysis] -> Some("src/Snippets/Docs/Hedging.cs::ActionGenerator") [StaticAnalysis] :: call to "ActionGenerator" resolves to exactly one candidate in the given snapshot pool
+Some("test/Polly.Core.Tests/Hedging/HedgingStrategyOptionsTests.cs::HedgingActionGenerator_EnsureDefaults") [Calls/StaticAnalysis] -> Some("src/Snippets/Docs/Hedging.cs::ActionGenerator") [StaticAnalysis] :: call to "ActionGenerator" resolves to exactly one candidate in the given snapshot pool
+Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::IncrementSuccess_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::IncrementFailure_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::GetHealthCount_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/RollingHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::IncrementSuccess_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::IncrementFailure_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::GetHealthCount_NeedsLock") [Calls/NameHeuristic] -> Some("src/Polly/CircuitBreaker/SingleHealthMetrics.cs::ActualiseCurrentMetric_NeedsLock") [NameHeuristic] :: call to "ActualiseCurrentMetric_NeedsLock" resolves to exactly one candidate once narrowed to the caller's own enclosing class
+Some("src/Polly.Core/PredicateBuilder.TResult.cs::Handle") [Calls/NameHeuristic] -> Some("src/Polly.Core/PredicateBuilder.TResult.cs::Add") [NameHeuristic] :: call to "Add" resolves to exactly one candidate once narrowed to the caller's own file
+Some("src/Polly.Core/PredicateBuilder.TResult.cs::HandleInner") [Calls/NameHeuristic] -> Some("src/Polly.Core/PredicateBuilder.TResult.cs::Add") [NameHeuristic] :: call to "Add" resolves to exactly one candidate once narrowed to the caller's own file
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_csharp_cpp.exe","20524","Console","23","21.848 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: 32064ed55ab47e05b590be0360c8c45ce3901a73
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 5121
+observe_commit(A) edge_count: 3220
+observe_commit(A) elapsed (full reindex): 4.111911s
+changed_files (git diff A..B): ["src/Polly/Bulkhead/AsyncBulkheadPolicy.cs", "src/Polly/Bulkhead/BulkheadPolicy.cs", "src/Polly/Fallback/AsyncFallbackPolicy.cs", "src/Polly/Fallback/FallbackPolicy.cs", "src/Polly/Polly.csproj", "src/Polly/RateLimit/AsyncRateLimitPolicy.cs", "src/Polly/RateLimit/LockFreeTokenBucketRateLimiter.cs", "src/Polly/RateLimit/RateLimitPolicy.cs", "src/Polly/Registry/PolicyRegistry.cs", "src/Polly/Retry/AsyncRetryPolicy.cs", "src/Polly/Retry/RetryPolicy.cs", "src/Polly/Timeout/AsyncTimeoutPolicy.cs", "src/Polly/Timeout/AsyncTimeoutSyntax.cs", "src/Polly/Timeout/AsyncTimeoutTResultSyntax.cs", "src/Polly/Timeout/TimeoutPolicy.cs", "src/Polly/Timeout/TimeoutSyntax.cs", "src/Polly/Timeout/TimeoutTResultSyntax.cs", "src/Polly/Utilities/SystemClock.cs", "test/Polly.Specs/Bulkhead/BulkheadSpecs.cs", "test/Polly.Specs/Caching/AbsoluteTtlSpecs.cs", "test/Polly.Specs/Caching/CacheTResultAsyncSpecs.cs", "test/Polly.Specs/Caching/CacheTResultSpecs.cs", "test/Polly.Specs/Caching/ContextualTtlSpecs.cs", "test/Polly.Specs/PolicySpecs.cs", "test/Polly.Specs/Polly.Specs.csproj", "test/Polly.Specs/RateLimit/AsyncRateLimitPolicySpecs.cs", "test/Polly.Specs/RateLimit/AsyncRateLimitPolicyTResultSpecs.cs", "test/Polly.Specs/RateLimit/RateLimitPolicySpecs.cs", "test/Polly.Specs/RateLimit/RateLimitPolicyTResultSpecs.cs", "test/Polly.Specs/RateLimit/RateLimitRejectedExceptionTests.cs", "test/Polly.Specs/Registry/ConcurrentPolicyRegistrySpecs.cs", "test/Polly.Specs/Registry/PolicyRegistrySpecs.cs", "test/Polly.Specs/ResiliencePipelineConversionExtensionsTests.cs", "test/Polly.Specs/Retry/RetryForeverAsyncSpecs.cs", "test/Polly.Specs/Retry/RetryTResultAsyncSpecs.cs", "test/Polly.Specs/Retry/WaitAndRetryForeverSpecs.cs", "test/Polly.Specs/Retry/WaitAndRetrySpecs.cs", "test/Polly.Specs/Timeout/TimeoutAsyncSpecs.cs", "test/Polly.Specs/Timeout/TimeoutSpecs.cs", "test/Polly.Specs/Timeout/TimeoutTResultAsyncSpecs.cs", "test/Polly.Specs/Timeout/TimeoutTResultSpecs.cs"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 41, files_reparsed: 41, snapshots_removed: 686, snapshots_added: 755, edges_rebuilt: 3904, raw_import_statements_extracted: 4, raw_import_statements_reused: 721, import_facts_resolved: 725, raw_impl_statements_extracted: 0, raw_impl_statements_reused: 0, impl_facts_resolved: 0, raw_csharp_type_declaration_contexts_extracted: 49, raw_csharp_type_declaration_contexts_reused: 811 }
+observe_commit(B) elapsed (incremental): 6.4749567s
+observe_commit(B) final snapshot_count: 5875
+observe_commit(B) final edge_count: 3219
+observe_commit(B) final lineage_edge_count: 685
+
+--- Imports measurement (via the real CodeGraphIndexer; C#/C++ domain -- namespaces/usings/includes) ---
+total_using_directives_at_commit_b (raw-parse count, MEASURED): 725
+csharp_import_facts_extracted (MEASURED, ImportFact, file-level): 725
+extraction_coverage: 725/725 (100.0%)
+total_import_facts_all_languages (MEASURED): 725
+  resolution_internal (MEASURED): 38
+  resolution_external (MEASURED): 571
+  resolution_ambiguous (MEASURED): 116
+  aliases_captured (MEASURED): 17
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 4
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 721
+note: BulkheadPolicy.cs itself has ZERO `using` directives (confirmed via dedicated grep on the definitive clone before this harness ran) -- this file relies entirely on its own `namespace Polly.Bulkhead;` declaration plus C#'s implicit same-namespace visibility, not on explicit per-file using statements. Any ImportFact-based cross-reference measurement for THIS file specifically will show zero import facts by design, not as a resolver defect.
+
+--- H. C#/C++ usefulness Q&A (Polly, commit B) ---
+Q1 [needs: Extends+Implements] 'Does BulkheadPolicy extend a base class AND implement an interface?' -> Extends: ["src/Polly/Policy.ContextAndKeys.cs::Policy"], Implements: [] (ground truth: extends Policy, implements IBulkheadPolicy)
+Q2 [needs: interface-to-interface inheritance] 'Does IBulkheadPolicy itself inherit from other interfaces?' -> ["Implements -> src/Polly/IsPolicy.cs::IsPolicy"] (ground truth: `interface IBulkheadPolicy : IsPolicy, IDisposable`, TWO interface bases -- IsPolicy/IDisposable are both outside this exact commit pair's own changed-file set, so whether this resolves depends on whether IsPolicy/IDisposable are themselves present as snapshots in this full-corpus pool)
+Q3 [needs: overload-aware resolution] 'How many distinct `Handle` snapshots does Policy.HandleSyntax.cs produce, and are they collapsed to one name bucket?' -> 4 snapshot(s) named exactly "Handle" found (ground truth: 4 real overloads exist in source -- Handle<TException>(), Handle<TException>(Func<TException,bool>), and their PolicyBuilder<TResult> counterparts). If this count is less than 4, extraction itself (not just resolve_calls) may be collapsing distinct overloads to one SymbolSnapshotId or rejecting some; if it is 4, resolve_calls still cannot distinguish WHICH of the 4 a given call site intends, since matching is by bare name only, not arity/type.
+  Handle snapshot: SymbolSnapshotId([36, 54, 197, 207, 35, 61, 117, 114, 96, 141, 192, 234, 23, 135, 88, 32, 211, 112, 197, 53, 13, 142, 103, 159, 94, 71, 185, 61, 101, 208, 156, 197]) (signature starts: "public static PolicyBuilder Handle<TException>(Func<TException, bool> exceptionP")
+  Handle snapshot: SymbolSnapshotId([139, 217, 61, 197, 91, 45, 182, 1, 156, 60, 236, 129, 31, 194, 140, 181, 148, 140, 209, 125, 190, 111, 233, 101, 65, 16, 177, 25, 82, 82, 180, 78]) (signature starts: "public static PolicyBuilder Handle<TException>()\n        where TException : Exce")
+  Handle snapshot: SymbolSnapshotId([155, 245, 72, 81, 101, 162, 99, 149, 54, 83, 196, 246, 64, 8, 163, 194, 37, 177, 155, 37, 254, 97, 227, 175, 139, 66, 67, 120, 240, 209, 3, 135]) (signature starts: "public static PolicyBuilder<TResult> Handle<TException>(Func<TException, bool> e")
+  Handle snapshot: SymbolSnapshotId([194, 33, 176, 233, 139, 214, 2, 172, 159, 248, 95, 63, 135, 199, 80, 75, 228, 186, 192, 68, 14, 80, 27, 11, 110, 66, 175, 35, 26, 208, 177, 111]) (signature starts: "public static PolicyBuilder<TResult> Handle<TException>()\n        where TExcepti")
+Q4 [needs: Module/File structure] 'What does src/Polly/Bulkhead/BulkheadPolicy.cs contain?' -> 6 symbols found ONLY via file-path string matching: ["Implementation", "Dispose", "Dispose", "BulkheadPolicy", "Implementation", "BulkheadPolicy"]
+Q5 [needs: callback/registration relationship, NOT Calls] 'Does any edge represent BulkheadPolicy storing _onBulkheadRejected in its constructor and invoking it later from Implementation()?' -> BulkheadPolicy's own outgoing Calls: [] (ground truth: _onBulkheadRejected is a constructor PARAMETER stored as a private field then invoked inside BulkheadEngine.Implementation -- never a named symbol this pipeline's Calls resolver could match against; confirms the same category of structurally invisible relationship B2-EVAL-007 named for pipx's dispatch table, recurring here via constructor-injected delegate FIELDS instead of a dynamic attribute lookup)
+Q6 [needs: TestsFor] 'Which tests cover BulkheadPolicy?' -> total TestsFor edges in corpus: 0
+  TestsFor edges pointing at BulkheadPolicy: []
+Q7 [needs: Calls, impact analysis] 'If I modify BulkheadPolicy.Dispose, what is impacted?' -> callers: ["src/Polly/Bulkhead/BulkheadPolicy.cs::Dispose"]
+
+=== done ===

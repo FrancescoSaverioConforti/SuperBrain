@@ -55,6 +55,7 @@ use codegraph_domain::{CommitHash, RepositoryId, RepositorySource, SymbolSnapsho
 use thiserror::Error;
 
 use super::pipeline::{build_graph, index_files, PipelineError};
+use crate::csharp_declarations::{resolve_csharp_type_declaration_contexts, RawCSharpTypeDeclarationContext};
 use crate::graph::{CodeGraph, GraphError};
 use crate::impls::{resolve_implements_from_impl_facts, resolve_raw_impl_statements, ImplFact, RawImplStatement};
 use crate::imports::{resolve_raw_import_statements, ImportFact, RawImportStatement};
@@ -92,6 +93,12 @@ struct RepositoryState {
     /// reason (see this struct's own doc comment above).
     raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
     impl_facts: Arc<Vec<ImplFact>>,
+    /// B2-ID-010: mirrors `raw_import_statements`/`import_facts` and
+    /// `raw_impl_statements`/`impl_facts` exactly — same incremental-
+    /// reuse-vs-always-recompute split, same reason. `csharp_contexts`
+    /// is consumed by `resolve_extends_implements_with_csharp_contexts`,
+    /// never persisted on `CodeGraph` itself.
+    raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
 }
 
 /// What [`CodeGraphIndexer::begin_observe`] (critical section 1)
@@ -104,6 +111,7 @@ struct ObserveClaim {
     prior_graph: Option<Arc<CodeGraph>>,
     prior_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
     prior_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
+    prior_raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
     generation: u64,
 }
 
@@ -198,6 +206,13 @@ pub struct IndexMetrics {
     /// the identical reason `import_facts_resolved` is — mirrors
     /// `import_facts_resolved` exactly.
     pub impl_facts_resolved: usize,
+    /// B2-ID-010: raw C# type-declaration contexts newly (re-)extracted
+    /// this call — mirrors `raw_import_statements_extracted` exactly.
+    pub raw_csharp_type_declaration_contexts_extracted: usize,
+    /// Raw C# type-declaration contexts CARRIED FORWARD unchanged from
+    /// the prior commit's untouched files, never re-extracted — mirrors
+    /// `raw_import_statements_reused` exactly.
+    pub raw_csharp_type_declaration_contexts_reused: usize,
 }
 
 /// What a successful [`CodeGraphIndexer::observe_commit`] call returns.
@@ -379,7 +394,7 @@ impl CodeGraphIndexer {
             });
         }
 
-        let (new_graph, new_raw_import_statements, import_facts, new_raw_impl_statements, impl_facts, metrics) = match claim.relationship {
+        let (new_graph, new_raw_import_statements, import_facts, new_raw_impl_statements, impl_facts, new_raw_csharp_type_declaration_contexts, metrics) = match claim.relationship {
             CommitRelationship::NewRepository | CommitRelationship::HistoryRewriteOrUnknownAncestor => self.full_reindex(source, repository, new_commit)?,
             CommitRelationship::NormalAdvance => {
                 let prior_graph = claim.prior_graph.expect("NormalAdvance implies prior state exists");
@@ -390,6 +405,7 @@ impl CodeGraphIndexer {
                     &prior_graph,
                     &claim.prior_raw_import_statements,
                     &claim.prior_raw_impl_statements,
+                    &claim.prior_raw_csharp_type_declaration_contexts,
                     changed_files,
                 )?
             }
@@ -405,6 +421,7 @@ impl CodeGraphIndexer {
             import_facts,
             new_raw_impl_statements,
             impl_facts,
+            new_raw_csharp_type_declaration_contexts,
             metrics,
         ))
     }
@@ -415,7 +432,7 @@ impl CodeGraphIndexer {
     /// rebuild. Returns the prior graph (a cloned `Arc`, cheap) so the
     /// caller can build the incremental update outside the lock.
     fn begin_observe(&self, repository: RepositoryId, new_commit: &CommitHash, expected_prev_commit: Option<&CommitHash>) -> ObserveClaim {
-        let (relationship, prior_graph, prior_raw_import_statements, prior_raw_impl_statements) = {
+        let (relationship, prior_graph, prior_raw_import_statements, prior_raw_impl_statements, prior_raw_csharp_type_declaration_contexts) = {
             let state = self.state.lock().unwrap();
             let prior = state.get(&repository);
             let relationship = classify_commit(prior, new_commit, expected_prev_commit);
@@ -424,6 +441,7 @@ impl CodeGraphIndexer {
                 prior.map(|s| s.graph.clone()),
                 prior.map(|s| s.raw_import_statements.clone()).unwrap_or_default(),
                 prior.map(|s| s.raw_impl_statements.clone()).unwrap_or_default(),
+                prior.map(|s| s.raw_csharp_type_declaration_contexts.clone()).unwrap_or_default(),
             )
         };
         // Claimed from a counter entirely separate from `state`'s own
@@ -442,6 +460,7 @@ impl CodeGraphIndexer {
             prior_graph,
             prior_raw_import_statements,
             prior_raw_impl_statements,
+            prior_raw_csharp_type_declaration_contexts,
             generation,
         }
     }
@@ -459,6 +478,7 @@ impl CodeGraphIndexer {
             Vec<ImportFact>,
             Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
             Vec<ImplFact>,
+            Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
             IndexMetrics,
         ),
         ObserveError,
@@ -483,11 +503,13 @@ impl CodeGraphIndexer {
             raw_impl_statements_extracted: output.raw_impl_statements.len(),
             raw_impl_statements_reused: 0,
             impl_facts_resolved: impl_facts.len(),
+            raw_csharp_type_declaration_contexts_extracted: output.raw_csharp_type_declaration_contexts.len(),
+            raw_csharp_type_declaration_contexts_reused: 0,
         };
         let mut typed_edges = output.typed_edges;
         typed_edges.extend(implements_edges);
         let graph = build_graph(output.snapshots, output.lineage_edges, typed_edges)?;
-        Ok((graph, output.raw_import_statements, import_facts, output.raw_impl_statements, impl_facts, metrics))
+        Ok((graph, output.raw_import_statements, import_facts, output.raw_impl_statements, impl_facts, output.raw_csharp_type_declaration_contexts, metrics))
     }
 
     /// Incremental update: re-parses/re-extracts/re-promotes ONLY
@@ -517,6 +539,7 @@ impl CodeGraphIndexer {
         prior_graph: &CodeGraph,
         prior_raw_import_statements: &[(codegraph_domain::FileIdentity, RawImportStatement)],
         prior_raw_impl_statements: &[(codegraph_domain::FileIdentity, RawImplStatement)],
+        prior_raw_csharp_type_declaration_contexts: &[(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)],
         changed_files: &[String],
     ) -> Result<
         (
@@ -525,6 +548,7 @@ impl CodeGraphIndexer {
             Vec<ImportFact>,
             Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
             Vec<ImplFact>,
+            Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
             IndexMetrics,
         ),
         ObserveError,
@@ -572,7 +596,26 @@ impl CodeGraphIndexer {
         let mut current_snapshots = untouched_snapshots;
         current_snapshots.extend(output.snapshots.clone());
 
-        let mut typed_edges = crate::edges::resolve_all_typed_edges(&current_snapshots).map_err(PipelineError::from)?;
+        // B2-ID-010: identical incremental semantics to
+        // `raw_import_statements`/`raw_impl_statements` below — reused
+        // for every UNTOUCHED file, freshly extracted for every file
+        // this call actually reparsed. Resolution (the `snapshot_id`
+        // join against the real pool) is, exactly like
+        // `import_facts`/`impl_facts`, ALWAYS recomputed from the full
+        // raw-context set against the full current pool, never reused
+        // incrementally — an untouched declaration's own context data
+        // never changes, but which `SymbolSnapshotId` it resolves to
+        // CAN (a renamed/moved file elsewhere does not change this
+        // declaration's own identity, but the identity is still
+        // re-derived from `current_snapshots` fresh every call, same as
+        // every other resolver here).
+        let untouched_raw_csharp_type_declaration_contexts: Vec<_> = prior_raw_csharp_type_declaration_contexts.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
+        let untouched_raw_csharp_type_declaration_contexts_len = untouched_raw_csharp_type_declaration_contexts.len();
+        let mut raw_csharp_type_declaration_contexts = untouched_raw_csharp_type_declaration_contexts;
+        raw_csharp_type_declaration_contexts.extend(output.raw_csharp_type_declaration_contexts.clone());
+        let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw_csharp_type_declaration_contexts, &current_snapshots);
+
+        let mut typed_edges = crate::edges::resolve_all_typed_edges_with_csharp_contexts(&current_snapshots, &csharp_contexts).map_err(PipelineError::from)?;
 
         // Lineage across the UNCHANGED portion is already final (it was
         // resolved and published by an earlier observe_commit call);
@@ -701,10 +744,12 @@ impl CodeGraphIndexer {
             raw_impl_statements_extracted: output.raw_impl_statements.len(),
             raw_impl_statements_reused: untouched_raw_impl_statements_len,
             impl_facts_resolved: impl_facts.len(),
+            raw_csharp_type_declaration_contexts_extracted: output.raw_csharp_type_declaration_contexts.len(),
+            raw_csharp_type_declaration_contexts_reused: untouched_raw_csharp_type_declaration_contexts_len,
         };
 
         let graph = build_graph(final_snapshots, lineage_edges, typed_edges)?;
-        Ok((graph, raw_import_statements, import_facts, raw_impl_statements, impl_facts, metrics))
+        Ok((graph, raw_import_statements, import_facts, raw_impl_statements, impl_facts, raw_csharp_type_declaration_contexts, metrics))
     }
 
     /// Critical section 2: publish `candidate_graph` for `repository`
@@ -723,6 +768,7 @@ impl CodeGraphIndexer {
         candidate_import_facts: Vec<ImportFact>,
         candidate_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
         candidate_impl_facts: Vec<ImplFact>,
+        candidate_raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
         metrics: IndexMetrics,
     ) -> ObserveOutcome {
         let mut state = self.state.lock().unwrap();
@@ -741,6 +787,7 @@ impl CodeGraphIndexer {
                     import_facts: import_facts.clone(),
                     raw_impl_statements: candidate_raw_impl_statements,
                     impl_facts: impl_facts.clone(),
+                    raw_csharp_type_declaration_contexts: candidate_raw_csharp_type_declaration_contexts,
                 },
             );
             ObserveOutcome { generation, graph, import_facts, impl_facts, metrics }
@@ -842,7 +889,7 @@ mod tests {
         let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
         let indexer = CodeGraphIndexer::new();
 
-        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
+        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
         assert_eq!(first_outcome.generation, 5);
 
         // Attempt to publish AGAIN at the SAME generation (5, not 4) —
@@ -851,7 +898,7 @@ mod tests {
         let file = FileIdentity::parse(repo, commit.clone(), "src/lib.rs").unwrap();
         let candidate = RawSymbolCandidate::new("marker".to_string(), "function_item".to_string(), ByteSpan { start: 0, end: 3 }, "fn marker() {}".to_string()).unwrap();
         second_candidate.insert_snapshot(promote(&candidate, file).unwrap()).unwrap();
-        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
+        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
 
         assert_eq!(second_outcome.generation, 5, "the reported generation must still be 5 (the one already published)");
         assert_eq!(second_outcome.graph.snapshot_count(), 0, "an equal-generation publish must NOT overwrite the already-published graph with its own candidate");
@@ -1897,6 +1944,163 @@ mod tests {
             incremental_resolved_traits, full_resolved_traits,
             "the incremental path must resolve the same number of traits to Resolved as a full reindex of the identical commit"
         );
+    }
+
+    // B2-ID-010 regression tests: the partial-class reconciliation fix
+    // must behave identically through the real production
+    // `CodeGraphIndexer` entry point — full reindex, incremental
+    // advance, incremental edit of ONE partial fragment, and deletion
+    // of a partial fragment — not just via the lower-level
+    // `resolve_extends_implements_with_csharp_contexts` unit tests in
+    // `edges::extends_implements`.
+    mod b2_id_010_csharp_partial_class_through_the_real_indexer {
+        use super::*;
+
+        const POLICY_PART_1: &[u8] = b"public partial class Policy {}\n";
+        const POLICY_PART_2: &[u8] = b"public partial class Policy { }\n";
+        const IBULKHEAD: &[u8] = b"public interface IBulkheadPolicy {}\n";
+        const BULKHEAD: &[u8] = b"public class BulkheadPolicy : Policy, IBulkheadPolicy {}\n";
+
+        #[test]
+        fn full_reindex_reconciles_the_real_polly_shape() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/IBulkheadPolicy.cs").unwrap(), IBULKHEAD)
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let bulkhead = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "BulkheadPolicy" && outcome.graph.lineage_from(s.id()).is_empty()).unwrap();
+            let extends: Vec<_> = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Extends)).to_vec();
+            let implements: Vec<_> = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Implements)).to_vec();
+            assert_eq!(extends.len(), 1, "a full reindex through the real indexer must reconcile BulkheadPolicy's own Extends edge toward one of Policy's 2 partial fragments");
+            assert_eq!(implements.len(), 1, "IBulkheadPolicy (not partial, unambiguous) must still resolve normally");
+        }
+
+        #[test]
+        fn incremental_advance_reconciles_identically_to_a_full_reindex() {
+            let repo_incremental = test_repo();
+            let repo_full = test_repo();
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let source_a = FakeSource::new()
+                .with_file(FileIdentity::parse(repo_incremental, commit_a.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo_incremental, commit_a.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo_incremental, commit_a.clone(), "src/IBulkheadPolicy.cs").unwrap(), IBULKHEAD);
+            let indexer = CodeGraphIndexer::new();
+            indexer.observe_commit(&source_a, repo_incremental, &commit_a, None, &[]).unwrap();
+
+            // Commit B adds BulkheadPolicy.cs as a NEW file -- Policy's
+            // own 2 partial fragments are UNTOUCHED, exercising the
+            // reuse path for raw_csharp_type_declaration_contexts.
+            let source_b = source_a
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/IBulkheadPolicy.cs").unwrap(), IBULKHEAD)
+                .with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let incremental_outcome = indexer.observe_commit(&source_b, repo_incremental, &commit_b, Some(&commit_a), &["src/BulkheadPolicy.cs".to_string()]).unwrap();
+
+            let full_source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/IBulkheadPolicy.cs").unwrap(), IBULKHEAD)
+                .with_file(FileIdentity::parse(repo_full, commit_b.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let full_indexer = CodeGraphIndexer::new();
+            let full_outcome = full_indexer.observe_commit(&full_source, repo_full, &commit_b, None, &[]).unwrap();
+
+            let incremental_extends_count = incremental_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Extends).count();
+            let full_extends_count = full_outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Extends).count();
+            assert_eq!(incremental_extends_count, 1, "the incremental path must reconcile Policy's 2 UNTOUCHED partial fragments via the reused raw context");
+            assert_eq!(incremental_extends_count, full_extends_count, "incremental must match a full reindex of the identical commit");
+        }
+
+        #[test]
+        fn editing_one_partial_fragment_does_not_break_reconciliation() {
+            // Policy.TResult.cs gets a cosmetic edit at commit B --
+            // reconciliation must still hold across the UNCHANGED
+            // Policy.cs fragment (reused context) plus the freshly
+            // re-extracted Policy.TResult.cs fragment (fresh context).
+            let repo = test_repo();
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let source_a = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let indexer = CodeGraphIndexer::new();
+            indexer.observe_commit(&source_a, repo, &commit_a, None, &[]).unwrap();
+
+            let source_b = source_a
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/Policy.TResult.cs").unwrap(), b"public partial class Policy { /* edited */ }\n")
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let outcome = indexer.observe_commit(&source_b, repo, &commit_b, Some(&commit_a), &["src/Policy.TResult.cs".to_string()]).unwrap();
+
+            let bulkhead = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "BulkheadPolicy" && outcome.graph.lineage_from(s.id()).is_empty()).unwrap();
+            let extends = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Extends));
+            assert_eq!(extends.len(), 1, "editing one partial fragment's own body must not break reconciliation toward whichever fragment is chosen as representative");
+        }
+
+        #[test]
+        fn deleting_one_partial_fragment_leaves_the_other_fragment_still_reconciled_alone() {
+            // Policy.TResult.cs is DELETED at commit B -- Policy still
+            // exists (via Policy.cs alone), still partial, so
+            // BulkheadPolicy : Policy must still resolve (trivially,
+            // now via a single unambiguous candidate -- not through
+            // reconciliation at all, but confirms deletion does not
+            // leave a stale raw context pointing at a dead snapshot).
+            // Uses a BulkheadPolicy shape with ONLY the Policy base (no
+            // IBulkheadPolicy interface) -- that interface is irrelevant
+            // to this specific test and omitting its own defining file
+            // would otherwise make BulkheadPolicy.cs itself a dangling
+            // reference to a name never in the pool.
+            const BULKHEAD_POLICY_ONLY: &[u8] = b"public class BulkheadPolicy : Policy {}\n";
+            let repo = test_repo();
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let source_a = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD_POLICY_ONLY);
+            let indexer = CodeGraphIndexer::new();
+            indexer.observe_commit(&source_a, repo, &commit_a, None, &[]).unwrap();
+
+            // Commit B's own file list simply omits Policy.TResult.cs —
+            // `FakeSource::with_file` registers per-commit, so NOT
+            // calling it for this path at commit_b is exactly "this
+            // file does not exist at commit B," the real deletion
+            // shape `list_files_at` would report.
+            let source_b = source_a.with_file(FileIdentity::parse(repo, commit_b.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1).with_file(FileIdentity::parse(repo, commit_b.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD_POLICY_ONLY);
+            let outcome = indexer.observe_commit(&source_b, repo, &commit_b, Some(&commit_a), &["src/Policy.TResult.cs".to_string(), "src/BulkheadPolicy.cs".to_string()]).unwrap();
+
+            let policy_fragments: Vec<_> = outcome.graph.all_snapshots().into_iter().filter(|s| s.name().as_str() == "Policy").collect();
+            assert_eq!(policy_fragments.len(), 1, "only Policy.cs's own fragment must remain after Policy.TResult.cs is deleted");
+            let bulkhead = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "BulkheadPolicy" && outcome.graph.lineage_from(s.id()).is_empty()).unwrap();
+            let extends = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Extends));
+            assert_eq!(extends.len(), 1, "after deleting one partial fragment, BulkheadPolicy must still resolve toward the one remaining Policy fragment");
+            assert_eq!(extends[0].to, policy_fragments[0].id());
+        }
+
+        #[test]
+        fn reconciliation_produces_no_duplicate_edges_through_the_real_indexer() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Policy.cs").unwrap(), POLICY_PART_1)
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Policy.TResult.cs").unwrap(), POLICY_PART_2)
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Policy.HandleSyntax.cs").unwrap(), b"public partial class Policy { }\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/BulkheadPolicy.cs").unwrap(), BULKHEAD);
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let bulkhead = outcome.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "BulkheadPolicy" && outcome.graph.lineage_from(s.id()).is_empty()).unwrap();
+            let extends = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Extends));
+            assert_eq!(extends.len(), 1, "3 partial Policy fragments must still produce exactly ONE Extends edge, never one per fragment");
+        }
     }
 
     #[test]

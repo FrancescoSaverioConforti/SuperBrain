@@ -67,16 +67,71 @@
 //! this, and why `resolve_instantiates`/`resolve_contains` were
 //! confirmed NOT to share this defect.
 
-use codegraph_domain::{EdgeKind, SymbolKind};
+use std::collections::HashMap;
+
+use codegraph_domain::{EdgeKind, SymbolKind, SymbolSnapshotId};
 
 use super::resolution::{resolved_evidence, Edge, EdgeResolutionError, TargetLookup};
+use crate::csharp_declarations::{CSharpTypeDeclarationContext, CSharpTypeKind};
 use crate::edges::calls::parser_for;
 use crate::parse::Language;
 use crate::snapshot::SymbolSnapshot;
 
+/// Compatibility wrapper: identical behavior to calling
+/// [`resolve_extends_implements_with_csharp_contexts`] with an empty
+/// `csharp_contexts` slice — confirmed by a dedicated equivalence test.
+/// Every one of this crate's ~30 existing call sites (tests, and every
+/// prior domain evaluation harness, none of which wire up C#
+/// declaration contexts) keeps this exact signature and exact behavior
+/// unchanged by B2-ID-010.
 pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeResolutionError> {
+    resolve_extends_implements_with_csharp_contexts(snapshots, &[])
+}
+
+/// B2-ID-010: identical to [`resolve_extends_implements`] in every way
+/// EXCEPT for one additional reconciliation step this function's own
+/// base-name lookup applies when `candidates.len() != 1` for a C#
+/// base/heritage name: before giving up on an ambiguous or
+/// zero-candidate match, check whether `csharp_contexts` shows that
+/// EVERY same-named candidate for THIS name among `snapshots` is a
+/// `partial` fragment of the SAME logical type (same namespace, same
+/// generic arity, same `CSharpTypeKind`) — if so, treat them as one
+/// logical target for this relation only (never merging the
+/// underlying snapshots, never changing their identity), per
+/// [B2-ID-010](../../../../docs/research/findings/B2-ID-010.md). A
+/// non-C# base name, or a C# name with no matching context at all
+/// (e.g. `csharp_contexts` is empty), falls through to the EXACT same
+/// "ambiguous/zero -> no edge" behavior `resolve_extends_implements`
+/// always had.
+pub fn resolve_extends_implements_with_csharp_contexts(snapshots: &[SymbolSnapshot], csharp_contexts: &[CSharpTypeDeclarationContext]) -> Result<Vec<Edge>, EdgeResolutionError> {
     let lookup = TargetLookup::new(snapshots)?;
     let mut edges = Vec::new();
+
+    // Index contexts by (namespace, simple_name, generic_arity,
+    // type_kind) — the FULL semantic type key, not just
+    // (namespace, simple_name). A real C# file commonly declares
+    // BOTH a non-generic and a generic partial type sharing one bare
+    // name in the SAME file (e.g. `partial class Policy { .. }`
+    // alongside `partial class Policy<TResult> { .. }` in
+    // Policy.HandleSyntax.cs) — grouping by name alone would merge
+    // these two genuinely DIFFERENT types' fragments into one group,
+    // whose own arity values disagree, incorrectly blocking
+    // reconciliation for BOTH instead of correctly reconciling each
+    // arity's own fragment set independently. Confirmed as a real
+    // defect via B2-EVAL-008's own real-corpus remeasurement on
+    // `App-vNext/Polly` before this fix: `BulkheadPolicy : Policy`
+    // (arity 0) failed to reconcile because `Policy`'s own 8 arity-0
+    // fragments and 2 arity-1 fragments were grouped together under
+    // one name-only key. `snapshot_id` is `None` for any declaration
+    // whose own candidate was rejected at promotion — such a context
+    // is never a usable reconciliation target (no real snapshot to
+    // point an edge at).
+    let mut contexts_by_name: HashMap<(&str, &str, usize, CSharpTypeKind), Vec<&CSharpTypeDeclarationContext>> = HashMap::new();
+    for context in csharp_contexts {
+        if context.snapshot_id.is_some() {
+            contexts_by_name.entry((context.namespace.as_str(), context.simple_name.as_str(), context.generic_arity, context.type_kind)).or_default().push(context);
+        }
+    }
 
     for snapshot in lookup.snapshots() {
         let Some(parser) = parser_for(snapshot.file()) else {
@@ -96,22 +151,30 @@ pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Ed
         // `StaticAnalysis` (an ambiguous/unresolved base produces no
         // edge at all), so there is no evidence-strength tie-break to
         // make here either.
-        let mut seen_targets: std::collections::HashSet<(codegraph_domain::SymbolSnapshotId, EdgeKind)> = std::collections::HashSet::new();
+        let mut seen_targets: std::collections::HashSet<(SymbolSnapshotId, EdgeKind)> = std::collections::HashSet::new();
 
         for (base_name, syntactic_kind) in base_names_in(&tree) {
             let candidates = lookup.find_by_name(&base_name, snapshot.id());
-            if candidates.len() != 1 {
+            let resolved_target = if candidates.len() == 1 {
+                Some(candidates[0])
+            } else if tree.language() == Language::CSharp {
+                reconcile_partial_fragments(&base_name, &candidates, &contexts_by_name)
+            } else {
+                None
+            };
+
+            let Some(target) = resolved_target else {
                 // Zero: base not found among the given pool (e.g. a
                 // stdlib/third-party base type) -> no edge. More than
-                // one: ambiguous same-named base across files -> no
-                // edge either (unlike Calls, inheritance is a 1:1
+                // one, and not a fully-partial fragment set of one
+                // logical type: ambiguous same-named base across files
+                // -> no edge either (unlike Calls, inheritance is a 1:1
                 // structural claim about THIS declaration's one actual
                 // base, so an ambiguous same-name match cannot honestly
                 // be split into multiple heuristic edges the way a call
                 // site's multiple real overload candidates can).
                 continue;
-            }
-            let target = candidates[0];
+            };
             let kind = edge_kind_for(syntactic_kind, target.kind());
             if !seen_targets.insert((target.id(), kind)) {
                 continue;
@@ -131,6 +194,141 @@ pub fn resolve_extends_implements(snapshots: &[SymbolSnapshot]) -> Result<Vec<Ed
     }
 
     Ok(edges)
+}
+
+/// B2-ID-010's own reconciliation rule. `candidates` is every snapshot
+/// in the pool named `base_name` (already excluding the caller's own
+/// snapshot), i.e. exactly the set `resolve_extends_implements`'s own
+/// base case found ambiguous (`!= 1`). Returns `Some` ONLY when:
+///
+/// 1. `csharp_contexts` has a context for at least one of `candidates`
+///    (if a C# base name has no context coverage at all — e.g. the
+///    caller never wired up C# contexts — this function changes
+///    nothing, matching the compatibility wrapper's own guarantee);
+/// 2. EVERY context found for THAT `(namespace, simple_name)` key is
+///    `is_partial: true` — a single non-partial declaration anywhere
+///    in that group means these are genuinely distinct types that
+///    merely share a bare name (ordinary duplicate-name ambiguity),
+///    never reconciled;
+/// 3. every context's own `generic_arity`/`type_kind` agrees — a
+///    `Policy`/`Policy<T>` pair is NEVER reconciled together (that is
+///    the SEPARATE, Moderate generic-arity-collision gap, explicitly
+///    out of this fix's scope); a `Class`/`Interface` pair sharing a
+///    bare name is likewise never reconciled (incompatible kinds can
+///    never be fragments of the same logical type);
+/// 4. the reconciled candidate SET (by `snapshot_id`) exactly equals
+///    `candidates` — if a context's own namespace/arity/kind group
+///    contains a snapshot NOT present in `candidates` (or vice versa),
+///    the context data and the live candidate pool disagree, and this
+///    function conservatively refuses to guess rather than reconcile
+///    on stale/mismatched information. (This equality requirement also
+///    guarantees the representative this function ultimately returns
+///    is always found inside `candidates` — never needs a separate
+///    fallback lookup against a wider pool.)
+///
+/// On success, returns ONE deterministically-chosen representative
+/// candidate (the lowest-byte-span-start fragment, a stable,
+/// order-independent tie-break) — never merges or fuses the
+/// candidates' own distinct `SymbolSnapshotId`s; the OTHER fragments
+/// remain fully independent snapshots, simply not individually pointed
+/// at by this one edge.
+fn reconcile_partial_fragments<'a>(base_name: &str, candidates: &[&'a SymbolSnapshot], contexts_by_name: &HashMap<(&str, &str, usize, CSharpTypeKind), Vec<&CSharpTypeDeclarationContext>>) -> Option<&'a SymbolSnapshot> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // `candidates` is every snapshot named `base_name` in the WHOLE
+    // pool, by bare name alone — this can legitimately span MULTIPLE
+    // distinct semantic types sharing that name (e.g. a real file
+    // commonly declares both `partial class Policy { .. }` and
+    // `partial class Policy<TResult> { .. }` side by side — two
+    // different arities, two different logical types, one shared bare
+    // name). `contexts_by_name` is already grouped by the FULL type
+    // key (namespace, simple_name, generic_arity, type_kind), so each
+    // group here represents exactly ONE candidate logical type's own
+    // fragment set. A base/heritage clause names a type by its bare
+    // simple name with no arity marker at all (C#'s own `: Policy`
+    // syntax never carries `<T>`), so the base clause itself always
+    // means the NON-GENERIC (arity 0) member of that name — the
+    // search below is therefore scoped to `generic_arity == 0`
+    // groups only, never guessing among multiple different-arity
+    // candidates sharing the bare name.
+    //
+    // Every group (across ALL namespaces/arities/kinds) sharing this
+    // bare `simple_name` must be examined together: `candidates` (the
+    // full, bare-by-name pool) can legitimately be the UNION of
+    // several genuinely distinct semantic types' own fragment sets
+    // (e.g. one non-generic `partial class Foo` plus an unrelated
+    // generic `partial class Foo<T>` in the same file; or two
+    // unrelated partial `Foo` types in two different namespaces).
+    // Reconciliation is sound ONLY when that union accounts for
+    // `candidate_ids` EXACTLY — i.e. there is NO leftover candidate
+    // this name-grouping cannot explain — which both guards against
+    // a stale/mismatched context data set (same invariant the
+    // original equality check enforced) and, crucially, against ever
+    // reconciling just because one namespace/arity GROUP happens to
+    // be a subset while ANOTHER real candidate (a different arity, a
+    // different namespace) is left unaccounted for.
+    let candidate_ids: std::collections::HashSet<SymbolSnapshotId> = candidates.iter().map(|c| c.id()).collect();
+
+    let all_groups_for_this_name: Vec<&Vec<&CSharpTypeDeclarationContext>> = contexts_by_name.iter().filter(|((_, simple_name, _, _), _)| *simple_name == base_name).map(|(_, group)| group).collect();
+    let union_of_all_groups: std::collections::HashSet<SymbolSnapshotId> = all_groups_for_this_name.iter().flat_map(|group| group.iter().filter_map(|c| c.snapshot_id)).collect();
+    if union_of_all_groups != candidate_ids {
+        return None;
+    }
+
+    // Exactly ONE arity-0 group (a base/heritage clause's own bare
+    // name, e.g. `: Policy`, always means arity 0 — C# base-clause
+    // syntax never carries a `<T>` marker) must exist among those
+    // groups; more than one would mean the SAME namespace declared
+    // this arity-0 type twice independently (impossible if every
+    // group is internally `is_partial`-consistent and this group set
+    // was built from real, non-overlapping namespace/arity/kind keys,
+    // but checked explicitly rather than assumed).
+    let arity_0_groups: Vec<&&Vec<&CSharpTypeDeclarationContext>> = all_groups_for_this_name.iter().filter(|group| group.iter().all(|c| c.generic_arity == 0)).collect();
+    if arity_0_groups.len() != 1 {
+        return None;
+    }
+    let matching_group = *arity_0_groups[0];
+
+    // A group of exactly ONE fragment is not a partial-class split at
+    // all — nothing to reconcile. If `candidates` was ambiguous
+    // (`.len() > 1`) while this arity-0 group has only one member, the
+    // real ambiguity is caused entirely by OTHER groups sharing this
+    // bare name (e.g. a same-named but different-arity type, or a
+    // same-named but non-partial duplicate) — never something this
+    // fix should explain away. Requiring at least 2 fragments here is
+    // what actually distinguishes "Foo (arity 0, 1 fragment) vs. Foo<T>
+    // (arity 1, 1 fragment), ambiguous by bare name alone" from "Foo
+    // (arity 0, split across 2+ partial fragments)."
+    if matching_group.len() < 2 {
+        return None;
+    }
+
+    // Every context in the matching group must be partial — a single
+    // non-partial declaration anywhere in this exact-arity, exact-kind
+    // group means these are genuinely distinct types that merely share
+    // a bare name (ordinary duplicate-name ambiguity), never
+    // reconciled. (generic_arity/type_kind agreement is already
+    // guaranteed by construction: `contexts_by_name`'s own key
+    // includes both, so every context inside one group shares them —
+    // this is no longer a separate check to perform here.)
+    let all_partial = matching_group.iter().all(|c| c.is_partial);
+    if !all_partial {
+        return None;
+    }
+
+    // Deterministic representative: the fragment with the lowest span
+    // start, found by looking up each context's own snapshot_id back
+    // against `candidates` (never guessed by name alone). The lookup
+    // is guaranteed to succeed: `matching_group` was found above by
+    // requiring its own snapshot-id set to equal `candidate_ids`
+    // exactly, so `representative_id` — drawn from that same group —
+    // is always a member of `candidates`.
+    let mut sorted_group: Vec<&CSharpTypeDeclarationContext> = matching_group.clone();
+    sorted_group.sort_by_key(|c| c.span.start);
+    let representative_id = sorted_group.first()?.snapshot_id?;
+    candidates.iter().find(|c| c.id() == representative_id).copied()
 }
 
 /// Picks the final `EdgeKind` for one resolved base/interface name.
@@ -815,6 +1013,364 @@ mod tests {
             let reversed_edges = resolve_extends_implements(&reversed).unwrap();
 
             assert_eq!(sources_of(&forward_edges, base, &snapshots), sources_of(&reversed_edges, base, &reversed), "ownership attribution must not depend on snapshot pool ordering");
+        }
+    }
+
+    // B2-ID-010 regression tests: C# `partial class`/`partial interface`
+    // fragmentation must be reconciled for Extends/Implements base-name
+    // resolution ONLY when every same-named candidate is confirmed, via
+    // real `CSharpTypeDeclarationContext` extraction, to be a `partial`
+    // fragment of the SAME logical type (same namespace, same generic
+    // arity, same type kind). Every fixture below uses REAL extraction
+    // (`extract_symbols_reporting_rejections` + `promote` +
+    // `extract_csharp_type_declaration_contexts` +
+    // `resolve_csharp_type_declaration_contexts`), never a hand-written
+    // placeholder context, for the same reason B2-ID-007's own tests do
+    // — a placeholder cannot exercise the real grammar shapes this fix
+    // depends on (the `modifier`/`partial` node, the `namespace`
+    // ancestor walk).
+    mod b2_id_010_partial_class_reconciliation {
+        use super::*;
+        use crate::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts};
+        use crate::extract::extract_symbols_reporting_rejections;
+        use crate::parse::parser_for;
+
+        fn repo() -> codegraph_domain::RepositoryId {
+            let mut registry = RepositoryRegistry::new();
+            registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+        }
+
+        /// Builds real snapshots AND real, correctly-resolved
+        /// `CSharpTypeDeclarationContext`s from one or more (path,
+        /// source) files, mirroring exactly what `pipeline.rs`'s own
+        /// `index_files` loop does today (extract per-file, then
+        /// resolve the combined raw contexts against the combined
+        /// snapshot pool).
+        fn real_snapshots_and_contexts(repo: codegraph_domain::RepositoryId, files: &[(&str, &str)]) -> (Vec<SymbolSnapshot>, Vec<CSharpTypeDeclarationContext>) {
+            let mut all_snapshots = Vec::new();
+            let mut raw_contexts = Vec::new();
+            for (path, source) in files {
+                let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+                let file = FileIdentity::parse(repo, commit, path).unwrap();
+                let parser = parser_for(&file).expect("supported extension");
+                let tree = parser.parse(source.as_bytes()).expect("fixture must parse");
+                let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+                assert!(rejections.is_empty(), "fixture must not trigger rejection: {rejections:?}");
+                for candidate in candidates {
+                    all_snapshots.push(promote(&candidate, file.clone()).expect("promote"));
+                }
+                for context in extract_csharp_type_declaration_contexts(&tree) {
+                    raw_contexts.push((file.clone(), context));
+                }
+            }
+            let resolved_contexts = resolve_csharp_type_declaration_contexts(&raw_contexts, &all_snapshots);
+            (all_snapshots, resolved_contexts)
+        }
+
+        fn find<'a>(snapshots: &'a [SymbolSnapshot], name: &str) -> &'a SymbolSnapshot {
+            snapshots.iter().find(|s| s.name().as_str() == name).unwrap_or_else(|| panic!("no snapshot named {name:?}"))
+        }
+
+        fn sources_of<'a>(edges: &'a [Edge], target: &SymbolSnapshot, snapshots: &'a [SymbolSnapshot]) -> Vec<&'a str> {
+            let mut names: Vec<&str> = edges.iter().filter(|e| e.to == target.id()).filter_map(|e| snapshots.iter().find(|s| s.id() == e.from)).map(|s| s.name().as_str()).collect();
+            names.sort_unstable();
+            names
+        }
+
+        /// Case 1 (required): partial class, base on only ONE part,
+        /// same file.
+        #[test]
+        fn partial_target_split_same_file_reconciles() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[("src/Case1.cs", "class Base {}\npartial class Foo : Base\n{\n}\npartial class Foo\n{\n}\n")],
+            );
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let base = find(&snapshots, "Base");
+
+            assert_eq!(sources_of(&edges, base, &snapshots), vec!["Foo"]);
+            let to_base = edges.iter().find(|e| e.to == base.id()).unwrap();
+            assert_eq!(to_base.kind, EdgeKind::Extends);
+        }
+
+        /// Mutation-testing-driven addition: verifies the reconciled
+        /// edge's own `to` is EXACTLY the TARGET fragment with the
+        /// lowest byte-span start (the documented tie-break), by
+        /// comparing real `SymbolSnapshotId`s directly -- not just the
+        /// shared name "Foo" every fragment has. This is what actually
+        /// exercises the final `==` candidate-id lookup in
+        /// `reconcile_partial_fragments`: every OTHER test in this
+        /// module checks only the resolved NAME of the reconciled
+        /// target, which cannot distinguish "picked the right
+        /// fragment" from "picked some other same-named fragment,"
+        /// since every fragment of one logical type shares one name by
+        /// construction. Here `Foo` (the AMBIGUOUS, multi-fragment
+        /// name) is the base clause's own TARGET, not the derived
+        /// type -- the exact shape `reconcile_partial_fragments` is
+        /// written to resolve.
+        #[test]
+        fn reconciled_edge_points_to_exactly_the_lowest_span_start_target_fragment() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[("src/Case1b.cs", "partial class Foo {}\npartial class Foo { }\nclass Derived : Foo {}\n")],
+            );
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let derived = find(&snapshots, "Derived");
+            let foo_fragments: Vec<&SymbolSnapshot> = snapshots.iter().filter(|s| s.name().as_str() == "Foo").collect();
+            assert_eq!(foo_fragments.len(), 2);
+            let lowest_span_fragment = foo_fragments.iter().min_by_key(|s| s.span().start).unwrap();
+
+            let derived_extends = edges.iter().find(|e| e.from == derived.id()).unwrap();
+            assert_eq!(derived_extends.to, lowest_span_fragment.id(), "the reconciled edge must point to exactly the lowest-span-start Foo fragment, not an arbitrary same-named one");
+        }
+
+        /// Case 2 (required): partial class, base split across
+        /// different files.
+        #[test]
+        fn partial_target_split_across_files_reconciles() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[
+                    ("src/Base.cs", "class Base {}\n"),
+                    ("src/Foo.A.cs", "partial class Foo : Base\n{\n}\n"),
+                    ("src/Foo.B.cs", "partial class Foo\n{\n}\n"),
+                    ("src/Foo.C.cs", "partial class Foo\n{\n}\n"),
+                ],
+            );
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let base = find(&snapshots, "Base");
+
+            assert_eq!(sources_of(&edges, base, &snapshots), vec!["Foo"], "exactly one Extends edge, even though Foo has 3 partial fragments across 3 files");
+        }
+
+        /// Case 3 (required): ALL candidates partial -> reconciliation
+        /// (the real Polly shape — base split 3 ways, derived elsewhere).
+        #[test]
+        fn real_polly_shape_all_partial_fragments_reconciles() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[
+                    ("src/Policy.cs", "public partial class Policy {}\n"),
+                    ("src/Policy.TResult.cs", "public partial class Policy { }\n"),
+                    ("src/Policy.HandleSyntax.cs", "public partial class Policy { }\n"),
+                    ("src/IBulkheadPolicy.cs", "public interface IBulkheadPolicy {}\n"),
+                    ("src/BulkheadPolicy.cs", "public class BulkheadPolicy : Policy, IBulkheadPolicy {}\n"),
+                ],
+            );
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let policy_fragments: Vec<&SymbolSnapshot> = snapshots.iter().filter(|s| s.name().as_str() == "Policy").collect();
+            assert_eq!(policy_fragments.len(), 3, "Policy must still be 3 DISTINCT snapshots -- never merged");
+
+            let bulkhead = find(&snapshots, "BulkheadPolicy");
+            let extends: Vec<_> = edges.iter().filter(|e| e.from == bulkhead.id() && e.kind == EdgeKind::Extends).collect();
+            assert_eq!(extends.len(), 1, "exactly one Extends edge must now exist toward one of Policy's 3 fragments");
+            assert!(policy_fragments.iter().any(|p| p.id() == extends[0].to), "the Extends edge's target must be one of the real Policy fragments");
+
+            let implements: Vec<_> = edges.iter().filter(|e| e.from == bulkhead.id() && e.kind == EdgeKind::Implements).collect();
+            assert_eq!(implements.len(), 1, "IBulkheadPolicy (not partial, unambiguous) must still resolve normally");
+        }
+
+        /// Case 4 (required): ONE candidate non-partial -> NO
+        /// reconciliation (mixed partial/non-partial stays ambiguous).
+        #[test]
+        fn one_non_partial_candidate_blocks_reconciliation() {
+            // One partial Foo, one NON-partial Foo, both same
+            // namespace/arity/kind -- a mix of partial and non-partial
+            // same-named candidates must never be reconciled.
+            let source = "namespace N {\n    partial class Foo {}\n    class Foo {}\n}\nclass Derived : Foo {}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/Mixed.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+
+            let foo_candidates: Vec<&SymbolSnapshot> = snapshots.iter().filter(|s| s.name().as_str() == "Foo").collect();
+            assert_eq!(foo_candidates.len(), 2, "one partial, one non-partial Foo, both real");
+            let derived = find(&snapshots, "Derived");
+            let derived_extends: Vec<_> = edges.iter().filter(|e| e.from == derived.id()).collect();
+            assert!(derived_extends.is_empty(), "a mix of partial and non-partial same-named candidates must NEVER be reconciled -- stays ambiguous, no edge");
+        }
+
+        /// Case 5 (required): same simple name, DIFFERENT namespace ->
+        /// NO reconciliation, even if both are partial.
+        #[test]
+        fn same_name_different_namespace_both_partial_blocks_reconciliation() {
+            let source = "namespace A {\n    partial class Foo {}\n}\nnamespace B {\n    partial class Foo {}\n}\nclass Derived : Foo {}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/NsClash.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+
+            let foo_candidates: Vec<&SymbolSnapshot> = snapshots.iter().filter(|s| s.name().as_str() == "Foo").collect();
+            assert_eq!(foo_candidates.len(), 2, "two distinct partial Foo types in two different namespaces");
+            let derived = find(&snapshots, "Derived");
+            let derived_extends: Vec<_> = edges.iter().filter(|e| e.from == derived.id()).collect();
+            assert!(derived_extends.is_empty(), "two partial Foo types in DIFFERENT namespaces are genuinely distinct types -- must never reconcile, per the exact counterexample that motivated adding namespace to this fix's own invariant");
+        }
+
+        /// Case 6 (required): same name, different generic arity -> NO
+        /// reconciliation, even if both are partial.
+        #[test]
+        fn same_name_different_generic_arity_both_partial_blocks_reconciliation() {
+            let source = "partial class Foo {}\npartial class Foo<T> {}\nclass Derived : Foo {}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/Arity.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+
+            let derived = find(&snapshots, "Derived");
+            let derived_extends: Vec<_> = edges.iter().filter(|e| e.from == derived.id()).collect();
+            assert!(derived_extends.is_empty(), "Foo and Foo<T> are different generic-arity types -- must never reconcile, this is the SEPARATE generic-arity-collision gap, out of scope for this fix");
+        }
+
+        /// Case 7 (required): partial generic class — both fragments
+        /// of a GENERIC partial type still reconcile, as long as arity
+        /// agrees across all fragments. Uses a NON-generic base
+        /// (`Base`, not `Base<T>`) deliberately: a generic base type in
+        /// a base clause (`Base<T>`) is a pre-existing, SEPARATE gap in
+        /// `collect_csharp_base_list` (it only recognizes a bare
+        /// `identifier` child of `base_list`, never a `generic_name`
+        /// child — confirmed by direct grammar probe, present
+        /// identically before and after this fix, exercised by no
+        /// prior test in this file). This test isolates B2-ID-010's own
+        /// claim (partial Foo<T> fragments reconcile when arity agrees)
+        /// from that unrelated, pre-existing gap — not in this fix's
+        /// scope to address.
+        #[test]
+        fn partial_generic_class_reconciles_when_arity_agrees() {
+            let source = "class Base {}\npartial class Foo<T> : Base\n{\n}\npartial class Foo<T>\n{\n}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/Generic.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let base = find(&snapshots, "Base");
+
+            assert_eq!(sources_of(&edges, base, &snapshots), vec!["Foo"], "partial Foo<T> fragments (same arity) must still reconcile toward Base");
+        }
+
+        /// Case 8 (required): ordinary duplicate NON-partial
+        /// declarations remain ambiguous — the baseline invariant this
+        /// fix must never weaken.
+        #[test]
+        fn ordinary_non_partial_duplicate_names_remain_ambiguous() {
+            // Two non-partial Foo classes (a genuine naming collision,
+            // not a partial-class split) plus a Derived class naming
+            // "Foo" as its own base -- the ambiguity to check is
+            // "what does Derived extend", since Base itself is unique
+            // and resolves correctly regardless (that would not
+            // exercise this invariant at all).
+            let source = "class Foo {}\nclass Foo {}\nclass Derived : Foo {}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/Dup.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let derived = find(&snapshots, "Derived");
+
+            let derived_extends: Vec<_> = edges.iter().filter(|e| e.from == derived.id()).collect();
+            assert!(derived_extends.is_empty(), "two non-partial classes sharing the bare name Foo must remain genuinely ambiguous -- the reconciliation fix must not weaken this baseline invariant");
+        }
+
+        /// Case 9 (required): with empty contexts (the legacy-wrapper
+        /// path), behavior is byte-for-byte identical to the
+        /// non-reconciled result — confirms the compatibility wrapper's
+        /// own guarantee directly against the real Polly-shaped
+        /// ambiguity, not just a synthetic case.
+        #[test]
+        fn empty_contexts_produce_the_same_result_as_the_legacy_wrapper() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[
+                    ("src/Policy.cs", "public partial class Policy {}\n"),
+                    ("src/Policy.TResult.cs", "public partial class Policy { }\n"),
+                    ("src/BulkheadPolicy.cs", "public class BulkheadPolicy : Policy {}\n"),
+                ],
+            );
+            let _ = contexts;
+
+            let via_wrapper = resolve_extends_implements(&snapshots).unwrap();
+            let via_empty_contexts = resolve_extends_implements_with_csharp_contexts(&snapshots, &[]).unwrap();
+            assert_eq!(via_wrapper, via_empty_contexts, "the legacy wrapper must be byte-for-byte equivalent to calling the new function with empty contexts");
+
+            let bulkhead = find(&snapshots, "BulkheadPolicy");
+            let bulkhead_extends: Vec<_> = via_wrapper.iter().filter(|e| e.from == bulkhead.id()).collect();
+            assert!(bulkhead_extends.is_empty(), "WITHOUT contexts, the real Polly-shaped ambiguity must still produce no edge -- confirms this fix changes nothing unless contexts are actually supplied");
+        }
+
+        /// Case 10 (required): no DUPLICATE Extends/Implements edge is
+        /// produced for the SAME (from, to, kind) triple — the
+        /// pre-existing B2-ID-002 dedup guarantee, confirmed to still
+        /// hold for a partial fragment whose own base clause names the
+        /// SAME base name twice within its own one declaration (e.g. a
+        /// syntactically odd `partial class Foo : Base, Base`). This is
+        /// a DIFFERENT case from two DISTINCT fragments each separately
+        /// naming Base in their OWN base clause — that legitimately
+        /// produces two edges (one per real `from` fragment), which is
+        /// correct, not a duplicate: each fragment really does declare
+        /// its own, textually separate inheritance relationship.
+        #[test]
+        fn same_base_named_twice_in_one_partial_fragments_own_clause_produces_one_edge_not_two() {
+            let source = "class Base {}\npartial class Foo : Base, Base\n{\n}\npartial class Foo\n{\n}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/RepeatedBase.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let base = find(&snapshots, "Base");
+
+            let to_base: Vec<_> = edges.iter().filter(|e| e.to == base.id()).collect();
+            assert_eq!(to_base.len(), 1, "Base named twice in ONE fragment's own base clause must still collapse to one edge, per the pre-existing B2-ID-002 dedup rule");
+        }
+
+        /// Two DISTINCT partial fragments, each independently naming
+        /// the same base in their OWN base clause, correctly produce
+        /// TWO edges (one per real fragment) — confirming this is not
+        /// mistaken for a duplicate by this fix's own reconciliation
+        /// logic (reconciliation only ever changes which TARGET an
+        /// ambiguous lookup resolves to; it never collapses two
+        /// genuinely separate `from` declarations into one).
+        #[test]
+        fn two_distinct_fragments_each_naming_the_same_base_produce_two_real_edges() {
+            let source = "class Base {}\npartial class Foo : Base\n{\n}\npartial class Foo : Base\n{\n}\n";
+            let (snapshots, contexts) = real_snapshots_and_contexts(repo(), &[("src/TwoFragments.cs", source)]);
+            let edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let base = find(&snapshots, "Base");
+
+            let to_base: Vec<_> = edges.iter().filter(|e| e.to == base.id()).collect();
+            assert_eq!(to_base.len(), 2, "two DISTINCT partial fragments, each with their own real base clause naming Base, must each produce their own edge -- not a duplicate, and not reconciled away");
+            let from_ids: std::collections::HashSet<_> = to_base.iter().map(|e| e.from).collect();
+            assert_eq!(from_ids.len(), 2, "the two edges must come from the two DIFFERENT fragment snapshots");
+        }
+
+        /// Determinism: the reconciliation's own representative choice
+        /// must not depend on snapshot pool ordering.
+        #[test]
+        fn reconciliation_result_is_deterministic_regardless_of_snapshot_order() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[
+                    ("src/Base.cs", "class Base {}\n"),
+                    ("src/Foo.A.cs", "partial class Foo : Base\n{\n}\n"),
+                    ("src/Foo.B.cs", "partial class Foo\n{\n}\n"),
+                ],
+            );
+            let base = find(&snapshots, "Base");
+
+            let forward_edges = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let mut reversed = snapshots.clone();
+            reversed.reverse();
+            let reversed_edges = resolve_extends_implements_with_csharp_contexts(&reversed, &contexts).unwrap();
+
+            assert_eq!(sources_of(&forward_edges, base, &snapshots), sources_of(&reversed_edges, base, &reversed));
+            let forward_target = forward_edges.iter().find(|e| e.to == base.id()).map(|e| e.from);
+            let reversed_target = reversed_edges.iter().find(|e| e.to == base.id()).map(|e| e.from);
+            assert_eq!(forward_target, reversed_target, "the chosen representative fragment must be the same regardless of snapshot pool ordering");
+        }
+
+        /// No snapshot identity change: reconciliation never alters,
+        /// merges, or removes any `SymbolSnapshotId` — every fragment
+        /// remains a fully independent snapshot before and after this
+        /// resolver runs.
+        #[test]
+        fn reconciliation_never_changes_snapshot_identity() {
+            let (snapshots, contexts) = real_snapshots_and_contexts(
+                repo(),
+                &[
+                    ("src/Policy.cs", "public partial class Policy {}\n"),
+                    ("src/Policy.TResult.cs", "public partial class Policy { }\n"),
+                    ("src/BulkheadPolicy.cs", "public class BulkheadPolicy : Policy {}\n"),
+                ],
+            );
+            let ids_before: std::collections::HashSet<SymbolSnapshotId> = snapshots.iter().map(|s| s.id()).collect();
+            let _ = resolve_extends_implements_with_csharp_contexts(&snapshots, &contexts).unwrap();
+            let ids_after: std::collections::HashSet<SymbolSnapshotId> = snapshots.iter().map(|s| s.id()).collect();
+            assert_eq!(ids_before, ids_after, "resolve_extends_implements_with_csharp_contexts must never mutate or merge any snapshot's own identity");
+            assert_eq!(snapshots.len(), 3, "all 3 original fragments/types remain distinct, independent snapshots");
         }
     }
 }

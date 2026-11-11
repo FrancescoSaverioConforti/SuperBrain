@@ -70,7 +70,7 @@ mod tests_for;
 
 pub use calls::resolve_calls;
 pub use contains::resolve_contains;
-pub use extends_implements::resolve_extends_implements;
+pub use extends_implements::{resolve_extends_implements, resolve_extends_implements_with_csharp_contexts};
 pub use instantiates::resolve_instantiates;
 pub use resolution::{Edge, EdgeResolutionError};
 pub use tests_for::resolve_tests_for;
@@ -88,9 +88,20 @@ use crate::snapshot::SymbolSnapshot;
 /// reindex. Both call sites now go through this single function
 /// instead of their own independent lists.
 pub fn resolve_all_typed_edges(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeResolutionError> {
+    resolve_all_typed_edges_with_csharp_contexts(snapshots, &[])
+}
+
+/// B2-ID-010: identical to [`resolve_all_typed_edges`] except
+/// `Extends`/`Implements` resolution also receives `csharp_contexts`,
+/// enabling the partial-class reconciliation
+/// [`extends_implements::resolve_extends_implements_with_csharp_contexts`]
+/// implements. With an empty `csharp_contexts` slice this is
+/// byte-for-byte identical to [`resolve_all_typed_edges`] — confirmed
+/// by a dedicated equivalence test.
+pub fn resolve_all_typed_edges_with_csharp_contexts(snapshots: &[SymbolSnapshot], csharp_contexts: &[crate::csharp_declarations::CSharpTypeDeclarationContext]) -> Result<Vec<Edge>, EdgeResolutionError> {
     let mut edges = Vec::new();
     edges.extend(resolve_calls(snapshots)?);
-    edges.extend(resolve_extends_implements(snapshots)?);
+    edges.extend(resolve_extends_implements_with_csharp_contexts(snapshots, csharp_contexts)?);
     edges.extend(resolve_tests_for(snapshots)?);
     edges.extend(resolve_contains(snapshots)?);
     edges.extend(resolve_instantiates(snapshots)?);

@@ -12,7 +12,8 @@
 use codegraph_domain::{CommitHash, FileIdentity, RepositoryId, RepositorySource, SourceError, SymbolSnapshotId};
 use thiserror::Error;
 
-use crate::edges::{resolve_all_typed_edges, Edge, EdgeResolutionError};
+use crate::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts, RawCSharpTypeDeclarationContext};
+use crate::edges::{resolve_all_typed_edges_with_csharp_contexts, Edge, EdgeResolutionError};
 use crate::extract::extract_symbols;
 use crate::graph::{CodeGraph, GraphError};
 use crate::impls::{extract_impl_statements, RawImplStatement};
@@ -72,6 +73,15 @@ pub struct PipelineOutput {
     /// `indexer.rs` assembles AFTER this function returns — see
     /// `impls` module's own doc comment.
     pub raw_impl_statements: Vec<(FileIdentity, RawImplStatement)>,
+    /// B2-ID-010: raw (UNRESOLVED) C# `class_declaration`/
+    /// `interface_declaration` contexts extracted from exactly the
+    /// files this call parsed, paired with the `FileIdentity` that
+    /// defines them. Mirrors `raw_import_statements`/`raw_impl_statements`
+    /// exactly, for the identical reason: resolving a context's own
+    /// `snapshot_id` requires the pool `indexer.rs` assembles AFTER
+    /// this function returns — see `csharp_declarations` module's own
+    /// doc comment.
+    pub raw_csharp_type_declaration_contexts: Vec<(FileIdentity, RawCSharpTypeDeclarationContext)>,
 }
 
 /// Parses, extracts and promotes every file in `relative_paths` (all
@@ -106,6 +116,7 @@ pub fn index_files(
     let mut snapshots = Vec::new();
     let mut raw_import_statements = Vec::new();
     let mut raw_impl_statements = Vec::new();
+    let mut raw_csharp_type_declaration_contexts = Vec::new();
 
     for relative_path in relative_paths {
         let file = FileIdentity::parse(repository, commit.clone(), relative_path).map_err(|e| PipelineError::Source(SourceError::Other { reason: e.to_string() }))?;
@@ -144,11 +155,28 @@ pub fn index_files(
         for statement in extract_impl_statements(&tree) {
             raw_impl_statements.push((file.clone(), statement));
         }
+        // B2-ID-010: raw C# type-declaration context extraction is
+        // likewise pure syntax (no snapshot-pool dependency), scoped to
+        // exactly the files this call parsed — mirroring import/impl
+        // extraction's own scope immediately above. Yields an empty
+        // Vec unconditionally for any non-C# file (checked internally
+        // by `extract_csharp_type_declaration_contexts` itself).
+        for context in extract_csharp_type_declaration_contexts(&tree) {
+            raw_csharp_type_declaration_contexts.push((file.clone(), context));
+        }
     }
 
     let lineage_edges = resolve_lineage(prev_snapshots, &snapshots, known_lineage_of)?;
 
-    let typed_edges = resolve_all_typed_edges(&snapshots)?;
+    // B2-ID-010: this call's own typed-edge resolution uses ONLY the
+    // contexts extracted from THIS call's own files — correct for a
+    // full reindex (every file, hence every context, is present), but
+    // `indexer.rs`'s incremental path (NormalAdvance) re-resolves
+    // typed_edges separately against the full current pool plus the
+    // full reused+fresh context set, exactly as it already does for
+    // import_facts/impl_facts; see that module's own doc comment.
+    let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw_csharp_type_declaration_contexts, &snapshots);
+    let typed_edges = resolve_all_typed_edges_with_csharp_contexts(&snapshots, &csharp_contexts)?;
 
     Ok(PipelineOutput {
         snapshots,
@@ -156,6 +184,7 @@ pub fn index_files(
         typed_edges,
         raw_import_statements,
         raw_impl_statements,
+        raw_csharp_type_declaration_contexts,
     })
 }
 
