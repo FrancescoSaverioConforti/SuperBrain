@@ -39,6 +39,24 @@ var fixtureGroups = new (string Name, string[] Files)[]
     ("b2_id_010_partial_class_policy", new[] { "partial_class_policy_a.cs", "partial_class_policy_b.cs", "partial_class_bulkhead.cs" }),
     ("generic_arity_collision_gap", new[] { "generic_arity_collision_gap.cs" }),
     ("b2_id_011_generic_method_call", new[] { "generic_method_call_extraction.cs" }),
+    // B2-EVAL-008 resumption (Semantic Reliability Hardening Phase 2
+    // stress-test): the REAL, unminimized App-vNext/Polly source files
+    // this evaluation's own findings were discovered against, not the
+    // golden-corpus's own minimized synthetics above -- covers method
+    // names (B2-ID-009), the real 8-way partial-class `Policy` plus
+    // `BulkheadPolicy : Policy, IBulkheadPolicy` (B2-ID-010), the real
+    // `IBulkheadPolicy`/`IBulkheadPolicy<TResult>` generic-arity
+    // collision, real namespaces (`Polly`/`Polly.Bulkhead`), and the
+    // real `Handle<TException>` overload family, all together in one
+    // compilation unit so Roslyn's own cross-file semantic binding is
+    // exercised, not just single-file syntax. Many of these real
+    // files' own dependencies (`Context`, `BulkheadEngine`, etc.) are
+    // NOT included here and will not resolve -- Roslyn's own `?.`-
+    // guarded null results for those specific symbols are the HONEST,
+    // expected outcome (a real external/unindexed reference, the same
+    // shape `EvidenceTier::Unresolved` exists for on this project's
+    // own side), not a harness defect.
+    ("b2_eval_008_real_polly_files", new[] { "b2_eval_008_real/real_policy_context_and_keys.cs", "b2_eval_008_real/real_policy_handle_syntax.cs", "b2_eval_008_real/real_is_policy.cs", "b2_eval_008_real/real_ibulkhead_policy.cs", "b2_eval_008_real/real_bulkhead_policy.cs" }),
 };
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = false };
