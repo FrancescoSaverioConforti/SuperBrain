@@ -75,6 +75,30 @@ pub struct ImplFactKey {
     pub trait_type_text: Option<String>,
 }
 
+/// Semantic Resolution & Reliability Checkpoint, Priority 2: a
+/// semantic `CallAttempt` comparison key. Deliberately resolves
+/// `caller` through its OWN `SnapshotKey` (identical reasoning to
+/// `EdgeKeyTuple`'s own `from`/`to` fields: a raw `SymbolSnapshotId`
+/// is structural, not semantic, and this gate exists to catch the
+/// SAME semantic call site ending up with a different attempt
+/// representation between the two paths). `candidate_count` (not the
+/// candidates' own raw ids) is the comparison granularity — the exact
+/// identity of which candidates were considered is real provenance
+/// data, but two attempts that agree on caller/callee/tier/reason/
+/// candidate-count are the SAME semantic attempt for parity purposes;
+/// a real identity-level divergence (same count, different actual
+/// candidates) would still be caught by a parity break at the
+/// `edge_keys`/`snapshot_keys` level if it ever changed which edge
+/// gets produced.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallAttemptKey {
+    pub caller: SnapshotKey,
+    pub callee_name: String,
+    pub tier_debug: String,
+    pub reason_debug: String,
+    pub candidate_count: usize,
+}
+
 /// A deterministic numeric rank for `EdgeKind`, used only so
 /// `EdgeKeyTuple` can derive `Ord` (the enum itself does not, and this
 /// module does not need it to beyond providing a stable sort key here
@@ -167,6 +191,37 @@ pub fn impl_fact_keys(outcome: &ObserveOutcome) -> Vec<ImplFactKey> {
     keys
 }
 
+/// Semantic Resolution & Reliability Checkpoint, Priority 2: resolves
+/// each `CallAttempt`'s own `caller` id through the SAME real graph
+/// `snapshot_keys`/`edge_keys` already use — a `CallAttempt` whose
+/// caller cannot be found in `outcome.graph` at all (should never
+/// happen in practice; the caller is always a real, currently-promoted
+/// snapshot) is skipped rather than panicking, mirroring `edge_keys`'
+/// own `filter_map` discipline.
+pub fn call_attempt_keys(outcome: &ObserveOutcome) -> Vec<CallAttemptKey> {
+    let mut keys: Vec<CallAttemptKey> = outcome
+        .call_attempts
+        .iter()
+        .filter_map(|a| {
+            let caller = outcome.graph.snapshot(a.caller)?;
+            Some(CallAttemptKey {
+                caller: SnapshotKey {
+                    name: caller.name().as_str().to_string(),
+                    kind: format!("{:?}", caller.kind()),
+                    file: caller.file().relative_path().to_string(),
+                    span: (caller.span().start, caller.span().end),
+                },
+                callee_name: a.callee_name.clone(),
+                tier_debug: format!("{:?}", a.tier),
+                reason_debug: format!("{:?}", a.reason),
+                candidate_count: a.candidates.len(),
+            })
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
 /// One dimension (snapshots / edges / imports / impls) on which two
 /// states were compared and found to disagree — either by true
 /// membership difference, or (the whole point of this module) by
@@ -182,6 +237,13 @@ pub enum Divergence {
     ImportFactMultiplicityDiffers { key: String, full_count: usize, incremental_count: usize },
     ImplFactsDiffer { only_in_full: Vec<String>, only_in_incremental: Vec<String> },
     ImplFactMultiplicityDiffers { key: String, full_count: usize, incremental_count: usize },
+    /// Semantic Resolution & Reliability Checkpoint, Priority 2:
+    /// mirrors every other `*Differ` variant exactly, for `CallAttempt`
+    /// membership.
+    CallAttemptsDiffer { only_in_full: Vec<String>, only_in_incremental: Vec<String> },
+    /// Mirrors every other `*MultiplicityDiffers` variant exactly, for
+    /// `CallAttempt` count.
+    CallAttemptMultiplicityDiffers { key: String, full_count: usize, incremental_count: usize },
 }
 
 /// Compares two already-sorted `Vec<K>`s as true MULTISETS: returns
@@ -292,6 +354,21 @@ pub fn compare_full_incremental_state(full: &ObserveOutcome, incremental: &Obser
         divergences.push(d);
     }
 
+    // Semantic Resolution & Reliability Checkpoint, Priority 2: the
+    // same exact-multiset discipline now extended to CallAttempt
+    // membership/multiplicity/tier/reason/candidate-count — closes the
+    // gap B2-EVAL-008 found (negative-knowledge was confirmed NOT
+    // wired into the real incremental path at all).
+    if let Some(d) = compare_multiset(
+        &call_attempt_keys(full),
+        &call_attempt_keys(incremental),
+        |k| format!("{k:?}"),
+        |only_in_full, only_in_incremental| Divergence::CallAttemptsDiffer { only_in_full, only_in_incremental },
+        |key, full_count, incremental_count| Divergence::CallAttemptMultiplicityDiffers { key, full_count, incremental_count },
+    ) {
+        divergences.push(d);
+    }
+
     divergences
 }
 
@@ -386,6 +463,24 @@ mod tests {
         let keys = impl_fact_keys(&outcome);
         assert!(!keys.is_empty(), "a real `impl Shape for Circle` block exists -- impl_fact_keys must not be empty");
         assert!(keys.iter().any(|k| k.self_type_text == "Circle" && k.trait_type_text.as_deref() == Some("Shape")), "expected an ImplFact for Circle/Shape among {keys:?}");
+    }
+
+    /// Semantic Resolution & Reliability Checkpoint, Priority 2: same
+    /// mutation-driven discipline as the three tests immediately
+    /// above, now for `call_attempt_keys`. A bare, unqualified
+    /// `missing()` call with zero candidates in the pool produces
+    /// exactly one real `Unresolved` `CallAttempt`.
+    #[test]
+    fn call_attempt_keys_is_non_empty_for_a_real_run_with_a_real_unresolved_attempt() {
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let source = FakeSource::new().with_file(FileIdentity::parse(repo, commit.clone(), "src/lib.rs").unwrap(), b"fn a() { missing(); }\n");
+        let indexer = CodeGraphIndexer::new();
+        let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        let keys = call_attempt_keys(&outcome);
+        assert!(!keys.is_empty(), "a real unresolved call site exists (a() calls missing(), which has zero candidates) -- call_attempt_keys must not be empty");
+        assert!(keys.iter().any(|k| k.caller.name == "a" && k.callee_name == "missing" && k.tier_debug == "Unresolved"), "expected an Unresolved CallAttempt for missing() among {keys:?}");
     }
 
     fn k(name: &str) -> SnapshotKey {
@@ -494,5 +589,238 @@ mod tests {
         sorted_ranks.sort();
         sorted_ranks.dedup();
         assert_eq!(sorted_ranks.len(), ranks.len(), "every EdgeKind variant must have a DISTINCT rank, got {ranks:?}");
+    }
+
+    // Semantic Resolution & Reliability Checkpoint, Priority 2 (the
+    // "CallAttempt incremental integration" requirement, flagged
+    // PARTIAL in B2-EVAL-008 and NOT DONE in the checkpoint's own
+    // first pass): the 7 required adversarial full/incremental
+    // CallAttempt parity cases, each run through the REAL
+    // `CodeGraphIndexer` (never a synthetic unit fixture) and checked
+    // via `compare_full_incremental_state` itself -- the exact same
+    // production entry point and comparison gate a real evaluation
+    // run uses, mirroring exactly how B2-ID-010's own
+    // `b2_id_010_csharp_partial_class_through_the_real_indexer` module
+    // validated full/incremental parity for partial-class
+    // reconciliation.
+    mod call_attempt_adversarial_parity {
+        use super::*;
+
+        /// Confirms a full reindex of commit B (as a brand-new,
+        /// separate repository) and an incremental advance A->B
+        /// through the SAME indexer produce IDENTICAL `CallAttempt`
+        /// multisets for the identical final commit -- the real-
+        /// indexer equivalent of this module's own synthetic
+        /// `compare_multiset` self-tests above. Each test builds its
+        /// own commit-A and commit-B file contents as
+        /// `(path, bytes)` pairs; this helper derives TWO independent
+        /// `RepositoryId`s (one for the incremental indexer, one for
+        /// the full-reindex indexer) and constructs each `FakeSource`
+        /// with the correct `FileIdentity`s itself, so the SAME file
+        /// content list can be reused for both paths without the
+        /// caller juggling two different `RepositoryId`s by hand.
+        fn assert_full_and_incremental_agree(
+            commit_a_files: &[(&str, &[u8])],
+            commit_b_files: &[(&str, &[u8])],
+            commit_a: &CommitHash,
+            commit_b: &CommitHash,
+            changed_files: &[String],
+        ) -> (ObserveOutcome, ObserveOutcome) {
+            let repo_incremental = test_repo();
+            let repo_full = test_repo();
+
+            let mut source_incremental = FakeSource::new();
+            for (path, bytes) in commit_a_files {
+                source_incremental = source_incremental.with_file(FileIdentity::parse(repo_incremental, commit_a.clone(), path).unwrap(), bytes);
+            }
+            for (path, bytes) in commit_b_files {
+                source_incremental = source_incremental.with_file(FileIdentity::parse(repo_incremental, commit_b.clone(), path).unwrap(), bytes);
+            }
+
+            let mut source_full = FakeSource::new();
+            for (path, bytes) in commit_b_files {
+                source_full = source_full.with_file(FileIdentity::parse(repo_full, commit_b.clone(), path).unwrap(), bytes);
+            }
+
+            let indexer = CodeGraphIndexer::new();
+            indexer.observe_commit(&source_incremental, repo_incremental, commit_a, None, &[]).unwrap();
+            let incremental_outcome = indexer.observe_commit(&source_incremental, repo_incremental, commit_b, Some(commit_a), changed_files).unwrap();
+
+            let full_indexer = CodeGraphIndexer::new();
+            let full_outcome = full_indexer.observe_commit(&source_full, repo_full, commit_b, None, &[]).unwrap();
+
+            let divergences = compare_full_incremental_state(&full_outcome, &incremental_outcome);
+            assert!(divergences.is_empty(), "full vs. incremental CallAttempt state must be IDENTICAL for the same final commit, found: {divergences:?}");
+            (full_outcome, incremental_outcome)
+        }
+
+        #[test]
+        fn unresolved_becomes_resolved() {
+            // Commit A: a() calls missing() -- zero candidates, Unresolved.
+            // Commit B: missing() is DEFINED -- a() calling it now resolves.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/lib.rs", b"fn a() { missing(); }\n")],
+                &[("src/lib.rs", b"fn a() { missing(); }\nfn missing() {}\n")],
+                &commit_a,
+                &commit_b,
+                &["src/lib.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(!keys.iter().any(|k| k.callee_name == "missing" && k.tier_debug == "Unresolved"), "missing() is now defined -- no Unresolved CallAttempt for it should remain among {keys:?}");
+        }
+
+        #[test]
+        fn resolved_becomes_ambiguous() {
+            // Commit A: caller.rs's a() calls shared() -- shared()
+            // itself lives in a DIFFERENT file (one.rs), so this is a
+            // genuine repo-wide resolution, not narrowed to
+            // same-file/same-class first (see `narrow_by_scope`'s own
+            // CALL-RES-A1 same-file preference -- if shared() lived in
+            // the CALLER's own file, adding a second same-named
+            // candidate elsewhere would never become ambiguous, since
+            // the same-file one would still be preferred; this fixture
+            // deliberately avoids that confound).
+            // Commit B: a SECOND shared() is added in yet another file
+            // -- now genuinely ambiguous repo-wide.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/caller.rs", b"fn a() { shared(); }\n"), ("src/one.rs", b"fn shared() {}\n")],
+                &[("src/caller.rs", b"fn a() { shared(); }\n"), ("src/one.rs", b"fn shared() {}\n"), ("src/two.rs", b"fn shared() {}\n")],
+                &commit_a,
+                &commit_b,
+                &["src/two.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(keys.iter().any(|k| k.callee_name == "shared" && k.tier_debug == "Ambiguous"), "a second shared() was added elsewhere -- the a() call site must now be Ambiguous among {keys:?}");
+        }
+
+        #[test]
+        fn target_deleted_resolved_becomes_unresolved() {
+            // Commit A: a() calls target() -- Resolved.
+            // Commit B: target()'s OWN file is deleted entirely (simply
+            // absent from commit_b_files).
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/caller.rs", b"fn a() { target(); }\n"), ("src/target.rs", b"fn target() {}\n")],
+                &[("src/caller.rs", b"fn a() { target(); }\n")],
+                &commit_a,
+                &commit_b,
+                &["src/target.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(keys.iter().any(|k| k.callee_name == "target" && k.tier_debug == "Unresolved"), "target() was deleted -- the a() call site must now be Unresolved among {keys:?}");
+        }
+
+        #[test]
+        fn target_added_unresolved_becomes_resolved() {
+            // Symmetric to `unresolved_becomes_resolved` but via a
+            // whole NEW file being added, not an edit to an existing one.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/caller.rs", b"fn a() { brand_new(); }\n")],
+                &[("src/caller.rs", b"fn a() { brand_new(); }\n"), ("src/new.rs", b"fn brand_new() {}\n")],
+                &commit_a,
+                &commit_b,
+                &["src/new.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(!keys.iter().any(|k| k.callee_name == "brand_new" && k.tier_debug == "Unresolved"), "brand_new() was just added -- no Unresolved CallAttempt should remain among {keys:?}");
+        }
+
+        #[test]
+        fn signature_too_long_introduced_changes_reason() {
+            // Commit A: a() calls missing() -- zero candidates, Unresolved/Unknown.
+            // Commit B: a REAL candidate named "missing" exists in source
+            // but is rejected via SignatureTooLong (an absurdly long
+            // signature) -- the SAME callee name's Unresolved reason
+            // must become ExtractionRejected, never staying generic
+            // Unknown, once the real rejection is observable.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let long_params = (0..2000).map(|i| format!("p{i}: i32")).collect::<Vec<_>>().join(", ");
+            let oversized_fn = format!("fn missing({long_params}) {{}}\n");
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/caller.rs", b"fn a() { missing(); }\n")],
+                &[("src/caller.rs", b"fn a() { missing(); }\n"), ("src/rejected.rs", oversized_fn.as_bytes())],
+                &commit_a,
+                &commit_b,
+                &["src/rejected.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(
+                keys.iter().any(|k| k.callee_name == "missing" && k.tier_debug == "Unresolved" && k.reason_debug.contains("ExtractionRejected")),
+                "a real SignatureTooLong rejection sharing the exact callee name now exists -- the reason must be ExtractionRejected, not generic Unknown, among {keys:?}"
+            );
+        }
+
+        #[test]
+        fn signature_too_long_removed_reverts_reason_to_unknown() {
+            // The exact reverse of the previous case: start WITH the
+            // rejection present, then remove the oversized file --
+            // the reason must revert to Unknown, never staying stuck
+            // at a stale ExtractionRejected classification.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let long_params = (0..2000).map(|i| format!("p{i}: i32")).collect::<Vec<_>>().join(", ");
+            let oversized_fn = format!("fn missing({long_params}) {{}}\n");
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/caller.rs", b"fn a() { missing(); }\n"), ("src/rejected.rs", oversized_fn.as_bytes())],
+                &[("src/caller.rs", b"fn a() { missing(); }\n")],
+                &commit_a,
+                &commit_b,
+                &["src/rejected.rs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            let missing_attempt = keys.iter().find(|k| k.callee_name == "missing").expect("an Unresolved attempt for missing() must still exist");
+            assert_eq!(missing_attempt.tier_debug, "Unresolved");
+            assert_eq!(missing_attempt.reason_debug, "Unknown", "once the rejected candidate's own file is deleted, the reason must revert to Unknown, not stay stuck at a stale ExtractionRejected");
+        }
+
+        #[test]
+        fn generic_arity_changes_the_candidate_set() {
+            // Commit A: Policy.Handle<T>() is the ONLY Handle -- a
+            // generic Handle<T>() call resolves unambiguously.
+            // Commit B: a SECOND, same-arity overload
+            // Handle<T>(Func<T,bool>) is added elsewhere -- arity alone
+            // can no longer distinguish them (this is the EXACT real
+            // Polly shape B2-EVAL-008 found), so the call site must
+            // become Ambiguous, not silently stay Resolved.
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let caller: &[u8] = b"class Caller { void Use() { Policy.Handle<TException>(); } }\n";
+            let policy_a: &[u8] = b"class Policy { public static PolicyBuilder Handle<TException>() => null; }\n";
+            let policy_b_extra: &[u8] = b"class Policy { public static PolicyBuilder Handle<TException>(System.Func<TException, bool> p) => null; }\n";
+
+            let (_, incremental_outcome) = assert_full_and_incremental_agree(
+                &[("src/Caller.cs", caller), ("src/Policy.cs", policy_a)],
+                &[("src/Caller.cs", caller), ("src/Policy.cs", policy_a), ("src/Policy.Extra.cs", policy_b_extra)],
+                &commit_a,
+                &commit_b,
+                &["src/Policy.Extra.cs".to_string()],
+            );
+
+            let keys = call_attempt_keys(&incremental_outcome);
+            assert!(
+                keys.iter().any(|k| k.callee_name == "Handle" && k.tier_debug == "Ambiguous" && k.candidate_count == 2),
+                "a second same-arity Handle overload was added -- arity alone cannot disambiguate 2 real candidates, so this must be Ambiguous (candidate_count 2), among {keys:?}"
+            );
+        }
     }
 }
