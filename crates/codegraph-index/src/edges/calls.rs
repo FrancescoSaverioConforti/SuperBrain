@@ -281,7 +281,15 @@ pub fn resolve_calls_with_extraction_rejections(snapshots: &[SymbolSnapshot], si
             // this resolver was given; arity-reduced-but-still-only-
             // partially-disambiguated certainty does not meet that
             // bar.
-            if call_site.generic_arity.is_some() && arity_narrowed_candidates.len() == 1 && candidates.len() > 1 {
+            //
+            // Note: `candidates.len() > 1` is NOT checked here — by
+            // this point, `candidates.len()` is already guaranteed to
+            // be `0` or `>= 2` (the `candidates.len() == 1` branch
+            // above already returned via `continue`), so a redundant
+            // `> 1`/`>= 1` check here would be a provably equivalent
+            // mutant target, confirmed by `cargo mutants` and removed
+            // rather than kept as dead-weight defensive code.
+            if call_site.generic_arity.is_some() && arity_narrowed_candidates.len() == 1 {
                 let (evidence, _confidence) = heuristic_evidence(
                     codegraph_domain::ResolutionMethod::NameHeuristic,
                     Confidence::Likely,
