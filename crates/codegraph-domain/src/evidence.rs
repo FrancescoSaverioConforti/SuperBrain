@@ -33,9 +33,11 @@ pub enum Confidence {
 /// Quality & Semantic Reliability Hardening, Phase 2 — a uniform
 /// evidence tier for ANY resolved-or-not relationship this pipeline
 /// produces: an `Edge`, a structural fact's own resolution status
-/// (`ImportResolution`, `ImplTargetResolution`), or (new in Phase 2)
-/// an [`crate::AmbiguousAttempt`]/[`crate::UnresolvedAttempt`] negative-
-/// knowledge record. Generalizes a pattern that already existed
+/// (`ImportResolution`, `ImplTargetResolution`), or (new in Phase 2) a
+/// `codegraph_index::negative_knowledge::CallAttempt` negative-
+/// knowledge record (that type lives in the `codegraph-index` crate,
+/// not here, so it cannot be an intra-doc link from this crate).
+/// Generalizes a pattern that already existed
 /// independently in `ImportResolution`/`ImplTargetResolution` — this
 /// is substantially a relabeling of proven prior art, not a new
 /// invention; see `docs/research/SEMANTIC_UNCERTAINTY_MODEL.md` for
