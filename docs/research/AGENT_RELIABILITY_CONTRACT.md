@@ -1,12 +1,20 @@
 # Agent reliability contract — design
 
 Quality & Semantic Reliability Hardening, Phase 1, deliverable 7.
-**Status: design/policy only, not yet enforced by any code — "Task 10"
-(the future coding agent itself) is explicitly NOT authorized and not
-touched by this document.** This contract is written now so that when
-Task 10 eventually begins, the rules governing how it may use the
-Code Graph are already settled, evidence-grounded, and reviewed —
-not improvised under schedule pressure once the agent exists.
+**Status: PARTIALLY EXECUTABLE (Phase 2).** The policy below is now
+real, unit-tested code in `crates/codegraph-index/src/agent_policy.rs`
+(`evaluate`, `evaluate_high_impact_modification`) — callable functions
+a future coding agent integration could invoke, returning a closed
+`PolicyVerdict` (`Permitted`/`PermittedWithDisclosedUncertainty`/
+`Forbidden { reason }`) for a given `EvidenceTier` + intended use.
+**"Task 10" (the future coding agent itself) remains explicitly NOT
+authorized and is NOT touched by this module** — no agent integration
+exists; this is the policy LAYER alone, tested independent of any
+agent ever calling it. This contract was written, and is now partly
+implemented, so that when Task 10 eventually begins, the rules
+governing how it may use the Code Graph are already settled,
+evidence-grounded, reviewed, AND mechanically checkable — not
+improvised under schedule pressure once the agent exists.
 
 This contract is defined in terms of the `EvidenceTier` model proposed
 in `SEMANTIC_UNCERTAINTY_MODEL.md` — read that document first. Where

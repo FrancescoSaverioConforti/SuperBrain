@@ -483,6 +483,55 @@ grouped here for completeness:
   Rust-specific gap with a dedicated full entry; no other Rust
   extraction gaps have been measured in this series beyond that one.
 
+## Phase 2 addendum: new evidence from the reliability-hardening pass
+
+These are observations surfaced by Quality & Semantic Reliability
+Hardening Phase 2 (negative-knowledge wiring, the Roslyn differential
+suite, agent-policy tests) — they refine or corroborate gaps already
+listed above; none of them is a newly-discovered defect requiring its
+own finding doc.
+
+- **Roslyn differential suite corroborates, does not narrow, the C++/C#
+  gaps above.** The automated suite
+  (`crates/codegraph-index/examples/roslyn_differential_suite.rs`)
+  found **zero divergences** between this pipeline's extraction and
+  Roslyn's real semantic model, across 10 type declarations + 6 method
+  declarations on the shared golden-corpus C# slice. This is a REAL,
+  external, independent confirmation that the post-B2-ID-009/010/011
+  extraction is correct on the specific shapes that corpus slice
+  exercises — it does NOT touch gaps #4/#5/#13 above (overload
+  resolution, generic-arity collision, `Should_...` test-naming), none
+  of which that slice's fixtures exercise. The suite's own scope is
+  type/method DECLARATION shape agreement, not call-resolution or
+  test-naming semantics — stated here explicitly so this zero-
+  divergence result is not later over-read as "Roslyn confirms the
+  Calls graph is complete."
+- **Negative-knowledge wiring (`resolve_calls_with_negative_knowledge`)
+  makes gaps #3/#4/#5/#17/#18's own "silent absence" cases newly
+  OBSERVABLE, without resolving any of them.** Before Phase 2, an
+  `Ambiguous` or `Unresolved` call outcome was indistinguishable from
+  "no call was attempted here at all" — the resolver simply produced no
+  edge, with no record of the attempt. `CallAttempt` now records WHICH
+  tier applied and WHY (candidates considered, provenance) for every
+  call the resolver's own scope-narrowing logic actually examined. This
+  does not shrink any gap in this inventory — CRC-001 is still an
+  `Ambiguous` case, CALL-RES-A4/A5 are still not implemented — but an
+  agent (or a future evaluation) can now distinguish "the resolver
+  tried and found 2 real candidates" from "the resolver never saw this
+  call at all" (e.g. because of gap #12's macro opacity, or because the
+  callee name itself never reached `resolve_calls`, the exact shape
+  B2-ID-011 fixed for generic calls). This is new INFRASTRUCTURE for
+  observing existing gaps, not a change to any gap's own underlying
+  cause or severity.
+- **The agent-policy tests (`agent_policy.rs`) confirm the Ambiguous-
+  tier policy described under gaps #4/#5/#17 is now mechanically
+  enforced, not just documented.** `evaluate(EvidenceTier::Ambiguous,
+  _)` returns `Forbidden` for every `IntendedUse` including
+  `InformationalDisplay` — real, tested code, not only the prose
+  contract in `AGENT_RELIABILITY_CONTRACT.md`. This does not change
+  what the gaps ARE; it changes what a future agent consuming this
+  pipeline is prevented from doing with them.
+
 ## Residual limitation of this inventory itself
 
 This inventory is a SNAPSHOT as of this Phase 1 hardening pass. It

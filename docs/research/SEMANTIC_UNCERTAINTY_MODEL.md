@@ -1,8 +1,16 @@
 # Semantic uncertainty / provenance model — design
 
 Quality & Semantic Reliability Hardening, Phase 1, deliverable 6.
-**Status: design only, grounded in the real current code below — not
-yet implemented as a new, unified type.**
+**Status: IMPLEMENTED (Phase 2) for the EvidenceTier/Provenance model
+and the negative-knowledge record below, as real, tested code.** See
+`crates/codegraph-domain/src/evidence.rs` (`EvidenceTier`,
+`Provenance`) and `crates/codegraph-index/src/negative_knowledge.rs`
+(`CallAttempt`, wired into `resolve_calls_with_negative_knowledge`,
+the ONE resolver this Phase 2 pass covers — see that module's own doc
+comment for why `resolve_extends_implements`/`resolve_instantiates`/
+`resolve_tests_for` are NOT yet wired and remain real future work).
+The rest of this document remains the original Phase 1 audit, grounded
+in the real current code below.
 
 ## Audit of the CURRENT state (as of this document, verified by
 ## direct code reading, not described from memory)
@@ -301,3 +309,51 @@ pub struct Provenance {
   at all) — that is a methodology question about what counts as
   evidence in the first place, not a provenance-representation
   question this model's own scope covers.
+
+## Query-result model assessment (Phase 2, deliverable 6)
+
+Audited by direct code reading of
+`crates/codegraph-index/src/graph/traversal.rs` and
+`crates/codegraph-index/src/graph/store.rs`.
+
+**Finding: there is no query-result type to retrofit, because there is
+no public query API yet.** `CodeGraph`'s real traversal methods —
+`callers_of`, `callees_of`, `tests_for`, `subtypes_of`,
+`reachable_from`, `neighbors` — all return bare `Vec<SymbolSnapshotId>`
+(or `Vec<&Edge>` for `neighbors`), discarding each contributing edge's
+own `Evidence`/tier entirely. This is not an oversight this phase
+introduces context for: `traversal.rs`'s own module doc comment
+already states these are "internal building blocks a future
+`get_code_context`/`graph_query` (out of this task's scope) will
+call," explicitly deferring the public query surface itself. Today,
+nothing outside this crate's own tests calls these methods, so there
+is no real "load-bearing query path" yet to retrofit a richer result
+onto without speculating about an API that does not exist.
+
+**What this means for a future `QueryResult<T>`-style type.** When
+Task 13 (or whichever future task) builds the real public query
+surface, the shape this Phase 2 work has already proven out is: return
+not just `Vec<SymbolSnapshotId>` but `Vec<(SymbolSnapshotId,
+EvidenceTier, Provenance)>` or an equivalent per-result wrapper — the
+exact same tier/provenance pair `CallAttempt` already carries for
+negative knowledge. `callers_of`/`callees_of` are the two methods where
+this matters most, since they are Calls-backed and Calls is the one
+edge kind `resolve_calls_with_negative_knowledge` already produces
+tier+provenance data for; a future wiring would need
+`CodeGraph::insert_edge` (or an adjacent store) to retain each edge's
+own `Evidence`, which it already does on `Edge`, so the data needed
+for a richer result is already present on `Edge` itself — only the
+public surface converting it into a result type is missing.
+
+**Why this phase does not implement that type now.** Doing so would
+mean either (a) inventing a public query API this phase was not
+authorized to build (the "do not broaden scope" instruction covers
+exactly this kind of speculative forward design), or (b) changing
+`callers_of`/`callees_of`/etc.'s own return types with zero real
+callers to validate the new shape against — a correctness risk this
+series' own discipline (real production-code exercising, never
+speculative API design) explicitly avoids. The concrete, low-risk next
+step, when the public query surface is actually built, is named above:
+reuse the `EvidenceTier`/`Provenance` pair already implemented in
+`crates/codegraph-domain/src/evidence.rs`, not a new, parallel result
+type.

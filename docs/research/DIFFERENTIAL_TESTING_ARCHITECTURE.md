@@ -1,9 +1,30 @@
 # Differential-testing architecture
 
 Quality & Semantic Reliability Hardening, Phase 1, deliverable 10.
-**Status: architecture designed; a real, working C# (Roslyn) PoC was
-built and run — see results below. Rust/TypeScript/C++/Python are
-design-only in this pass.**
+**Status: architecture designed; the C# (Roslyn) PoC is now a small
+AUTOMATED differential suite (Phase 2, deliverable 8) — see results
+below. Rust/TypeScript/C++/Python remain design-only in this pass.**
+
+### Phase 2 update: from PoC to automated suite
+
+`crates/codegraph-index/examples/roslyn_differential_suite.rs`
+automates what was previously a manual `dotnet run` + eyeball
+comparison: it invokes the oracle, runs this pipeline's own real
+extraction (`extract_symbols_reporting_rejections` +
+`extract_csharp_type_declaration_contexts`) against the identical
+golden-corpus fixtures, and produces a structured, machine-readable
+`Divergence` list via a dependency-free JSON reader (consistent with
+`ground_truth.rs`'s own no-serde discipline). A real run on the shared
+corpus slice: 10 type declarations + 6 method declarations on each
+side, **zero divergences** — an independent, external-oracle
+confirmation that extraction agrees with Roslyn's real semantic model
+here. 4 self-tests (including an adversarial case that proves
+`compare()` genuinely detects an injected divergence, not vacuously
+always-equivalent) back the comparison logic itself. It is deliberately
+an `example`, never a `#[test]`: `cargo test` must never require a
+working `dotnet` SDK, keeping the oracle a pure opt-in validation tool,
+never a runtime or test-suite dependency, per the standing instruction
+from Phase 1 authorization.
 
 ## What "differential testing" means here
 

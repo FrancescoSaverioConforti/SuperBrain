@@ -355,3 +355,44 @@ fn crc_002_prop_shadowing_false_positive_is_the_current_documented_gap() {
          been fixed (the edge should be ABSENT, not present) and this test must be updated"
     );
 }
+
+// ===========================================================================
+// Phase 2, deliverable 9: golden corpus + ground truth schema +
+// reliability model integration. This is the one place all three meet:
+// the SAME real fixture (generic_arity_collision_gap.cs) that the gap
+// test above drives through the real pipeline also has a real
+// ground-truth row (tests/ground_truth_fixtures/b2-eval-008-extends-
+// implements.jsonl, row 5) recording the EvidenceTier this case should
+// resolve to. This test proves those two artifacts agree with each
+// other and with the real resolver's own current output, rather than
+// letting the ground-truth fixture silently drift from what the code
+// actually does.
+// ===========================================================================
+
+#[test]
+fn golden_corpus_ground_truth_and_the_real_resolver_agree_on_the_generic_arity_collision_case() {
+    let source = CorpusSource::load("csharp", &["generic_arity_collision_gap.cs"]);
+    let outcome = index(&source);
+    let bulkhead = find_one_by_name_in_file(&outcome, "BulkheadPolicy", "generic_arity_collision_gap.cs");
+    let real_implements_edges = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Implements));
+    assert!(real_implements_edges.is_empty(), "the real pipeline must still produce no Implements edge for this known-ambiguous case");
+
+    let contents = std::fs::read_to_string("tests/ground_truth_fixtures/b2-eval-008-extends-implements.jsonl").expect("the retrofitted B2-EVAL-008 ground-truth fixture must exist");
+    let rows = codegraph_index::ground_truth::parse_jsonl(&contents).expect("the fixture must parse cleanly");
+    let ambiguous_row = rows
+        .iter()
+        .find(|r| r.caller == "src/Polly/Bulkhead/BulkheadPolicy.cs::BulkheadPolicy" && r.expected_targets.len() >= 2)
+        .expect("a ground-truth row recording the generic-arity-collision ambiguity must exist in the real fixture");
+
+    assert_eq!(
+        ambiguous_row.resolution_method,
+        Some(codegraph_index::ground_truth::EvidenceTierField::Ambiguous),
+        "the ground-truth row's own recorded resolution_method must be Ambiguous, matching the real EvidenceTier this case resolves to"
+    );
+    assert!(ambiguous_row.predicted_targets.is_empty(), "the ground-truth row's own predicted_targets must mirror the real resolver producing no edge");
+    assert_eq!(
+        ambiguous_row.compute_status(),
+        codegraph_index::ground_truth::Status::AmbiguousCorrect,
+        "a genuinely ambiguous case with no predicted edge is AmbiguousCorrect per the schema's own status table -- never a silent FalseNegative for the resolver correctly declining to guess"
+    );
+}

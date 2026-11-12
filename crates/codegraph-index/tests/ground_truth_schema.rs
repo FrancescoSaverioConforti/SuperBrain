@@ -12,14 +12,34 @@
 //! derived directly from `docs/research/evaluations/B2-EVAL-008.md`'s
 //! own Section C, which itself documents these facts as confirmed by
 //! direct source reading against the real `App-vNext/Polly` corpus.
+//!
+//! Row 5 (added Phase 2, deliverable 9) retrofits the generic-arity-
+//! collision gap (`Known Semantic Gaps` #5) as an `Ambiguous` row,
+//! cross-checked against the real resolver's own output in
+//! `golden_corpus.rs`'s
+//! `golden_corpus_ground_truth_and_the_real_resolver_agree_on_the_generic_arity_collision_case`.
 
-use codegraph_index::ground_truth::{compute_metrics, parse_jsonl, Status};
+use codegraph_index::ground_truth::{compute_metrics, parse_jsonl, EvidenceTierField, Status};
 
 #[test]
 fn the_real_b2_eval_008_fixture_parses_without_error() {
     let contents = std::fs::read_to_string("tests/ground_truth_fixtures/b2-eval-008-extends-implements.jsonl").expect("fixture file must exist and be readable");
     let rows = parse_jsonl(&contents).expect("a real, well-formed ground-truth fixture must parse cleanly");
-    assert_eq!(rows.len(), 4, "the fixture has exactly 4 rows retrofitted from B2-EVAL-008's own Section C");
+    assert_eq!(rows.len(), 5, "the fixture has 5 rows: 4 retrofitted from B2-EVAL-008's own Section C, plus 1 Ambiguous row added in Phase 2 deliverable 9");
+}
+
+#[test]
+fn the_generic_arity_collision_row_computes_as_ambiguous_correct() {
+    let contents = std::fs::read_to_string("tests/ground_truth_fixtures/b2-eval-008-extends-implements.jsonl").unwrap();
+    let rows = parse_jsonl(&contents).unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.resolution_method == Some(EvidenceTierField::Ambiguous))
+        .expect("the one Ambiguous row (generic-arity collision) must be present in the real fixture");
+    assert_eq!(row.caller, "src/Polly/Bulkhead/BulkheadPolicy.cs::BulkheadPolicy");
+    assert_eq!(row.expected_targets.len(), 2, "two equally-valid real candidates sharing one bare name, per the generic-arity-collision gap");
+    assert!(row.predicted_targets.is_empty(), "the real resolver correctly declines to guess between them");
+    assert_eq!(row.compute_status(), Status::AmbiguousCorrect);
 }
 
 #[test]

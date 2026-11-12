@@ -1,13 +1,25 @@
 # Machine-readable ground-truth schema (precision/recall harness)
 
 Quality & Semantic Reliability Hardening, Phase 1, deliverable 9.
-**Status: schema design only — not yet wired into any evaluation
-harness as a real emitted artifact.** Every real evaluation in this
-series so far (B2-EVAL-001 through 008) has recorded its own manual
-Calls-quality samples as PROSE inside the evaluation markdown document
-— this schema is what a FUTURE evaluation could emit instead (or
-alongside), to make recomputation of precision/recall mechanical
-rather than requiring a human to re-read the prose table every time.
+**Status: IMPLEMENTED (Phase 2).** This schema is now real, tested
+code in `crates/codegraph-index/src/ground_truth.rs`: a dependency-free
+JSONL parser (`parse_jsonl`), the `GroundTruthRow`/`Status`/
+`EvidenceTierField` types, the status-derivation table as
+`GroundTruthRow::compute_status()`, and `compute_metrics` (gated by
+`MIN_ROWS_FOR_COMPUTED_METRICS` so a too-small sample refuses to report
+a misleadingly precise percentage). A real fixture,
+`crates/codegraph-index/tests/ground_truth_fixtures/b2-eval-008-extends-implements.jsonl`,
+retrofits 4 rows directly from B2-EVAL-008's own already-confirmed
+Section C findings, exercised by
+`crates/codegraph-index/tests/ground_truth_schema.rs`. Every real
+evaluation before this phase (B2-EVAL-001 through 008) still recorded
+its Calls-quality samples as prose inside the evaluation markdown
+document — this schema is what a FUTURE evaluation can now emit
+instead (or alongside), making recomputation of precision/recall
+mechanical rather than requiring a human to re-read a prose table every
+time. Golden-corpus/ground-truth integration (asserting an expected
+resolution tier per fixture, not just expected edges) remains separate,
+pending Phase 2 deliverable 9.
 
 ## Format
 
