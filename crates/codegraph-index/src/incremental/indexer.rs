@@ -59,6 +59,7 @@ use crate::csharp_declarations::{resolve_csharp_type_declaration_contexts, RawCS
 use crate::graph::{CodeGraph, GraphError};
 use crate::impls::{resolve_implements_from_impl_facts, resolve_raw_impl_statements, ImplFact, RawImplStatement};
 use crate::imports::{resolve_raw_import_statements, ImportFact, RawImportStatement};
+use crate::negative_knowledge::CallAttempt;
 use crate::snapshot::SymbolSnapshot;
 
 /// Internal, per-repository bookkeeping the indexer keeps alongside
@@ -99,6 +100,28 @@ struct RepositoryState {
     /// is consumed by `resolve_extends_implements_with_csharp_contexts`,
     /// never persisted on `CodeGraph` itself.
     raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 1 + 3:
+    /// mirrors `raw_import_statements`/`raw_impl_statements`/
+    /// `raw_csharp_type_declaration_contexts` exactly — the per-file
+    /// `SignatureTooLong` rejection names, reused for untouched files,
+    /// freshly collected for reparsed ones.
+    raw_signature_too_long_names: Vec<(codegraph_domain::FileIdentity, String)>,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 1 + 4:
+    /// the CURRENTLY published negative-knowledge `CallAttempt`
+    /// records — mirrors `import_facts`/`impl_facts` exactly: ALWAYS
+    /// recomputed from scratch on every `observe_commit` call (never
+    /// incrementally reused), for the identical reason those two
+    /// fields are — `resolve_calls_with_extraction_rejections` resolves
+    /// against the full CURRENT snapshot pool, so an untouched call
+    /// site's own attempt (resolved/ambiguous/unresolved) can still
+    /// change when some OTHER file adds/removes/renames a candidate
+    /// elsewhere in the repository. There is no separate
+    /// "raw_call_attempts" field: unlike `ImportFact`/`ImplFact`,
+    /// `CallAttempt` has no raw/unresolved extraction phase of its own
+    /// to reuse — it is produced directly by the SAME `resolve_calls_with_extraction_rejections`
+    /// call that already produces `typed_edges`' own `Calls` edges,
+    /// against the same pool, in the same pass.
+    call_attempts: Arc<Vec<CallAttempt>>,
 }
 
 /// What [`CodeGraphIndexer::begin_observe`] (critical section 1)
@@ -112,6 +135,7 @@ struct ObserveClaim {
     prior_raw_import_statements: Vec<(codegraph_domain::FileIdentity, RawImportStatement)>,
     prior_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
     prior_raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
+    prior_signature_too_long_names: Vec<(codegraph_domain::FileIdentity, String)>,
     generation: u64,
 }
 
@@ -238,6 +262,12 @@ pub struct ObserveOutcome {
     /// either this call's own freshly-resolved facts, or a later
     /// generation's facts if this call lost the publish race).
     pub impl_facts: Arc<Vec<ImplFact>>,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 1 + 4:
+    /// the CURRENTLY published `CallAttempt`s for this repository —
+    /// mirrors `import_facts`/`impl_facts` exactly (same atomicity:
+    /// either this call's own freshly-resolved attempts, or a later
+    /// generation's attempts if this call lost the publish race).
+    pub call_attempts: Arc<Vec<CallAttempt>>,
     pub metrics: IndexMetrics,
 }
 
@@ -390,11 +420,12 @@ impl CodeGraphIndexer {
                 graph: existing.graph.clone(),
                 import_facts: existing.import_facts.clone(),
                 impl_facts: existing.impl_facts.clone(),
+                call_attempts: existing.call_attempts.clone(),
                 metrics: IndexMetrics::default(),
             });
         }
 
-        let (new_graph, new_raw_import_statements, import_facts, new_raw_impl_statements, impl_facts, new_raw_csharp_type_declaration_contexts, metrics) = match claim.relationship {
+        let (new_graph, new_raw_import_statements, import_facts, new_raw_impl_statements, impl_facts, new_raw_csharp_type_declaration_contexts, new_raw_signature_too_long_names, call_attempts, metrics) = match claim.relationship {
             CommitRelationship::NewRepository | CommitRelationship::HistoryRewriteOrUnknownAncestor => self.full_reindex(source, repository, new_commit)?,
             CommitRelationship::NormalAdvance => {
                 let prior_graph = claim.prior_graph.expect("NormalAdvance implies prior state exists");
@@ -406,6 +437,7 @@ impl CodeGraphIndexer {
                     &claim.prior_raw_import_statements,
                     &claim.prior_raw_impl_statements,
                     &claim.prior_raw_csharp_type_declaration_contexts,
+                    &claim.prior_signature_too_long_names,
                     changed_files,
                 )?
             }
@@ -422,6 +454,8 @@ impl CodeGraphIndexer {
             new_raw_impl_statements,
             impl_facts,
             new_raw_csharp_type_declaration_contexts,
+            new_raw_signature_too_long_names,
+            call_attempts,
             metrics,
         ))
     }
@@ -432,7 +466,7 @@ impl CodeGraphIndexer {
     /// rebuild. Returns the prior graph (a cloned `Arc`, cheap) so the
     /// caller can build the incremental update outside the lock.
     fn begin_observe(&self, repository: RepositoryId, new_commit: &CommitHash, expected_prev_commit: Option<&CommitHash>) -> ObserveClaim {
-        let (relationship, prior_graph, prior_raw_import_statements, prior_raw_impl_statements, prior_raw_csharp_type_declaration_contexts) = {
+        let (relationship, prior_graph, prior_raw_import_statements, prior_raw_impl_statements, prior_raw_csharp_type_declaration_contexts, prior_signature_too_long_names) = {
             let state = self.state.lock().unwrap();
             let prior = state.get(&repository);
             let relationship = classify_commit(prior, new_commit, expected_prev_commit);
@@ -442,6 +476,7 @@ impl CodeGraphIndexer {
                 prior.map(|s| s.raw_import_statements.clone()).unwrap_or_default(),
                 prior.map(|s| s.raw_impl_statements.clone()).unwrap_or_default(),
                 prior.map(|s| s.raw_csharp_type_declaration_contexts.clone()).unwrap_or_default(),
+                prior.map(|s| s.raw_signature_too_long_names.clone()).unwrap_or_default(),
             )
         };
         // Claimed from a counter entirely separate from `state`'s own
@@ -461,6 +496,7 @@ impl CodeGraphIndexer {
             prior_raw_import_statements,
             prior_raw_impl_statements,
             prior_raw_csharp_type_declaration_contexts,
+            prior_signature_too_long_names,
             generation,
         }
     }
@@ -479,6 +515,8 @@ impl CodeGraphIndexer {
             Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
             Vec<ImplFact>,
             Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
+            Vec<(codegraph_domain::FileIdentity, String)>,
+            Vec<CallAttempt>,
             IndexMetrics,
         ),
         ObserveError,
@@ -509,7 +547,17 @@ impl CodeGraphIndexer {
         let mut typed_edges = output.typed_edges;
         typed_edges.extend(implements_edges);
         let graph = build_graph(output.snapshots, output.lineage_edges, typed_edges)?;
-        Ok((graph, output.raw_import_statements, import_facts, output.raw_impl_statements, impl_facts, output.raw_csharp_type_declaration_contexts, metrics))
+        Ok((
+            graph,
+            output.raw_import_statements,
+            import_facts,
+            output.raw_impl_statements,
+            impl_facts,
+            output.raw_csharp_type_declaration_contexts,
+            output.signature_too_long_names,
+            output.call_attempts,
+            metrics,
+        ))
     }
 
     /// Incremental update: re-parses/re-extracts/re-promotes ONLY
@@ -540,6 +588,7 @@ impl CodeGraphIndexer {
         prior_raw_import_statements: &[(codegraph_domain::FileIdentity, RawImportStatement)],
         prior_raw_impl_statements: &[(codegraph_domain::FileIdentity, RawImplStatement)],
         prior_raw_csharp_type_declaration_contexts: &[(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)],
+        prior_signature_too_long_names: &[(codegraph_domain::FileIdentity, String)],
         changed_files: &[String],
     ) -> Result<
         (
@@ -549,6 +598,8 @@ impl CodeGraphIndexer {
             Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
             Vec<ImplFact>,
             Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
+            Vec<(codegraph_domain::FileIdentity, String)>,
+            Vec<CallAttempt>,
             IndexMetrics,
         ),
         ObserveError,
@@ -615,7 +666,25 @@ impl CodeGraphIndexer {
         raw_csharp_type_declaration_contexts.extend(output.raw_csharp_type_declaration_contexts.clone());
         let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw_csharp_type_declaration_contexts, &current_snapshots);
 
-        let mut typed_edges = crate::edges::resolve_all_typed_edges_with_csharp_contexts(&current_snapshots, &csharp_contexts).map_err(PipelineError::from)?;
+        // Semantic Resolution & Reliability Checkpoint, Priority 1 + 3
+        // + 4: identical incremental semantics to
+        // `raw_csharp_type_declaration_contexts` immediately above —
+        // `SignatureTooLong` rejection NAMES are pure syntax facts
+        // (no snapshot-pool dependency), so they are reused for every
+        // UNTOUCHED file and freshly collected for every file this
+        // call actually reparsed. `call_attempts`' own RESOLUTION
+        // (like `typed_edges`' own `Calls` edges) is, exactly like
+        // `import_facts`/`impl_facts`/`csharp_contexts`, ALWAYS
+        // recomputed from the full current pool on every call — never
+        // reused incrementally, for the identical reason: an untouched
+        // call site's own attempt can still change when some OTHER
+        // file adds/removes/renames a real candidate elsewhere.
+        let untouched_signature_too_long_names: Vec<_> = prior_signature_too_long_names.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
+        let mut signature_too_long_names = untouched_signature_too_long_names;
+        signature_too_long_names.extend(output.signature_too_long_names.clone());
+        let signature_too_long_names_only: Vec<String> = signature_too_long_names.iter().map(|(_, name)| name.clone()).collect();
+
+        let (mut typed_edges, call_attempts) = crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&current_snapshots, &csharp_contexts, &signature_too_long_names_only).map_err(PipelineError::from)?;
 
         // Lineage across the UNCHANGED portion is already final (it was
         // resolved and published by an earlier observe_commit call);
@@ -749,7 +818,7 @@ impl CodeGraphIndexer {
         };
 
         let graph = build_graph(final_snapshots, lineage_edges, typed_edges)?;
-        Ok((graph, raw_import_statements, import_facts, raw_impl_statements, impl_facts, raw_csharp_type_declaration_contexts, metrics))
+        Ok((graph, raw_import_statements, import_facts, raw_impl_statements, impl_facts, raw_csharp_type_declaration_contexts, signature_too_long_names, call_attempts, metrics))
     }
 
     /// Critical section 2: publish `candidate_graph` for `repository`
@@ -769,6 +838,8 @@ impl CodeGraphIndexer {
         candidate_raw_impl_statements: Vec<(codegraph_domain::FileIdentity, RawImplStatement)>,
         candidate_impl_facts: Vec<ImplFact>,
         candidate_raw_csharp_type_declaration_contexts: Vec<(codegraph_domain::FileIdentity, RawCSharpTypeDeclarationContext)>,
+        candidate_raw_signature_too_long_names: Vec<(codegraph_domain::FileIdentity, String)>,
+        candidate_call_attempts: Vec<CallAttempt>,
         metrics: IndexMetrics,
     ) -> ObserveOutcome {
         let mut state = self.state.lock().unwrap();
@@ -777,6 +848,7 @@ impl CodeGraphIndexer {
             let graph = Arc::new(candidate_graph);
             let import_facts = Arc::new(candidate_import_facts);
             let impl_facts = Arc::new(candidate_impl_facts);
+            let call_attempts = Arc::new(candidate_call_attempts);
             state.insert(
                 repository,
                 RepositoryState {
@@ -788,22 +860,25 @@ impl CodeGraphIndexer {
                     raw_impl_statements: candidate_raw_impl_statements,
                     impl_facts: impl_facts.clone(),
                     raw_csharp_type_declaration_contexts: candidate_raw_csharp_type_declaration_contexts,
+                    raw_signature_too_long_names: candidate_raw_signature_too_long_names,
+                    call_attempts: call_attempts.clone(),
                 },
             );
-            ObserveOutcome { generation, graph, import_facts, impl_facts, metrics }
+            ObserveOutcome { generation, graph, import_facts, impl_facts, call_attempts, metrics }
         } else {
             // A later generation already published — this call's
-            // candidate (graph AND import/impl state) is discarded.
-            // Return the ACTUAL current state, not this call's own
-            // (stale, never-published) data — the same atomicity
-            // guarantee `graph`/`import_facts` already had now covers
-            // `impl_facts` too.
+            // candidate (graph AND import/impl/call-attempt state) is
+            // discarded. Return the ACTUAL current state, not this
+            // call's own (stale, never-published) data — the same
+            // atomicity guarantee `graph`/`import_facts` already had
+            // now covers `impl_facts`/`call_attempts` too.
             let existing = state.get(&repository).expect("current_generation > 0 implies prior state exists when generation <= current_generation");
             ObserveOutcome {
                 generation: existing.generation,
                 graph: existing.graph.clone(),
                 import_facts: existing.import_facts.clone(),
                 impl_facts: existing.impl_facts.clone(),
+                call_attempts: existing.call_attempts.clone(),
                 metrics,
             }
         }
@@ -889,7 +964,7 @@ mod tests {
         let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
         let indexer = CodeGraphIndexer::new();
 
-        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
+        let first_outcome = indexer.publish(repo, commit.clone(), 5, CodeGraph::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
         assert_eq!(first_outcome.generation, 5);
 
         // Attempt to publish AGAIN at the SAME generation (5, not 4) —
@@ -898,7 +973,7 @@ mod tests {
         let file = FileIdentity::parse(repo, commit.clone(), "src/lib.rs").unwrap();
         let candidate = RawSymbolCandidate::new("marker".to_string(), "function_item".to_string(), ByteSpan { start: 0, end: 3 }, "fn marker() {}".to_string()).unwrap();
         second_candidate.insert_snapshot(promote(&candidate, file).unwrap()).unwrap();
-        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
+        let second_outcome = indexer.publish(repo, commit, 5, second_candidate, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), IndexMetrics::default());
 
         assert_eq!(second_outcome.generation, 5, "the reported generation must still be 5 (the one already published)");
         assert_eq!(second_outcome.graph.snapshot_count(), 0, "an equal-generation publish must NOT overwrite the already-published graph with its own candidate");

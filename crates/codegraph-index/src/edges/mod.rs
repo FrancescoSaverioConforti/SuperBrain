@@ -68,7 +68,7 @@ mod instantiates;
 mod resolution;
 mod tests_for;
 
-pub use calls::{resolve_calls, resolve_calls_with_negative_knowledge};
+pub use calls::{resolve_calls, resolve_calls_with_extraction_rejections, resolve_calls_with_negative_knowledge};
 pub use contains::resolve_contains;
 pub use extends_implements::{resolve_extends_implements, resolve_extends_implements_with_csharp_contexts};
 pub use instantiates::resolve_instantiates;
@@ -99,11 +99,35 @@ pub fn resolve_all_typed_edges(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>
 /// byte-for-byte identical to [`resolve_all_typed_edges`] — confirmed
 /// by a dedicated equivalence test.
 pub fn resolve_all_typed_edges_with_csharp_contexts(snapshots: &[SymbolSnapshot], csharp_contexts: &[crate::csharp_declarations::CSharpTypeDeclarationContext]) -> Result<Vec<Edge>, EdgeResolutionError> {
+    resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(snapshots, csharp_contexts, &[]).map(|(edges, _attempts)| edges)
+}
+
+/// Semantic Resolution & Reliability Checkpoint, Priority 1 + 3:
+/// identical to [`resolve_all_typed_edges_with_csharp_contexts`] except
+/// `Calls` resolution also returns its own negative-knowledge
+/// `CallAttempt` records (via
+/// [`calls::resolve_calls_with_extraction_rejections`] rather than the
+/// plain [`resolve_calls`]), using `signature_too_long_names` as the
+/// real, caller-verified `SignatureTooLong` evidence that function
+/// requires before linking an `Unresolved` attempt to
+/// `UnresolvedReason::ExtractionRejected`. With an empty
+/// `signature_too_long_names` slice, the `Vec<Edge>` half of this
+/// function's own output is byte-for-byte identical to
+/// [`resolve_all_typed_edges_with_csharp_contexts`]'s — confirmed by a
+/// dedicated equivalence test, mirroring exactly how every prior
+/// "_with_X" extension in this module (B2-ID-010's own
+/// `_with_csharp_contexts`) preserved its own predecessor's behavior.
+pub fn resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(
+    snapshots: &[SymbolSnapshot],
+    csharp_contexts: &[crate::csharp_declarations::CSharpTypeDeclarationContext],
+    signature_too_long_names: &[String],
+) -> Result<(Vec<Edge>, Vec<crate::negative_knowledge::CallAttempt>), EdgeResolutionError> {
     let mut edges = Vec::new();
-    edges.extend(resolve_calls(snapshots)?);
+    let (calls_edges, call_attempts) = resolve_calls_with_extraction_rejections(snapshots, signature_too_long_names)?;
+    edges.extend(calls_edges);
     edges.extend(resolve_extends_implements_with_csharp_contexts(snapshots, csharp_contexts)?);
     edges.extend(resolve_tests_for(snapshots)?);
     edges.extend(resolve_contains(snapshots)?);
     edges.extend(resolve_instantiates(snapshots)?);
-    Ok(edges)
+    Ok((edges, call_attempts))
 }

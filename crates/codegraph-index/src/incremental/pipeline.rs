@@ -13,9 +13,10 @@ use codegraph_domain::{CommitHash, FileIdentity, RepositoryId, RepositorySource,
 use thiserror::Error;
 
 use crate::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts, RawCSharpTypeDeclarationContext};
-use crate::edges::{resolve_all_typed_edges_with_csharp_contexts, Edge, EdgeResolutionError};
-use crate::extract::extract_symbols;
+use crate::edges::{resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge, Edge, EdgeResolutionError};
+use crate::extract::{extract_symbols_reporting_rejections, CandidateRejection};
 use crate::graph::{CodeGraph, GraphError};
+use crate::negative_knowledge::CallAttempt;
 use crate::impls::{extract_impl_statements, RawImplStatement};
 use crate::imports::{extract_import_statements, ImportFactError, RawImportStatement};
 use crate::lineage::{resolve_lineage, LineageEdge, LineageResolutionError};
@@ -82,6 +83,29 @@ pub struct PipelineOutput {
     /// this function returns — see `csharp_declarations` module's own
     /// doc comment.
     pub raw_csharp_type_declaration_contexts: Vec<(FileIdentity, RawCSharpTypeDeclarationContext)>,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 1: the
+    /// negative-knowledge `CallAttempt` record for every call site
+    /// `resolve_calls_with_extraction_rejections` examined in THIS
+    /// call's own typed-edge resolution pass — mirrors `typed_edges`
+    /// exactly (same resolution call, same pool, same scope), never
+    /// incrementally reused on its own (see `indexer.rs`'s own
+    /// re-resolution convention for why).
+    pub call_attempts: Vec<CallAttempt>,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 3: every
+    /// real `SignatureTooLong` rejection's own candidate name, paired
+    /// with the `FileIdentity` it was rejected from — collected from
+    /// exactly the files this call parsed. Kept per-file (mirroring
+    /// `raw_import_statements`/`raw_impl_statements` exactly) so
+    /// `indexer.rs`'s incremental path can reuse an untouched file's
+    /// own rejection names rather than re-deriving them, while still
+    /// dropping a changed/deleted file's stale names correctly. This
+    /// is the independently-verified evidence
+    /// `resolve_calls_with_extraction_rejections` requires before it
+    /// may ever link an `Unresolved` `CallAttempt` to
+    /// `UnresolvedReason::ExtractionRejected` (see that function's own
+    /// doc comment: it performs no rejection detection of its own,
+    /// only consumes what its caller already verified).
+    pub signature_too_long_names: Vec<(FileIdentity, String)>,
 }
 
 /// Parses, extracts and promotes every file in `relative_paths` (all
@@ -117,6 +141,7 @@ pub fn index_files(
     let mut raw_import_statements = Vec::new();
     let mut raw_impl_statements = Vec::new();
     let mut raw_csharp_type_declaration_contexts = Vec::new();
+    let mut signature_too_long_names = Vec::new();
 
     for relative_path in relative_paths {
         let file = FileIdentity::parse(repository, commit.clone(), relative_path).map_err(|e| PipelineError::Source(SourceError::Other { reason: e.to_string() }))?;
@@ -133,7 +158,19 @@ pub fn index_files(
             // file must not abort indexing everything else.
             continue;
         };
-        for candidate in extract_symbols(&tree) {
+        // Semantic Resolution & Reliability Checkpoint, Priority 3:
+        // `extract_symbols_reporting_rejections` (not the rejection-
+        // discarding `extract_symbols`) so a real `SignatureTooLong`
+        // rejection's own candidate name is observable here, scoped to
+        // exactly the files this call parsed — mirroring every other
+        // raw-fact extraction's own scope in this function.
+        let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+        for rejection in rejections {
+            if let CandidateRejection::SignatureTooLong { name, .. } = rejection {
+                signature_too_long_names.push((file.clone(), name));
+            }
+        }
+        for candidate in candidates {
             // promote's own errors (oversized name/signature, invalid
             // span, unrecognized kind hint) ARE fatal to the whole
             // commit, per this function's fail-closed contract — a
@@ -176,7 +213,16 @@ pub fn index_files(
     // full reused+fresh context set, exactly as it already does for
     // import_facts/impl_facts; see that module's own doc comment.
     let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw_csharp_type_declaration_contexts, &snapshots);
-    let typed_edges = resolve_all_typed_edges_with_csharp_contexts(&snapshots, &csharp_contexts)?;
+    // Semantic Resolution & Reliability Checkpoint, Priority 1 + 3:
+    // this call's own `signature_too_long_names` (collected above,
+    // scoped to exactly the files this call parsed) is the real,
+    // independently-verified evidence `resolve_calls_with_extraction_rejections`
+    // requires before linking an Unresolved CallAttempt to
+    // UnresolvedReason::ExtractionRejected — never fabricated, per
+    // that function's own "performs no rejection detection of its own"
+    // discipline.
+    let signature_too_long_names_only: Vec<String> = signature_too_long_names.iter().map(|(_, name)| name.clone()).collect();
+    let (typed_edges, call_attempts) = resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&snapshots, &csharp_contexts, &signature_too_long_names_only)?;
 
     Ok(PipelineOutput {
         snapshots,
@@ -185,6 +231,8 @@ pub fn index_files(
         raw_import_statements,
         raw_impl_statements,
         raw_csharp_type_declaration_contexts,
+        call_attempts,
+        signature_too_long_names,
     })
 }
 
