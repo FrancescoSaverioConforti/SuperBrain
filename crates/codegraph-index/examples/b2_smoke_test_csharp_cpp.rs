@@ -34,14 +34,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use codegraph_domain::{CommitHash, EdgeKind, RepositorySource, ResolutionMethod, SymbolKind};
+use codegraph_domain::{CommitHash, EdgeKind, EvidenceTier, RepositorySource, ResolutionMethod, SymbolKind};
+use codegraph_index::agent_policy::{evaluate, IntendedUse, PolicyVerdict};
 use codegraph_index::allowlist::RepositoryAllowlist;
 use codegraph_index::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts};
-use codegraph_index::edges::{resolve_calls, resolve_extends_implements_with_csharp_contexts, resolve_tests_for};
+use codegraph_index::edges::{resolve_calls_with_negative_knowledge, resolve_extends_implements_with_csharp_contexts, resolve_tests_for};
 use codegraph_index::extract::extract_symbols_reporting_rejections;
 use codegraph_index::imports::ImportResolution;
 use codegraph_index::incremental::CodeGraphIndexer;
 use codegraph_index::local_git_source::LocalGitRepositorySource;
+use codegraph_index::negative_knowledge::CallAttempt;
 use codegraph_index::parse::parser_for;
 use codegraph_index::snapshot::promote;
 
@@ -220,7 +222,15 @@ fn main() {
     let no_known_lineage = |_: codegraph_domain::SymbolSnapshotId| None;
     let lineage_edges = codegraph_index::lineage::resolve_lineage(&[], &snapshots, &no_known_lineage).expect("resolve_lineage at B (no prev)");
 
-    let calls_edges = resolve_calls(&snapshots).expect("resolve_calls");
+    // Semantic Reliability Hardening Phase 2 stress-test: use the
+    // negative-knowledge-preserving entry point, not the plain
+    // resolve_calls wrapper, so this evaluation can measure
+    // EvidenceTier/Provenance/CallAttempt on the real corpus, not just
+    // edge-present/edge-absent. `calls_edges` itself is byte-for-byte
+    // identical to what resolve_calls would have returned (confirmed
+    // by the dedicated equivalence test in calls.rs), so every section
+    // below that already used `calls_edges` is unaffected.
+    let (calls_edges, call_attempts) = resolve_calls_with_negative_knowledge(&snapshots).expect("resolve_calls_with_negative_knowledge");
     // B2-ID-010: resolve the C# declaration contexts against the FULL
     // current snapshot pool (same convention as import_facts/impl_facts
     // in the real production pipeline), then pass them into the
@@ -255,6 +265,100 @@ fn main() {
     }
 
     let full_index_elapsed = t0.elapsed();
+
+    // --- Reliability layer measurement (Semantic Reliability Hardening
+    // Phase 2 stress-test). EvidenceTier distribution over the
+    // resolved Calls edges, plus the negative-knowledge CallAttempt
+    // records for every call site that did NOT produce an edge.
+    println!("\n--- R. Reliability layer: EvidenceTier/Provenance/CallAttempt (Calls only, per Phase 2 scope) ---");
+    let mut tier_counts_resolved_edges: HashMap<EvidenceTier, usize> = HashMap::new();
+    for edge in &calls_edges {
+        let tier = EvidenceTier::from_resolution_method(edge.evidence.method());
+        *tier_counts_resolved_edges.entry(tier).or_insert(0) += 1;
+    }
+    println!("resolved Calls edges by EvidenceTier (MEASURED):");
+    let mut tier_vec: Vec<_> = tier_counts_resolved_edges.into_iter().collect();
+    tier_vec.sort_by_key(|(t, _)| format!("{t:?}"));
+    for (tier, count) in &tier_vec {
+        println!("  {tier:?}: {count}");
+    }
+
+    let ambiguous_attempts: Vec<&CallAttempt> = call_attempts.iter().filter(|a| a.tier == EvidenceTier::Ambiguous).collect();
+    let unresolved_attempts: Vec<&CallAttempt> = call_attempts.iter().filter(|a| a.tier == EvidenceTier::Unresolved).collect();
+    println!("total_call_attempts (negative knowledge, MEASURED): {}", call_attempts.len());
+    println!("  Ambiguous: {} (2+ real candidates, resolver declined to choose)", ambiguous_attempts.len());
+    println!("  Unresolved: {} (zero real candidates in the given pool)", unresolved_attempts.len());
+
+    // Negative-knowledge quality: for a deterministic sample of
+    // Ambiguous attempts, print the real candidate set and the
+    // provenance's own method_limitations string, so the eval doc can
+    // classify whether the explanation is genuinely specific or a
+    // generic canned reason collapsing multiple distinct real causes.
+    {
+        let mut sample: Vec<&CallAttempt> = ambiguous_attempts.clone();
+        sample.sort_by(|a, b| a.callee_name.cmp(&b.callee_name).then_with(|| format!("{:?}", a.caller).cmp(&format!("{:?}", b.caller))));
+        println!("\n--- R1. Negative-knowledge quality sample: first 15 Ambiguous CallAttempts (deterministic order) ---");
+        for attempt in sample.iter().take(15) {
+            let caller_name = snapshots.iter().find(|s| s.id() == attempt.caller).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str()));
+            let candidate_names: Vec<String> = attempt.candidates.iter().filter_map(|id| snapshots.iter().find(|s| s.id() == *id)).map(|s| format!("{}::{}", s.file().relative_path(), s.name().as_str())).collect();
+            println!(
+                "  caller={caller_name:?} callee_name={:?} candidate_count={} candidates={candidate_names:?} rationale={:?} limitations={:?}",
+                attempt.callee_name,
+                attempt.candidates.len(),
+                attempt.provenance.selection_rationale(),
+                attempt.provenance.method_limitations()
+            );
+        }
+    }
+
+    // Specifically re-check the Handle<TException> case now that
+    // B2-ID-011's fix makes these call sites extractable: how many
+    // Handle-named CallAttempts (Ambiguous, since 4 real overloads
+    // share this bare name) exist, vs. how many Handle calls actually
+    // produced a resolved edge (StaticAnalysis/Heuristic, meaning
+    // exactly one Handle-named candidate survived for that specific
+    // occurrence's own scope).
+    {
+        let handle_attempts: Vec<&CallAttempt> = call_attempts.iter().filter(|a| a.callee_name == "Handle").collect();
+        let handle_resolved_edges: Vec<&codegraph_index::edges::Edge> = calls_edges
+            .iter()
+            .filter(|e| snapshots.iter().find(|s| s.id() == e.to).map(|s| s.name().as_str()) == Some("Handle"))
+            .collect();
+        println!("\n--- R2. Handle<TException> case, separated by layer (MEASURED, post B2-ID-009/010/011) ---");
+        println!("Handle-named CallAttempts (candidate discovery succeeded, but tier != Resolved): {}", handle_attempts.len());
+        for attempt in &handle_attempts {
+            println!("  tier={:?} candidate_count={}", attempt.tier, attempt.candidates.len());
+        }
+        println!("Handle-named resolved Calls edges (StaticAnalysis/Heuristic): {}", handle_resolved_edges.len());
+        for edge in &handle_resolved_edges {
+            println!("  method={:?}", edge.evidence.method());
+        }
+    }
+
+    // Agent-reliability-policy simulation on real evaluation data: for
+    // every Ambiguous/Unresolved CallAttempt, what would the executable
+    // policy say about (a) informational display and (b) treating this
+    // caller as part of a high-impact modification's blast radius?
+    {
+        println!("\n--- R3. Agent-reliability-policy simulation on real CallAttempts (first 10 Ambiguous, deterministic) ---");
+        let mut sample: Vec<&CallAttempt> = ambiguous_attempts.clone();
+        sample.sort_by(|a, b| a.callee_name.cmp(&b.callee_name).then_with(|| format!("{:?}", a.caller).cmp(&format!("{:?}", b.caller))));
+        for attempt in sample.iter().take(10) {
+            let display_verdict = evaluate(attempt.tier, IntendedUse::InformationalDisplay);
+            let high_impact_verdict = evaluate(attempt.tier, IntendedUse::HighImpactModification);
+            let display_tag = match display_verdict {
+                PolicyVerdict::Permitted => "Permitted",
+                PolicyVerdict::PermittedWithDisclosedUncertainty => "PermittedWithDisclosedUncertainty",
+                PolicyVerdict::Forbidden { .. } => "Forbidden",
+            };
+            let high_impact_tag = match high_impact_verdict {
+                PolicyVerdict::Permitted => "Permitted",
+                PolicyVerdict::PermittedWithDisclosedUncertainty => "PermittedWithDisclosedUncertainty",
+                PolicyVerdict::Forbidden { .. } => "Forbidden",
+            };
+            println!("  callee_name={:?} tier={:?} informational_display={display_tag} high_impact_modification={high_impact_tag}", attempt.callee_name, attempt.tier);
+        }
+    }
 
     println!("\n--- B. Pipeline results (full index at commit B) ---");
     println!("total_files_in_tree: {total_files}");
