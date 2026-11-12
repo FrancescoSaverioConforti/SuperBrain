@@ -377,6 +377,74 @@ B2-ID-NNN docs in this pass (left for the user's own triage):
    1's own code comments; not a new extraction bug (nothing is
    mis-extracted), but a real, confirmed scope boundary on what
    arity-aware resolution can ever cover for C++.
+
+   **Re-confirmed independently (Priority 8, this checkpoint's own
+   later resumption), with its own fresh grammar probe** (`template<typename T> void Handle() { return; }`):
+   `tree-sitter-cpp` correctly parses this as `template_declaration`
+   → (`template_parameter_list`, `function_definition`) — the
+   `function_definition` node's own span (`"void Handle() { return; }"`)
+   is EXACTLY the promoted candidate's own `signature_text`; its parent
+   IS `template_declaration`, confirmed by direct `.parent()`
+   inspection. Re-parsing that exact fragment text alone (precisely
+   what `csharp_method_generic_arity`'s own re-parse-the-signature
+   convention would do for C++ if it existed) produces a fresh
+   `translation_unit` → `function_definition` with ZERO trace of the
+   template wrapper — the information is not merely unused, it is
+   genuinely absent from the text being re-parsed.
+
+   **Classification: a MODEL limitation (this project's own
+   extraction/snapshot design choice), NOT a syntax limitation and NOT
+   a parser limitation.**
+   - **Not a syntax limitation**: C++ template syntax unambiguously
+     expresses the type-parameter count at the declaration site
+     (`template<typename T, typename U> ...` is syntactically no
+     different in principle from C#'s `Handle<T, U>()`) — the
+     information exists in the source text and in the parse tree, in
+     the same sense C#'s own `type_parameter_list` does.
+   - **Not a parser limitation**: `tree-sitter-cpp` parses the real
+     structure completely correctly (`template_declaration` as parent,
+     `template_parameter_list` as its own countable child, exactly
+     analogous to C#'s own `type_parameter_list`) — confirmed directly
+     above. The parser loses nothing; this project's own extraction
+     step does, by choosing to promote only the inner
+     `function_definition` node as the candidate's span/signature,
+     discarding the enclosing wrapper before the arity-reading code
+     ever runs.
+   - **Is a model limitation**: fixing this would require either (a)
+     `extract/cpp.rs` promoting the `template_declaration`'s own full
+     span (template header + function) as the candidate's
+     `signature_text` instead of just the inner `function_definition`
+     — a change to what "the candidate's own signature" MEANS for
+     every C++ template function corpus-wide, with its own ripple
+     effects on every existing C++ test/fixture that currently asserts
+     on the narrower span, or (b) a C++-specific sibling to
+     `csharp_method_generic_arity` that walks UP from the promoted
+     snapshot to find an enclosing `template_declaration` in the
+     ORIGINAL source file (not a re-parsed fragment) — which the
+     current snapshot model has no mechanism for at all (a
+     `SymbolSnapshot` carries its own span and signature text, not a
+     back-reference to its originating file's full parse tree). Both
+     are real, scoped, non-trivial design changes — correctly left
+     unimplemented this pass, per this priority's own explicit "do NOT
+     implement a fix" instruction.
+   - **Future path**: a future Clang-based or other real C++ semantic
+     oracle (mirroring this evaluation series' own Roslyn-oracle
+     pattern for C#) would not have this limitation at all — Clang's
+     own AST/semantic model represents a template function's full
+     declaration, including its template parameter list, as one
+     coherent unit with real type information, independent of
+     whatever span convention this project's own tree-sitter-based
+     extraction currently chooses. This reframes the limitation as
+     "this project's own lightweight tree-sitter-based extraction
+     model does not carry enough context from source to promoted
+     candidate for C++ templates specifically" rather than "C++
+     generic arity is unknowable in principle" — consistent with this
+     whole evaluation series' own repeated finding (Roslyn differential
+     testing, B2-ID-011's own C++ residual gaps) that a real compiler-
+     grade tool recovers strictly more than this pipeline's own
+     syntax-only extraction, by design, at the cost this project
+     deliberately accepts for staying dependency-light and
+     cross-language-uniform.
 2. **`LocalGitRepositorySource::read_file` re-opens the entire git
    repository on every single call** (`Repository::open` inside the
    per-file `read_file` path, confirmed via direct code reading) —
