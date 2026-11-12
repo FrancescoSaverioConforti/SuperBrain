@@ -268,13 +268,68 @@ pattern specifically would be needed to close this out properly.
 itself is not yet conclusive enough to justify a specific fix's own
 real cost/risk.
 
-## Priority 6 — Agent reliability re-check: NOT DONE
+## Priority 5 (continued) — Resumed with proper multi-run methodology: CONCLUSIVE, root-caused (B2-ID-012)
 
-Explicitly not attempted — this priority's own stated prerequisite
-("after Priorities 1-2 land") is satisfied, but re-running
-`agent_policy.rs` against real cases from this checkpoint's own new
-arity-aware/reason-taxonomy outcomes was not reached within this
-pass's time budget. Left for a dedicated follow-up pass.
+A later resumption of this checkpoint redid this investigation with
+the proper repeated-run protocol this section's own prior pass
+recommended but did not have time to execute: 10 full repeated runs
+(same real Polly commit pair, same machine, temporary `Instant`
+probes at four points inside `pipeline::index_files`/
+`indexer::incremental_reindex`, never committed, fully reverted
+afterward — confirmed via `git diff` showing zero net change).
+
+**Result: the prior pass's "30% variance, inconclusive" framing does
+NOT reproduce.** This pass's own 10-run dispersion is tight (~3%
+spread on both the dominant cost and the overall total), and the
+dominant cost is now precisely isolated: `resolve_lineage`'s own
+O(n² × avg-signature-length²) similarity-scoring path (triggered only
+when `prev_snapshots` is non-empty, i.e. only on a genuine incremental
+step — the full-reindex case starts with an empty `prev` pool and
+never reaches this cost at all, which is WHY the full-reindex
+`resolve_lineage` call measures ~131µs against the SAME corpus's
+larger 5121-snapshot pool while the incremental call measures ~3.88s
+against a SMALLER 755-snapshot pool). Written up in full, with root
+cause, measurement methodology, raw evidence, and severity reasoning,
+as **B2-ID-012** (`docs/research/findings/B2-ID-012.md`, Moderate,
+documented not fixed — a pure-performance finding below the
+Critical/Important bar this pass's own instruction requires before
+fixing rather than documenting).
+
+This supersedes this section's own prior "not yet fully isolated as
+THE cause" conclusion: `resolve_lineage` is now confirmed as the
+dominant, specific, reproducible cost for this corpus/commit-pair's
+own incremental step — roughly 10x the remaining ~800ms non-lineage
+cost of the same 41-file incremental path (which is itself where the
+PRIOR, separate, still-real `LocalGitRepositorySource::read_file`
+per-file git-reopen inefficiency lives — both findings are real and
+independently confirmed; B2-ID-012 ranks them for this specific
+measurement rather than superseding either). **Still not fixed**, per
+the same "do NOT blindly optimize a Moderate-severity performance
+finding" instruction — see B2-ID-012's own "why this is NOT fixed"
+section for the full reasoning.
+
+## Priority 6 — Agent reliability re-check: DONE
+
+Resumed and completed in a later pass: `agent_policy.rs`'s own
+abstract tier-by-tier rules were re-checked against the REAL cases
+this checkpoint's arity-narrowing resolution path actually produces
+(`golden_corpus.rs`'s own
+`arity_resolved_edge_is_heuristic_tier_and_the_policy_permits_it_only_with_disclosed_uncertainty`
+and
+`same_arity_ambiguity_produces_a_real_callattempt_the_policy_forbids_for_every_use`
+tests, driven through the real production pipeline, not synthetic
+`EvidenceTier` values alone). Confirmed: an arity-narrowed
+single-survivor edge classifies as `Heuristic` (never `Resolved`) and
+the policy correctly permits it for informational display ONLY with
+disclosed uncertainty while still forbidding it alone as sole
+justification for a high-impact modification; the required negative
+case (same generic arity, differing ordinary parameter type) produces
+a real `Ambiguous` `CallAttempt` that the policy correctly forbids for
+every intended use, including mere display. Cross-checked against the
+real Polly corpus run itself (Section R3 of
+`b2_smoke_test_csharp_cpp.rs`): all 846 real Handle-named Ambiguous
+`CallAttempt`s correctly simulate as Forbidden for both informational
+display and high-impact modification.
 
 ## Golden corpus additions: NOT DONE
 

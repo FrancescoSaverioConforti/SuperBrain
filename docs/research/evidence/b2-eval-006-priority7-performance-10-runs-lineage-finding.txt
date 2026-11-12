@@ -1,0 +1,110 @@
+=== RUN 1 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8649828s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 107.3µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.133ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.374956s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 188.032ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8986039s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 71.1µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 612.9389ms
+PERF_PROBE index_files(41 files): 4.7012609s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.6027194s
+=== RUN 2 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8429006s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 106.5µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.148ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4145582s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 184.6036ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8620738s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 72.9µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 611.5002ms
+PERF_PROBE index_files(41 files): 4.6584198s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5594739s
+=== RUN 3 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.844708s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 176.7µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.0864ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4193018s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 184.0957ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.880403s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 80.3µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 620.7417ms
+PERF_PROBE index_files(41 files): 4.6854953s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5547976s
+=== RUN 4 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8819305s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 146.7µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.2391ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4056199s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 183.3143ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8863831s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 70.2µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 617.2379ms
+PERF_PROBE index_files(41 files): 4.6871777s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5424055s
+=== RUN 5 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8610837s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 183.4µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.9528ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4565128s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 186.0776ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8558738s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 79.1µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 616.9251ms
+PERF_PROBE index_files(41 files): 4.6591495s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5719949s
+=== RUN 6 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.870649s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 130.6µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.1537ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.3905482s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 182.8396ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8831628s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 70.7µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 624.13ms
+PERF_PROBE index_files(41 files): 4.6903769s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5623293s
+=== RUN 7 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8630249s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 111.4µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.1419ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.3975406s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 187.8192ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8754486s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 62.4µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 610.2789ms
+PERF_PROBE index_files(41 files): 4.6737786s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.5745417s
+=== RUN 8 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8697438s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 116.8µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.2193ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4195226s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 200.3822ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.9798826s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 70.3µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 649.5196ms
+PERF_PROBE index_files(41 files): 4.8300609s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.7497891s
+=== RUN 9 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.8776064s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 106.9µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.2291ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4283509s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 184.3309ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.8832354s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 83.2µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 613.9266ms
+PERF_PROBE index_files(41 files): 4.6817508s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.6008582s
+=== RUN 10 ===
+PERF_PROBE index_files parse+extract loop (1015 files, 5121 snapshots): 1.9441787s
+PERF_PROBE resolve_lineage (prev 0, current 5121): 145.5µs
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 860, pool 5121): 5.4227ms
+PERF_PROBE index_files's own typed-edge resolution (pool 5121): 3.4143883s
+PERF_PROBE index_files parse+extract loop (41 files, 755 snapshots): 186.5131ms
+PERF_PROBE resolve_lineage (prev 686, current 755): 3.9036222s
+PERF_PROBE index_files's own resolve_csharp_type_declaration_contexts (contexts 49, pool 755): 74.4µs
+PERF_PROBE index_files's own typed-edge resolution (pool 755): 606.9654ms
+PERF_PROBE index_files(41 files): 4.6973508s
+PERF_PROBE resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(pool 5190): 3.6096731s
