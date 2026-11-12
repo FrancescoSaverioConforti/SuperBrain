@@ -14,9 +14,14 @@
 //!   declaration) and `IBulkheadPolicy : IsPolicy, IDisposable`
 //!   (interface-to-interface multiple inheritance).
 //! - Section C2: real method-overload ground truth, queried against
-//!   the four `Handle<TException>()`/`Handle<TException>(Func<...>)`
-//!   overloads in `Policy.HandleSyntax.cs`, to determine whether
-//!   `resolve_calls`'s pure-name matching collapses them.
+//!   the `Handle<TException>()`/`Handle<TException>(Func<...>)`
+//!   overloads in `Policy.HandleSyntax.cs` (4 within that one file;
+//!   6 corpus-wide once `PredicateBuilder<TResult>`'s own
+//!   independently-declared same-name/same-arity pair is included,
+//!   per B2-EVAL-008's corrected ground truth), to determine whether
+//!   `resolve_calls`'s pure-name matching (now with call-site
+//!   generic-arity narrowing, Semantic Resolution & Reliability
+//!   Checkpoint Priority 1) collapses them.
 //! - Section C3: a constructor-injected delegate-field callback shape
 //!   (`BulkheadPolicy`'s `_onBulkheadRejected`, `FallbackPolicy`'s
 //!   `_onFallback`) checked against the command-registration-graph
@@ -38,7 +43,7 @@ use codegraph_domain::{CommitHash, EdgeKind, EvidenceTier, RepositorySource, Res
 use codegraph_index::agent_policy::{evaluate, IntendedUse, PolicyVerdict};
 use codegraph_index::allowlist::RepositoryAllowlist;
 use codegraph_index::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts};
-use codegraph_index::edges::{resolve_calls_with_negative_knowledge, resolve_extends_implements_with_csharp_contexts, resolve_tests_for};
+use codegraph_index::edges::{resolve_calls_with_extraction_rejections, resolve_extends_implements_with_csharp_contexts, resolve_tests_for};
 use codegraph_index::extract::extract_symbols_reporting_rejections;
 use codegraph_index::imports::ImportResolution;
 use codegraph_index::incremental::CodeGraphIndexer;
@@ -92,6 +97,7 @@ fn main() {
     let mut promotion_failures: Vec<String> = Vec::new();
     let mut kind_counts: HashMap<SymbolKind, usize> = HashMap::new();
     let mut signature_too_long_rejections: Vec<String> = Vec::new();
+    let mut signature_too_long_names: Vec<String> = Vec::new();
     let mut rejections_by_kind: HashMap<String, usize> = HashMap::new();
 
     let mut top_level_counts_by_file: HashMap<String, usize> = HashMap::new();
@@ -177,8 +183,9 @@ fn main() {
         rejections_total += rejections.len();
         for rejection in &rejections {
             let kind_label = match rejection {
-                codegraph_index::extract::CandidateRejection::SignatureTooLong { .. } => {
+                codegraph_index::extract::CandidateRejection::SignatureTooLong { name, .. } => {
                     signature_too_long_rejections.push(relative_path.clone());
+                    signature_too_long_names.push(name.clone());
                     "SignatureTooLong"
                 }
                 codegraph_index::extract::CandidateRejection::NameTooLong { .. } => "NameTooLong",
@@ -222,15 +229,18 @@ fn main() {
     let no_known_lineage = |_: codegraph_domain::SymbolSnapshotId| None;
     let lineage_edges = codegraph_index::lineage::resolve_lineage(&[], &snapshots, &no_known_lineage).expect("resolve_lineage at B (no prev)");
 
-    // Semantic Reliability Hardening Phase 2 stress-test: use the
-    // negative-knowledge-preserving entry point, not the plain
-    // resolve_calls wrapper, so this evaluation can measure
-    // EvidenceTier/Provenance/CallAttempt on the real corpus, not just
-    // edge-present/edge-absent. `calls_edges` itself is byte-for-byte
-    // identical to what resolve_calls would have returned (confirmed
-    // by the dedicated equivalence test in calls.rs), so every section
-    // below that already used `calls_edges` is unaffected.
-    let (calls_edges, call_attempts) = resolve_calls_with_negative_knowledge(&snapshots).expect("resolve_calls_with_negative_knowledge");
+    // Semantic Reliability Hardening Phase 2 stress-test, extended by
+    // Semantic Resolution & Reliability Checkpoint Priority 1: use the
+    // extraction-rejection-aware entry point (not the plain
+    // resolve_calls_with_negative_knowledge wrapper), so this
+    // evaluation measures EvidenceTier/Provenance/CallAttempt AND
+    // SignatureTooLong-caused ExtractionRejected provenance on the
+    // real corpus, not just edge-present/edge-absent. `calls_edges`
+    // itself is byte-for-byte identical to what resolve_calls would
+    // have returned when no rejection applies (confirmed by the
+    // dedicated equivalence test in calls.rs), so every section below
+    // that already used `calls_edges` is unaffected.
+    let (calls_edges, call_attempts) = resolve_calls_with_extraction_rejections(&snapshots, &signature_too_long_names).expect("resolve_calls_with_extraction_rejections");
     // B2-ID-010: resolve the C# declaration contexts against the FULL
     // current snapshot pool (same convention as import_facts/impl_facts
     // in the real production pipeline), then pass them into the
@@ -289,6 +299,73 @@ fn main() {
     println!("  Ambiguous: {} (2+ real candidates, resolver declined to choose)", ambiguous_attempts.len());
     println!("  Unresolved: {} (zero real candidates in the given pool)", unresolved_attempts.len());
 
+    // Semantic Resolution & Reliability Checkpoint, Priority 1: reason
+    // distribution over real `UnresolvedReason`s on the real corpus,
+    // specifically to verify SignatureTooLong-caused unavailability is
+    // now observably distinct from "genuinely external/no candidate"
+    // (Unknown) and from "2+ real candidates" (AmbiguousCandidates),
+    // instead of collapsing to one indistinguishable "no edge"
+    // outcome. A misclassification here would be any ExtractionRejected
+    // reason whose callee_name is NOT actually in
+    // signature_too_long_names (impossible by this resolver's own
+    // construction -- checked anyway as a direct real-data sanity
+    // check, not merely trusted from reading the code).
+    {
+        let mut reason_counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut misclassified_extraction_rejected = 0usize;
+        for attempt in &call_attempts {
+            let label = match &attempt.reason {
+                codegraph_index::negative_knowledge::UnresolvedReason::Unknown => "Unknown",
+                codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { .. } => "ExtractionRejected",
+                codegraph_index::negative_knowledge::UnresolvedReason::AmbiguousCandidates => "AmbiguousCandidates",
+            };
+            *reason_counts.entry(label).or_insert(0) += 1;
+            if let codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { .. } = &attempt.reason {
+                if !signature_too_long_names.contains(&attempt.callee_name) {
+                    misclassified_extraction_rejected += 1;
+                }
+            }
+        }
+        println!("\n--- R0a. UnresolvedReason distribution across all real CallAttempts (MEASURED, Priority 1) ---");
+        println!(
+            "real SignatureTooLong-rejected names observed this run (first 15 of {}, deterministic order): {:?}",
+            signature_too_long_names.len(),
+            {
+                let mut sorted_names = signature_too_long_names.clone();
+                sorted_names.sort();
+                sorted_names.dedup();
+                sorted_names.into_iter().take(15).collect::<Vec<_>>()
+            }
+        );
+        let mut reason_vec: Vec<_> = reason_counts.into_iter().collect();
+        reason_vec.sort_by_key(|(k, _)| k.to_string());
+        for (reason, count) in &reason_vec {
+            println!("  {reason}: {count}");
+        }
+        println!(
+            "misclassified ExtractionRejected (reason claims SignatureTooLong but callee_name is absent from the real \
+             signature_too_long_names set this run observed, {} names): {}",
+            signature_too_long_names.len(),
+            misclassified_extraction_rejected
+        );
+        let extraction_rejected_sample: Vec<&CallAttempt> = call_attempts
+            .iter()
+            .filter(|a| matches!(a.reason, codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { .. }))
+            .collect();
+        println!(
+            "ExtractionRejected CallAttempts found on this real run: {} (ground truth: {} real SignatureTooLong \
+             extraction rejections exist in this corpus; an ExtractionRejected CallAttempt requires BOTH zero resolvable \
+             candidates for that callee_name AND that exact name appearing in signature_too_long_names, so this count can \
+             be lower than 213 whenever a same-named, non-rejected candidate elsewhere in the corpus still resolves or \
+             disambiguates the call)",
+            extraction_rejected_sample.len(),
+            rejections_total
+        );
+        for attempt in extraction_rejected_sample.iter().take(10) {
+            println!("  callee_name={:?} reason={:?}", attempt.callee_name, attempt.reason);
+        }
+    }
+
     // Negative-knowledge quality: for a deterministic sample of
     // Ambiguous attempts, print the real candidate set and the
     // provenance's own method_limitations string, so the eval doc can
@@ -312,27 +389,53 @@ fn main() {
     }
 
     // Specifically re-check the Handle<TException> case now that
-    // B2-ID-011's fix makes these call sites extractable: how many
-    // Handle-named CallAttempts (Ambiguous, since 4 real overloads
-    // share this bare name) exist, vs. how many Handle calls actually
-    // produced a resolved edge (StaticAnalysis/Heuristic, meaning
-    // exactly one Handle-named candidate survived for that specific
-    // occurrence's own scope).
+    // B2-ID-011's fix makes these call sites extractable, AND now that
+    // Semantic Resolution & Reliability Checkpoint Priority 1 wires
+    // call-site generic-arity narrowing directly into resolve_calls:
+    // how many Handle-named CallAttempts (Ambiguous or Unresolved)
+    // exist, vs. how many Handle calls actually produced a resolved
+    // edge, and of those, how many resolved via arity-narrowing
+    // specifically (StaticAnalysis selection_rationale mentioning
+    // "generic arity") vs. the pre-existing same-file NameHeuristic
+    // short-circuit. B2-EVAL-008's own corrected ground truth: the
+    // real Handle-named candidate pool is 6, not 4 -- `Policy.Handle<TException>()`/
+    // `Policy.Handle<TException>(Func<TException,bool>)` AND an
+    // independently-declared `PredicateBuilder<TResult>` class in
+    // src/Polly.Core/PredicateBuilder.TResult.cs that happens to
+    // declare its OWN same-named, same-arity overload pair. Because
+    // all 6 real candidates share identical generic arity (one
+    // `TException` type parameter) for a same-arity call site, arity
+    // narrowing CANNOT disambiguate any of them -- this is the real
+    // corpus's own instance of the required negative case ("same name
+    // + same generic arity must still resolve Ambiguous").
     {
         let handle_attempts: Vec<&CallAttempt> = call_attempts.iter().filter(|a| a.callee_name == "Handle").collect();
         let handle_resolved_edges: Vec<&codegraph_index::edges::Edge> = calls_edges
             .iter()
             .filter(|e| snapshots.iter().find(|s| s.id() == e.to).map(|s| s.name().as_str()) == Some("Handle"))
             .collect();
-        println!("\n--- R2. Handle<TException> case, separated by layer (MEASURED, post B2-ID-009/010/011) ---");
+        let handle_arity_narrowed: Vec<&codegraph_index::edges::Edge> = handle_resolved_edges
+            .iter()
+            .filter(|e| e.evidence.note().contains("generic arity"))
+            .copied()
+            .collect();
+        println!("\n--- R2. Handle<TException> case, separated by layer (MEASURED, post B2-ID-009/010/011, arity-aware) ---");
+        println!("real Handle-named candidate pool size (ground truth, B2-EVAL-008 corrected count): 6 (Policy x2, PredicateBuilder<TResult> x2, their generic PolicyBuilder/PredicateBuilder<TResult> counterparts x2 -- all same generic arity)");
         println!("Handle-named CallAttempts (candidate discovery succeeded, but tier != Resolved): {}", handle_attempts.len());
         for attempt in &handle_attempts {
             println!("  tier={:?} candidate_count={}", attempt.tier, attempt.candidates.len());
         }
-        println!("Handle-named resolved Calls edges (StaticAnalysis/Heuristic): {}", handle_resolved_edges.len());
+        println!("Handle-named resolved Calls edges (StaticAnalysis/Heuristic, any mechanism): {}", handle_resolved_edges.len());
         for edge in &handle_resolved_edges {
-            println!("  method={:?}", edge.evidence.method());
+            println!("  method={:?} note={:?}", edge.evidence.method(), edge.evidence.note());
         }
+        println!(
+            "Handle-named edges resolved SPECIFICALLY via call-site generic-arity narrowing (new this checkpoint): {} \
+             (expected 0 on this real corpus: all 6 real Handle candidates share the same single-TException generic arity, \
+             so arity narrowing has no discriminating power here -- confirms the required negative case holds on real data, \
+             not just synthetic fixtures)",
+            handle_arity_narrowed.len()
+        );
     }
 
     // Agent-reliability-policy simulation on real evaluation data: for
@@ -617,17 +720,35 @@ fn main() {
 
         // Q3 [needs: overload-aware resolution -- the domain's own
         // central question on Calls]: how many distinct `Handle`
-        // snapshots exist, and does resolve_calls's pure-name matching
-        // collapse the four real Handle<TException> overloads into
-        // ambiguity or a single silently-wrong target?
+        // snapshots exist within Policy.HandleSyntax.cs specifically,
+        // and does resolve_calls's pure-name matching (now extended
+        // with call-site generic-arity narrowing) collapse the real
+        // Handle<TException> overloads into ambiguity or a single
+        // silently-wrong target? Corrected ground truth (B2-EVAL-008,
+        // confirmed by direct source tracing, superseding this
+        // harness's own earlier "4 real overloads" assumption): within
+        // Policy.HandleSyntax.cs alone there are 4 (Policy's own
+        // Handle<TException>()/Handle<TException>(Func<...>) pair plus
+        // their PolicyBuilder<TResult> generic counterparts), but the
+        // REAL corpus-wide candidate pool for bare name "Handle" is 6,
+        // because src/Polly.Core/PredicateBuilder.TResult.cs
+        // independently declares its OWN same-named, same-generic-
+        // arity Handle<TException>() pair on an unrelated class
+        // (PredicateBuilder<TResult>). This section intentionally
+        // scopes to one file to match the original Q3 question's own
+        // framing; Section R2 above measures the real, corpus-wide
+        // 6-candidate pool.
         let handle_snapshots: Vec<&codegraph_index::snapshot::SymbolSnapshot> = find_by_name("Handle").into_iter().filter(|s| graph.lineage_from(s.id()).is_empty() && s.file().relative_path().ends_with("Policy.HandleSyntax.cs")).collect();
         println!(
             "Q3 [needs: overload-aware resolution] 'How many distinct `Handle` snapshots does Policy.HandleSyntax.cs produce, \
-             and are they collapsed to one name bucket?' -> {} snapshot(s) named exactly \"Handle\" found (ground truth: 4 \
-             real overloads exist in source -- Handle<TException>(), Handle<TException>(Func<TException,bool>), and their \
-             PolicyBuilder<TResult> counterparts). If this count is less than 4, extraction itself (not just resolve_calls) \
-             may be collapsing distinct overloads to one SymbolSnapshotId or rejecting some; if it is 4, resolve_calls still \
-             cannot distinguish WHICH of the 4 a given call site intends, since matching is by bare name only, not arity/type.",
+             and are they collapsed to one name bucket?' -> {} snapshot(s) named exactly \"Handle\" found in this ONE file \
+             (ground truth within this file: 4 real overloads -- Handle<TException>(), Handle<TException>(Func<TException,bool>), \
+             and their PolicyBuilder<TResult> counterparts; the REAL corpus-wide pool is 6, not 4, once PredicateBuilder<TResult>'s \
+             own independently-declared same-name/same-arity pair in a different file is included -- see Section R2). If this \
+             count is less than 4, extraction itself (not just resolve_calls) may be collapsing distinct overloads to one \
+             SymbolSnapshotId or rejecting some; if it is 4, resolve_calls with arity narrowing still cannot distinguish WHICH \
+             of the (file-local 4, corpus-wide 6) a given call site intends, since all share the identical single-TException \
+             generic arity -- arity alone has no discriminating power over this specific real overload family.",
             handle_snapshots.len()
         );
         for s in &handle_snapshots {
@@ -745,10 +866,15 @@ fn overload_ground_truth_section(snapshots: &[codegraph_index::snapshot::SymbolS
     println!(
         "interpretation: if ANY edge above resolved via StaticAnalysis (not NameHeuristic), that call site had EXACTLY ONE \
          candidate named \"Handle\" in the given pool for that resolve_calls invocation (per-signature-text re-parse scope) -- \
-         meaning the other 3 overloads were simply not visible to THAT resolution, not correctly disambiguated by type/arity. \
-         If NameHeuristic/Speculative, the ambiguity was honestly recorded instead of guessed. Neither path means overload-aware \
-         (CALL-RES-A5-style) resolution is happening; this section measures whether real overloads produce visible ambiguity or \
-         silent single-candidate luck, to ground the user's own research question on A4/A5 justification."
+         meaning the other real overloads (ground truth: 6 corpus-wide, per B2-EVAL-008's corrected count, not the 4 originally \
+         assumed) were simply not visible to THAT resolution, not correctly disambiguated by type/arity. If NameHeuristic, this \
+         may now be EITHER the pre-existing same-file-preference short-circuit OR (new this checkpoint) a call-site \
+         generic-arity-narrowing resolution -- Section R2 above distinguishes the two by inspecting each edge's evidence note \
+         for the arity-narrowing phrase. Because all 6 real Handle candidates share the identical single-TException generic \
+         arity, arity narrowing is expected to contribute ZERO of these edges on this real corpus -- confirming arity alone \
+         cannot and does not silently fabricate false certainty here. Neither path means full overload-aware (CALL-RES-A5-style, \
+         type-aware) resolution is happening; this section measures whether real overloads produce visible ambiguity or silent \
+         single-candidate luck, to ground the user's own research question on A4/A5 justification."
     );
 }
 

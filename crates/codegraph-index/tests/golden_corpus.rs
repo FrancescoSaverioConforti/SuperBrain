@@ -313,6 +313,80 @@ fn b2_id_011_cpp_template_method_calls_are_extracted_and_resolved() {
 }
 
 // ===========================================================================
+// Semantic Resolution & Reliability Checkpoint, Priority 1: call-site
+// generic-arity narrowing resolves a real same-name ambiguity when
+// arity actually discriminates, and the required negative case stays
+// genuinely Ambiguous when it does not (same name + same generic
+// arity + differing ORDINARY parameter type) -- the exact real shape
+// of Polly's own Handle<TException>() overload family.
+// ===========================================================================
+
+#[test]
+fn arity_narrowing_resolves_a_genuine_arity_based_ambiguity() {
+    let source = CorpusSource::load("csharp", &["generic_arity_narrowing_call_resolution.cs"]);
+    let outcome = index(&source);
+
+    let caller = find_one_by_name_in_file(&outcome, "ArityResolvesAmbiguity", "generic_arity_narrowing_call_resolution.cs");
+    let callees: Vec<&codegraph_index::snapshot::SymbolSnapshot> = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).collect();
+    assert_eq!(callees.len(), 1, "picker.Pick<System.Exception>() must resolve to EXACTLY ONE edge once narrowed by call-site generic arity (1) among the two same-named Pick/Pick<T> candidates");
+    assert_eq!(callees[0].name().as_str(), "Pick");
+
+    let snapshots: Vec<codegraph_index::snapshot::SymbolSnapshot> = outcome.graph.all_snapshots().into_iter().cloned().collect();
+    let (_edges, attempts) = codegraph_index::edges::resolve_calls_with_negative_knowledge(&snapshots).expect("resolve_calls_with_negative_knowledge");
+    let call_attempts_for_pick: Vec<_> = attempts.into_iter().filter(|a| a.callee_name == "Pick" && a.caller == caller.id()).collect();
+    assert!(call_attempts_for_pick.is_empty(), "a call resolved via arity-narrowing must produce a real Edge, never also an Ambiguous/Unresolved CallAttempt for the same call site");
+}
+
+// ===========================================================================
+// Semantic Resolution & Reliability Checkpoint, Priority 2: a real
+// SignatureTooLong extraction rejection must link to the matching
+// zero-candidate call site as UnresolvedReason::ExtractionRejected,
+// never collapsing to the same Unknown reason a genuinely external
+// (never-indexed) target would get. Permanent regression fixture for
+// the real-corpus finding this checkpoint measured against
+// App-vNext/Polly (213 real SignatureTooLong rejections there).
+// ===========================================================================
+
+#[test]
+fn signature_too_long_rejection_links_to_extraction_rejected_reason() {
+    let source = CorpusSource::load("csharp", &["signature_too_long_extraction_rejection_linkage.cs"]);
+    let outcome = index(&source);
+
+    let caller = find_one_by_name_in_file(&outcome, "InvokesRejectedTarget", "signature_too_long_extraction_rejection_linkage.cs");
+    let callees: Vec<&codegraph_index::snapshot::SymbolSnapshot> = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).collect();
+    assert!(callees.is_empty(), "VeryLongSignatureMethod's own candidate must have been dropped at extraction time (real SignatureTooLong), so no edge can exist for this call");
+
+    let attempt = outcome
+        .call_attempts
+        .iter()
+        .find(|a| a.callee_name == "VeryLongSignatureMethod" && a.caller == caller.id())
+        .expect("a CallAttempt must exist for this call site through the real production pipeline (pipeline.rs/indexer.rs wiring)");
+    assert_eq!(attempt.tier, codegraph_domain::EvidenceTier::Unresolved);
+    assert_eq!(
+        attempt.reason,
+        codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { rejection_kind: "SignatureTooLong" },
+        "the real production pipeline must link this zero-candidate call site to the SAME real extraction rejection \
+         that dropped VeryLongSignatureMethod, not the generic Unknown reason a genuinely external target would get"
+    );
+}
+
+#[test]
+fn same_generic_arity_with_differing_ordinary_parameter_type_stays_ambiguous() {
+    let source = CorpusSource::load("csharp", &["generic_arity_narrowing_call_resolution.cs"]);
+    let outcome = index(&source);
+
+    let caller = find_one_by_name_in_file(&outcome, "SameArityStillAmbiguous", "generic_arity_narrowing_call_resolution.cs");
+    let callees: Vec<&codegraph_index::snapshot::SymbolSnapshot> = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).collect();
+    assert!(
+        callees.is_empty(),
+        "required negative case: picker.Choose<System.Exception>(1) has TWO same-arity (both generic arity 1) candidates \
+         differing only in ordinary parameter type (int vs string) -- arity narrowing has no discriminating power here, \
+         so this must stay genuinely Ambiguous (no edge), exactly like the real Polly Handle<TException>() family \
+         (B2-EVAL-006/008: 0 of 846 real Handle call sites resolve via arity narrowing, for this same structural reason)"
+    );
+}
+
+// ===========================================================================
 // Known gap: C++ namespace-qualified calls — the NEW residual limitation
 // B2-ID-011's own independent review found. Documents the CURRENT gap.
 // ===========================================================================
