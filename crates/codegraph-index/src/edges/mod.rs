@@ -131,3 +131,66 @@ pub fn resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(
     edges.extend(resolve_instantiates(snapshots)?);
     Ok((edges, call_attempts))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_domain::{CommitHash, EdgeKind, FileIdentity, RepositoryRegistry, RepositoryRoot};
+
+    use crate::extract::{ByteSpan, RawSymbolCandidate};
+    use crate::snapshot::promote;
+
+    fn test_repo() -> codegraph_domain::RepositoryId {
+        let mut registry = RepositoryRegistry::new();
+        registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+    }
+
+    fn test_snapshot(repo: codegraph_domain::RepositoryId, path: &str, name: &str, kind_hint: &str, signature: &str, start: usize, end: usize) -> SymbolSnapshot {
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file = FileIdentity::parse(repo, commit, path).unwrap();
+        let candidate = RawSymbolCandidate::new(name.to_string(), kind_hint.to_string(), ByteSpan { start, end }, signature.to_string()).unwrap();
+        promote(&candidate, file).unwrap()
+    }
+
+    /// Neither `resolve_all_typed_edges` nor
+    /// `resolve_all_typed_edges_with_csharp_contexts` had any direct
+    /// caller anywhere in this crate (production code goes straight to
+    /// `resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`)
+    /// — confirmed by `cargo mutants` finding both thin wrappers'
+    /// entire bodies replaceable with `Ok(vec![])` without a single
+    /// test failing. These two tests close that real test-coverage gap
+    /// directly: a hand-built class/method pair produces a real
+    /// `Contains` edge via `resolve_contains`, which both wrappers
+    /// include — proving each one genuinely calls through to its
+    /// documented richer counterpart rather than returning an empty
+    /// Vec unconditionally.
+    #[test]
+    fn resolve_all_typed_edges_actually_resolves_a_real_contains_edge() {
+        let repo = test_repo();
+        let class = test_snapshot(repo, "src/m.py", "MyModel", "class_definition", "class MyModel:\n    def forward(self): pass\n", 0, 100);
+        let method = test_snapshot(repo, "src/m.py", "forward", "function_definition", "def forward(self): pass", 20, 90);
+        let snapshots = vec![class.clone(), method.clone()];
+
+        let edges = resolve_all_typed_edges(&snapshots).unwrap();
+
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::Contains && e.from == class.id() && e.to == method.id()),
+            "resolve_all_typed_edges must actually run resolve_contains, not silently return an empty edge set"
+        );
+    }
+
+    #[test]
+    fn resolve_all_typed_edges_with_csharp_contexts_actually_resolves_a_real_contains_edge() {
+        let repo = test_repo();
+        let class = test_snapshot(repo, "src/m.py", "MyModel", "class_definition", "class MyModel:\n    def forward(self): pass\n", 0, 100);
+        let method = test_snapshot(repo, "src/m.py", "forward", "function_definition", "def forward(self): pass", 20, 90);
+        let snapshots = vec![class.clone(), method.clone()];
+
+        let edges = resolve_all_typed_edges_with_csharp_contexts(&snapshots, &[]).unwrap();
+
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::Contains && e.from == class.id() && e.to == method.id()),
+            "resolve_all_typed_edges_with_csharp_contexts must actually run resolve_contains, not silently return an empty edge set"
+        );
+    }
+}

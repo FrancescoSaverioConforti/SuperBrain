@@ -1960,6 +1960,41 @@ mod tests {
     }
 
     #[test]
+    fn full_reindexs_edges_rebuilt_metric_sums_lineage_typed_and_implements_edges_correctly() {
+        // Pins full_reindex's own three-term `edges_rebuilt` summation
+        // (`lineage_edges.len() + typed_edges.len() + implements_edges.len()`)
+        // against a fixture where ALL THREE terms are independently
+        // checkable and the `implements_edges` term specifically is
+        // non-zero -- the C#-only `full_reindex_reconciles_the_real_polly_shape`
+        // fixture elsewhere in this file has implements_edges.len() == 0
+        // by construction (ImplFact/resolve_implements_from_impl_facts
+        // is Rust-`impl`-only), which left a `+`/`-` mutation on that
+        // specific term undetectable (0 + x == 0 - x is false in
+        // general, but the mutant surfaced here was on the OTHER `+`,
+        // between typed_edges and implements_edges -- adding 0 or
+        // subtracting 0 are identical, so that term being zero hid the
+        // mutation). A real `impl Shape for Circle` fixture makes
+        // implements_edges.len() == 1, genuinely exercising the full
+        // three-term arithmetic.
+        let repo = test_repo();
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let source = FakeSource::new()
+            .with_file(FileIdentity::parse(repo, commit.clone(), "src/shape.rs").unwrap(), b"trait Shape { fn area(&self) -> f64; }\n")
+            .with_file(FileIdentity::parse(repo, commit.clone(), "src/circle.rs").unwrap(), b"struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }\n");
+        let indexer = CodeGraphIndexer::new();
+        let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+        let implements_count = outcome.graph.all_edges().iter().filter(|e| e.kind == EdgeKind::Implements).count();
+        assert_eq!(implements_count, 1, "Circle must implement Shape via ImplFact, giving this fixture a genuinely non-zero implements_edges term");
+
+        // A full reindex's own lineage_edges is always empty (no prior
+        // commit to derive lineage from), so edges_rebuilt must equal
+        // exactly the real graph's own total typed-edge count here.
+        assert_eq!(outcome.metrics.edges_rebuilt, outcome.graph.all_edges().len(), "edges_rebuilt must equal lineage_edges (0, no prior commit) + typed_edges + implements_edges, matching the real graph's own stored edge count exactly");
+        assert_eq!(outcome.metrics.edges_rebuilt, implements_count, "with this fixture's real shape (one Implements edge, zero Calls/Extends/etc.), edges_rebuilt's own three-term sum must reduce to exactly the implements_edges count");
+    }
+
+    #[test]
     fn incremental_reindex_of_a_commit_produces_the_same_implements_edges_as_a_full_reindex_of_that_same_commit() {
         // C1's own second required test: incrementally observing A->B
         // (where B's src/shape.rs gets a cosmetic edit, exactly like the
@@ -2053,6 +2088,25 @@ mod tests {
             let implements: Vec<_> = outcome.graph.outgoing_edges(bulkhead.id(), Some(EdgeKind::Implements)).to_vec();
             assert_eq!(extends.len(), 1, "a full reindex through the real indexer must reconcile BulkheadPolicy's own Extends edge toward one of Policy's 2 partial fragments");
             assert_eq!(implements.len(), 1, "IBulkheadPolicy (not partial, unambiguous) must still resolve normally");
+
+            // Pins full_reindex's OWN edges_rebuilt summation directly
+            // against the real CodeGraph's own total edge count (every
+            // edge build_graph actually stored comes from exactly
+            // `lineage_edges` + `typed_edges` (which already includes
+            // the Rust-impl-derived `implements_edges` -- see
+            // full_reindex's own `typed_edges.extend(implements_edges)`
+            // call just above the `build_graph` call this metrics
+            // value is computed alongside), so the two must always be
+            // equal for a full reindex specifically (no edge is ever
+            // dropped between metrics computation and graph storage).
+            // This C# fixture's own `implements_edges` term (the
+            // Rust-`impl`-only mechanism) is 0 by construction, so this
+            // assertion exercises the lineage+typed two-term portion of
+            // the sum concretely; the dedicated Rust-impl fixture
+            // elsewhere in this file already exercises a non-zero
+            // `implements_edges` term for the INCREMENTAL path's own
+            // (different) two-term formula.
+            assert_eq!(outcome.metrics.edges_rebuilt, outcome.graph.all_edges().len(), "a full reindex's own edges_rebuilt metric must equal the real graph's own total stored edge count -- the `+`/`-`/`*` arithmetic in this metric's own construction must never silently diverge from what build_graph actually stored");
         }
 
         #[test]
