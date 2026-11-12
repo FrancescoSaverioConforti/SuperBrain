@@ -149,27 +149,82 @@ preserved in full at
    pipeline's own fix extracting and resolving both call shapes
    post-B2-ID-011).
 
+4. **Semantic Resolution & Reliability Checkpoint, Priority 4 —
+   arity-aware resolution and SignatureTooLong, both oracle-confirmed**:
+   two new fixture groups (`arity_aware_resolution`,
+   `signature_too_long_linkage`) extend this PoC and the automated
+   suite (`roslyn_differential_suite.rs`) to this checkpoint's own new
+   resolution path.
+   - `generic_arity_narrowing_call_resolution.cs`'s
+     `picker.Choose<System.Exception>(1)` call: Roslyn resolves this
+     to a single, unambiguous `AmbiguousPicker.Choose` target
+     (`roslyn_candidate_count: 0`) by using the literal argument's own
+     TYPE (`int`) to disambiguate `Choose<T>(int)` from
+     `Choose<T>(string)` — full semantic overload resolution SuperBrain
+     deliberately does not attempt. SuperBrain's own resolver correctly
+     stays `Ambiguous` for this exact call (confirmed by
+     `same_generic_arity_with_differing_ordinary_parameter_type_stays_ambiguous`
+     in `golden_corpus.rs`). This is NOT a SuperBrain defect: it is the
+     expected, honestly-scoped gap between arity-only narrowing and
+     full type-aware overload resolution (A5's own future scope),
+     oracle-confirmed on a real divergence rather than merely asserted.
+   - `signature_too_long_extraction_rejection_linkage.cs`'s
+     `Target.VeryLongSignatureMethod(...)` (450 real `int` parameters,
+     call site argument count matching): the automated suite's own
+     machine-readable diff reports this method as
+     `MethodObservationOnlyIn { side: "roslyn", ... }` — Roslyn resolves
+     it cleanly (`roslyn_resolved_target: "VeryLongSignatureMethod"`,
+     containing type `Target`) because Roslyn has no signature-length
+     limit, while SuperBrain's own extraction deliberately drops this
+     candidate at `MAX_SIGNATURE_BYTES` (4096 bytes) before it ever
+     reaches promotion. This is SuperBrain's own documented, deliberate
+     bounded-extraction policy working as designed, oracle-confirmed as
+     the EXPECTED divergence shape (never a parser bug silently
+     dropping a symbol it should have kept) — exactly the real-corpus
+     shape this checkpoint measured 213 instances of against
+     App-vNext/Polly. See
+     `docs/research/evidence/b2-eval-006-priority4-roslyn-differential-arity-and-signature-too-long.txt`
+     for the preserved raw run.
+
 ### Residual limitations of this PoC
 
-- Covers only 4 of this pipeline's own 6 C# golden-corpus fixture
-  groups (the `partial_class_policy_b.cs`/`partial_class_bulkhead.cs`
-  file-split case IS covered; the standalone CRC/non-C#-specific
-  fixtures are not applicable to a C#-only oracle). The TypeScript
-  CRC-002 fixture and the Rust/C++ fixtures have NO C# oracle
-  equivalent, by definition.
-- Output comparison is currently MANUAL (read both JSON outputs side
-  by side) — no automated diff script exists yet. Building one is
-  real, not-yet-done future work, not a design gap: the normalized-but-
-  not-identical-schema choice above means an automated diff would need
-  its own per-field comparison logic, not a generic JSON-equality
-  check.
+- The Roslyn oracle itself (`tools/roslyn-oracle/Program.cs`) runs all
+  8 of its own defined `fixtureGroups` cleanly. The standalone CRC/
+  non-C#-specific fixtures (TypeScript CRC-002, Rust, C++) have NO C#
+  oracle equivalent, by definition, and are out of this oracle's own
+  scope.
+- **Known scope gap, found during the Semantic Resolution &
+  Reliability Checkpoint's own Priority 4 work (not a new defect, a
+  pre-existing limitation of this comparison harness itself)**: the
+  AUTOMATED suite's (`roslyn_differential_suite.rs`)
+  `extract_superbrain_observations` walks `tests/corpus/csharp/` with
+  a single, non-recursive `read_dir` — it never descends into the
+  `b2_eval_008_real/` subdirectory, even though
+  `tools/roslyn-oracle/Program.cs`'s own `b2_eval_008_real_polly_files`
+  fixture group DOES include those files. This is why every
+  `b2_eval_008_real/*.cs` type/method ends up reported as
+  `TypeObservationOnlyIn`/`MethodObservationOnlyIn { side: "roslyn" }`
+  on every run — a harness-side comparison-scope artifact, confirmed
+  by direct code reading, not a genuine semantic divergence about
+  SuperBrain's own extraction (SuperBrain's own golden-corpus tests
+  against those exact files pass independently). Fixing this
+  (recursing into subdirectories) is real, scoped, low-risk future
+  work, intentionally not done as part of this checkpoint (out of this
+  pass's own authorized scope — this document only records the
+  finding honestly so a future pass does not re-discover it from
+  scratch).
 - This PoC does not yet cover `TestsFor`, `Imports`/`using` resolution,
   or the callback/registration-graph category — scoped deliberately to
-  the three findings (009/010/011) and one gap (generic-arity
-  collision) this Phase 1 pass's own evaluation series most recently
-  worked on, not a claim of full coverage.
-- The PoC was run manually once, interactively, during this hardening
-  pass — it is not wired into any repeatable CI job yet.
+  the findings/gaps this project's own evaluation series has worked on
+  to date, not a claim of full coverage.
+- The suite (`cargo run --example roslyn_differential_suite`) IS now
+  automated (Phase 2's own deliverable 8) and extended with two more
+  fixture groups by the Semantic Resolution & Reliability Checkpoint's
+  own Priority 4 (see result 4 above) — it is still run manually/
+  on-demand, not wired into any repeatable CI job, since doing so
+  would require a `dotnet` SDK on every CI runner this project uses,
+  a cost/dependency decision out of this document's own scope to make
+  unilaterally.
 
 ## Rust oracle: rustc / rust-analyzer — design only
 

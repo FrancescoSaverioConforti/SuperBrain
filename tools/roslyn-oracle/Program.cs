@@ -57,6 +57,16 @@ var fixtureGroups = new (string Name, string[] Files)[]
     // shape `EvidenceTier::Unresolved` exists for on this project's
     // own side), not a harness defect.
     ("b2_eval_008_real_polly_files", new[] { "b2_eval_008_real/real_policy_context_and_keys.cs", "b2_eval_008_real/real_policy_handle_syntax.cs", "b2_eval_008_real/real_is_policy.cs", "b2_eval_008_real/real_ibulkhead_policy.cs", "b2_eval_008_real/real_bulkhead_policy.cs" }),
+    // Semantic Resolution & Reliability Checkpoint, Priority 4: the
+    // SAME two golden-corpus fixtures golden_corpus.rs's own
+    // arity_narrowing_resolves_a_genuine_arity_based_ambiguity /
+    // same_generic_arity_with_differing_ordinary_parameter_type_stays_ambiguous
+    // / signature_too_long_rejection_links_to_extraction_rejected_reason
+    // tests use -- extends the differential to this checkpoint's own
+    // new arity-aware resolution path, not just the pre-existing
+    // B2-ID-009/010/011 cases above.
+    ("arity_aware_resolution", new[] { "generic_arity_narrowing_call_resolution.cs" }),
+    ("signature_too_long_linkage", new[] { "signature_too_long_extraction_rejection_linkage.cs" }),
 };
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = false };
