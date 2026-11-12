@@ -38,6 +38,68 @@
 
 use codegraph_domain::{EvidenceTier, Provenance, SymbolSnapshotId};
 
+/// Semantic Resolution & Reliability Checkpoint, Priority 2: WHY a
+/// `CallAttempt`'s own tier ended up `Unresolved` (or, for
+/// `AmbiguousCandidates`, `Ambiguous`) — the minimum reason model
+/// needed to stop collapsing structurally different causes into one
+/// indistinguishable "no edge, no explanation" outcome.
+///
+/// # Discipline: never fabricate a reason the resolver cannot actually
+/// observe
+///
+/// Every variant here is constructed ONLY where the resolver that
+/// produces it has REAL, direct evidence for that specific cause —
+/// never inferred from absence alone. `Unknown` exists precisely so a
+/// caller that genuinely cannot distinguish WHY zero candidates
+/// matched (the ordinary, overwhelmingly common case today — most
+/// unresolved callees are simply outside the given snapshot pool for
+/// no reason this resolver tracks) reports that honestly, rather than
+/// this module inventing a false-specific classification to look more
+/// complete than it is. Each variant's own doc comment below states
+/// EXACTLY what real, checkable condition must hold before a caller
+/// may construct it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnresolvedReason {
+    /// Zero candidates matched, and the resolver has no further basis
+    /// to distinguish "genuinely external" (stdlib/third-party/not
+    /// yet indexed) from any other zero-candidate cause — the honest,
+    /// default classification for the ordinary case where nothing
+    /// more specific is actually known. This is NOT a weaker claim
+    /// than the other variants below; it is the CORRECT claim whenever
+    /// a caller has not verified one of the more specific conditions.
+    Unknown,
+    /// Zero candidates matched the callee name, AND this resolver was
+    /// separately told (by its own caller, who must have checked a
+    /// real `CandidateRejection` record — see
+    /// `CallAttempt::unresolved_with_extraction_rejection`'s own doc
+    /// comment) that a real extraction candidate sharing this exact
+    /// name WAS found in the source but dropped before promotion
+    /// (`SignatureTooLong`/`NameTooLong`). This is the Priority 3
+    /// linkage: an extraction rejection that would otherwise look
+    /// identical to a genuine external target.
+    ExtractionRejected { rejection_kind: &'static str },
+    /// 2+ real candidates existed and the resolver declined to pick
+    /// one — mirrors `EvidenceTier::Ambiguous` exactly; kept as an
+    /// `UnresolvedReason` variant too so a caller inspecting ONLY the
+    /// reason enum (without separately checking `tier`) still sees an
+    /// honest, non-`Unknown` explanation for why no edge resulted.
+    AmbiguousCandidates,
+}
+
+impl UnresolvedReason {
+    /// A short, human-readable description — never used to RE-DERIVE
+    /// the reason (callers should match on the enum itself), only to
+    /// populate `Provenance::method_limitations`'s own free-text slot
+    /// consistently.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Unknown => "zero candidates matched this callee name in the given snapshot pool, for a reason this resolver does not further distinguish".to_string(),
+            Self::ExtractionRejected { rejection_kind } => format!("a real candidate sharing this exact callee name was found in the source but rejected at extraction time ({rejection_kind}), never reaching the snapshot pool this resolver was given"),
+            Self::AmbiguousCandidates => "name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing".to_string(),
+        }
+    }
+}
+
 /// One call site's own resolution ATTEMPT, regardless of outcome —
 /// kept even when `tier` is `Ambiguous`/`Unresolved` and NO `Edge` was
 /// ever produced for it. This is deliberately NOT keyed the same way
@@ -53,23 +115,49 @@ pub struct CallAttempt {
     pub tier: EvidenceTier,
     pub candidates: Vec<SymbolSnapshotId>,
     pub provenance: Provenance,
+    /// Semantic Resolution & Reliability Checkpoint, Priority 2: the
+    /// specific, honestly-determined cause behind this attempt's own
+    /// `tier`. See [`UnresolvedReason`]'s own doc comment for the
+    /// never-fabricate discipline this field is built under.
+    pub reason: UnresolvedReason,
 }
 
 impl CallAttempt {
+    /// Builds an `Unresolved` attempt with [`UnresolvedReason::Unknown`]
+    /// — the correct, honest default for the ordinary case where no
+    /// more specific cause has been separately verified. Use
+    /// [`CallAttempt::unresolved_with_extraction_rejection`] instead
+    /// when a real `CandidateRejection` for this exact name is
+    /// independently known.
     pub fn unresolved(caller: SymbolSnapshotId, callee_name: String) -> Self {
-        let provenance = Provenance::new("resolve_calls", vec![], None, vec!["zero candidates matched this callee name in the given snapshot pool".to_string()]).expect("built short, within bounds");
-        Self { caller, callee_name, tier: EvidenceTier::Unresolved, candidates: vec![], provenance }
+        Self::unresolved_with_reason(caller, callee_name, UnresolvedReason::Unknown)
+    }
+
+    /// Semantic Resolution & Reliability Checkpoint, Priority 3: builds
+    /// an `Unresolved` attempt whose reason is
+    /// [`UnresolvedReason::ExtractionRejected`] — the caller (not this
+    /// module) must have already confirmed, against a real
+    /// `CandidateRejection` from the SAME extraction pass, that a
+    /// candidate sharing this exact `callee_name` was dropped before
+    /// promotion. This function performs no such lookup itself (it has
+    /// no access to the rejection list) — it only records what the
+    /// caller already verified, per this module's own "never fabricate"
+    /// discipline. `rejection_kind` is the rejection's own discriminant
+    /// name (`"SignatureTooLong"`/`"NameTooLong"`), not a free-text
+    /// guess.
+    pub fn unresolved_with_extraction_rejection(caller: SymbolSnapshotId, callee_name: String, rejection_kind: &'static str) -> Self {
+        Self::unresolved_with_reason(caller, callee_name, UnresolvedReason::ExtractionRejected { rejection_kind })
+    }
+
+    fn unresolved_with_reason(caller: SymbolSnapshotId, callee_name: String, reason: UnresolvedReason) -> Self {
+        let provenance = Provenance::new("resolve_calls", vec![], None, vec![reason.description()]).expect("built short, within bounds");
+        Self { caller, callee_name, tier: EvidenceTier::Unresolved, candidates: vec![], provenance, reason }
     }
 
     pub fn ambiguous(caller: SymbolSnapshotId, callee_name: String, candidates: Vec<SymbolSnapshotId>) -> Self {
-        let provenance = Provenance::new(
-            "resolve_calls",
-            candidates.clone(),
-            None,
-            vec!["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope narrowing".to_string()],
-        )
-        .expect("built short, within bounds");
-        Self { caller, callee_name, tier: EvidenceTier::Ambiguous, candidates, provenance }
+        let reason = UnresolvedReason::AmbiguousCandidates;
+        let provenance = Provenance::new("resolve_calls", candidates.clone(), None, vec![reason.description()]).expect("built short, within bounds");
+        Self { caller, callee_name, tier: EvidenceTier::Ambiguous, candidates, provenance, reason }
     }
 }
 
@@ -101,5 +189,46 @@ mod tests {
         assert_eq!(attempt.tier, EvidenceTier::Ambiguous);
         assert_eq!(attempt.candidates, candidates);
         assert_eq!(attempt.provenance.candidates_considered(), candidates.as_slice());
+    }
+
+    // --- Priority 2: reason taxonomy ---
+
+    #[test]
+    fn plain_unresolved_has_the_unknown_reason_never_a_fabricated_specific_one() {
+        let attempt = CallAttempt::unresolved(test_id("caller"), "missing_callee".to_string());
+        assert_eq!(attempt.reason, UnresolvedReason::Unknown, "without a separately-verified specific cause, Unknown is the honest, correct classification");
+    }
+
+    #[test]
+    fn ambiguous_attempt_carries_the_ambiguous_candidates_reason() {
+        let candidates = vec![test_id("a"), test_id("b")];
+        let attempt = CallAttempt::ambiguous(test_id("caller"), "overloaded".to_string(), candidates);
+        assert_eq!(attempt.reason, UnresolvedReason::AmbiguousCandidates);
+    }
+
+    #[test]
+    fn extraction_rejected_reason_is_only_constructed_via_its_own_dedicated_constructor() {
+        let attempt = CallAttempt::unresolved_with_extraction_rejection(test_id("caller"), "TooLongName".to_string(), "SignatureTooLong");
+        assert_eq!(attempt.tier, EvidenceTier::Unresolved, "extraction-rejected is still an Unresolved TIER -- the reason taxonomy refines WHY, it does not introduce a fifth tier");
+        assert_eq!(attempt.reason, UnresolvedReason::ExtractionRejected { rejection_kind: "SignatureTooLong" });
+        assert!(
+            attempt.provenance.method_limitations()[0].contains("SignatureTooLong"),
+            "the provenance's own free text must name the real rejection kind, not a generic unresolved description"
+        );
+    }
+
+    #[test]
+    fn different_reasons_produce_distinguishable_provenance_text() {
+        // The whole point of Priority 2: a consumer reading ONLY the
+        // provenance text (as today's pre-Priority-2 model forced)
+        // could not tell these apart; confirms the descriptions are
+        // genuinely different strings, not the same generic sentence
+        // reused for every reason.
+        let unknown = UnresolvedReason::Unknown.description();
+        let rejected = UnresolvedReason::ExtractionRejected { rejection_kind: "SignatureTooLong" }.description();
+        let ambiguous = UnresolvedReason::AmbiguousCandidates.description();
+        assert_ne!(unknown, rejected);
+        assert_ne!(unknown, ambiguous);
+        assert_ne!(rejected, ambiguous);
     }
 }

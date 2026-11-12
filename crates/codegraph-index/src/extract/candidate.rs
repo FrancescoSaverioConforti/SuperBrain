@@ -74,12 +74,28 @@ pub struct RawSymbolCandidate {
     pub signature_text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CandidateRejection {
+    /// `name` itself is what exceeded the bound, so the oversized text
+    /// is deliberately NOT carried here (echoing it back would defeat
+    /// the whole point of a bounded-text discipline) — a future
+    /// consumer wanting to correlate this rejection with a specific
+    /// call site has no usable name to match against, confirmed as a
+    /// real, distinct residual limitation from `SignatureTooLong`'s
+    /// own case below (see `name` there).
     #[error("candidate name is {actual} bytes, maximum accepted is {max}")]
     NameTooLong { max: usize, actual: usize },
-    #[error("candidate signature_text is {actual} bytes, maximum accepted is {max}")]
-    SignatureTooLong { max: usize, actual: usize },
+    /// Semantic Resolution & Reliability Checkpoint, Priority 3: `name`
+    /// carries the candidate's own (bound-respecting, already-short)
+    /// name — the signature text is what was rejected, not the name
+    /// itself, so it is always safe and available to echo here. This
+    /// is the ONE piece of data `CallAttempt::unresolved_with_extraction_rejection`
+    /// needs to link a downstream `Unresolved` call attempt back to
+    /// the real extraction-time cause, per the Priority 3 finding that
+    /// a `SignatureTooLong`-dropped symbol previously looked
+    /// indistinguishable from a genuine external target.
+    #[error("candidate {name:?}'s signature_text is {actual} bytes, maximum accepted is {max}")]
+    SignatureTooLong { name: String, max: usize, actual: usize },
 }
 
 impl RawSymbolCandidate {
@@ -101,6 +117,7 @@ impl RawSymbolCandidate {
         }
         if signature_text.len() > MAX_SIGNATURE_BYTES {
             return Err(CandidateRejection::SignatureTooLong {
+                name,
                 max: MAX_SIGNATURE_BYTES,
                 actual: signature_text.len(),
             });
@@ -163,10 +180,27 @@ mod tests {
         assert_eq!(
             result,
             Err(CandidateRejection::SignatureTooLong {
+                name: "n".to_string(),
                 max: MAX_SIGNATURE_BYTES,
                 actual: MAX_SIGNATURE_BYTES + 1,
             })
         );
+    }
+
+    #[test]
+    fn signature_too_long_carries_the_real_candidate_name_for_downstream_provenance_linkage() {
+        // Semantic Resolution & Reliability Checkpoint, Priority 3:
+        // confirms the rejection's own `name` field is the REAL
+        // candidate name, not a placeholder -- this is the one piece
+        // of data that lets a downstream CallAttempt correctly link
+        // "this callee name was rejected at extraction" instead of
+        // looking identical to a genuine external/unknown target.
+        let signature = "s".repeat(MAX_SIGNATURE_BYTES + 1);
+        let result = RawSymbolCandidate::new("Handle".to_string(), "k".to_string(), ByteSpan { start: 0, end: 1 }, signature);
+        match result {
+            Err(CandidateRejection::SignatureTooLong { name, .. }) => assert_eq!(name, "Handle"),
+            other => panic!("expected SignatureTooLong, got {other:?}"),
+        }
     }
 
     #[test]

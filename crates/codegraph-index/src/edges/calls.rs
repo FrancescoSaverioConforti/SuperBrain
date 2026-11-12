@@ -96,9 +96,37 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
 /// identical reason: a consumer asking "is `foo()` ambiguous in this
 /// function?" wants one honest answer, not N identical copies of it).
 pub fn resolve_calls_with_negative_knowledge(snapshots: &[SymbolSnapshot]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
+    resolve_calls_with_extraction_rejections(snapshots, &[])
+}
+
+/// Semantic Resolution & Reliability Checkpoint, Priority 3 — identical
+/// to [`resolve_calls_with_negative_knowledge`] in every way EXCEPT:
+/// when a call site's own callee name matches NO real candidate (the
+/// zero-candidate case), AND that exact name also appears in
+/// `signature_too_long_names` (the caller's own, already-collected
+/// `CandidateRejection::SignatureTooLong { name, .. }` names from the
+/// SAME extraction pass this snapshot pool was built from), the
+/// resulting `CallAttempt` carries
+/// [`crate::negative_knowledge::UnresolvedReason::ExtractionRejected`]
+/// instead of the generic `Unknown` reason — making the real, specific
+/// cause (a real candidate sharing this exact name WAS found in the
+/// source but dropped before promotion) observable, rather than
+/// looking identical to a genuine external/unknown target. This
+/// function performs NO extraction-rejection detection of its own — it
+/// only consumes what the caller already collected, per this module's
+/// "never fabricate a reason" discipline (see
+/// `CallAttempt::unresolved_with_extraction_rejection`'s own doc
+/// comment).
+///
+/// `resolve_calls_with_negative_knowledge` is now a thin compatibility
+/// wrapper calling this with an empty `signature_too_long_names` slice
+/// — byte-for-byte identical behavior for every existing call site,
+/// confirmed by a dedicated equivalence test.
+pub fn resolve_calls_with_extraction_rejections(snapshots: &[SymbolSnapshot], signature_too_long_names: &[String]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
     let lookup = TargetLookup::new(snapshots)?;
     let mut edges = Vec::new();
     let mut attempts = Vec::new();
+    let rejected_names: std::collections::HashSet<&str> = signature_too_long_names.iter().map(|s| s.as_str()).collect();
 
     for caller in lookup.snapshots() {
         // B2-ID-006, mechanism 1 of 2 (caller eligibility): a snapshot
@@ -340,7 +368,19 @@ pub fn resolve_calls_with_negative_knowledge(snapshots: &[SymbolSnapshot]) -> Re
             // above already distinguishes in PROSE but, before this
             // change, never preserved as DATA past this point.
             let attempt = if candidates.is_empty() {
-                CallAttempt::unresolved(caller.id(), callee_name.clone())
+                // Priority 3: if a real candidate sharing this EXACT
+                // callee name was independently confirmed to be a
+                // `SignatureTooLong` rejection from this same
+                // extraction pass, report that specific, real cause
+                // instead of the generic `Unknown` — never guessed,
+                // only when the caller's own `rejected_names` set
+                // (built from real `CandidateRejection` records)
+                // confirms it.
+                if rejected_names.contains(callee_name.as_str()) {
+                    CallAttempt::unresolved_with_extraction_rejection(caller.id(), callee_name.clone(), "SignatureTooLong")
+                } else {
+                    CallAttempt::unresolved(caller.id(), callee_name.clone())
+                }
             } else {
                 CallAttempt::ambiguous(caller.id(), callee_name.clone(), candidates.iter().map(|c| c.id()).collect())
             };
@@ -2790,4 +2830,80 @@ mod tests {
         }
     }
 
+    /// Semantic Resolution & Reliability Checkpoint, Priority 3:
+    /// SignatureTooLong extraction-rejection provenance linkage.
+    mod extraction_rejection_provenance {
+        use super::*;
+        use crate::negative_knowledge::UnresolvedReason;
+
+        #[test]
+        fn resolve_calls_with_negative_knowledge_is_unaffected_an_equivalence_test() {
+            // The compatibility wrapper must be byte-for-byte identical
+            // to calling the new function with an empty rejection list.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { missing(); }", 0, 30);
+            let snapshots = vec![caller];
+
+            let via_wrapper = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+            let via_new_fn = resolve_calls_with_extraction_rejections(&snapshots, &[]).unwrap();
+
+            assert_eq!(via_wrapper, via_new_fn);
+        }
+
+        #[test]
+        fn a_zero_candidate_callee_matching_a_known_signature_too_long_name_reports_extraction_rejected() {
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { Handle(); }", 0, 30);
+            let snapshots = vec![caller.clone()];
+            let rejected_names = vec!["Handle".to_string()];
+
+            let (edges, attempts) = resolve_calls_with_extraction_rejections(&snapshots, &rejected_names).unwrap();
+
+            assert!(edges.is_empty(), "the real candidate was rejected at extraction -- it was never promoted, so no edge can exist");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Unresolved, "extraction-rejected is still the Unresolved TIER -- the reason refines WHY, not the tier itself");
+            assert_eq!(attempts[0].reason, UnresolvedReason::ExtractionRejected { rejection_kind: "SignatureTooLong" });
+        }
+
+        #[test]
+        fn a_zero_candidate_callee_not_matching_any_known_rejection_still_reports_unknown_never_a_false_positive_rejection_reason() {
+            // The never-fabricate discipline's own negative case: a
+            // rejection list that does NOT contain this callee's name
+            // must never cause a false ExtractionRejected classification.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { trulyExternal(); }", 0, 40);
+            let snapshots = vec![caller.clone()];
+            let rejected_names = vec!["SomeOtherRejectedName".to_string()];
+
+            let (_edges, attempts) = resolve_calls_with_extraction_rejections(&snapshots, &rejected_names).unwrap();
+
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].reason, UnresolvedReason::Unknown, "a rejection list not naming this exact callee must never produce a false ExtractionRejected classification");
+        }
+
+        #[test]
+        fn an_ambiguous_outcome_is_unaffected_by_the_rejection_list_even_if_the_name_happens_to_also_appear_there() {
+            // The rejection-name check must only ever apply to the
+            // ZERO-candidate branch -- a real ambiguity (2+ candidates)
+            // must never be reclassified just because the SAME bare
+            // name coincidentally also appears in a rejection list
+            // (e.g. one overload fragment was rejected while another,
+            // real, promoted candidate with the same name exists
+            // elsewhere -- genuinely possible, and must not corrupt
+            // the ambiguity classification).
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "foo", "function_item", "fn foo() { run(); }", 0, 20);
+            let candidate_a = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* a */ }", 30, 50);
+            let candidate_b = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* b */ }", 60, 80);
+            let snapshots = vec![caller, candidate_a, candidate_b];
+            let rejected_names = vec!["run".to_string()];
+
+            let (edges, attempts) = resolve_calls_with_extraction_rejections(&snapshots, &rejected_names).unwrap();
+
+            assert!(edges.is_empty());
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous);
+            assert_eq!(attempts[0].reason, UnresolvedReason::AmbiguousCandidates, "real ambiguity among promoted candidates must never be reclassified by an unrelated rejection-name coincidence");
+        }
+    }
 }
