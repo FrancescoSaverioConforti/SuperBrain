@@ -15,17 +15,20 @@
 //! in-memory allowlist/registry, no exposed API, no MCP, no Task 9
 //! incremental indexing yet.
 
+pub mod agent_policy;
 pub mod allowlist;
 pub mod conformance;
 pub mod csharp_declarations;
 pub mod edges;
 pub mod extract;
 pub mod graph;
+pub mod ground_truth;
 pub mod impls;
 pub mod imports;
 pub mod incremental;
 pub mod lineage;
 pub mod local_git_source;
+pub mod negative_knowledge;
 pub mod parse;
 pub mod snapshot;
 

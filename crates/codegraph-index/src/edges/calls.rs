@@ -52,6 +52,7 @@ use codegraph_domain::{Confidence, EdgeKind, SymbolKind};
 
 use super::resolution::{heuristic_evidence, resolved_evidence, Edge, EdgeResolutionError, TargetLookup};
 pub(crate) use crate::parse::parser_for;
+use crate::negative_knowledge::CallAttempt;
 use crate::parse::Language;
 use crate::snapshot::SymbolSnapshot;
 
@@ -62,9 +63,42 @@ use crate::snapshot::SymbolSnapshot;
 /// its potential callees are expected to be given together, unlike
 /// Task 6's lineage resolver's `prev`/`next` split (lineage is
 /// inherently directional across commits; calls are not).
+///
+/// Compatibility wrapper: identical behavior to calling
+/// [`resolve_calls_with_negative_knowledge`] and discarding its second
+/// return value — the `Vec<Edge>` this function returns is byte-for-
+/// byte unchanged from before Phase 2's own negative-knowledge
+/// addition, confirmed by a dedicated equivalence test. Every existing
+/// call site keeps this exact signature.
 pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeResolutionError> {
+    resolve_calls_with_negative_knowledge(snapshots).map(|(edges, _attempts)| edges)
+}
+
+/// Quality & Semantic Reliability Hardening, Phase 2 — identical to
+/// [`resolve_calls`] in every way EXCEPT it additionally returns a
+/// [`CallAttempt`] for every call-site occurrence that did NOT produce
+/// a resolved edge: `Ambiguous` (2+ real candidates survived scope
+/// narrowing) or `Unresolved` (zero real candidates at all). A call
+/// site that DID resolve (exactly one real candidate, with or without
+/// scope narrowing) produces only its `Edge`, same as always — no
+/// `CallAttempt` is recorded for the success path, since `Edge` itself
+/// already carries that outcome's own `Evidence`; recording a
+/// redundant `CallAttempt` for every successful call too would
+/// duplicate information this type exists specifically to add where
+/// NONE existed before.
+///
+/// `CallAttempt`s are deduplicated per (caller, callee_name) the same
+/// way `Edge`s are deduplicated per (from, to) by `per_target` below —
+/// a callee name invoked many times in one caller's body with the same
+/// ambiguous/unresolved outcome produces ONE `CallAttempt`, not one per
+/// occurrence (mirroring B2-ID-002's own occurrence-vs-relation
+/// discipline, generalized to the negative-knowledge case for the
+/// identical reason: a consumer asking "is `foo()` ambiguous in this
+/// function?" wants one honest answer, not N identical copies of it).
+pub fn resolve_calls_with_negative_knowledge(snapshots: &[SymbolSnapshot]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
     let lookup = TargetLookup::new(snapshots)?;
     let mut edges = Vec::new();
+    let mut attempts = Vec::new();
 
     for caller in lookup.snapshots() {
         // B2-ID-006, mechanism 1 of 2 (caller eligibility): a snapshot
@@ -108,6 +142,17 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
         // DISTINCT targets — only repeated occurrences of the same
         // `(from, to)` pair.
         let mut per_target: std::collections::HashMap<codegraph_domain::SymbolSnapshotId, Edge> = std::collections::HashMap::new();
+        // Phase 2: deduplicates negative-knowledge CallAttempts the
+        // same way per_target deduplicates Edges — one CallAttempt per
+        // DISTINCT callee_name this caller attempted and failed to
+        // resolve, never one per repeated occurrence. Keyed by name
+        // alone (not by candidate set) because this resolver's own
+        // candidate pool for a given name is identical across every
+        // occurrence within one resolve_calls_with_negative_knowledge
+        // call — there is no scenario where the SAME callee_name in
+        // the SAME caller resolves to a different candidate set on a
+        // later occurrence.
+        let mut per_attempt_name: std::collections::HashMap<String, CallAttempt> = std::collections::HashMap::new();
 
         for call_site in call_sites_in_tree(&tree) {
             // B2-ID-006, mechanism 2 of 2 (nested-scope boundary): this
@@ -219,18 +264,35 @@ pub fn resolve_calls(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>, EdgeReso
                     evidence,
                 };
                 upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
             }
             // Else: ambiguity remains even at the narrowest non-empty
             // scope level — no edge is produced for this occurrence,
             // per CALL-RES-A1's "no edge beats N speculative edges" rule.
+            // Phase 2: record WHICH outcome this was (zero candidates
+            // vs. real ambiguity among 2+), per CallAttempt/EvidenceTier
+            // — the negative-knowledge record this module's own
+            // "zero candidates" / "more than one candidate" comment
+            // above already distinguishes in PROSE but, before this
+            // change, never preserved as DATA past this point.
+            let attempt = if candidates.is_empty() {
+                CallAttempt::unresolved(caller.id(), callee_name.clone())
+            } else {
+                CallAttempt::ambiguous(caller.id(), callee_name.clone(), candidates.iter().map(|c| c.id()).collect())
+            };
+            per_attempt_name.entry(callee_name).or_insert(attempt);
         }
+
+        let mut caller_attempts: Vec<CallAttempt> = per_attempt_name.into_values().collect();
+        caller_attempts.sort_by(|a, b| a.callee_name.cmp(&b.callee_name));
+        attempts.extend(caller_attempts);
 
         let mut caller_edges: Vec<Edge> = per_target.into_values().collect();
         caller_edges.sort_by(|a, b| a.to.as_bytes().cmp(b.to.as_bytes()));
         edges.extend(caller_edges);
     }
 
-    Ok(edges)
+    Ok((edges, attempts))
 }
 
 /// Task 9.5, Priority 5(A): the `Class` snapshot that structurally
@@ -2132,6 +2194,197 @@ mod tests {
             let reversed_edges = resolve_calls(&reversed).unwrap();
 
             assert_eq!(callers_of(&forward_edges, target, &snapshots), callers_of(&reversed_edges, target, &reversed), "caller attribution must not depend on snapshot pool ordering");
+        }
+    }
+
+    // =======================================================================
+    // Quality & Semantic Reliability Hardening, Phase 2:
+    // resolve_calls_with_negative_knowledge. These tests confirm (a) the
+    // Edge output is byte-for-byte identical to resolve_calls (the
+    // compatibility-wrapper invariant), and (b) ambiguous/unresolved
+    // call sites that previously vanished without a trace now produce
+    // a real, inspectable CallAttempt.
+    // =======================================================================
+
+    mod negative_knowledge_wiring {
+        use super::*;
+
+        #[test]
+        fn edges_output_is_identical_to_resolve_calls_for_a_resolved_call() {
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { b(); }", 0, 20);
+            let callee = spanned_snapshot_in_repo(repo, "src/lib.rs", "b", "function_item", "fn b() {}", 30, 40);
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let via_wrapper = resolve_calls(&snapshots).unwrap();
+            let (via_new_fn, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert_eq!(via_wrapper, via_new_fn, "resolve_calls must be byte-for-byte identical to resolve_calls_with_negative_knowledge's own Edge output");
+            assert!(attempts.is_empty(), "a cleanly resolved call must produce no CallAttempt at all -- Edge already carries this outcome");
+        }
+
+        #[test]
+        fn an_unresolved_call_zero_candidates_produces_an_unresolved_attempt_and_no_edge() {
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { nonexistent_callee(); }", 0, 40);
+            let snapshots = vec![caller.clone()];
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty());
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Unresolved);
+            assert_eq!(attempts[0].caller, caller.id());
+            assert_eq!(attempts[0].callee_name, "nonexistent_callee");
+            assert!(attempts[0].candidates.is_empty());
+        }
+
+        #[test]
+        fn an_ambiguous_call_two_same_file_candidates_produces_an_ambiguous_attempt_with_both_real_candidates() {
+            // Mirrors an_ambiguous_call_with_two_same_file_candidates_still_produces_no_edge
+            // above, but asserts the NEW negative-knowledge side too.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "foo", "function_item", "fn foo() { run(); }", 0, 20);
+            let candidate_a = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* a */ }", 30, 50);
+            let candidate_b = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* b */ }", 60, 80);
+            let snapshots = vec![caller.clone(), candidate_a.clone(), candidate_b.clone()];
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty(), "two indistinguishable candidates must still produce no edge");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous);
+            assert_eq!(attempts[0].caller, caller.id());
+            assert_eq!(attempts[0].callee_name, "run");
+            let mut candidate_ids = attempts[0].candidates.clone();
+            candidate_ids.sort_by_key(|id| id.as_bytes().to_vec());
+            let mut expected = vec![candidate_a.id(), candidate_b.id()];
+            expected.sort_by_key(|id| id.as_bytes().to_vec());
+            assert_eq!(candidate_ids, expected, "both real ambiguous candidates must be preserved, not just a count");
+        }
+
+        #[test]
+        fn repeated_occurrences_of_the_same_unresolved_callee_produce_one_attempt_not_many() {
+            // Mirrors B2-ID-002's own occurrence-vs-relation discipline
+            // for Edges, generalized here to CallAttempt: the same
+            // unresolved callee name invoked 3 times in one body must
+            // still produce exactly one CallAttempt.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { missing(); missing(); missing(); }", 0, 60);
+            let snapshots = vec![caller];
+
+            let (_, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert_eq!(attempts.len(), 1, "3 occurrences of the same unresolved callee must collapse to ONE CallAttempt, not three");
+        }
+
+        #[test]
+        fn a_resolved_call_and_an_unresolved_call_in_the_same_body_each_report_correctly() {
+            // Confirms the two code paths (Edge-producing and
+            // CallAttempt-producing) do not interfere with each other
+            // within the same caller's own body.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { b(); missing(); }", 0, 50);
+            let callee = spanned_snapshot_in_repo(repo, "src/lib.rs", "b", "function_item", "fn b() {}", 60, 70);
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1, "the resolved call to b() must still produce its edge");
+            assert_eq!(edges[0].to, callee.id());
+            assert_eq!(attempts.len(), 1, "the unresolved call to missing() must still produce its attempt");
+            assert_eq!(attempts[0].callee_name, "missing");
+        }
+
+        #[test]
+        fn candidates_recorded_in_the_provenance_match_the_attempts_own_candidates_field() {
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "foo", "function_item", "fn foo() { run(); }", 0, 20);
+            let candidate_a = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* a */ }", 30, 50);
+            let candidate_b = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* b */ }", 60, 80);
+            let snapshots = vec![caller, candidate_a, candidate_b];
+
+            let (_, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert_eq!(attempts.len(), 1);
+            let mut provenance_ids = attempts[0].provenance.candidates_considered().to_vec();
+            provenance_ids.sort_by_key(|id| id.as_bytes().to_vec());
+            let mut field_ids = attempts[0].candidates.clone();
+            field_ids.sort_by_key(|id| id.as_bytes().to_vec());
+            assert_eq!(provenance_ids, field_ids, "Provenance.candidates_considered must match CallAttempt.candidates exactly");
+            assert_eq!(attempts[0].provenance.resolver(), "resolve_calls");
+        }
+
+        #[test]
+        fn result_is_deterministic_regardless_of_snapshot_pool_ordering() {
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "foo", "function_item", "fn foo() { run(); }", 0, 20);
+            let candidate_a = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* a */ }", 30, 50);
+            let candidate_b = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* b */ }", 60, 80);
+            let snapshots = vec![caller.clone(), candidate_a.clone(), candidate_b.clone()];
+            let mut reversed = snapshots.clone();
+            reversed.reverse();
+
+            let (_, forward_attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+            let (_, reversed_attempts) = resolve_calls_with_negative_knowledge(&reversed).unwrap();
+
+            assert_eq!(forward_attempts.len(), 1);
+            assert_eq!(reversed_attempts.len(), 1);
+            let mut forward_candidates = forward_attempts[0].candidates.clone();
+            forward_candidates.sort_by_key(|id| id.as_bytes().to_vec());
+            let mut reversed_candidates = reversed_attempts[0].candidates.clone();
+            reversed_candidates.sort_by_key(|id| id.as_bytes().to_vec());
+            assert_eq!(forward_candidates, reversed_candidates, "the recorded candidate set must not depend on snapshot pool ordering");
+        }
+
+        // ===================================================================
+        // The two critical invariants, reflected as concrete tests (per
+        // the user's own explicit instruction): a future change that
+        // violates either of these must fail a real test, not merely
+        // violate a documented principle nobody checks.
+        // ===================================================================
+
+        #[test]
+        fn invariant_absence_of_evidence_is_never_silently_represented_as_evidence_of_absence() {
+            // "This pipeline found no candidate for `missing()`" must
+            // produce an EXPLICIT Unresolved CallAttempt recording that
+            // a resolution ATTEMPT happened and failed -- never the
+            // same silent "nothing at all" a callee that was simply
+            // never mentioned anywhere would also produce. This test
+            // would fail if a future change made resolve_calls_with_negative_knowledge
+            // simply skip recording an attempt for the zero-candidate
+            // case (reverting to today's pre-Phase-2 silence).
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "a", "function_item", "fn a() { missing(); }", 0, 30);
+            let snapshots = vec![caller];
+
+            let (_, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert_eq!(attempts.len(), 1, "a real resolution attempt that found zero candidates must be recorded explicitly, not silently dropped");
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Unresolved, "must be the explicit Unresolved tier, not merely absent from any output");
+        }
+
+        #[test]
+        fn invariant_ambiguity_is_never_converted_into_certainty_to_make_the_graph_more_complete() {
+            // Two equally-plausible same-named candidates must NEVER
+            // collapse into a single, arbitrarily-chosen Edge just
+            // because recording an Ambiguous CallAttempt instead of an
+            // Edge makes the graph "less complete." This test would
+            // fail if a future change (e.g. "while I'm here, let's just
+            // pick the first candidate for Ambiguous cases too") started
+            // emitting an Edge for this exact shape.
+            let repo = test_repo_calls();
+            let caller = spanned_snapshot_in_repo(repo, "src/lib.rs", "foo", "function_item", "fn foo() { run(); }", 0, 20);
+            let candidate_a = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* a */ }", 30, 50);
+            let candidate_b = spanned_snapshot_in_repo(repo, "src/lib.rs", "run", "function_item", "fn run() { /* b */ }", 60, 80);
+            let snapshots = vec![caller, candidate_a, candidate_b];
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty(), "ambiguity must NEVER be silently resolved into an Edge, regardless of how plausible one candidate might seem");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous, "the real ambiguity must be reported honestly as Ambiguous, never upgraded to a false certainty");
+            assert_eq!(attempts[0].candidates.len(), 2, "both real candidates must remain visible -- neither silently dropped to manufacture a single answer");
         }
     }
 }
