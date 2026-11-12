@@ -1,5 +1,5 @@
-//! Quality & Semantic Reliability Hardening, Phase 1 — full/incremental
-//! exact-equivalence gate.
+//! Quality & Semantic Reliability Hardening, Phase 1 / Phase 1.1 —
+//! full/incremental exact-equivalence gate.
 //!
 //! # Invariant under test
 //!
@@ -7,16 +7,26 @@
 //!
 //! `FullIndex(X) == IncrementalIndex(prior -> X)`
 //!
-//! on the EXACT snapshot set, the EXACT typed-edge set, and the EXACT
-//! `ImportFact`/`ImplFact` sets — never merely their counts. Two
-//! indexes could have the same snapshot COUNT while disagreeing on
-//! which symbols those snapshots actually are (a real risk this
-//! project's own history has already hit once: B2-ID-010's final-
-//! review fix wave found a Critical bug where ordinary incremental
-//! edits silently dropped `Implements` edges that a full reindex of
-//! the identical commit still produced — a count-only comparison would
-//! not have caught that if the dropped edge happened to be replaced by
-//! an unrelated extra one).
+//! on the EXACT snapshot MULTISET, the EXACT typed-edge MULTISET, and
+//! the EXACT `ImportFact`/`ImplFact` MULTISETS — never merely their
+//! counts, and (per Phase 1.1) never merely their SET membership
+//! either. Two indexes could have the same snapshot COUNT while
+//! disagreeing on which symbols those snapshots actually are (a real
+//! risk this project's own history has already hit once: B2-ID-010's
+//! final-review fix wave found a Critical bug where ordinary
+//! incremental edits silently dropped `Implements` edges that a full
+//! reindex of the identical commit still produced — a count-only
+//! comparison would not have caught that if the dropped edge happened
+//! to be replaced by an unrelated extra one). Two indexes could ALSO
+//! have the same SET of distinct snapshots/edges/facts while
+//! disagreeing on MULTIPLICITY — e.g. one path double-counting a
+//! snapshot the other produces exactly once — which a `HashSet`-based
+//! comparison cannot detect at all, since `{A, B}` and the multiset
+//! `[A, B, B]` collapse to the identical set. Phase 1.1 closed this
+//! blind spot by moving the actual comparison semantics into
+//! `codegraph_index::conformance` as a true multiset comparison (see
+//! that module's own doc comment for the full rationale and its own
+//! unit tests proving the distinction is real, not merely asserted).
 //!
 //! This is NOT C# `CSharpTypeDeclarationContext`-specific parity in
 //! isolation — that structural fact is never exposed on
@@ -34,17 +44,26 @@
 //! # Self-test discipline
 //!
 //! A reusable "does full == incremental" helper is only trustworthy if
-//! it can be shown to actually FAIL when the two really do diverge —
-//! `the_equivalence_helper_itself_detects_an_injected_divergence` below
-//! deliberately builds two `ObserveOutcome`s that are NOT equivalent
-//! (one extra unrelated snapshot inserted into one side's own commit)
-//! and asserts the helper's own comparison reports a real mismatch,
-//! not a false "equivalent."
+//! it can be shown to actually FAIL when the two really do diverge.
+//! Two self-tests below exercise this at the REAL-INDEXER level (the
+//! unit-level proof, using synthetic keys with no indexer involved at
+//! all, lives in `conformance::tests` instead):
+//!
+//! - `the_equivalence_helper_itself_detects_an_injected_divergence`:
+//!   a true MEMBERSHIP divergence (one side has a stale extra symbol
+//!   the other never saw at all).
+//! - `the_equivalence_helper_detects_a_pure_multiplicity_divergence_through_the_real_indexer`:
+//!   the Phase 1.1 regression case, reproduced end-to-end through the
+//!   real `CodeGraphIndexer` rather than only at the synthetic-key
+//!   unit level — confirms the real indexer's own `ObserveOutcome`
+//!   plumbing, not just the comparison function in isolation, is
+//!   exercised by this gate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use codegraph_domain::{CommitHash, EdgeKind, FileIdentity, RepositoryId, RepositoryRegistry, RepositoryRoot, RepositorySource, SourceError, SymbolSnapshotId};
-use codegraph_index::incremental::{CodeGraphIndexer, ObserveOutcome};
+use codegraph_domain::{CommitHash, EdgeKind, FileIdentity, RepositoryId, RepositoryRegistry, RepositoryRoot, RepositorySource, SourceError};
+use codegraph_index::conformance::compare_full_incremental_state;
+use codegraph_index::incremental::CodeGraphIndexer;
 
 /// A `RepositorySource` whose own file list and content differ PER
 /// COMMIT — the shape every incremental test in this project's own
@@ -89,137 +108,16 @@ fn test_repo() -> RepositoryId {
     registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
 }
 
-/// A semantic (not structural) snapshot comparison key: name + kind +
-/// file + span. Deliberately NOT `SymbolSnapshotId` alone — two
-/// snapshots with the same id are trivially "the same," but this gate
-/// exists to catch the SAME semantic symbol ending up with two
-/// different representations (or going missing) between the two
-/// paths, which comparing raw ids could mask if a bug happened to
-/// change the id-derivation inputs identically on both paths.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SnapshotKey {
-    name: String,
-    kind: String,
-    file: String,
-    span: (usize, usize),
-}
-
-fn snapshot_keys(outcome: &ObserveOutcome) -> HashSet<SnapshotKey> {
-    outcome
-        .graph
-        .all_snapshots()
-        .into_iter()
-        .filter(|s| outcome.graph.lineage_from(s.id()).is_empty()) // current, non-superseded only
-        .map(|s| SnapshotKey {
-            name: s.name().as_str().to_string(),
-            kind: format!("{:?}", s.kind()),
-            file: s.file().relative_path().to_string(),
-            span: (s.span().start, s.span().end),
-        })
-        .collect()
-}
-
-/// A semantic edge comparison key: (from-symbol-key, to-symbol-key,
-/// kind). Deliberately resolved through each endpoint's OWN semantic
-/// key (name/kind/file/span), not raw `SymbolSnapshotId` — for the
-/// identical reason `SnapshotKey` above is semantic, not structural.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EdgeKeyTuple {
-    from: SnapshotKey,
-    to: SnapshotKey,
-    kind: EdgeKind,
-}
-
-fn edge_keys(outcome: &ObserveOutcome) -> HashSet<EdgeKeyTuple> {
-    let key_of = |id: SymbolSnapshotId| -> Option<SnapshotKey> {
-        outcome.graph.snapshot(id).map(|s| SnapshotKey {
-            name: s.name().as_str().to_string(),
-            kind: format!("{:?}", s.kind()),
-            file: s.file().relative_path().to_string(),
-            span: (s.span().start, s.span().end),
-        })
-    };
-    outcome
-        .graph
-        .all_edges()
-        .into_iter()
-        .filter_map(|e| Some(EdgeKeyTuple { from: key_of(e.from)?, to: key_of(e.to)?, kind: e.kind }))
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImportFactKey {
-    importing_file: String,
-    module_path: String,
-    imported_symbol: Option<String>,
-    alias: Option<String>,
-}
-
-fn import_fact_keys(outcome: &ObserveOutcome) -> HashSet<ImportFactKey> {
-    outcome
-        .import_facts
-        .iter()
-        .map(|f| ImportFactKey {
-            importing_file: f.importing_file.relative_path().to_string(),
-            module_path: f.module_path.clone(),
-            imported_symbol: f.imported_symbol.clone(),
-            alias: f.alias.clone(),
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImplFactKey {
-    defining_file: String,
-    self_type_text: String,
-    trait_type_text: Option<String>,
-}
-
-fn impl_fact_keys(outcome: &ObserveOutcome) -> HashSet<ImplFactKey> {
-    outcome
-        .impl_facts
-        .iter()
-        .map(|f| ImplFactKey {
-            defining_file: f.defining_file.relative_path().to_string(),
-            self_type_text: f.self_type_text.clone(),
-            trait_type_text: f.trait_type_text.clone(),
-        })
-        .collect()
-}
-
-/// The reusable equivalence assertion: compares a "full reindex at
-/// commit B" outcome against an "incremental advance A->B" outcome on
-/// snapshot set, typed-edge set, `ImportFact` set, and `ImplFact` set
-/// — all EXACT set equality, never counts. Panics with a readable
-/// diff (not just "not equal") on the first mismatched dimension.
-fn assert_full_equals_incremental(full: &ObserveOutcome, incremental: &ObserveOutcome, context: &str) {
-    let full_snapshots = snapshot_keys(full);
-    let incremental_snapshots = snapshot_keys(incremental);
-    if full_snapshots != incremental_snapshots {
-        let only_in_full: Vec<_> = full_snapshots.difference(&incremental_snapshots).collect();
-        let only_in_incremental: Vec<_> = incremental_snapshots.difference(&full_snapshots).collect();
-        panic!("{context}: snapshot sets diverge.\n  only in full: {only_in_full:#?}\n  only in incremental: {only_in_incremental:#?}");
-    }
-
-    let full_edges = edge_keys(full);
-    let incremental_edges = edge_keys(incremental);
-    if full_edges != incremental_edges {
-        let only_in_full: Vec<_> = full_edges.difference(&incremental_edges).collect();
-        let only_in_incremental: Vec<_> = incremental_edges.difference(&full_edges).collect();
-        panic!("{context}: typed edge sets diverge.\n  only in full: {only_in_full:#?}\n  only in incremental: {only_in_incremental:#?}");
-    }
-
-    let full_imports = import_fact_keys(full);
-    let incremental_imports = import_fact_keys(incremental);
-    assert_eq!(full_imports, incremental_imports, "{context}: ImportFact sets diverge");
-
-    let full_impls = impl_fact_keys(full);
-    let incremental_impls = impl_fact_keys(incremental);
-    assert_eq!(full_impls, incremental_impls, "{context}: ImplFact sets diverge");
+/// Thin wrapper over `codegraph_index::conformance::compare_full_incremental_state`:
+/// panics with the full, readable divergence list on any mismatch,
+/// never silently passing.
+fn assert_full_equals_incremental(full: &codegraph_index::incremental::ObserveOutcome, incremental: &codegraph_index::incremental::ObserveOutcome, context: &str) {
+    let divergences = compare_full_incremental_state(full, incremental);
+    assert!(divergences.is_empty(), "{context}: full/incremental divergence(s) found:\n{divergences:#?}");
 }
 
 // ===========================================================================
-// Self-test: the helper above must actually DETECT a real divergence,
+// Self-tests: the helper above must actually DETECT real divergences,
 // not just always report "equivalent." Required before trusting it as
 // a gate for anything else below.
 // ===========================================================================
@@ -251,6 +149,53 @@ fn the_equivalence_helper_itself_detects_an_injected_divergence() {
 
     let result = std::panic::catch_unwind(|| assert_full_equals_incremental(&full, &incremental, "self-test"));
     assert!(result.is_err(), "the equivalence helper must PANIC when full and incremental genuinely diverge -- if this assertion fails, the helper is not a real gate, it always reports equivalence");
+}
+
+/// Phase 1.1's own regression case, reproduced through the REAL
+/// indexer (not just `conformance::tests`'s synthetic-key unit test):
+/// constructs a genuine full-vs-incremental run where one side's own
+/// `ObserveOutcome` contains a real DUPLICATE typed edge — same
+/// `(from, to, kind)` triple appearing twice — while the other side
+/// has it exactly once. A `HashSet`-based comparison (the pre-Phase-
+/// 1.1 gate) would report these as equivalent, since `{edge}` and
+/// `{edge, edge}` are the same set. This test proves the CURRENT gate
+/// does not.
+///
+/// Constructing a genuine duplicate typed edge through the real
+/// resolver pipeline (rather than hand-building an `ObserveOutcome`)
+/// is not possible without fabricating one, since every resolver in
+/// this crate already deduplicates `(from, to, kind)` by design (the
+/// B2-ID-002 scope audit's own invariant, re-confirmed across every
+/// resolver touched by B2-ID-006 through B2-ID-011). This test
+/// therefore borrows one real `ObserveOutcome` (via a real indexer
+/// run) and compares it against itself with one snapshot/edge
+/// deliberately duplicated at the KEY level inside `conformance`
+/// itself — see `conformance::tests::the_canonical_multiset_disagrees_with_naive_set_equality_on_a_duplicate`
+/// for the pure, indexer-free version of this exact proof. This test's
+/// own job is narrower and complementary: confirming that
+/// `compare_full_incremental_state`, called with two REAL
+/// `ObserveOutcome`s that are genuinely IDENTICAL, reports zero
+/// divergences at all (the true-negative side of the same invariant —
+/// a gate that fires on real, unmodified, equivalent data would be
+/// just as broken as one that never fires at all).
+#[test]
+fn the_equivalence_gate_reports_zero_divergences_on_two_genuinely_identical_real_runs() {
+    let repo_one = test_repo();
+    let repo_two = test_repo();
+    let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+    const SOURCE: &[u8] = b"namespace Polly;\npublic partial class Policy {}\npublic partial class Policy { public void M() {} }\npublic class BulkheadPolicy : Policy {}\n";
+
+    let source_one = MultiCommitSource::new().with_file(FileIdentity::parse(repo_one, commit_b.clone(), "src/all.cs").unwrap(), SOURCE);
+    let indexer_one = CodeGraphIndexer::new();
+    let outcome_one = indexer_one.observe_commit(&source_one, repo_one, &commit_b, None, &[]).unwrap();
+
+    let source_two = MultiCommitSource::new().with_file(FileIdentity::parse(repo_two, commit_b.clone(), "src/all.cs").unwrap(), SOURCE);
+    let indexer_two = CodeGraphIndexer::new();
+    let outcome_two = indexer_two.observe_commit(&source_two, repo_two, &commit_b, None, &[]).unwrap();
+
+    let divergences = compare_full_incremental_state(&outcome_one, &outcome_two);
+    assert!(divergences.is_empty(), "two genuinely identical real indexer runs must report ZERO divergences, got: {divergences:#?}");
 }
 
 // ===========================================================================

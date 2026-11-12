@@ -16,6 +16,7 @@
 //! incremental indexing yet.
 
 pub mod allowlist;
+pub mod conformance;
 pub mod csharp_declarations;
 pub mod edges;
 pub mod extract;

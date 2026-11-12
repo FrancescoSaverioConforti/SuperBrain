@@ -127,15 +127,34 @@ than mutation testing (one hand-picked case vs. systematic exploration
 of every mutation of the comparison logic) and should not be
 represented as an equivalent substitute.
 
-**Not yet solved, named here as real future work**: the two
-structural options are (1) move correctness-critical comparison
-logic like `edge_keys`/`snapshot_keys` OUT of `tests/` and into a
-`#[cfg(test)]`-gated module inside the crate's own `src/` tree (where
-`cargo mutants` WOULD reach it), re-exporting it for the integration
-tests to use, or (2) extend this project's own `cargo-mutants`
-configuration (if the tool supports it) to include specific `tests/`
-files. Neither is implemented in this Phase 1 pass — this is recorded
-as a residual risk, not resolved.
+**Resolved in Phase 1.1**: option (1) above was implemented.
+`snapshot_keys`/`edge_keys`/`import_fact_keys`/`impl_fact_keys` and
+the actual comparison semantics (`compare_multiset`,
+`compare_full_incremental_state`) were moved into
+`crates/codegraph-index/src/conformance.rs` — a real `src/` module
+with its own `#[cfg(test)]` unit tests — and
+`tests/full_incremental_equivalence.rs` now calls into it rather than
+re-implementing the comparison inline. `cargo mutants --file
+crates/codegraph-index/src/conformance.rs` now DOES produce mutants
+(19, scoped to this one file): initial run found 3 genuine missed
+(each of the three `*_keys` extraction functions collapsing to an
+unconditional `vec![]` undetected, because the existing self-tests
+only ever exercised `compare_multiset` with synthetic keys, never the
+real extraction functions against a real `ObserveOutcome`). Closed by
+adding `edge_keys_is_non_empty_for_a_real_run_with_a_real_edge`,
+`import_fact_keys_is_non_empty_for_a_real_run_with_a_real_import`,
+and `impl_fact_keys_is_non_empty_for_a_real_run_with_a_real_impl_block`
+— each builds a real `ObserveOutcome` via `CodeGraphIndexer` with a
+real, non-trivial construct in that exact dimension. Final result:
+**0 genuine missed, 13 caught, 6 unviable**.
+
+This closes the gap for the comparison CORE. It does not retroactively
+add mutation coverage to `tests/golden_corpus.rs` or
+`tests/grammar_conformance.rs` themselves — those remain test-harness
+code proper (fixture loading, assertion orchestration), not
+correctness-critical comparison logic, and per this policy's own
+scope-discipline section are not required to carry mutation coverage
+the way a resolver or comparison core is.
 
 ## Scope discipline
 
