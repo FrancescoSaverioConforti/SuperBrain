@@ -95,6 +95,48 @@ own closure discipline) until its own mutation run reports `0 genuine
 missed` for the files it touched, with every `equivalent` claim
 carrying the structural argument above, documented inline.
 
+## Known blind spot: code under `tests/` is never mutated
+
+Confirmed directly (this Phase 1 pass's own experience, not a
+theoretical concern): `cargo mutants --file <path-under-tests/>`
+reports **`Found 0 mutants to test`** for any file under a crate's
+`tests/` directory (a Rust integration-test binary), regardless of how
+much real, non-trivial logic that file contains. `cargo-mutants`'
+own default scope is `src/` — it does not mutate integration-test
+crates at all, by design (mutating test-only code is not meaningful
+in the tool's own model, matching the "test-module code itself" line
+already in this document's "correctness-relevant" exclusion above —
+but that line was written with `#[cfg(test)]` unit-test modules in
+mind, not realizing it ALSO exempts entire integration-test binaries
+that contain real, load-bearing comparison logic).
+
+This is a genuine, currently-unaddressed gap for code like
+`full_incremental_equivalence.rs`'s own `snapshot_keys`/`edge_keys`/
+`import_fact_keys`/`impl_fact_keys`/`assert_full_equals_incremental`
+functions — real correctness-critical logic (a bug in `edge_keys`
+could make the equivalence gate silently blind to a true divergence)
+that currently has ZERO mutation-coverage verification, and cannot
+get any under this policy's own standard command as written.
+
+**Mitigation in place today, not a full substitute**: this exact risk
+is why `full_incremental_equivalence.rs` includes
+`the_equivalence_helper_itself_detects_an_injected_divergence` — a
+manually-constructed, single adversarial case proving the helper
+catches AT LEAST ONE real kind of divergence. This is strictly weaker
+than mutation testing (one hand-picked case vs. systematic exploration
+of every mutation of the comparison logic) and should not be
+represented as an equivalent substitute.
+
+**Not yet solved, named here as real future work**: the two
+structural options are (1) move correctness-critical comparison
+logic like `edge_keys`/`snapshot_keys` OUT of `tests/` and into a
+`#[cfg(test)]`-gated module inside the crate's own `src/` tree (where
+`cargo mutants` WOULD reach it), re-exporting it for the integration
+tests to use, or (2) extend this project's own `cargo-mutants`
+configuration (if the tool supports it) to include specific `tests/`
+files. Neither is implemented in this Phase 1 pass — this is recorded
+as a residual risk, not resolved.
+
 ## Scope discipline
 
 Mutation testing is run SCOPED to the specific file(s) a fix actually
