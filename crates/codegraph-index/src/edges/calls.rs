@@ -220,6 +220,70 @@ pub fn resolve_calls_with_negative_knowledge(snapshots: &[SymbolSnapshot]) -> Re
                 upsert_preferring_stronger_evidence(&mut per_target, edge);
                 continue;
             }
+
+            // Semantic Resolution & Reliability Checkpoint, Priority 1:
+            // before falling into the existing scope-narrowing/
+            // ambiguity logic below, narrow `candidates` by the call
+            // site's own generic arity when it is known (C#'s
+            // `Foo<T>(...)`/`obj.Foo<T1,T2>(...)` — B2-ID-011's own
+            // extraction already made this arity observable at the
+            // call site; this checkpoint is the first consumer of it).
+            // Never applies to a non-generic call (`call_site.generic_arity
+            // == None`) — `narrow_candidates_by_call_site_arity` itself
+            // returns `candidates` UNCHANGED in that case, so this is a
+            // pure addition, never a behavior change for the (vast
+            // majority) non-generic call sites this resolver already
+            // handled correctly.
+            let arity_narrowed_candidates = narrow_candidates_by_call_site_arity(&candidates, call_site.generic_arity);
+
+            // Deliberately classified `NameHeuristic`, never
+            // `StaticAnalysis`, even though arity narrowing is a
+            // structural/syntactic fact (matching type-argument
+            // count), not a spatial guess like `narrow_by_scope`'s
+            // own enclosing-class/file narrowing: two real overloads
+            // can still share the SAME generic arity while differing
+            // only in ORDINARY parameter types (e.g.
+            // `Handle<TException>()` vs.
+            // `Handle<TException>(Func<TException,bool>)` — both
+            // arity 1). Arity narrowing is strictly MORE than bare-
+            // name matching alone, but it is not full overload
+            // resolution (parameter-type comparison, A5's own future
+            // scope) — `StaticAnalysis` is reserved for the case where
+            // NO ambiguity of any kind remained among the candidates
+            // this resolver was given; arity-reduced-but-still-only-
+            // partially-disambiguated certainty does not meet that
+            // bar.
+            if call_site.generic_arity.is_some() && arity_narrowed_candidates.len() == 1 && candidates.len() > 1 {
+                let (evidence, _confidence) = heuristic_evidence(
+                    codegraph_domain::ResolutionMethod::NameHeuristic,
+                    Confidence::Likely,
+                    &format!(
+                        "call to {callee_name:?} resolves to exactly one candidate once narrowed by its own call-site generic arity ({:?}) among {} same-named candidates",
+                        call_site.generic_arity,
+                        candidates.len()
+                    ),
+                );
+                let edge = Edge {
+                    from: caller.id(),
+                    to: arity_narrowed_candidates[0].id(),
+                    kind: EdgeKind::Calls,
+                    evidence,
+                };
+                upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
+            }
+
+            // If arity narrowing found a real, smaller-but-still-
+            // ambiguous set (2+ candidates sharing both the bare name
+            // AND the call site's own arity), continue the REST of
+            // this function's own ambiguity handling against that
+            // NARROWER set rather than the original, so a real
+            // genuine ambiguity that arity cannot resolve is reported
+            // (and scope-narrowed, if applicable) against the correct,
+            // smaller candidate pool — never silently reverting to the
+            // wider, arity-blind set once arity information was
+            // actually available and used to narrow at all.
+            let candidates = if call_site.generic_arity.is_some() { arity_narrowed_candidates } else { candidates };
             // Zero candidates: the callee is outside what this resolver
             // was given to work with (see this module's doc comment) —
             // "unresolved: no candidate exists" (tracked as a distinct
@@ -462,6 +526,126 @@ fn narrow_by_scope<'a>(snapshots: &[SymbolSnapshot], caller: &SymbolSnapshot, ca
     }
 }
 
+/// Semantic Resolution & Reliability Checkpoint, Priority 1: narrows
+/// `candidates` to those whose own generic arity matches `call_arity`,
+/// when `call_arity` is known (`Some`) — the call site itself exposes
+/// a generic/template clause (`Foo<T>(...)`, B2-ID-011's own
+/// extraction). Returns the UNFILTERED `candidates` slice unchanged
+/// when `call_arity` is `None` (an ordinary, non-generic call — no
+/// arity information to narrow by at all, never treated as "arity
+/// zero"; see `wrapped_callee_simple_name`'s own doc comment for why
+/// these two cases must never be conflated).
+///
+/// # Scope: C# only, confirmed by direct grammar probe — not C++
+///
+/// A C# `method_declaration`'s own `type_parameter_list` (its
+/// generic-method arity) is a DIRECT CHILD of the declaration node
+/// itself, inside the exact span `extract/csharp.rs` promotes as that
+/// method's own `signature_text` — reachable today by re-parsing
+/// `candidate.signature()` exactly as `narrow_by_scope`'s own sibling
+/// resolvers already re-parse signatures for other purposes.
+///
+/// C++ is NOT handled here, confirmed structurally absent rather than
+/// merely unimplemented: a C++ TEMPLATE function
+/// (`template<typename T> void Handle() {}`) is extracted by
+/// `extract/cpp.rs` as a bare `function_definition` candidate whose
+/// own `span`/`signature_text` is ONLY the inner `function_definition`
+/// node's text (`"void Handle() {}"`) — the enclosing
+/// `template_declaration` and its own `template_parameter_list` are
+/// OUTSIDE that span entirely (confirmed via a direct grammar probe:
+/// `template_declaration` is the PARENT of `function_definition`, not
+/// reachable by re-parsing the promoted signature fragment in
+/// isolation). A C++ template function's own arity is therefore not
+/// recoverable from the current snapshot model at all today — a
+/// separate, pre-existing extraction gap, not something this
+/// checkpoint's own narrow scope (arity-aware CANDIDATE NARROWING, not
+/// new extraction surface) fixes. Documented honestly as a residual
+/// limitation rather than silently applying narrowing that would
+/// always find `None` and look like "C++ was checked and found to
+/// have no arity-reducible ambiguity" when the true state is "C++
+/// method arity is currently unobservable."
+fn narrow_candidates_by_call_site_arity<'a>(candidates: &[&'a SymbolSnapshot], call_arity: Option<usize>) -> Vec<&'a SymbolSnapshot> {
+    let Some(arity) = call_arity else {
+        return candidates.to_vec();
+    };
+    let narrowed: Vec<&SymbolSnapshot> = candidates.iter().copied().filter(|c| csharp_method_generic_arity(c) == Some(arity)).collect();
+    if narrowed.is_empty() {
+        // Every candidate either has an unknown/unobservable arity (a
+        // non-C# candidate) or a non-matching one. Narrowing to an
+        // EMPTY set here would incorrectly turn "ambiguous among real
+        // candidates" into "unresolved: no candidate" — a worse,
+        // dishonest outcome (the real candidates DO exist; this
+        // resolver simply cannot use arity to pick among them in this
+        // case). Return the ORIGINAL, unfiltered set instead, so the
+        // caller's existing ambiguity handling applies unchanged.
+        candidates.to_vec()
+    } else {
+        narrowed
+    }
+}
+
+/// A C# `SymbolSnapshot`'s own method-level generic arity, re-derived
+/// by re-parsing `candidate.signature()` as a standalone C# fragment
+/// (the same re-parse-the-signature convention every other resolver in
+/// this crate already uses) and counting the resulting declaration
+/// node's own direct `type_parameter_list` child — the exact same
+/// counting logic `csharp_declarations.rs`'s own `generic_arity_of`
+/// already established for TYPE declarations, applied here to a
+/// METHOD-shaped declaration instead (confirmed via direct grammar
+/// probe: identical shape, `type_parameter_list` is a direct child
+/// either way).
+///
+/// Confirmed via direct grammar probe that a standalone re-parse of a
+/// real extracted method signature (no enclosing `class`) produces
+/// `local_function_statement`, NOT `method_declaration` — a re-parse
+/// artifact of the missing class context, not a real semantic
+/// difference (the real snapshot IS a class method; `extract/csharp.rs`
+/// only ever promotes a `method_declaration` as `SymbolKind::Method`
+/// in the first place, confirmed by the `candidate.kind()` guard
+/// below). Both node kinds are searched for here, for exactly this
+/// reason.
+///
+/// Returns `None` for a non-C# candidate (file's own language is not
+/// C#) or a candidate whose signature fails to re-parse as a
+/// `method_declaration`/`local_function_statement` at all — never a
+/// guessed `Some(0)` for a case this function cannot actually observe.
+fn csharp_method_generic_arity(candidate: &SymbolSnapshot) -> Option<usize> {
+    if candidate.kind() != SymbolKind::Method {
+        return None;
+    }
+    let parser = parser_for(candidate.file())?;
+    let tree = parser.parse(candidate.signature().as_str().as_bytes()).ok()?;
+    if tree.language() != Language::CSharp {
+        return None;
+    }
+    let root = tree.tree().root_node();
+    let method_node = find_descendant_of_kind(root, &["method_declaration", "local_function_statement"])?;
+    let mut cursor = method_node.walk();
+    let type_parameter_list = method_node.children(&mut cursor).find(|c| c.kind() == "type_parameter_list")?;
+    let mut tp_cursor = type_parameter_list.walk();
+    Some(type_parameter_list.children(&mut tp_cursor).filter(|c| c.kind() == "type_parameter").count())
+}
+
+/// Depth-first search for the first descendant (including `node`
+/// itself) of any kind in `kinds`. Used by
+/// [`csharp_method_generic_arity`] to find the re-parsed fragment's own
+/// method-shaped declaration node without assuming it is the tree's
+/// direct root child, and without assuming which of the two possible
+/// node kinds a standalone re-parse produces (see that function's own
+/// doc comment for why there are two).
+fn find_descendant_of_kind<'a>(node: tree_sitter::Node<'a>, kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
+    if kinds.contains(&node.kind()) {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_descendant_of_kind(child, kinds) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Inserts `edge` into `per_target` (keyed by `edge.to`), or, if a
 /// different occurrence already produced an edge to the SAME target,
 /// keeps whichever one `prefer_edge` ranks higher — deterministically,
@@ -511,6 +695,16 @@ pub(super) fn call_names_in_tree(tree: &crate::parse::ParseTree) -> Vec<String> 
     call_sites_in_tree(tree).into_iter().map(|site| site.callee_name).collect()
 }
 
+/// Test/probe convenience: callee name paired with its own call-site
+/// generic arity (`None` for a non-generic/template call), per the
+/// Semantic Resolution & Reliability Checkpoint's own arity-aware
+/// extraction. Mirrors [`call_names_in_tree`] exactly, extended with
+/// the one new field.
+#[cfg(test)]
+pub(super) fn call_names_with_arity_in_tree(tree: &crate::parse::ParseTree) -> Vec<(String, Option<usize>)> {
+    call_sites_in_tree(tree).into_iter().map(|site| (site.callee_name, site.generic_arity)).collect()
+}
+
 /// One syntactic call-site occurrence: the callee name being called,
 /// plus (Task 9.5, Priority 5(A)) the `self`/`this`-qualified receiver
 /// FIELD name, when the call is of the shape `self.field.method(...)`/
@@ -522,6 +716,14 @@ pub(super) fn call_names_in_tree(tree: &crate::parse::ParseTree) -> Vec<String> 
 /// comment for why this is deliberately conservative).
 pub(super) struct CallSite {
     pub(super) callee_name: String,
+    /// Semantic Resolution & Reliability Checkpoint: this call site's
+    /// own generic/template type-argument count, when the call is
+    /// generic/template-shaped (`Foo<T>()`, `obj.Foo<T1,T2>()`) —
+    /// `None` for an ordinary, non-generic call. See
+    /// `wrapped_callee_simple_name`'s own doc comment for exactly why
+    /// `None` (never `Some(0)`) is the correct "no arity information"
+    /// value.
+    pub(super) generic_arity: Option<usize>,
     pub(super) self_receiver_field: Option<String>,
     /// B2-ID-006: the call expression's own start byte, relative to the
     /// re-parsed FRAGMENT text (`caller.signature()`'s own bytes, NOT
@@ -552,10 +754,11 @@ fn walk_for_calls(node: tree_sitter::Node, source: &[u8], language: Language, ou
         Language::Html | Language::Css => false,
     };
     if is_call_node {
-        if let Some(callee_name) = callee_name(node, source) {
+        if let Some((callee_name, generic_arity)) = callee_name(node, source) {
             let self_receiver_field = node.child(0).and_then(|callee| self_or_this_receiver_field_name(callee, source));
             out.push(CallSite {
                 callee_name,
+                generic_arity,
                 self_receiver_field,
                 fragment_relative_start_byte: node.start_byte(),
             });
@@ -654,10 +857,10 @@ fn walk_for_calls(node: tree_sitter::Node, source: &[u8], language: Language, ou
 /// `generic_name` did not. Both are added to this function's own
 /// existing C#/C++ handling, via the SAME two helper functions this
 /// fix already introduced for C# (renamed to reflect both languages).
-fn callee_name(call_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+fn callee_name(call_node: tree_sitter::Node, source: &[u8]) -> Option<(String, Option<usize>)> {
     let callee = call_node.child(0)?;
     match callee.kind() {
-        "identifier" => Some(text_of(callee, source)),
+        "identifier" => Some((text_of(callee, source), None)),
         "generic_name" | "template_function" => wrapped_callee_simple_name(callee, source),
         "attribute" | "field_expression" | "member_expression" | "member_access_expression" => {
             let mut cursor = callee.walk();
@@ -668,7 +871,7 @@ fn callee_name(call_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
             if matches!(last_name_child.kind(), "generic_name" | "template_method") {
                 wrapped_callee_simple_name(last_name_child, source)
             } else {
-                Some(text_of(last_name_child, source))
+                Some((text_of(last_name_child, source), None))
             }
         }
         _ => None,
@@ -687,16 +890,41 @@ fn callee_name(call_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
 /// — no competing same-kind sibling exists at this position (unlike
 /// `method_declaration`'s own return-type/name collision B2-ID-009
 /// fixed), so a positional "first matching-kind child" search is safe
-/// here, not the bug class that fix was scoped to. This function never
-/// inspects the type/template-argument list's own contents (how MANY
-/// generic arguments were passed, or what they are) — B2-ID-011 is an
-/// extraction-only fix; arity is deliberately not extracted or used
-/// here, per the task's own explicit scope (no type-aware or
-/// arity-aware target disambiguation is introduced by this function).
-fn wrapped_callee_simple_name(wrapper_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+/// here, not the bug class that fix was scoped to.
+///
+/// # Semantic Resolution & Reliability Checkpoint: call-site generic arity
+///
+/// Also counts the wrapper's own `type_argument_list`/
+/// `template_argument_list` children (every direct child EXCLUDING the
+/// literal `<`/`>`/`,` punctuation tokens — the same counting
+/// convention `csharp_declarations.rs`'s own `generic_arity_of`
+/// already established for TYPE declarations, confirmed identical here
+/// by direct grammar probe: a C# call's `type_argument_list` holds one
+/// `identifier`/`predefined_type`/... per type argument; a C++ call's
+/// `template_argument_list` holds one `type_descriptor` per argument),
+/// returned as `Some(arity)`. A non-generic/template call (the plain
+/// `"identifier"` arm above, and the plain-name branch of the
+/// receiver-qualified arm) returns `None` for arity — meaningfully
+/// different from `Some(0)`: `None` means "this call site carries no
+/// arity information to narrow by at all" (arity-aware resolution must
+/// never apply here), while a real `Foo()` call with explicit empty
+/// angle brackets does not occur in either grammar (you cannot write
+/// `Foo<>()` to mean "zero type arguments" — a method with no type
+/// parameters is simply called as a plain identifier), so `Some(0)`
+/// is not a real case this function needs to produce.
+fn wrapped_callee_simple_name(wrapper_node: tree_sitter::Node, source: &[u8]) -> Option<(String, Option<usize>)> {
     let mut cursor = wrapper_node.walk();
     let name_child = wrapper_node.children(&mut cursor).find(|c| matches!(c.kind(), "identifier" | "field_identifier"))?;
-    Some(text_of(name_child, source))
+    let name = text_of(name_child, source);
+    let mut arg_cursor = wrapper_node.walk();
+    let arity = wrapper_node
+        .children(&mut arg_cursor)
+        .find(|c| matches!(c.kind(), "type_argument_list" | "template_argument_list"))
+        .map(|list| {
+            let mut list_cursor = list.walk();
+            list.children(&mut list_cursor).filter(|c| !matches!(c.kind(), "<" | ">" | ",")).count()
+        });
+    Some((name, arity))
 }
 
 /// `true` if `callee`'s node kind is one of the receiver-qualified
@@ -1181,16 +1409,26 @@ mod tests {
             assert_eq!(edges[0].to, callee.id());
         }
 
-        /// Case 8 (required): the SAME simple name shared by a generic
-        /// and a non-generic overload must extract/resolve to the SAME
-        /// bare name either way -- this fix does not, and must not,
-        /// attempt arity-aware disambiguation (that is explicitly out
-        /// of scope; the two overloads sharing one bare name produce
-        /// the SAME kind of ambiguity `resolve_calls` already handles
-        /// for any other same-named candidate pair, confirmed here by
-        /// asserting NameHeuristic/no-edge, never an arbitrary pick).
+        /// Case 8 (required), UPDATED by the Semantic Resolution &
+        /// Reliability Checkpoint: at B2-ID-011's own time, this test
+        /// asserted that a generic/non-generic overload collision
+        /// sharing one bare name produced NO edge, because arity-aware
+        /// disambiguation was explicitly out of that fix's own scope.
+        /// The checkpoint's own Priority 1 now explicitly AUTHORIZES
+        /// exactly this disambiguation: the call site `Handle<int>()`
+        /// has arity 1; `Handle<T>()` also has arity 1 (matches);
+        /// `Handle()` has NO generic clause at all (arity `None`, never
+        /// matches any known call-site arity) -- arity narrowing
+        /// correctly finds exactly one real match and resolves it,
+        /// `NameHeuristic` tier (arity narrowing is more than bare-name
+        /// matching but not full overload resolution — see
+        /// `narrow_candidates_by_call_site_arity`'s own doc comment for
+        /// why `StaticAnalysis` is not used here). This supersedes the
+        /// OLD assertion deliberately, not a regression: B2-ID-011
+        /// itself never claimed arity-aware resolution was permanently
+        /// out of scope, only that IT was not the task to add it.
         #[test]
-        fn generic_and_non_generic_overloads_sharing_one_bare_name_are_both_candidates_not_disambiguated_by_arity() {
+        fn generic_and_non_generic_overloads_sharing_one_bare_name_are_now_correctly_narrowed_by_arity() {
             let repo_for_test = {
                 let mut registry = RepositoryRegistry::new();
                 registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
@@ -1202,13 +1440,9 @@ mod tests {
 
             let edges = resolve_calls(&snapshots).unwrap();
 
-            // Both share the bare name "Handle" and neither shares the
-            // caller's own file/class, so per CALL-RES-A1/A2 this is
-            // repo-wide ambiguity with no scope signal -- no edge,
-            // exactly the same outcome any other same-named pair would
-            // produce. This fix must not special-case generic arity to
-            // "fix" this ambiguity.
-            assert!(edges.is_empty(), "two same-named candidates (generic + non-generic) with no scope signal must produce no edge, not an arbitrary pick: got {edges:?}");
+            assert_eq!(edges.len(), 1, "arity 1 matches ONLY the generic overload -- the non-generic one (no arity at all) must never be a candidate match: got {edges:?}");
+            assert_eq!(edges[0].to, generic_overload.id());
+            assert_eq!(edges[0].evidence.method(), codegraph_domain::ResolutionMethod::NameHeuristic, "arity-narrowed resolution is NameHeuristic, never StaticAnalysis");
         }
 
         /// Determinism: repeated occurrences of the same resolved
@@ -1266,6 +1500,174 @@ mod tests {
 
             assert_eq!(edges.len(), 1, "expected exactly one edge: {edges:?}");
             assert_eq!(edges[0].to, callee.id());
+        }
+    }
+
+    /// Semantic Resolution & Reliability Checkpoint, Priority 1:
+    /// arity-aware C# call resolution. Every fixture below mirrors the
+    /// real `App-vNext/Polly` shape B2-EVAL-008's own reliability-
+    /// layer pass measured directly (`Policy.HandleSyntax.cs`'s real 6
+    /// `Handle`-named overloads, 2 of which share arity 1 and differ
+    /// only in ordinary parameter type — confirmed to correctly STAY
+    /// ambiguous even after arity narrowing, never silently resolved
+    /// by this checkpoint's own narrower scope).
+    mod arity_aware_resolution {
+        use super::*;
+        use crate::parse::{CSharpParser, LanguageParser};
+
+        #[test]
+        fn call_site_arity_is_extracted_for_bare_and_receiver_qualified_generic_calls() {
+            let tree = CSharpParser.parse(b"class C { void M() { Handle<T>(); policy.Handle<A,B>(); Plain(); } }").unwrap();
+            let names_with_arity = call_names_with_arity_in_tree(&tree);
+            assert_eq!(
+                names_with_arity,
+                vec![("Handle".to_string(), Some(1)), ("Handle".to_string(), Some(2)), ("Plain".to_string(), None),],
+                "bare generic arity 1, receiver-qualified generic arity 2, ordinary call has no arity (None, never Some(0))"
+            );
+        }
+
+        #[test]
+        fn csharp_method_generic_arity_is_read_correctly_for_a_real_class_method() {
+            // Promoted via the REAL extractor (not a hand-built
+            // signature string) so the re-parse path this function
+            // depends on is exercised exactly as production does it.
+            let source = "class Policy {\n    public static PolicyBuilder Handle<TException>() { return null; }\n    public static PolicyBuilder HandleInner() { return null; }\n}\n";
+            let snapshots = real_csharp_snapshots("src/Policy.cs", source);
+            let handle = snapshots.iter().find(|s| s.name().as_str() == "Handle").unwrap();
+            let handle_inner = snapshots.iter().find(|s| s.name().as_str() == "HandleInner").unwrap();
+            assert_eq!(csharp_method_generic_arity(handle), Some(1));
+            // A NON-generic method has no `type_parameter_list` child
+            // at all -- correctly `None` ("no arity information"),
+            // never a guessed `Some(0)`, mirroring the exact same
+            // distinction `wrapped_callee_simple_name`'s own doc
+            // comment establishes for call sites.
+            assert_eq!(csharp_method_generic_arity(handle_inner), None);
+        }
+
+        #[test]
+        fn a_bare_generic_call_narrows_to_its_unique_same_arity_target_among_two_overloads() {
+            // Handle<TException>() [arity 1] vs. HandleOther() [arity
+            // 0, different bare name so it would never collide by name
+            // anyway] -- the REAL collision case is covered by the two
+            // tests below; this one confirms the basic single-overload
+            // arity match path end to end.
+            let source = "class Policy {\n    public static PolicyBuilder Handle<TException>() { return null; }\n}\nclass Caller {\n    void M() { Handle<TimeoutException>(); }\n}\n";
+            let snapshots = real_csharp_snapshots("src/a.cs", source);
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            let handle = snapshots.iter().find(|s| s.name().as_str() == "Handle").unwrap();
+            assert_eq!(edges.len(), 1, "expected exactly one edge: {edges:?}");
+            assert_eq!(edges[0].to, handle.id());
+        }
+
+        #[test]
+        fn the_real_polly_handle_shape_two_same_arity_overloads_are_correctly_narrowed_when_only_one_shares_the_call_sites_own_arity() {
+            // Mirrors Policy.HandleSyntax.cs's own real shape:
+            // Handle<TException>() [arity 1] and
+            // Handle<TException>(Func<TException,bool>) [ALSO arity 1
+            // -- the generic clause itself, not the ordinary parameter
+            // list, drives arity] are TWO overloads sharing both name
+            // AND arity. A call site with arity 2 (naming two type
+            // arguments) cannot match either of them, demonstrating
+            // arity narrowing correctly finds ZERO matches and falls
+            // back to the original, unfiltered ambiguity handling
+            // rather than incorrectly claiming a match that isn't
+            // there.
+            let source = "class Policy {\n    public static PolicyBuilder Handle<TException>() { return null; }\n    public static PolicyBuilder Handle<TException>(System.Func<TException, bool> p) { return null; }\n}\nclass Caller {\n    void M() { Handle<A,B>(); }\n}\n";
+            let snapshots = real_csharp_snapshots("src/a.cs", source);
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty(), "arity 2 matches NEITHER real arity-1 overload -- must never be force-matched to one of them");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous);
+            assert_eq!(attempts[0].candidates.len(), 2, "both same-arity-1 overloads remain real candidates the call's own arity-2 just cannot pick between");
+        }
+
+        #[test]
+        fn two_overloads_sharing_both_name_and_arity_remain_genuinely_ambiguous_after_arity_narrowing() {
+            // THE central negative case this checkpoint must get
+            // right: Handle<TException>() and
+            // Handle<TException>(Func<TException,bool>) both have
+            // arity 1 (confirmed above). A call site that ALSO has
+            // arity 1 (`Handle<TimeoutException>(somePredicate)`)
+            // narrows to BOTH of them -- arity alone cannot
+            // distinguish overloads that differ only in ORDINARY
+            // parameter type, which is exactly what B2-EVAL-008's own
+            // real-corpus measurement found and what this checkpoint
+            // is explicitly scoped to NOT solve (that is A5's future
+            // job). Must stay Ambiguous, never silently resolved to
+            // either one.
+            let source = "class Policy {\n    public static PolicyBuilder Handle<TException>() { return null; }\n    public static PolicyBuilder Handle<TException>(System.Func<TException, bool> p) { return null; }\n}\nclass Caller {\n    void M() { Handle<TimeoutException>(somePredicate); }\n}\n";
+            let snapshots = real_csharp_snapshots("src/a.cs", source);
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty(), "two real overloads share the SAME arity -- arity narrowing must never force-pick one of them");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous, "genuine same-arity overload ambiguity must be reported honestly, never upgraded to a false certainty");
+            assert_eq!(attempts[0].candidates.len(), 2);
+        }
+
+        #[test]
+        fn an_ordinary_non_generic_call_is_completely_unaffected_by_arity_narrowing() {
+            // call_site.generic_arity is None here -- arity narrowing
+            // must be a no-op, confirming this checkpoint adds no
+            // behavior change whatsoever for the vast majority of
+            // (non-generic) call sites every prior finding in this
+            // series already validated.
+            let caller = test_snapshot("src/a.cs", "M", "method_declaration", "void M() { Helper(); }");
+            let callee = test_snapshot("src/a.cs", "Helper", "method_declaration", "void Helper() {}");
+            let snapshots = vec![caller.clone(), callee.clone()];
+
+            let edges = resolve_calls(&snapshots).unwrap();
+
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0].to, callee.id());
+        }
+
+        #[test]
+        fn cpp_template_calls_are_unaffected_by_csharp_only_arity_narrowing_no_regression() {
+            // C++ is explicitly out of scope for method-side arity
+            // (csharp_method_generic_arity's own C#-only guard) --
+            // confirms a C++ template call with real ambiguity still
+            // goes through the EXACT same pre-existing scope-narrowing/
+            // ambiguity path as before this checkpoint, unaffected by
+            // the new C#-only logic.
+            let caller = test_snapshot("src/a.cpp", "M", "function_definition", "void M() { Handle<int>(); }");
+            let candidate_a = test_snapshot("src/a.cpp", "Handle", "function_definition", "void Handle() { /* a */ }");
+            let candidate_b = test_snapshot("src/b.cpp", "Handle", "function_definition", "void Handle() { /* b */ }");
+            let snapshots = vec![caller.clone(), candidate_a, candidate_b];
+
+            let (edges, attempts) = resolve_calls_with_negative_knowledge(&snapshots).unwrap();
+
+            assert!(edges.is_empty(), "real cross-file ambiguity among two Handle candidates must remain unresolved for C++, exactly as before this checkpoint");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].tier, codegraph_domain::EvidenceTier::Ambiguous);
+        }
+
+        /// Promotes real `method_declaration`/`class_declaration`
+        /// candidates from `source` via the REAL extractor
+        /// (`extract_symbols_reporting_rejections` + `promote`), all
+        /// in the SAME repo so cross-snapshot resolution works
+        /// normally — mirrors the real-extraction fixture pattern
+        /// `b2_id_007_nested_declaration_ownership`/
+        /// `b2_id_010_partial_class_reconciliation` already established
+        /// elsewhere in this crate, reused here rather than
+        /// hand-building signature strings that could silently drift
+        /// from what the real extractor actually produces.
+        fn real_csharp_snapshots(path: &str, source: &str) -> Vec<SymbolSnapshot> {
+            use crate::extract::extract_symbols_reporting_rejections;
+            let mut registry = RepositoryRegistry::new();
+            let repo = registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap());
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = parser_for(&file).expect("csharp extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("fixture must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture must not trigger a rejection: {rejections:?}");
+            candidates.into_iter().map(|c| promote(&c, file.clone()).expect("promote")).collect()
         }
     }
 
@@ -2387,4 +2789,5 @@ mod tests {
             assert_eq!(attempts[0].candidates.len(), 2, "both real candidates must remain visible -- neither silently dropped to manufacture a single answer");
         }
     }
+
 }
