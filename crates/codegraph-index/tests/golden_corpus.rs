@@ -370,6 +370,81 @@ fn signature_too_long_rejection_links_to_extraction_rejected_reason() {
     );
 }
 
+// ===========================================================================
+// Semantic Resolution & Reliability Checkpoint, Priority 6: real-case
+// agent-policy re-check. Drives the SAME two arity-aware golden-corpus
+// fixtures above through the real production pipeline, then checks
+// codegraph_index::agent_policy::evaluate against the REAL resulting
+// EvidenceTier for each case -- confirming the policy layer's own
+// transitions are correct for cases this checkpoint's new resolution
+// path actually produces, not merely asserted abstractly over
+// synthetic EvidenceTier values (agent_policy.rs's own existing unit
+// tests already cover the abstract tier-by-tier rules; this is the
+// real-case integration check Priority 6 explicitly asks for).
+// ===========================================================================
+
+#[test]
+fn arity_resolved_edge_is_heuristic_tier_and_the_policy_permits_it_only_with_disclosed_uncertainty() {
+    let source = CorpusSource::load("csharp", &["generic_arity_narrowing_call_resolution.cs"]);
+    let outcome = index(&source);
+
+    let caller = find_one_by_name_in_file(&outcome, "ArityResolvesAmbiguity", "generic_arity_narrowing_call_resolution.cs");
+    let edges = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls));
+    assert_eq!(edges.len(), 1, "arity narrowing must have produced exactly one real Calls edge");
+    let tier = codegraph_domain::EvidenceTier::from_resolution_method(edges[0].evidence.method());
+
+    // The real, load-bearing transition this checkpoint's own Priority
+    // 1 made possible: BEFORE arity narrowing existed, this call site
+    // would have had 2+ same-named candidates and stayed Ambiguous
+    // (Forbidden for every intended use, including mere display). The
+    // real resolver now produces a Heuristic-tier edge instead -- more
+    // permissive than Ambiguous/Forbidden, but still deliberately NOT
+    // Resolved/fully Permitted, since arity narrowing is a syntactic
+    // fact weaker than full overload resolution (see calls.rs's own
+    // doc comment on this exact classification choice).
+    assert_eq!(tier, codegraph_domain::EvidenceTier::Heuristic, "an arity-narrowed single-survivor edge must classify as Heuristic, never Resolved -- arity narrowing is strictly more than bare-name matching but not full type-aware overload resolution");
+
+    let display_verdict = codegraph_index::agent_policy::evaluate(tier, codegraph_index::agent_policy::IntendedUse::InformationalDisplay);
+    assert_eq!(display_verdict, codegraph_index::agent_policy::PolicyVerdict::PermittedWithDisclosedUncertainty, "informational display of an arity-resolved edge must disclose the uncertainty, never present it as certain fact");
+
+    let high_impact_verdict = codegraph_index::agent_policy::evaluate(tier, codegraph_index::agent_policy::IntendedUse::HighImpactModification);
+    assert!(matches!(high_impact_verdict, codegraph_index::agent_policy::PolicyVerdict::Forbidden { .. }), "a high-impact modification must still be Forbidden on a Heuristic-tier (arity-narrowed) edge alone -- it requires independent confirmation first, exactly like any other Heuristic edge");
+}
+
+#[test]
+fn same_arity_ambiguity_produces_a_real_callattempt_the_policy_forbids_for_every_use() {
+    let source = CorpusSource::load("csharp", &["generic_arity_narrowing_call_resolution.cs"]);
+    let outcome = index(&source);
+
+    let caller = find_one_by_name_in_file(&outcome, "SameArityStillAmbiguous", "generic_arity_narrowing_call_resolution.cs");
+    let edges = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls));
+    assert!(edges.is_empty(), "the required negative case must still produce no edge");
+
+    let attempt = outcome
+        .call_attempts
+        .iter()
+        .find(|a| a.callee_name == "Choose" && a.caller == caller.id())
+        .expect("a real CallAttempt must exist for this call site through the real production pipeline");
+    assert_eq!(attempt.tier, codegraph_domain::EvidenceTier::Ambiguous, "same generic arity with differing ordinary parameter types must stay genuinely Ambiguous, never silently narrowed to Heuristic/Resolved just because SOME arity information was available");
+
+    // Arity narrowing correctly did NOT resolve this to false certainty
+    // -- the real downstream policy consequence must be the SAME
+    // Forbidden-for-every-use verdict as any other genuine ambiguity,
+    // confirmed here against this checkpoint's own real new case, not
+    // only the pre-existing synthetic EvidenceTier::Ambiguous unit
+    // tests in agent_policy.rs itself.
+    for intended_use in [
+        codegraph_index::agent_policy::IntendedUse::InformationalDisplay,
+        codegraph_index::agent_policy::IntendedUse::AssertAsFactOrSoleJustification,
+        codegraph_index::agent_policy::IntendedUse::HighImpactModification,
+    ] {
+        assert!(
+            matches!(codegraph_index::agent_policy::evaluate(attempt.tier, intended_use), codegraph_index::agent_policy::PolicyVerdict::Forbidden { .. }),
+            "a real same-arity-ambiguity CallAttempt must be Forbidden for intended use {intended_use:?}, including mere informational display"
+        );
+    }
+}
+
 #[test]
 fn same_generic_arity_with_differing_ordinary_parameter_type_stays_ambiguous() {
     let source = CorpusSource::load("csharp", &["generic_arity_narrowing_call_resolution.cs"]);
