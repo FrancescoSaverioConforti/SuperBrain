@@ -46,6 +46,25 @@ fn walk(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Candidate>, class_
                 out.push(candidate);
             }
         }
+        // B2-ID-020: TypeScript/Tsx's `abstract_class_declaration` is a
+        // DISTINCT node kind from `class_declaration` (confirmed by real
+        // parse: `abstract class Foo {}` produces `abstract_class_declaration`
+        // wrapping the same direct-child shape `class_declaration` has --
+        // `abstract`, `class`, the name identifier, an optional
+        // `class_heritage`, `class_body` -- not a `class_declaration` with
+        // an extra modifier). Named via the SAME `class_name_kind` child
+        // class_declaration already uses under TS/Tsx, and reported under
+        // the SAME `kind_hint` string ("class_declaration") via
+        // `build_candidate_with_kind` so it maps to `SymbolKind::Class`
+        // through the exact same existing mapping entry -- no new
+        // SymbolKind, no new mapping, no abstract-specific semantics
+        // beyond making the symbol itself visible. This node kind does
+        // not exist in plain JavaScript's grammar at all.
+        "abstract_class_declaration" => {
+            if let Some(candidate) = named_by_direct_child_kind_with_kind(node, source, class_name_kind, "class_declaration") {
+                out.push(candidate);
+            }
+        }
         // B2-ID-018: TypeScript/Tsx's `interface_declaration` names via
         // a direct `type_identifier` child — confirmed by real parse,
         // same name-kind `class_declaration` already uses under TS/Tsx.
@@ -90,6 +109,17 @@ fn named_by_direct_child_kind(node: tree_sitter::Node, source: &[u8], name_kind:
     let name_node = node.children(&mut cursor).find(|c| c.kind() == name_kind && !c.is_missing())?;
     let name = node_text(&name_node, source).to_string();
     build_candidate(node, source, name)
+}
+
+/// Same as [`named_by_direct_child_kind`], but reports the candidate
+/// under an explicit `kind_hint` rather than the node's own
+/// `node.kind()` -- used by `abstract_class_declaration` (B2-ID-020) to
+/// map through the SAME existing `"class_declaration"` mapping entry.
+fn named_by_direct_child_kind_with_kind(node: tree_sitter::Node, source: &[u8], name_kind: &str, kind_hint: &str) -> Option<Candidate> {
+    let mut cursor = node.walk();
+    let name_node = node.children(&mut cursor).find(|c| c.kind() == name_kind && !c.is_missing())?;
+    let name = node_text(&name_node, source).to_string();
+    build_candidate_with_kind(node, source, name, kind_hint.to_string())
 }
 
 /// An `arrow_function` node has no name child of its own. The common
@@ -578,5 +608,64 @@ mod tests {
         let candidates = extract_tsx(b"interface Foo { bar(): void; }\n");
         let iface = candidates.iter().find(|c| c.0 == "Foo").expect("interface Foo must be extracted in Tsx");
         assert_eq!(iface.1, "interface_declaration");
+    }
+
+    // --- B2-ID-020: TypeScript `abstract_class_declaration` extraction ---
+
+    #[test]
+    fn typescript_simple_abstract_class_is_extracted_as_class() {
+        let candidates = extract_ts(b"abstract class Foo { bar(): void {} }\n");
+        let class = candidates.iter().find(|c| c.0 == "Foo").expect("abstract class Foo must be extracted");
+        assert_eq!(class.1, "class_declaration", "must map through the SAME existing class_declaration kind_hint, not a new/synthetic one");
+        let method = candidates.iter().find(|c| c.0 == "bar").expect("abstract class's own method bar must still be extracted");
+        assert_eq!(method.1, "method_definition");
+    }
+
+    #[test]
+    fn typescript_abstract_class_extends_is_extracted() {
+        let candidates = extract_ts(b"abstract class Foo extends Base { bar(): void {} }\n");
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Foo"), "expected Foo in {names:?}");
+    }
+
+    #[test]
+    fn typescript_abstract_class_implements_is_extracted() {
+        let candidates = extract_ts(b"abstract class Foo implements IFoo { bar(): void {} }\n");
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Foo"), "expected Foo in {names:?}");
+    }
+
+    #[test]
+    fn typescript_abstract_class_implements_multiple_interfaces_is_extracted() {
+        let candidates = extract_ts(b"abstract class Foo implements IFoo, IBar { bar(): void {} }\n");
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Foo"), "expected Foo in {names:?}");
+    }
+
+    #[test]
+    fn typescript_generic_abstract_class_is_extracted() {
+        // Already supported naturally: generic_type_parameters is just
+        // another direct child, irrelevant to named_by_direct_child_kind's
+        // own search for the name_kind child -- no extra work needed.
+        let candidates = extract_ts(b"abstract class Foo<T> { bar(x: T): void {} }\n");
+        let names: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        assert!(names.contains(&"Foo"), "expected Foo in {names:?}");
+    }
+
+    #[test]
+    fn typescript_abstract_class_is_not_extracted_from_plain_javascript() {
+        // Plain JavaScript's grammar has no `abstract_class_declaration`
+        // node kind at all -- sanity check that the new match arm is
+        // genuinely unreachable from `extract_javascript`, not just
+        // untested.
+        let candidates = extract_js(b"const x = 1;\n");
+        assert!(!candidates.iter().any(|c| c.1 == "abstract_class_declaration"));
+    }
+
+    #[test]
+    fn typescript_abstract_class_in_tsx_is_extracted() {
+        let candidates = extract_tsx(b"abstract class Foo { bar(): void {} }\n");
+        let class = candidates.iter().find(|c| c.0 == "Foo").expect("abstract class Foo must be extracted in Tsx");
+        assert_eq!(class.1, "class_declaration");
     }
 }
