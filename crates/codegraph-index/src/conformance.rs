@@ -619,7 +619,7 @@ mod tests {
         /// with the correct `FileIdentity`s itself, so the SAME file
         /// content list can be reused for both paths without the
         /// caller juggling two different `RepositoryId`s by hand.
-        fn assert_full_and_incremental_agree(
+        pub(super) fn assert_full_and_incremental_agree(
             commit_a_files: &[(&str, &[u8])],
             commit_b_files: &[(&str, &[u8])],
             commit_a: &CommitHash,
@@ -824,51 +824,42 @@ mod tests {
         }
     }
 
-    /// CALL-RES-A4 reliability-policy re-check, "Full/incremental parity
-    /// extension (§15)" item. The honest, surprising finding this test
-    /// exists to pin down with real evidence rather than prose: the
-    /// REAL production entry point this module's own
-    /// `assert_full_and_incremental_agree` helper exercises
+    /// CALL-RES-A4 wiring task: the prior checkpoint's reliability-policy
+    /// re-check found that the REAL production entry point this module's
+    /// own `assert_full_and_incremental_agree` helper exercises
     /// (`CodeGraphIndexer::observe_commit`, via
     /// `resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`
-    /// at `incremental/indexer.rs`'s own call-resolution step) calls
+    /// at `incremental/indexer.rs`'s own call-resolution step) called
     /// `resolve_calls_with_extraction_rejections` — the PRE-A4 entry
-    /// point — for ITS call-resolution pass, never
+    /// point — for its call-resolution pass, never
     /// `resolve_calls_with_imports`/`resolve_calls_with_namespace_context`,
-    /// even though the SAME real `csharp_contexts` (and, elsewhere in
-    /// the same pipeline, real `import_facts`) are already computed and
-    /// available at that exact call site (confirmed by reading
-    /// `crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`'s
-    /// own body directly: it hard-codes the pre-A4 function, full stop).
-    /// A4's own Python-alias and C#-namespace mechanisms are therefore
-    /// real, tested, mutation-closed, and separately measured on real
-    /// corpora via standalone example binaries and unit tests — but are
-    /// NOT reachable from `CodeGraphIndexer` at all, in either the full
-    /// or the incremental path (both paths call the exact same
-    /// function). "Full/incremental parity for A4" is consequently
-    /// VACUOUSLY true against the real indexer today, for the
-    /// uninteresting reason that A4 never runs there at all, not
-    /// because its real mechanism has been parity-checked.
-    mod call_res_a4_not_wired_into_the_real_indexer {
+    /// even though the SAME real `csharp_contexts`/`import_facts` were
+    /// already computed and available at that exact call site. This
+    /// module now wires `import_facts` through to that call (both the
+    /// full-reindex path, via `pipeline::index_files`, and the
+    /// incremental path, via `indexer.rs`'s own `incremental_reindex`)
+    /// and routes it through `resolve_calls_with_namespace_context`
+    /// instead. This test, which used to PIN THE GAP (asserting the
+    /// stale `Ambiguous(2)` outcome), now confirms the FIX with the
+    /// exact same real data and real entry point.
+    mod call_res_a4_wired_into_the_real_indexer {
         use super::*;
         use crate::incremental::CodeGraphIndexer;
+        use codegraph_domain::ResolutionMethod;
 
-        /// Demonstrates the gap directly with real data, rather than
-        /// merely asserting it from reading source: builds the EXACT
-        /// real-corpus shape `edges::calls`'s own
+        /// Builds the EXACT real-corpus shape `edges::calls`'s own
         /// `namespace_import_excludes_the_non_imported_namespace_candidate`
-        /// test proves A4's namespace mechanism DOES resolve (two
+        /// test proves A4's namespace mechanism resolves (two
         /// same-named candidates in different namespaces, caller `using`s
         /// one of them) and runs it through the REAL
-        /// `CodeGraphIndexer::observe_commit` entry point. If A4 were
-        /// wired in, this call site would be `Resolved`-tier (well,
-        /// `Heuristic`, per A4's own `NameHeuristic` evidence) with
-        /// `candidate_count == 1`. It is not: the real indexer still
-        /// reports it as the pre-A4 outcome, `Ambiguous` with 2
-        /// candidates — confirming A4's own real mechanism contributes
-        /// NOTHING to what `CodeGraphIndexer` actually produces today.
+        /// `CodeGraphIndexer::observe_commit` entry point (this task's
+        /// required live-indexer test 1). Confirms the real indexer now
+        /// reports `Heuristic`/1-candidate (A4's own `NameHeuristic`
+        /// evidence), not the pre-wiring `Ambiguous`/2-candidate outcome,
+        /// and that a real `Calls` edge to the correct, single `Target`
+        /// now exists.
         #[test]
-        fn the_real_indexer_still_reports_the_pre_a4_ambiguous_outcome_for_a_case_a4_itself_resolves() {
+        fn the_real_indexer_now_resolves_a_case_a4_itself_resolves() {
             let repo = test_repo();
             let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
             let source = FakeSource::new()
@@ -882,11 +873,194 @@ mod tests {
             let keys = call_attempt_keys(&outcome);
             let run_attempt = keys.iter().find(|k| k.callee_name == "Target");
             assert!(
-                run_attempt.is_some_and(|k| k.tier_debug == "Ambiguous" && k.candidate_count == 2),
-                "FINDING, confirmed with real data: the real indexer must still report this call site as the PRE-A4 Ambiguous(2) outcome, because resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge calls resolve_calls_with_extraction_rejections, never A4's own resolve_calls_with_namespace_context -- A4's real recovery mechanism (proven in edges::calls's own unit tests to resolve this EXACT shape to a single candidate) is unreachable from CodeGraphIndexer today. Got: {run_attempt:?}"
+                run_attempt.is_none(),
+                "A4 must resolve this call site to a real edge, not leave a CallAttempt behind -- found {run_attempt:?}"
             );
             let edges = edge_keys(&outcome);
-            assert!(edges.iter().all(|e| e.kind_debug != "Calls" || e.to.name != "Target"), "confirms no Calls edge to Target exists either -- A4 did not silently resolve this through some other path");
+            assert!(
+                edges.iter().any(|e| e.kind_debug == "Calls" && e.to.name == "Target" && e.to.file.contains("NsA")),
+                "the real wired indexer must now produce a Calls edge to NsA's Target (the `using NsA;` import-visible candidate), confirming A4's namespace mechanism is reachable from CodeGraphIndexer::observe_commit. Edges: {edges:?}"
+            );
+        }
+
+        /// This task's required live-indexer test 2: the SAME real case
+        /// and SAME expected outcome, reproduced through
+        /// `CodeGraphIndexer::observe_commit`'s INCREMENTAL path
+        /// (`NormalAdvance`, not `NewRepository`) — a first commit with
+        /// only the two namespace-ambiguous candidates, then a second
+        /// commit that adds the caller file as the only change.
+        #[test]
+        fn the_same_resolution_reproduces_through_observe_commit_incrementally() {
+            let repo = test_repo();
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/NsA/Foo.cs").unwrap(), b"namespace NsA;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit_a.clone(), "src/NsB/Foo.cs").unwrap(), b"namespace NsB;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/NsA/Foo.cs").unwrap(), b"namespace NsA;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/NsB/Foo.cs").unwrap(), b"namespace NsB;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit_b.clone(), "src/Caller.cs").unwrap(), b"using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let indexer = CodeGraphIndexer::new();
+            let first = indexer.observe_commit(&source, repo, &commit_a, None, &[]).unwrap();
+            let outcome = indexer.observe_commit(&source, repo, &commit_b, Some(&commit_a), &["src/Caller.cs".to_string()]).unwrap();
+            drop(first);
+
+            let keys = call_attempt_keys(&outcome);
+            assert!(keys.iter().find(|k| k.callee_name == "Target").is_none(), "incremental advance must also resolve this call site to a real edge, leaving no CallAttempt");
+            let edges = edge_keys(&outcome);
+            assert!(
+                edges.iter().any(|e| e.kind_debug == "Calls" && e.to.name == "Target" && e.to.file.contains("NsA")),
+                "the incremental path must reach the identical A4 resolution as the full path. Edges: {edges:?}"
+            );
+        }
+
+        /// This task's required live-indexer test 3: full-index vs.
+        /// incremental-index equivalence extended to edge, CallAttempt,
+        /// tier (both already covered by `assert_full_and_incremental_agree`'s
+        /// own `compare_full_incremental_state`, which this reuses
+        /// directly rather than duplicating), AND provenance — the one
+        /// dimension `compare_full_incremental_state` does not compare
+        /// (its `EdgeKeyTuple` has no evidence-note field). Confirms
+        /// both paths produce the real, raw `Edge`/`Evidence` for the
+        /// SAME A4 namespace-resolved call site with byte-identical
+        /// `ResolutionMethod` and evidence-note text, not just agreeing
+        /// multiset keys.
+        #[test]
+        fn full_and_incremental_agree_on_edge_call_attempt_tier_and_provenance_for_the_newly_wired_case() {
+            let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+            let (full_outcome, incremental_outcome) = super::call_attempt_adversarial_parity::assert_full_and_incremental_agree(
+                &[
+                    ("src/NsA/Foo.cs", b"namespace NsA;\nclass Foo { public void Target() {} }\n" as &[u8]),
+                    ("src/NsB/Foo.cs", b"namespace NsB;\nclass Foo { public void Target() {} }\n" as &[u8]),
+                ],
+                &[
+                    ("src/NsA/Foo.cs", b"namespace NsA;\nclass Foo { public void Target() {} }\n" as &[u8]),
+                    ("src/NsB/Foo.cs", b"namespace NsB;\nclass Foo { public void Target() {} }\n" as &[u8]),
+                    ("src/Caller.cs", b"using NsA;\nclass Caller { public void Run() { Target(); } }\n" as &[u8]),
+                ],
+                &commit_a,
+                &commit_b,
+                &["src/Caller.cs".to_string()],
+            );
+            // assert_full_and_incremental_agree already asserted
+            // compare_full_incremental_state is empty -- edges,
+            // CallAttempts (hence tier/reason/candidate_count), import
+            // facts, impl facts, and snapshots all already agree as a
+            // multiset. The real, raw Evidence (not just its EdgeKeyTuple
+            // projection) for the specific A4-resolved edge is compared
+            // directly here, against both outcomes' own real `Edge`s.
+            let find_target_edge = |outcome: &ObserveOutcome| -> codegraph_domain::Evidence {
+                outcome
+                    .graph
+                    .all_snapshots()
+                    .into_iter()
+                    .find(|s| s.name().as_str() == "Target" && s.file().relative_path().contains("NsA"))
+                    .and_then(|target| outcome.graph.incoming_edges(target.id(), Some(EdgeKind::Calls)).into_iter().next().cloned())
+                    .map(|e| e.evidence)
+                    .expect("the A4-resolved Calls edge to NsA's Target must exist in both outcomes")
+            };
+            let full_evidence = find_target_edge(&full_outcome);
+            let incremental_evidence = find_target_edge(&incremental_outcome);
+            assert_eq!(full_evidence.method(), incremental_evidence.method(), "full and incremental must agree on ResolutionMethod for the A4-resolved edge");
+            assert_eq!(full_evidence.note(), incremental_evidence.note(), "full and incremental must agree on the evidence note (provenance) for the A4-resolved edge, not just its structural key");
+            assert_eq!(full_evidence.method(), ResolutionMethod::NameHeuristic, "A4's namespace mechanism must produce NameHeuristic evidence, never StaticAnalysis -- it is still name-based linking, not full semantic resolution");
+        }
+
+        /// This task's required live-indexer test 4 (CRC-001): the EXACT
+        /// real-corpus shape `edges::calls::call_res_a4_import_alias::crc_001_ambiguous_constructor_call_regression_check`
+        /// already proves non-regressed at the isolated-resolver level,
+        /// now run through the REAL `CodeGraphIndexer::observe_commit`
+        /// entry point for the first time. A4's zero-candidate-only
+        /// scope never touches this `>=2` ambiguity -- must stay
+        /// honestly Ambiguous with 2 candidates through the real wired
+        /// indexer too, never resolved and never a new FalsePositive.
+        #[test]
+        fn crc_001_through_the_real_wired_indexer_stays_ambiguous() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "models/a.py").unwrap(), b"class RNNModel:\n    pass\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "models/b.py").unwrap(), b"class RNNModel:\n    pass\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "models/trainer.py").unwrap(), b"import os\n\n\ndef _run_trainer():\n    return RNNModel()\n");
+
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let keys = call_attempt_keys(&outcome);
+            let attempt = keys.iter().find(|k| k.callee_name == "RNNModel").expect("CRC-001's own ambiguous constructor call must still produce a CallAttempt through the real indexer");
+            assert_eq!(attempt.tier_debug, "Ambiguous", "CRC-001 must stay Ambiguous through the real wired indexer -- A4 never touches a >=2-candidate ambiguity");
+            assert_eq!(attempt.candidate_count, 2);
+            let edges = edge_keys(&outcome);
+            assert!(edges.iter().all(|e| e.to.name != "RNNModel"), "no Calls edge to RNNModel must exist -- confirms A4 introduced no new FalsePositive on CRC-001 through the real indexer");
+        }
+
+        /// This task's required live-indexer test 4 (CRC-002): the EXACT
+        /// real-corpus shape `edges::calls::call_res_a4_import_alias::crc_002_local_binding_shadowing_regression_check`
+        /// already proves byte-for-byte identical before/after at the
+        /// isolated-resolver level -- CRC-002 is PRE-EXISTING,
+        /// documented, undocumented-parameter-shadowing territory A4
+        /// has no visibility into (see CALL-RES-A4-CHECKPOINT.md's own
+        /// "No local-binding/parameter-shadowing awareness" residual
+        /// limitation): the pre-A4 baseline ALREADY wires a `Calls`
+        /// edge from `render` to the unrelated module-level `Button`,
+        /// and A4 does not change that. This test confirms the real
+        /// wired indexer reproduces that SAME pre-existing shape
+        /// (neither fixing nor worsening it), not a byte-identical-to-
+        /// isolated-resolver claim the real indexer's own full pipeline
+        /// (lineage/metrics/graph assembly) was never asserted to give.
+        #[test]
+        fn crc_002_through_the_real_wired_indexer_does_not_regress() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "components/other.py").unwrap(), b"def Button():\n    pass\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "components/card.py").unwrap(), b"import os\n\n\ndef render(Button):\n    return Button()\n");
+
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let edges = edge_keys(&outcome);
+            assert!(
+                edges.iter().any(|e| e.kind_debug == "Calls" && e.to.name == "Button" && e.to.file.contains("other.py")),
+                "CRC-002's own pre-existing shape (render's local `Button` parameter is not recognized as shadowing the module-level `Button`) must reproduce IDENTICALLY through the real wired indexer -- A4 neither introduces nor fixes this known limitation. Edges: {edges:?}"
+            );
+            let keys = call_attempt_keys(&outcome);
+            assert!(keys.iter().find(|k| k.callee_name == "Button").is_none(), "matches the isolated-resolver baseline exactly: this call site resolves directly (no CallAttempt), both before and after A4");
+        }
+
+        /// This task's required live-indexer test 4 (CRC-003): the EXACT
+        /// real-corpus shape `edges::calls::call_res_a4_import_alias::crc_003_exact_shape_recovers_only_to_ambiguous_due_to_a_real_name_collision`
+        /// already proves at the isolated-resolver level that A4's
+        /// alias mechanism finds a real match whose own target remains
+        /// ambiguous due to a genuine name collision (the wrapper
+        /// function shares its own bare name with the real target it
+        /// wraps). Run through the real indexer for the first time:
+        /// confirms the SAME honest `ImportedSymbolAmbiguous` outcome,
+        /// not a silently-picked wrong target.
+        #[test]
+        fn crc_003_through_the_real_wired_indexer_reports_the_same_honest_ambiguity() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "janitor/ml.py").unwrap(), b"def get_features_targets():\n    pass\n")
+                .with_file(
+                    FileIdentity::parse(repo, commit.clone(), "janitor/__init__.py").unwrap(),
+                    b"from .ml import get_features_targets as _get_features_targets\n\n\ndef get_features_targets(*args, **kwargs):\n    return _get_features_targets(*args, **kwargs)\n",
+                );
+
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let keys = call_attempt_keys(&outcome);
+            let attempt = keys
+                .iter()
+                .find(|k| k.callee_name == "_get_features_targets")
+                .expect("CRC-003's own alias call must produce a CallAttempt through the real indexer -- A4's alias mechanism found a real match, but that match's own target is ambiguous");
+            assert_eq!(attempt.reason_debug, "ImportedSymbolAmbiguous", "the real wired indexer must report the same honest, specific ambiguity A4's isolated resolver already proved, never a plain Unknown and never a silently-picked wrong target");
+            assert_eq!(attempt.candidate_count, 2, "both the real target and the wrapper's own same-named self remain real candidates");
         }
     }
 }

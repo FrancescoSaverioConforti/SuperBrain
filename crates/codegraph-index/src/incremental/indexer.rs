@@ -684,7 +684,31 @@ impl CodeGraphIndexer {
         signature_too_long_names.extend(output.signature_too_long_names.clone());
         let signature_too_long_names_only: Vec<String> = signature_too_long_names.iter().map(|(_, name)| name.clone()).collect();
 
-        let (mut typed_edges, call_attempts) = crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&current_snapshots, &csharp_contexts, &signature_too_long_names_only).map_err(PipelineError::from)?;
+        // CALL-RES-A4 wiring: identical incremental semantics to
+        // `csharp_contexts` immediately above — raw import statements
+        // are reused for every UNTOUCHED file and freshly extracted for
+        // every file this call actually reparsed. Moved up from this
+        // function's own prior position (immediately before the
+        // `impl_facts` block below) so A4's own import-alias-aware
+        // resolver has real `import_facts` to consume at the same call
+        // that produces `typed_edges`, instead of resolving `import_facts`
+        // only after `typed_edges` already ran against the pre-A4
+        // resolver. Resolved against `current_snapshots` — the SAME pool
+        // `typed_edges` itself resolves against — mirroring exactly how
+        // `impl_facts` already documents its own choice of
+        // `current_snapshots` over `final_snapshots` a few lines below.
+        // This SAME `raw_import_statements` is reused again below,
+        // unchanged, for the function's own returned/published
+        // `import_facts` (resolved there against the broader
+        // `final_snapshots` pool instead — a deliberately different
+        // resolution, not a second extraction).
+        let untouched_raw_import_statements: Vec<_> = prior_raw_import_statements.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
+        let untouched_raw_import_statements_len = untouched_raw_import_statements.len();
+        let mut raw_import_statements = untouched_raw_import_statements;
+        raw_import_statements.extend(output.raw_import_statements.clone());
+        let import_facts_for_typed_edges = resolve_raw_import_statements(&raw_import_statements, &current_snapshots).map_err(PipelineError::from)?;
+
+        let (mut typed_edges, call_attempts) = crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&current_snapshots, &csharp_contexts, &signature_too_long_names_only, &import_facts_for_typed_edges).map_err(PipelineError::from)?;
 
         // Lineage across the UNCHANGED portion is already final (it was
         // resolved and published by an earlier observe_commit call);
@@ -731,22 +755,14 @@ impl CodeGraphIndexer {
             }
         }
 
-        // Priority 6 incremental semantics: raw import statements are
-        // reused for every UNTOUCHED file (pure syntax that cannot have
-        // changed if the file itself did not), and freshly extracted
-        // for every file this call actually reparsed — `changed_set`
-        // already distinguishes these the exact same way snapshots do.
-        // Deleted files correctly drop out here too: `prior_raw_import_statements`
-        // is filtered by `changed_set`, so a deleted file's old raw
-        // statements are never carried forward (it IS in `changed_set`),
-        // and it produces no new ones either (`output.raw_import_statements`
-        // only contains files `index_files` actually parsed, which a
-        // deleted file never is).
-        let untouched_raw_import_statements: Vec<_> = prior_raw_import_statements.iter().filter(|(file, _)| !changed_set.contains(file.relative_path())).cloned().collect();
-        let untouched_raw_import_statements_len = untouched_raw_import_statements.len();
-        let mut raw_import_statements = untouched_raw_import_statements;
-        raw_import_statements.extend(output.raw_import_statements.clone());
-
+        // `raw_import_statements` (reused for every UNTOUCHED file, fresh
+        // for every reparsed file; deleted files correctly drop out via
+        // `changed_set`) was already assembled above, before typed-edge
+        // resolution — see CALL-RES-A4 wiring comment there. Reused
+        // here unchanged for the function's own returned/published
+        // `import_facts`, resolved against the broader `final_snapshots`
+        // pool instead of `current_snapshots`.
+        //
         // Resolution is ALWAYS recomputed from the full raw-statement
         // set against the full current snapshot pool — never reused
         // incrementally, even for untouched-file statements (see

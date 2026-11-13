@@ -75,6 +75,7 @@ pub use instantiates::resolve_instantiates;
 pub use resolution::{Edge, EdgeResolutionError};
 pub use tests_for::resolve_tests_for;
 
+use crate::imports::ImportFact;
 use crate::snapshot::SymbolSnapshot;
 
 /// Runs EVERY typed-edge resolver this module owns against the same
@@ -99,31 +100,33 @@ pub fn resolve_all_typed_edges(snapshots: &[SymbolSnapshot]) -> Result<Vec<Edge>
 /// byte-for-byte identical to [`resolve_all_typed_edges`] — confirmed
 /// by a dedicated equivalence test.
 pub fn resolve_all_typed_edges_with_csharp_contexts(snapshots: &[SymbolSnapshot], csharp_contexts: &[crate::csharp_declarations::CSharpTypeDeclarationContext]) -> Result<Vec<Edge>, EdgeResolutionError> {
-    resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(snapshots, csharp_contexts, &[]).map(|(edges, _attempts)| edges)
+    resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(snapshots, csharp_contexts, &[], &[]).map(|(edges, _attempts)| edges)
 }
 
-/// Semantic Resolution & Reliability Checkpoint, Priority 1 + 3:
-/// identical to [`resolve_all_typed_edges_with_csharp_contexts`] except
-/// `Calls` resolution also returns its own negative-knowledge
-/// `CallAttempt` records (via
-/// [`calls::resolve_calls_with_extraction_rejections`] rather than the
-/// plain [`resolve_calls`]), using `signature_too_long_names` as the
-/// real, caller-verified `SignatureTooLong` evidence that function
-/// requires before linking an `Unresolved` attempt to
-/// `UnresolvedReason::ExtractionRejected`. With an empty
-/// `signature_too_long_names` slice, the `Vec<Edge>` half of this
-/// function's own output is byte-for-byte identical to
-/// [`resolve_all_typed_edges_with_csharp_contexts`]'s — confirmed by a
-/// dedicated equivalence test, mirroring exactly how every prior
-/// "_with_X" extension in this module (B2-ID-010's own
+/// Semantic Resolution & Reliability Checkpoint, Priority 1 + 3; CALL-RES-A4
+/// wiring: identical to [`resolve_all_typed_edges_with_csharp_contexts`]
+/// except `Calls` resolution also returns its own negative-knowledge
+/// `CallAttempt` records, and now runs through
+/// [`calls::resolve_calls_with_namespace_context`] — CALL-RES-A4's own
+/// import-alias-aware (Python) and namespace-aware (C#) resolver —
+/// rather than the pre-A4 [`resolve_calls_with_extraction_rejections`].
+/// `resolve_calls_with_namespace_context` itself falls back to
+/// byte-identical pre-A4 behavior whenever `csharp_contexts` is empty
+/// (which falls back again to byte-identical behavior whenever
+/// `import_facts` is empty or has no matching alias for a given call) —
+/// so passing `&[]` for either or both of `import_facts`/`csharp_contexts`
+/// reproduces [`resolve_calls_with_extraction_rejections`]'s own output
+/// exactly, confirmed by a dedicated equivalence test, mirroring exactly
+/// how every prior "_with_X" extension in this module (B2-ID-010's own
 /// `_with_csharp_contexts`) preserved its own predecessor's behavior.
 pub fn resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(
     snapshots: &[SymbolSnapshot],
     csharp_contexts: &[crate::csharp_declarations::CSharpTypeDeclarationContext],
     signature_too_long_names: &[String],
+    import_facts: &[ImportFact],
 ) -> Result<(Vec<Edge>, Vec<crate::negative_knowledge::CallAttempt>), EdgeResolutionError> {
     let mut edges = Vec::new();
-    let (calls_edges, call_attempts) = resolve_calls_with_extraction_rejections(snapshots, signature_too_long_names)?;
+    let (calls_edges, call_attempts) = resolve_calls_with_namespace_context(snapshots, signature_too_long_names, import_facts, csharp_contexts)?;
     edges.extend(calls_edges);
     edges.extend(resolve_extends_implements_with_csharp_contexts(snapshots, csharp_contexts)?);
     edges.extend(resolve_tests_for(snapshots)?);

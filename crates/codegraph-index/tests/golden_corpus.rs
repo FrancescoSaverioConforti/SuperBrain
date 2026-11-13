@@ -158,24 +158,26 @@ fn b2_id_007_nested_class_extends_is_owned_by_inner_not_outer() {
 }
 
 // ===========================================================================
-// CRC-003: import-alias blindness — documents the CURRENT gap (no edge),
-// not a desired outcome. A future fix flips this assertion.
+// CRC-003: import-alias blindness — FIXED by CALL-RES-A4, now wired into
+// the real indexer. This fixture's own clean, unambiguous alias shape
+// (unlike the real pyjanitor repro, there is no same-name collision here)
+// now resolves to a real edge, per this file's own prior comment: "if
+// this assertion ever fails, CRC-003 has been fixed and this test (and
+// the CRC doc) must be updated to assert the real edge instead."
 // ===========================================================================
 
 #[test]
-fn crc_003_import_alias_blindness_is_the_current_documented_gap() {
+fn crc_003_import_alias_blindness_is_fixed_by_call_res_a4() {
     let source = CorpusSource::load("python", &["import_alias_crc_003.py", "helper.py"]);
     let outcome = index(&source);
 
     let caller = find_one_by_name_in_file(&outcome, "caller", "import_alias_crc_003.py");
     let callees: Vec<String> = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).map(|s| s.name().as_str().to_string()).collect();
 
-    assert!(
-        callees.is_empty(),
-        "CRC-003's known gap: a call through an import alias produces NO edge today, \
-         since resolve_calls never consults ImportFact.alias -- if this assertion ever fails, \
-         CRC-003 has been fixed and this test (and the CRC doc) must be updated to assert \
-         the real edge instead of its absence"
+    assert_eq!(
+        callees,
+        vec!["real_target"],
+        "CALL-RES-A4's import-alias mechanism, now wired into the real indexer, must resolve this clean (collision-free) alias call to helper.py's real_target"
     );
 }
 

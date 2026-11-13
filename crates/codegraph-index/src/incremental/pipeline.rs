@@ -18,7 +18,7 @@ use crate::extract::{extract_symbols_reporting_rejections, CandidateRejection};
 use crate::graph::{CodeGraph, GraphError};
 use crate::negative_knowledge::CallAttempt;
 use crate::impls::{extract_impl_statements, RawImplStatement};
-use crate::imports::{extract_import_statements, ImportFactError, RawImportStatement};
+use crate::imports::{extract_import_statements, resolve_raw_import_statements, ImportFactError, RawImportStatement};
 use crate::lineage::{resolve_lineage, LineageEdge, LineageResolutionError};
 use crate::parse::parser_for;
 use crate::snapshot::{promote, PromotionError, SymbolSnapshot};
@@ -213,6 +213,14 @@ pub fn index_files(
     // full reused+fresh context set, exactly as it already does for
     // import_facts/impl_facts; see that module's own doc comment.
     let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw_csharp_type_declaration_contexts, &snapshots);
+    // CALL-RES-A4 wiring: mirrors `csharp_contexts` immediately above
+    // exactly, for the identical reason — this call's own
+    // `raw_import_statements` only covers THIS call's own files,
+    // correct for a full reindex (every file's own import statement is
+    // present), but `indexer.rs`'s incremental path re-resolves
+    // `import_facts` separately against the full current pool, same as
+    // `csharp_contexts`.
+    let import_facts = resolve_raw_import_statements(&raw_import_statements, &snapshots)?;
     // Semantic Resolution & Reliability Checkpoint, Priority 1 + 3:
     // this call's own `signature_too_long_names` (collected above,
     // scoped to exactly the files this call parsed) is the real,
@@ -222,7 +230,7 @@ pub fn index_files(
     // that function's own "performs no rejection detection of its own"
     // discipline.
     let signature_too_long_names_only: Vec<String> = signature_too_long_names.iter().map(|(_, name)| name.clone()).collect();
-    let (typed_edges, call_attempts) = resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&snapshots, &csharp_contexts, &signature_too_long_names_only)?;
+    let (typed_edges, call_attempts) = resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(&snapshots, &csharp_contexts, &signature_too_long_names_only, &import_facts)?;
 
     Ok(PipelineOutput {
         snapshots,

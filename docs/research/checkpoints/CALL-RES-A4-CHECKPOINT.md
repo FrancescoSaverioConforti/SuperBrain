@@ -438,6 +438,21 @@ in spirit (moved to the sections above) rather than left ambiguous:
 
 ## Final multi-corpus metrics (CALL-RES-A4, final item)
 
+**CAVEAT, added by the wiring pass below: every number in this section
+is a resolver-level measurement, not live-indexer evidence.** Both
+harnesses call A4's resolvers (`resolve_calls_with_namespace_context`/
+`resolve_calls_with_imports`) directly against real parsed snapshots —
+they do NOT go through `CodeGraphIndexer::observe_commit`. At the time
+these numbers were measured, A4 was not yet wired into the real
+indexer at all (see the "Reliability-policy / full-incremental-parity
+re-check" section's own MAJOR FINDING below) — these Polly/pyjanitor
+deltas describe what A4's mechanism does in isolation, not what any
+real indexing run actually produced. The wiring gap is now closed (see
+"Wiring into the real indexer" section, added after this one) but
+these specific numbers were never re-measured through the wired
+indexer, and re-measuring them was explicitly out of scope for the
+wiring task.
+
 Real before/after runs, two new standalone example harnesses
 (`call_res_a4_metrics_csharp.rs`, `call_res_a4_metrics_python.rs`),
 reusing the SAME parse/extract/promote loop every prior domain smoke
@@ -573,9 +588,123 @@ reported as a finding for the user's own next decision.
 
 **Tests added this pass**: 6 in `agent_policy.rs`
 (`call_res_a4_policy_recheck` module), 1 in `conformance.rs`
-(`call_res_a4_not_wired_into_the_real_indexer` module). Full lib suite:
-602/602 passing (up from 595). Full workspace `codegraph-index` test
-run (lib + 6 integration binaries): 680/680 passing, 0 failures.
+(originally `call_res_a4_not_wired_into_the_real_indexer`, now flipped
+to confirm the fix -- see below). Full lib suite: 602/602 passing (up
+from 595). Full workspace `codegraph-index` test run (lib + 6
+integration binaries): 680/680 passing, 0 failures.
+
+## Wiring into the real indexer — CLOSED
+
+**The MAJOR finding above is fixed.** `import_facts` is now resolved
+BEFORE typed-edge resolution (not after, as it was) in both
+`incremental::pipeline::index_files` (full-reindex path — resolved
+locally against that call's own complete snapshot pool, correct
+because a full reindex's one `index_files` call already covers every
+file) and `incremental::indexer::incremental_reindex` (the incremental
+path — moved up from its own prior position after typed-edge
+resolution to before it, resolved against `current_snapshots`, the
+same pool `typed_edges` itself resolves against). Both now pass
+`import_facts` into
+`resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`,
+which gained a 4th parameter and now calls A4's own
+`resolve_calls_with_namespace_context` instead of the pre-A4
+`resolve_calls_with_extraction_rejections`. No redesign: one resolver
+call swapped for another at the SAME call site, with the SAME
+fallback behavior A4's own resolvers already provide (empty
+`csharp_contexts`/`import_facts` reproduces the pre-A4 behavior
+byte-for-byte, confirmed by the pre-existing equivalence tests, now
+re-confirmed with a non-empty default `&[]` call shape still compiling
+and passing).
+
+**Required test 1 (live case, Ambiguous(2) -> 1 candidate):**
+`conformance::tests::call_res_a4_wired_into_the_real_indexer::the_real_indexer_now_resolves_a_case_a4_itself_resolves`
+— the exact fixture the prior fork's gap-pinning test used, now
+flipped: the real `CodeGraphIndexer::observe_commit` produces a real
+`Calls` edge to the `using`-visible `NsA::Foo::Target`, no `CallAttempt`
+left behind. PASS.
+
+**Required test 2 (same case via `observe_commit` incrementally):**
+`the_same_resolution_reproduces_through_observe_commit_incrementally`
+— the identical two-namespace-candidate shape, first commit establishes
+the ambiguity, second commit (`NormalAdvance`, changed_files =
+`["src/Caller.cs"]`) adds the caller. Identical resolution via the
+incremental path. PASS.
+
+**Required test 3 (full/incremental parity — edge + CallAttempt + tier
++ provenance):**
+`full_and_incremental_agree_on_edge_call_attempt_tier_and_provenance_for_the_newly_wired_case`
+— reuses the pre-existing `assert_full_and_incremental_agree` helper
+(now `pub(super)`) for its own `compare_full_incremental_state` check
+(edges/CallAttempts/import facts/impl facts/snapshots all agree as a
+multiset, which already folds in tier/reason/candidate_count via
+`CallAttemptKey`), PLUS a direct comparison of the real, raw `Edge`'s
+`Evidence` for the A4-resolved call site — `ResolutionMethod` and the
+evidence note text are asserted byte-identical between the full and
+incremental outcome, and the method is asserted to be exactly
+`NameHeuristic` (never `StaticAnalysis`). PASS.
+
+**Required test 4 (CRC-001/002/003 through the real wired indexer, not
+the isolated resolver):** three new tests, each reusing the EXACT real
+corpus fixture content the isolated-resolver regression tests in
+`edges::calls` already used, now run through
+`CodeGraphIndexer::observe_commit` for the first time:
+- `crc_001_through_the_real_wired_indexer_stays_ambiguous` — stays
+  `Ambiguous`/2-candidates, no new edge. PASS, no regression.
+- `crc_002_through_the_real_wired_indexer_does_not_regress` — this one
+  surfaced a real, honest subtlety worth recording: CRC-002's own
+  PRE-EXISTING, documented limitation (A4 has no local-parameter-
+  shadowing awareness) means the pre-A4 baseline ALREADY wires a
+  `Calls` edge from `render` to the unrelated module-level `Button` —
+  the isolated-resolver test asserts this stays BYTE-IDENTICAL
+  before/after A4, not that it is absent. The real-indexer test
+  confirms the SAME pre-existing shape reproduces identically through
+  the full pipeline — neither fixed nor worsened by wiring. PASS
+  (as non-regression, not as a fix).
+- `crc_003_through_the_real_wired_indexer_reports_the_same_honest_ambiguity`
+  — the real corpus's own name-collision shape reports
+  `ImportedSymbolAmbiguous` through the real indexer too, same as the
+  isolated resolver. PASS.
+
+Separately, the golden-corpus integration test
+`crc_003_import_alias_blindness_is_the_current_documented_gap` (which
+pinned the OLD gap — "no edge" — on a clean, collision-free alias
+fixture) now correctly FAILS once wiring lands, exactly as its own
+comment anticipated ("if this assertion ever fails, CRC-003 has been
+fixed and this test... must be updated"). Flipped to
+`crc_003_import_alias_blindness_is_fixed_by_call_res_a4`, asserting the
+real recovered edge to `helper.py`'s `real_target`. The fixture file's
+own header comment is updated to match.
+
+**Required test 5 (mutation testing on the new wiring, 0 genuine
+missed):** `cargo mutants --in-diff` scoped strictly to this pass's
+own changed lines in `edges/mod.rs`, `incremental/pipeline.rs`, and
+`incremental/indexer.rs` (not the whole files — a whole-file scope
+pulled in hundreds of unrelated whole-function mutants on pre-existing
+code this pass never touched). 200 mutants found; 4 caught
+(`resolve_all_typed_edges_with_csharp_contexts`'s and
+`..._and_negative_knowledge`'s own bodies, `incremental_reindex`'s
+single viable whole-function return-tuple mutant, and a real `!`
+negation on the moved-up `raw_import_statements` filter), 196
+unviable. **0 missed, 0 timeout.** The 196 unviable figure is
+dominated (191 of 196) by a single mutation SITE —
+`incremental_reindex`'s own 9-tuple return type — where `cargo mutants`
+enumerates every combinatorial `Default::default()`/`vec![]`
+permutation as a separate candidate mutant; only one combination
+type-checks (and that one WAS caught), the rest fail to compile by
+construction. Confirmed by inspecting `mutants.out/unviable.txt`
+directly, not assumed.
+
+**Full suite after wiring:** 607/607 lib tests, 0 failures across
+every `codegraph-index` integration binary (18/18, 34/34, 12/12, 10/10,
+0/0 across the six binaries), full workspace build clean.
+
+**Not done, by this task's own explicit scope:** the full multi-corpus
+Polly/pyjanitor/CRC metrics were NOT re-measured through the newly
+wired real indexer — the section above now carries the caveat that
+those numbers are resolver-level, not live-indexer evidence; no new
+corpus run was performed here. Performance measurement and a final
+closing independent review of the whole A4 effort remain separately
+open, untouched by this pass.
 
 ## Recommendation
 
