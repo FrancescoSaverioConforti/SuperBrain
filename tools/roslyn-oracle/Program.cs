@@ -67,6 +67,17 @@ var fixtureGroups = new (string Name, string[] Files)[]
     // B2-ID-009/010/011 cases above.
     ("arity_aware_resolution", new[] { "generic_arity_narrowing_call_resolution.cs" }),
     ("signature_too_long_linkage", new[] { "signature_too_long_extraction_rejection_linkage.cs" }),
+    // CALL-RES-A4, item 2: the C# namespace-aware candidate-filtering
+    // mechanism (`resolve_calls_with_namespace_context`, commit
+    // `068a7de`) -- same cross-namespace same-method-name
+    // disambiguation this project's own
+    // `namespace_import_excludes_the_non_imported_namespace_candidate`
+    // unit test covers, reshaped into genuinely compilable C# so
+    // Roslyn's real semantic model can bind the call site (see
+    // namespace_aware_resolution_caller.cs's own doc comment for why
+    // the original unit-test fixture's bare-call syntax does not
+    // compile and could not be reused as written).
+    ("namespace_aware_resolution", new[] { "namespace_aware_resolution_ns_a.cs", "namespace_aware_resolution_ns_b.cs", "namespace_aware_resolution_caller.cs" }),
 };
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = false };
