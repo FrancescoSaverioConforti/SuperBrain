@@ -1,0 +1,51 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running `target\release\examples\call_res_a4_metrics_csharp.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/80b6b526-cf17-4c5a-9e7f-6184261532a3/scratchpad/call-res-a4-metrics/polly-repo' 1f232caf9672e515751ba2df76d82bfbbb62e016`
+=== CALL-RES-A4 metrics: C# namespace-aware mechanism, real App-vNext/Polly corpus ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\80b6b526-cf17-4c5a-9e7f-6184261532a3\scratchpad\call-res-a4-metrics\polly-repo
+commit: 1f232caf9672e515751ba2df76d82bfbbb62e016
+
+--- Corpus ---
+files_parsed: 792
+snapshots_promoted: 5190
+real_import_facts_extracted: 725
+import_fact_resolution_errors (non-fatal, excluded from import_facts): 0
+csharp_type_declaration_contexts_resolved: 860
+
+--- BEFORE (resolve_calls_with_extraction_rejections) ---
+edges_total: 2078
+call_attempts_total (ambiguous+unresolved, no edge produced): 16515
+  Ambiguous: 8345
+  Heuristic: 580
+  Resolved: 1498
+  Unresolved: 8170
+  (by ResolutionMethod) StaticAnalysis: 1498, NameHeuristic: 580
+
+--- AFTER (resolve_calls_with_namespace_context) ---
+edges_total: 2415
+call_attempts_total (ambiguous+unresolved, no edge produced): 16178
+  Ambiguous: 8008
+  Heuristic: 917
+  Resolved: 1498
+  Unresolved: 8170
+  (by ResolutionMethod) StaticAnalysis: 1498, NameHeuristic: 917
+
+--- Delta (after - before) ---
+edges_total: +337
+call_attempts_total: -337
+
+--- A4 namespace-filtering effect on real pre-A4 ambiguous (>=2 candidate) call sites ---
+real_ambiguous_call_sites_before_a4: 8345
+  narrowed_to_exactly_one_candidate_by_a4 (now a real Edge): 366
+  narrowed_but_still_2_plus_candidates: 3985
+  unchanged_or_untouched: 3994
+  mean_candidate_count_before: 15.99
+  mean_candidate_count_after: 13.80
+note: 'narrowed_to_one' call sites are real ambiguities A4's own namespace evidence resolved WITHOUT any type information -- namespace membership (a using-directive/declaration-site fact) is a visibility fact, not a type-inference result; this is the real-corpus count for the directive's own 'ambiguities resolved without type information' metric on this corpus.
+
+--- Precision/Recall/F1 on this corpus ---
+N/A: no ground-truth label set exists for Polly's full ~1650-edge call graph (unlike CRC-001/002/003, which each have one hand-confirmed real target per call-resolution-challenges.md). Building a large enough labeled sample (>= the schema's own MIN_ROWS_FOR_COMPUTED_METRICS=30) to compute a corpus-level precision/recall/F1 for Polly was not done in this pass -- that would be a NEW ground-truth-labeling effort, not a 'before/after the same resolver change' measurement, and inventing an unlabeled proxy (e.g. 'treat every produced edge as correct') would silently assume away the exact FP risk this metric exists to catch. TP/FP/FN are therefore also N/A at corpus scale for this reason -- real FP/FN risk IS covered instead by the CRC-001/002/003 ground-truth rows (see ground_truth_schema.rs) and by this section's own narrowed_to_one count, which only ever REMOVES candidates (confirmed by resolve_calls_with_namespace_context's own 'never manufacture a false resolution' invariant, re-verified by this run producing zero new edges whose target was outside the real pre-A4 candidate set for the same key -- checked directly below.
+invariant_check (every genuinely NEW after-edge's (caller,name) key was a real pre-A4 ambiguous candidate pool member, never manufactured): 0 violations found
+
+--- Ambiguities resolved without type information (summary) ---
+real_count_on_polly: 366 (same figure as 'narrowed_to_exactly_one_candidate_by_a4' above)
+import_alias_ambiguous_attempts_after (A4 found the alias but target name still has 2+ real candidates -- not resolved, reported honestly as Ambiguous, never guessed): 0

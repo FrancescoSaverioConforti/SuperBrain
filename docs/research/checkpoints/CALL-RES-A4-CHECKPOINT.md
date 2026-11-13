@@ -403,16 +403,18 @@ in spirit (moved to the sections above) rather than left ambiguous:
   carry. A distinct, richer "which candidates were excluded and why"
   structured field was not built — judged unnecessary, not merely
   skipped; open to revisiting if a future consumer needs it.
-- **Oracle/ground-truth extension** (§10) — still not touched. The
-  Roslyn differential suite was not extended to the new C# namespace
-  cases this pass added.
-- **Full evaluation-metrics pass** (§1, §13) — still not done. No
-  baseline-freeze re-run against the real Polly corpus with this
-  pass's own namespace mechanism wired in; candidate-reduction counts,
-  precision/recall/F1, and "ambiguities resolved without type
-  information" remain unmeasured at the corpus level (only measured
-  directly, per-test, on the synthetic fixtures this pass's own tests
-  construct).
+- ~~Oracle/ground-truth extension~~ (§10) — **done in a later pass**:
+  the Roslyn differential suite was extended to 5 real C# cases
+  (namespace alias, qualified name, real ambiguity, plus the existing
+  same-name/imported-namespace coverage), 3/3 new call-site comparisons
+  agree with Roslyn, 0 divergences. See `call-res-a4-namespace-roslyn-differential.jsonl`
+  and `roslyn_differential_suite.rs`.
+- ~~Full evaluation-metrics pass~~ (§1, §13) — **done in this pass**.
+  See "Final multi-corpus metrics" section below for the full real
+  before/after numbers on Polly (C# namespace mechanism) and pyjanitor
+  (Python import-alias mechanism), plus the CRC-001/002/003 numbers
+  already retrofitted into `call-res-a4-crc-regression.jsonl` by a
+  prior pass (`92b7bf8`).
 - **Reliability-policy re-checks** (`agent_policy.rs`, §14) — still
   not run against either pass's new code.
 - **Full/incremental parity extension** (`conformance.rs`, §15) —
@@ -434,6 +436,53 @@ in spirit (moved to the sections above) rather than left ambiguous:
 - **CALL-RES-A5** (§18) — correctly not implemented in either pass,
   per explicit directive exclusion.
 
+## Final multi-corpus metrics (CALL-RES-A4, final item)
+
+Real before/after runs, two new standalone example harnesses
+(`call_res_a4_metrics_csharp.rs`, `call_res_a4_metrics_python.rs`),
+reusing the SAME parse/extract/promote loop every prior domain smoke
+test already uses, plus `resolve_import_facts` on the SAME per-file
+tree each harness already parses (no new parsing infrastructure). Each
+harness runs the shipped pre-A4 entry point
+(`resolve_calls_with_extraction_rejections`) and A4's own entry point
+(`resolve_calls_with_namespace_context` / `resolve_calls_with_imports`)
+against the SAME real snapshots, and reports the real delta.
+
+### Polly (C#, `App-vNext/Polly`, commit `1f232caf9672e515751ba2df76d82bfbbb62e016` — same commit prior A4/B2-EVAL-008/Roslyn-oracle work used)
+
+- files_parsed: 792; snapshots_promoted: 5190; real_import_facts_extracted: 725; csharp_type_declaration_contexts_resolved: 860
+- **Before** (`resolve_calls_with_extraction_rejections`): edges 2078 (StaticAnalysis 1498, NameHeuristic 580); call_attempts 16515 (Ambiguous 8345, Unresolved 8170)
+- **After** (`resolve_calls_with_namespace_context`): edges 2415 (StaticAnalysis 1498, NameHeuristic 917); call_attempts 16178 (Ambiguous 8008, Unresolved 8170)
+- **Delta**: edges +337, call_attempts -337
+- Of the 8345 real pre-A4 ambiguous (>=2 candidate) call sites: **366 narrowed to exactly one candidate** (now a real edge — "ambiguities resolved without type information", since namespace visibility is a using-directive/declaration-site fact, never a type-inference result), 3985 narrowed but still 2+ candidates, 3994 unchanged. Mean candidate count 15.99 → 13.80.
+- Invariant re-check (every genuinely new after-edge's target was a real pre-A4 candidate-pool member, never manufactured): **0 violations**.
+- Precision/recall/F1/TP/FP/FN: **N/A** — no ground-truth label set exists for Polly's full ~2000-edge call graph (unlike CRC-001/002/003, which each have one hand-confirmed real target). Building a >=30-row labeled sample for Polly was judged a new ground-truth-labeling effort, not a before/after measurement, and out of this pass's own scope; an unlabeled proxy (e.g. "every produced edge is correct") would hide the exact FP risk this metric exists to catch. Real FP/FN risk is instead covered by the invariant re-check above (0 violations) and by CRC-001/002/003's own ground-truth rows.
+- Full raw output: `docs/research/evidence/call-res-a4-metrics-csharp-polly-run.txt`.
+
+### pyjanitor (Python, `pyjanitor-devs/pyjanitor`, commit `1247923ff01dd9a74f40f55d55f108e503e4b218` — same commit CRC-003/B2-EVAL-006 already used)
+
+- files_parsed: 291; snapshots_promoted: 2822; real_import_facts_extracted: 1752
+- **Before**: edges 1485 (StaticAnalysis 1430, NameHeuristic 55); call_attempts 8341 (Ambiguous 158, Unresolved 8183)
+- **After**: edges 1485 (unchanged); call_attempts 8340 (Ambiguous 159, Unresolved 8181)
+- **Delta**: edges +0, call_attempts -1
+- Of the 8183 real pre-A4 zero-candidate call sites: **0 recovered to a real edge** on this corpus at this commit; 1 `ImportTargetExternal`; 1 `ImportedSymbolAmbiguous` (the real CRC-003 second-collision shape, recurring here); 7224 `NoMatchingImportAlias` (no candidate, no alias either); 956 `ExtractionRejected` (the callee name is itself a real `SignatureTooLong` rejection — the resolver's own branch order checks this BEFORE the alias path per `calls.rs`, so A4 never gets a chance to act on these; real, not a defect, confirmed directly against real SignatureTooLong names like `conditional_join`/`get_join_indices`); 1 residual unaccounted.
+- This is consistent with, not contradicted by, CRC-003's own documented recovery: CRC-003's one specific call site resolves to `ImportedSymbolAmbiguous` (the mechanism found the real alias and the real 2-candidate set, correctly declined to guess), not `Internal` — so a 0-recovery corpus-level count here is the EXPECTED real-world shape, not a sign the mechanism is broken. The mechanism's own clean-recovery path is separately proven by the synthetic `case_1_correct_import_alias_resolves_cleanly_when_unambiguous` unit test (no second real-corpus collision in that fixture).
+- Invariant re-check: **0 violations**.
+- Precision/recall/F1/TP/FP/FN: **N/A**, same reasoning as Polly — no corpus-level ground-truth label set beyond CRC-003's own single row.
+- Full raw output: `docs/research/evidence/call-res-a4-metrics-python-pyjanitor-run.txt`.
+
+### TS/TSX
+
+**N/A, explicitly not measured.** The existing frontend smoke test (`b2_smoke_test_frontend_ts.rs`) calls plain `resolve_calls`, not even the pre-A4 `resolve_calls_with_extraction_rejections` — wiring either A4 entry point into a real TS/TSX corpus would require new harness setup this task's own scope excludes ("TS/TSX only if already available without new setup"). The checkpoint's own prior claim that the alias mechanism "should already generalize" to TS/JS (via `ImportFact` extraction's existing named/default/aliased distinction) remains a structural argument, not a corpus-measured one.
+
+### CRC-001/002/003 (already retrofitted into the machine-readable ground-truth schema by a prior pass, `92b7bf8`)
+
+- **CRC-001** (`pytorch/examples`, ambiguous unqualified constructor call): computes as `FalseNegative` — A4's own zero-candidate-only scope never touches this `>=2` ambiguity; never a `FalsePositive`. No regression.
+- **CRC-002** (`yoonge/conduit-react`, local-binding shadowing): `resolve_calls_with_extraction_rejections` and `resolve_calls_with_imports` produce byte-for-byte identical output; confirmed never `FalsePositive`. No regression, pre-existing scope-blindness limitation unchanged.
+- **CRC-003** (`pyjanitor-devs/pyjanitor`, import-alias blindness): two-row story — the real corpus's own name-collision call site computes `FalseNegative` with `resolution_method: Ambiguous` (mechanism found the real 2-candidate set, correctly declined to guess); the clean-mechanism row (no real second collision) computes `TruePositive`. Net improvement, not merely non-regression.
+- NO-GO condition (`A4 recovers CRC-003 but introduces a new FP on CRC-002` → NO-GO) — **confirmed NOT triggered**, directly re-verified by `no_go_condition_is_confirmed_not_triggered_across_all_four_crc_rows` against the real computed `Status` of every row.
+- See `ground_truth_schema.rs` tests and `call-res-a4-crc-regression.jsonl` for the machine-checked source of these numbers.
+
 ## Recommendation
 
 **GO** for merging both passes' work as a discrete, net-positive
@@ -447,11 +496,13 @@ full 594-test lib suite) — subject to the remaining directive sections below b
 follow-up pass before CALL-RES-A4 itself is declared fully complete.
 
 **NO-GO** on treating CALL-RES-A4 as closed. Oracle/ground-truth
-extension, full corpus-level evaluation metrics, policy/conformance
-re-checks, full/incremental parity extension, final mutation-run
-confirmation, performance measurement, Python candidate-filtering
-beyond alias matching, and TS/JS module-visibility filtering all
-remain open.
+extension (DONE, see above) and full corpus-level evaluation metrics
+(DONE, see above) are now closed, but policy/conformance re-checks,
+full/incremental parity extension, performance measurement, Python
+candidate-filtering beyond alias matching, and TS/JS module-visibility
+filtering all remain open — this metrics-only pass deliberately did
+not touch `agent_policy.rs`/`conformance.rs` or performance, per its
+own explicit scope.
 
 **NO-GO** on resuming B2-EVAL-009 until CALL-RES-A4 is either
 completed or explicitly descoped by the user/coordinator — consistent

@@ -1,0 +1,51 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `target\release\examples\call_res_a4_metrics_python.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/80b6b526-cf17-4c5a-9e7f-6184261532a3/scratchpad/call-res-a4-metrics/pyjanitor-repo' 1247923ff01dd9a74f40f55d55f108e503e4b218`
+=== CALL-RES-A4 metrics: Python import-alias mechanism, real pyjanitor-devs/pyjanitor corpus ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\80b6b526-cf17-4c5a-9e7f-6184261532a3\scratchpad\call-res-a4-metrics\pyjanitor-repo
+commit: 1247923ff01dd9a74f40f55d55f108e503e4b218
+
+--- Corpus ---
+files_parsed: 291
+snapshots_promoted: 2822
+real_import_facts_extracted: 1752
+import_fact_resolution_errors (non-fatal, excluded from import_facts): 0
+
+--- BEFORE (resolve_calls_with_extraction_rejections) ---
+edges_total: 1485
+call_attempts_total (ambiguous+unresolved, no edge produced): 8341
+  Ambiguous: 158
+  Heuristic: 55
+  Resolved: 1430
+  Unresolved: 8183
+  (by ResolutionMethod) StaticAnalysis: 1430, NameHeuristic: 55
+
+--- AFTER (resolve_calls_with_imports) ---
+edges_total: 1485
+call_attempts_total (ambiguous+unresolved, no edge produced): 8340
+  Ambiguous: 159
+  Heuristic: 55
+  Resolved: 1430
+  Unresolved: 8181
+  (by ResolutionMethod) StaticAnalysis: 1430, NameHeuristic: 55
+
+--- Delta (after - before) ---
+edges_total: +0
+call_attempts_total: -1
+
+--- A4 import-alias effect on real pre-A4 zero-candidate call sites ---
+real_zero_candidate_call_sites_before_a4 (distinct caller+name keys): 8183
+real_zero_candidate_call_occurrences_before_a4 (multiset total, accounts for repeated identical calls from the same caller): 8183
+  recovered_to_a_real_edge (Internal alias target, now StaticAnalysis/NameHeuristic): 0
+  import_target_external (alias found, confirmed external, honestly Unresolved): 1
+  imported_symbol_ambiguous (alias found, target name has 2+ real candidates, honestly Ambiguous -- the real CRC-003 second-collision shape): 1
+  no_matching_import_alias (no candidate, no alias match either): 7224
+  extraction_rejected (callee name is itself a real SignatureTooLong/NameTooLong rejection -- the resolver's own branch order checks this BEFORE the alias path, so A4 never gets a chance to act on these; real, not a defect): 956
+  still_unknown_or_other (truly unexpected bucket -- reported honestly rather than hidden): 1
+note: 'recovered_to_a_real_edge' call sites are real zero-candidate cases A4's own import-alias evidence resolved WITHOUT any type information -- an import alias is a name-binding fact (from import X as Y), not a type-inference result; this is the real-corpus count for the directive's own 'ambiguities resolved without type information' metric (here, more precisely, 'unresolved-by-name-alone call sites recovered without type information') on this corpus.
+
+--- Precision/Recall/F1 on this corpus ---
+N/A: no ground-truth label set exists for pyjanitor's full call graph beyond the one real CRC-003 call site already covered by ground_truth_schema.rs's own call-res-a4-crc-regression.jsonl rows. Building a separate >= 30-row labeled sample for this corpus was not done in this pass for the same reason given in call_res_a4_metrics_csharp.rs -- it would be a new ground-truth-labeling effort, not a before/after measurement, and an unlabeled proxy would hide the exact FP risk this metric exists to catch. TP/FP/FN are therefore also N/A at corpus scale here; real FP/FN risk for this corpus is covered by CRC-003's own ground-truth row plus the invariant check below.
+invariant_check (every genuinely NEW after-edge's (caller,name) key was a real pre-A4 zero-candidate site, never manufactured): 0 violations found
+
+--- Ambiguities resolved without type information (summary) ---
+real_count_on_pyjanitor: 0 (same figure as 'recovered_to_a_real_edge' above)
