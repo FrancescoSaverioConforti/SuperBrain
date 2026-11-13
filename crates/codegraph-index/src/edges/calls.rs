@@ -4183,46 +4183,118 @@ mod tests {
         }
 
         /// Closes the receiver-field match-guard mutant at this
-        /// function's own copy of the `this.field.method()` restriction
-        /// logic. An earlier version of this test used a bare
-        /// `src_mask.Size(0)` receiver (no `this.` prefix) -- which
-        /// `self_or_this_receiver_field_name` never recognizes as
-        /// receiver-qualified at all (confirmed by reading that
-        /// function: it requires a dedicated `this`/`self` node kind, or
-        /// Python's literal `"self"` text fallback), so
-        /// `call_site.self_receiver_field` was always `None` and the
-        /// match always took the `_ => all_candidates` arm regardless
-        /// of the guard's truth value -- the guard was never actually
-        /// evaluated against real data, making the mutant unobservable
-        /// by construction. Fixed by using `this.src_mask.Size(0)`, and
-        /// by giving `Caller` its OWN `Size` method too, so the guard's
-        /// two outcomes genuinely diverge: guard true (real behavior)
-        /// restricts to `Caller`'s own `Size`, resolving unambiguously;
-        /// guard false (the `true`/`false` mutants) would instead use
-        /// the UNRESTRICTED `all_candidates` (both `Caller.Size` and the
-        /// unrelated `Unrelated.Size`), which is ambiguous and produces
-        /// NO edge at all -- a directly observable difference.
+        /// function's own copy of the `self.field.method()` restriction
+        /// logic. Several earlier fixtures for this test all failed to
+        /// kill it, for THREE different reasons, each confirmed by
+        /// manually applying the mutant and observing the test still
+        /// pass before settling on this shape:
+        ///
+        /// 1. Several C# fixtures (`this.src_mask.Size(0)`) all failed
+        ///    for the same root cause, found by reading
+        ///    `kind_mapping.rs` directly: `SymbolKind::Field` is
+        ///    produced ONLY from Python's `self_attribute_assignment`
+        ///    synthetic kind hint (`kind_mapping.rs`'s own test asserts
+        ///    `map_kind_hint("field_declaration").is_err()` for C#'s
+        ///    real field-declaration node) -- C# fields are never
+        ///    extracted as snapshots at all, so
+        ///    `receiver_field_is_a_known_member` always returns `false`
+        ///    for any C# fixture, no matter the mutation.
+        /// 2. A Python fixture with the real method on the RECEIVER
+        ///    FIELD's declared type (not the caller's own class) also
+        ///    failed, and by DIFFERENT reasoning than expected:
+        ///    `restrict_to_callers_own_class` restricts to the CALLER's
+        ///    own enclosing class, not the field's declared type's
+        ///    class (confirmed by reading its implementation after this
+        ///    fixture produced 0 candidates, not 1) -- so the real
+        ///    (guard-true) code path was itself broken by this fixture,
+        ///    not just the mutant-closing property.
+        /// 3. Fixing that (the real method moved onto the CALLER's own
+        ///    class, with 2 same-named decoys in other files) still did
+        ///    not kill the mutant: `narrow_by_scope`'s own class-level
+        ///    check (run unconditionally right after, independent of
+        ///    the guard) performs the EXACT SAME `strictly_contains`
+        ///    filter the guard's own restriction does, so whenever the
+        ///    caller genuinely owns a matching method, both paths
+        ///    converge on the identical target edge regardless of the
+        ///    guard's truth value -- confirmed by manually forcing the
+        ///    guard to `false` and seeing the test still pass. The two
+        ///    mechanisms are NOT redundant in general (the guard's
+        ///    restriction is reached BEFORE `narrow_by_scope`, via the
+        ///    unconditional earlier `candidates.len() == 1` check at
+        ///    line 637), but reaching that earlier check or falling
+        ///    through to `narrow_by_scope`'s later, same-answer check
+        ///    produce the SAME edge target either way.
+        ///
+        /// The one place these two paths actually diverge observably is
+        /// their EVIDENCE: the guard-true path resolves at the EARLIER
+        /// `candidates.len() == 1` check with `resolved_evidence`
+        /// (`ResolutionMethod::StaticAnalysis`, syntactically certain);
+        /// falling through to `narrow_by_scope` instead uses
+        /// `heuristic_evidence(..., Confidence::Speculative, ...)`
+        /// (`ResolutionMethod::NameHeuristic`) even when it lands on the
+        /// exact same target -- mirroring the pre-existing (pre-A4)
+        /// test `a_receiver_qualified_call_still_resolves_when_the_matching_method_is_on_the_callers_own_class`'s
+        /// own assertion shape, which already pins this StaticAnalysis
+        /// distinction for the SAME underlying mechanism via
+        /// `resolve_calls` directly.
         #[test]
         fn receiver_field_restriction_is_preserved_through_the_namespace_aware_entry_point() {
             let repo = test_repo_calls();
-            let (_a_file, _a_tree, a_snapshots, _a_raw) = real_snapshots_contexts_and_tree(repo, "src/Unrelated.cs", "class Unrelated { public int Size(int x) { return x; } }\n");
-            let (_b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(
+            let (_a_file, _a_tree, a_snapshots) = real_snapshots_and_tree(
                 repo,
-                "src/Caller.cs",
-                "class Caller { private Unrelated src_mask; public int Size(int x) { return x; } public int Run() { return this.src_mask.Size(0); } }\n",
+                "src/model.py",
+                "class Caller:\n    def __init__(self):\n        self.helper = Helper()\n\n    def run(self):\n        pass\n\n    def forward(self):\n        self.helper.run()\n",
             );
+            let (_b_file, _b_tree, b_snapshots) = real_snapshots_and_tree(repo, "src/decoy_one.py", "class DecoyOne:\n    def run(self):\n        pass\n");
             let mut all_snapshots = a_snapshots.clone();
             all_snapshots.extend(b_snapshots.clone());
-            let csharp_contexts = resolve_csharp_type_declaration_contexts(&b_raw, &all_snapshots);
+
+            let (_dummy_file, _dummy_tree, dummy_snapshots, dummy_raw) = real_snapshots_contexts_and_tree(repo, "src/Dummy.cs", "namespace NsDummy;\nclass Dummy {}\n");
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&dummy_raw, &dummy_snapshots);
             assert!(!csharp_contexts.is_empty(), "fixture premise: non-empty csharp_contexts, so this function's own loop body actually executes");
 
-            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &csharp_contexts).unwrap();
-            let run_method = find(&b_snapshots, "Run");
-            let callers_own_size = all_snapshots.iter().find(|s| s.name().as_str() == "Size" && s.file() == run_method.file()).expect("Caller's own Size method must exist");
+            let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &csharp_contexts).unwrap();
+            let forward_method = find(&a_snapshots, "forward");
+            let callers_own_run = find(&a_snapshots, "run");
 
             assert!(
-                edges.iter().any(|e| e.from == run_method.id() && e.to == callers_own_size.id()),
-                "this.src_mask.Size(0) must resolve specifically to Caller's OWN Size method -- a bypassed restriction (the guard-false mutants) would instead see 2 unrestricted candidates (Caller.Size and Unrelated.Size) and produce no edge at all"
+                edges
+                    .iter()
+                    .any(|e| e.from == forward_method.id() && e.to == callers_own_run.id() && e.evidence.method() == codegraph_domain::ResolutionMethod::StaticAnalysis),
+                "self.helper.run() must resolve to Caller's own run with StaticAnalysis evidence, resolved at the EARLIER candidates.len()==1 check once the receiver-field restriction narrows all_candidates down to 1 -- a bypassed restriction (the guard-false mutant) would instead leave 2 unrestricted candidates (Caller.run and DecoyOne.run), which narrow_by_scope's class-level check ALSO narrows back down to Caller.run on its own, but only with NameHeuristic/Speculative evidence (ResolutionMethod::StaticAnalysis is reserved for the earlier, syntactically-certain check this guard gates) -- so the target is unchanged but the evidence tier is not. Attempts: {attempts:?}"
+            );
+
+            // Second half: closes the `true` direction of the same
+            // mutant, which the scenario above cannot (the guard
+            // genuinely evaluates `true` for `self.helper.run()`, so
+            // mutating it TO `true` is a no-op there). Here
+            // `other_obj` is NOT a field of `Caller2` at all (no
+            // `self.other_obj = ...` anywhere) -- `call()` is called on
+            // a value that merely happens to share a name with
+            // something, so the real (guard-false, correctly so) code
+            // must use the UNRESTRICTED `all_candidates`, resolving to
+            // `OtherClass.call` via `narrow_by_scope`'s same-file/-class
+            // reasoning being inapplicable (it lives in a separate
+            // file) but the plain unrestricted name match still
+            // succeeding. A wrongly-forced-`true` guard would instead
+            // call `restrict_to_callers_own_class`, which only keeps
+            // candidates inside `Caller2`'s OWN span -- zero here,
+            // since the real `call` lives in `OtherClass` -- producing
+            // an `Unresolved` attempt instead of a edge.
+            let (_d_file, _d_tree, d_snapshots) = real_snapshots_and_tree(
+                repo,
+                "src/caller2.py",
+                "class Caller2:\n    def forward(self):\n        self.other_obj.call()\n",
+            );
+            let (_e_file, _e_tree, e_snapshots) = real_snapshots_and_tree(repo, "src/other_class.py", "class OtherClass:\n    def call(self):\n        pass\n");
+            let mut all_snapshots_2 = d_snapshots.clone();
+            all_snapshots_2.extend(e_snapshots.clone());
+            let (edges2, attempts2) = resolve_calls_with_namespace_context(&all_snapshots_2, &[], &[], &csharp_contexts).unwrap();
+            let forward2 = find(&d_snapshots, "forward");
+            let other_call = find(&e_snapshots, "call");
+            assert!(
+                edges2.iter().any(|e| e.from == forward2.id() && e.to == other_call.id()),
+                "other_obj.call() must still resolve to OtherClass.call when other_obj is NOT a known field of the caller's own class -- a wrongly-forced-true guard mutant would instead restrict to Caller2's own (empty) class membership and produce no edge at all. Attempts: {attempts2:?}"
             );
         }
 
