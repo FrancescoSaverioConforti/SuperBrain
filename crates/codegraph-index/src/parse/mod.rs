@@ -184,6 +184,8 @@ pub fn parser_for(file: &codegraph_domain::FileIdentity) -> Option<&'static dyn 
         "js" | "mjs" | "cjs" => Some(&JavaScriptParser),
         "ts" => Some(&TypeScriptParser),
         "tsx" | "jsx" => Some(&TsxParser),
+        "html" | "htm" => Some(&HtmlParser),
+        "css" => Some(&CssParser),
         _ => None,
     }
 }
@@ -191,6 +193,16 @@ pub fn parser_for(file: &codegraph_domain::FileIdentity) -> Option<&'static dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codegraph_domain::{CommitHash, FileIdentity, RepositoryId, RepositoryRegistry, RepositoryRoot};
+
+    fn test_repo() -> RepositoryId {
+        let mut registry = RepositoryRegistry::new();
+        registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+    }
+
+    fn file(relative_path: &str) -> FileIdentity {
+        FileIdentity::parse(test_repo(), CommitHash::parse(&"a".repeat(40)).unwrap(), relative_path).unwrap()
+    }
 
     /// One fixture set per language: minimal valid source, a non-trivial
     /// source with nested constructs, and a truncated/malformed source.
@@ -428,5 +440,57 @@ mod tests {
             // acceptable.
             let _ = parser.parse(&source);
         }
+    }
+
+    // =======================================================================
+    // B2-ID-017: `parser_for` (the one dispatch every production call site
+    // uses) was missing match arms for "html"/"css", so every HTML/CSS file
+    // was silently treated as an unsupported extension (`None`), even
+    // though `HtmlParser`/`CssParser` and their extractors were fully wired
+    // and tested in isolation. The tests below pin the dispatch itself;
+    // `tests::full/incremental parity and real-indexer extraction are
+    // covered separately in `tests/html_css_dispatch.rs` (integration
+    // level, since they need `CodeGraphIndexer`, not available to this
+    // crate's own unit tests without a cyclic dev-dependency).
+    // =======================================================================
+
+    #[test]
+    fn parser_for_recognizes_html_extension() {
+        let parser = parser_for(&file("index.html")).expect("parser_for must return Some for a .html file");
+        let tree = parser.parse(b"<div id=\"x\"></div>\n").unwrap();
+        assert_eq!(tree.language(), Language::Html);
+    }
+
+    #[test]
+    fn parser_for_recognizes_htm_extension() {
+        // Same grammar/parser as .html, not a new language -- the other
+        // real-world extension for the identical file type.
+        let parser = parser_for(&file("index.htm")).expect("parser_for must return Some for a .htm file");
+        let tree = parser.parse(b"<div id=\"x\"></div>\n").unwrap();
+        assert_eq!(tree.language(), Language::Html);
+    }
+
+    #[test]
+    fn parser_for_recognizes_css_extension() {
+        let parser = parser_for(&file("style.css")).expect("parser_for must return Some for a .css file");
+        let tree = parser.parse(b".a { color: red; }\n").unwrap();
+        assert_eq!(tree.language(), Language::Css);
+    }
+
+    /// B2-ID-017's own regression pin: on the pre-fix code (match had no
+    /// "html"/"css" arms), this assertion failed -- `parser_for` returned
+    /// `None` for a `.html` file, exactly like a genuinely unknown
+    /// extension such as `.md`. Verified by temporarily reverting the two
+    /// new arms and re-running this test before writing this comment: it
+    /// failed with "expected Some, got None" as predicted. Kept permanently
+    /// as the regression gate.
+    #[test]
+    fn b2_id_017_html_and_css_are_no_longer_treated_as_unsupported_extensions() {
+        assert!(parser_for(&file("index.html")).is_some(), "B2-ID-017 regression: .html must not be an unsupported extension");
+        assert!(parser_for(&file("style.css")).is_some(), "B2-ID-017 regression: .css must not be an unsupported extension");
+        // Control: a genuinely unknown extension must still be None --
+        // confirms the fix is additive, not a fallback that swallows
+        // everything.
+        assert!(parser_for(&file("README.md")).is_none(), "an actually unsupported extension must still be None");
     }
 }
