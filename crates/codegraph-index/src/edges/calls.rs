@@ -52,6 +52,7 @@ use codegraph_domain::{Confidence, EdgeKind, SymbolKind};
 
 use super::resolution::{heuristic_evidence, resolved_evidence, Edge, EdgeResolutionError, TargetLookup};
 pub(crate) use crate::parse::parser_for;
+use crate::csharp_declarations::CSharpTypeDeclarationContext;
 use crate::imports::{ImportFact, ImportResolution};
 use crate::negative_knowledge::CallAttempt;
 use crate::parse::Language;
@@ -524,6 +525,285 @@ pub fn resolve_calls_with_imports(snapshots: &[SymbolSnapshot], signature_too_lo
     }
 
     Ok((edges, attempts))
+}
+
+/// CALL-RES-A4 — C# namespace-aware candidate filtering. Identical to
+/// [`resolve_calls_with_imports`] in every way EXCEPT: when a call
+/// site's direct by-name lookup finds **2 or more** real candidates (the
+/// ambiguity branch CRC-001/CRC-002 occupy, and which
+/// `resolve_calls_with_imports`'s own import-alias mechanism never
+/// touches), and the caller is a C# snapshot, this function additionally
+/// consults `csharp_contexts` to determine each candidate's own
+/// containing-type namespace (via [`enclosing_class_of`], then a
+/// `(file, span)` lookup into `csharp_contexts` for that containing
+/// type), and `import_facts` to determine which namespaces the caller's
+/// own file has brought into scope via a real `using Namespace;`
+/// directive (a *bare* using directive — `module_path` with no `alias`,
+/// confirmed as the real shape `collect_csharp_using` extracts for this
+/// form). A candidate is excluded from the pool ONLY when its own
+/// namespace is DEFINITELY not visible: it differs from the caller's
+/// own namespace AND does not match any `using`'d namespace in the
+/// caller's file. A candidate whose namespace cannot be determined at
+/// all (no containing class found, or that class has no
+/// `CSharpTypeDeclarationContext` entry) is NEVER excluded — incomplete
+/// namespace information must never be treated as "definitely not
+/// visible," per this checkpoint's own three-way visibility discipline
+/// (visible / definitely-not-visible / unknown — `unknown` is never
+/// collapsed into `not-visible`).
+///
+/// # Never invents a target
+///
+/// This function only ever REMOVES candidates whose exclusion is
+/// positively demonstrated by real namespace/using evidence; it never
+/// ADDS a candidate, never resolves via name similarity, and if
+/// filtering leaves zero or one candidate, control falls through to
+/// this function's own byte-identical copy of the existing scope-
+/// narrowing/ambiguity-recording logic — the same "no edge beats a
+/// false edge" discipline every other resolver in this module already
+/// follows. If `csharp_contexts` is empty, or the caller is not C#, this
+/// function is a byte-for-byte no-op versus
+/// [`resolve_calls_with_imports`] — confirmed by a dedicated equivalence
+/// test.
+///
+/// # Scope: only the already-ambiguous (`>= 2`) branch
+///
+/// This function's own namespace filter runs ONLY after the direct
+/// by-name lookup already found 2+ candidates (and, for a generic call
+/// site, only after arity-narrowing has already been applied — see
+/// [`resolve_calls_with_imports`]'s own Priority-1 arity logic, which
+/// this function reuses unchanged). It never touches the zero-candidate
+/// import-alias path above.
+pub fn resolve_calls_with_namespace_context(snapshots: &[SymbolSnapshot], signature_too_long_names: &[String], import_facts: &[ImportFact], csharp_contexts: &[CSharpTypeDeclarationContext]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
+    resolve_calls_with_imports_and_namespaces(snapshots, signature_too_long_names, import_facts, csharp_contexts)
+}
+
+/// The real implementation behind [`resolve_calls_with_namespace_context`].
+/// Deliberately a thin, separately-named function (rather than adding a
+/// 4th parameter to [`resolve_calls_with_imports`] itself) so every
+/// existing call site of that function keeps its exact 3-argument
+/// signature unchanged.
+fn resolve_calls_with_imports_and_namespaces(snapshots: &[SymbolSnapshot], signature_too_long_names: &[String], import_facts: &[ImportFact], csharp_contexts: &[CSharpTypeDeclarationContext]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
+    if csharp_contexts.is_empty() {
+        // No namespace evidence given at all -- byte-identical to the
+        // pre-A4-namespace behavior, confirmed by a dedicated
+        // equivalence test.
+        return resolve_calls_with_imports(snapshots, signature_too_long_names, import_facts);
+    }
+
+    let lookup = TargetLookup::new(snapshots)?;
+    let mut edges = Vec::new();
+    let mut attempts = Vec::new();
+    let rejected_names: std::collections::HashSet<&str> = signature_too_long_names.iter().map(|s| s.as_str()).collect();
+
+    for caller in lookup.snapshots() {
+        if !caller.kind().can_originate_calls() {
+            continue;
+        }
+        let Some(parser) = parser_for(caller.file()) else {
+            continue;
+        };
+        let Ok(tree) = parser.parse(caller.signature().as_str().as_bytes()) else {
+            continue;
+        };
+
+        // The caller's own containing-type namespace (if determinable)
+        // and the set of namespaces its own file brings into scope via
+        // a bare `using Namespace;` directive (never via an aliased
+        // `using Foo = ...;` -- that shape is a symbol alias, not a
+        // namespace import, and stays exclusively in the zero-candidate
+        // alias path above).
+        let caller_namespace = namespace_of_snapshot(lookup.snapshots(), csharp_contexts, caller);
+        let used_namespaces = bare_using_namespaces_in_file(import_facts, caller.file());
+
+        let mut per_target: std::collections::HashMap<codegraph_domain::SymbolSnapshotId, Edge> = std::collections::HashMap::new();
+        let mut per_attempt_name: std::collections::HashMap<String, CallAttempt> = std::collections::HashMap::new();
+
+        for call_site in call_sites_in_tree(&tree) {
+            let absolute_call_site_position = caller.span().start + call_site.fragment_relative_start_byte;
+            if call_site_belongs_to_a_more_nested_caller(lookup.snapshots(), caller, absolute_call_site_position) {
+                continue;
+            }
+
+            let callee_name = call_site.callee_name;
+            let all_candidates = lookup.find_by_name(&callee_name, caller.id());
+
+            let candidates = match &call_site.self_receiver_field {
+                Some(field_name) if receiver_field_is_a_known_member(lookup.snapshots(), caller, field_name) => {
+                    restrict_to_callers_own_class(lookup.snapshots(), caller, &all_candidates)
+                }
+                _ => all_candidates,
+            };
+
+            if candidates.len() == 1 {
+                let evidence = resolved_evidence(&format!("call to {callee_name:?} resolves to exactly one candidate in the given snapshot pool"));
+                let edge = Edge { from: caller.id(), to: candidates[0].id(), kind: EdgeKind::Calls, evidence };
+                upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
+            }
+
+            if candidates.is_empty() {
+                if let Some(outcome) = resolve_via_import_alias(caller, &callee_name, import_facts, lookup.snapshots()) {
+                    match outcome {
+                        ImportAliasOutcome::Resolved(target_id) => {
+                            let (evidence, _confidence) = heuristic_evidence(
+                                codegraph_domain::ResolutionMethod::NameHeuristic,
+                                Confidence::Likely,
+                                &format!("call to {callee_name:?} matches no candidate directly, but resolves via a real import alias in the caller's own file to exactly one candidate"),
+                            );
+                            let edge = Edge { from: caller.id(), to: target_id, kind: EdgeKind::Calls, evidence };
+                            upsert_preferring_stronger_evidence(&mut per_target, edge);
+                            continue;
+                        }
+                        ImportAliasOutcome::External => {
+                            let attempt = CallAttempt::unresolved_import_target_external(caller.id(), callee_name.clone());
+                            per_attempt_name.entry(callee_name).or_insert(attempt);
+                            continue;
+                        }
+                        ImportAliasOutcome::Ambiguous(candidate_ids) => {
+                            let attempt = CallAttempt::ambiguous_import_target(caller.id(), callee_name.clone(), candidate_ids);
+                            per_attempt_name.entry(callee_name).or_insert(attempt);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let arity_narrowed_candidates = narrow_candidates_by_call_site_arity(&candidates, call_site.generic_arity);
+            if call_site.generic_arity.is_some() && arity_narrowed_candidates.len() == 1 {
+                let (evidence, _confidence) = heuristic_evidence(
+                    codegraph_domain::ResolutionMethod::NameHeuristic,
+                    Confidence::Likely,
+                    &format!(
+                        "call to {callee_name:?} resolves to exactly one candidate once narrowed by its own call-site generic arity ({:?}) among {} same-named candidates",
+                        call_site.generic_arity,
+                        candidates.len()
+                    ),
+                );
+                let edge = Edge { from: caller.id(), to: arity_narrowed_candidates[0].id(), kind: EdgeKind::Calls, evidence };
+                upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
+            }
+            let candidates = if call_site.generic_arity.is_some() { arity_narrowed_candidates } else { candidates };
+
+            // CALL-RES-A4 namespace filtering: only when 2+ candidates
+            // remain after arity narrowing, and only for a C# caller
+            // (namespace_of_snapshot/bare_using_namespaces_in_file both
+            // return conservative empty/None results for every other
+            // language, making this a no-op there).
+            let namespace_filtered = exclude_definitely_not_visible_by_namespace(lookup.snapshots(), csharp_contexts, &candidates, caller_namespace.as_deref(), &used_namespaces);
+            let namespace_narrowed_this_call = namespace_filtered.len() < candidates.len();
+            let candidates = namespace_filtered;
+
+            if namespace_narrowed_this_call && candidates.len() == 1 {
+                let (evidence, _confidence) = heuristic_evidence(
+                    codegraph_domain::ResolutionMethod::NameHeuristic,
+                    Confidence::Likely,
+                    &format!("call to {callee_name:?} resolves to exactly one candidate once candidates outside the caller's own or any used namespace are excluded"),
+                );
+                let edge = Edge { from: caller.id(), to: candidates[0].id(), kind: EdgeKind::Calls, evidence };
+                upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
+            }
+
+            if let Some((scoped_candidate, scope_description)) = narrow_by_scope(lookup.snapshots(), caller, &candidates) {
+                let (evidence, _confidence) = heuristic_evidence(
+                    codegraph_domain::ResolutionMethod::NameHeuristic,
+                    Confidence::Speculative,
+                    &format!("call to {callee_name:?} resolves to exactly one candidate once narrowed to {scope_description}"),
+                );
+                let edge = Edge { from: caller.id(), to: scoped_candidate.id(), kind: EdgeKind::Calls, evidence };
+                upsert_preferring_stronger_evidence(&mut per_target, edge);
+                continue;
+            }
+
+            let attempt = if candidates.is_empty() {
+                if rejected_names.contains(callee_name.as_str()) {
+                    CallAttempt::unresolved_with_extraction_rejection(caller.id(), callee_name.clone(), "SignatureTooLong")
+                } else if import_facts.is_empty() {
+                    CallAttempt::unresolved(caller.id(), callee_name.clone())
+                } else {
+                    CallAttempt::unresolved_no_matching_import_alias(caller.id(), callee_name.clone())
+                }
+            } else {
+                CallAttempt::ambiguous(caller.id(), callee_name.clone(), candidates.iter().map(|c| c.id()).collect())
+            };
+            per_attempt_name.entry(callee_name).or_insert(attempt);
+        }
+
+        let mut caller_attempts: Vec<CallAttempt> = per_attempt_name.into_values().collect();
+        caller_attempts.sort_by(|a, b| a.callee_name.cmp(&b.callee_name));
+        attempts.extend(caller_attempts);
+
+        let mut caller_edges: Vec<Edge> = per_target.into_values().collect();
+        caller_edges.sort_by(|a, b| a.to.as_bytes().cmp(b.to.as_bytes()));
+        edges.extend(caller_edges);
+    }
+
+    Ok((edges, attempts))
+}
+
+/// Looks up `symbol`'s own containing-type namespace: finds its
+/// enclosing `Class` (via [`enclosing_class_of`] — note this does not
+/// yet consider an enclosing `Interface`, a pre-existing limitation of
+/// `enclosing_class_of` itself, not newly introduced here), then finds
+/// that class's own `(file, span)` entry in `csharp_contexts`. Returns
+/// `None` — never a guessed/default namespace — when either step fails
+/// to find a real match, which this module's own callers treat as
+/// "namespace unknown," never as "global namespace" or "not visible."
+fn namespace_of_snapshot(snapshots: &[SymbolSnapshot], csharp_contexts: &[CSharpTypeDeclarationContext], symbol: &SymbolSnapshot) -> Option<String> {
+    let enclosing_class = enclosing_class_of(snapshots, symbol)?;
+    csharp_contexts.iter().find(|c| &c.file == enclosing_class.file() && c.span == enclosing_class.span()).map(|c| c.namespace.clone())
+}
+
+/// Every namespace a file brings into scope via a real, BARE
+/// `using Namespace;` directive — i.e. an `ImportFact` for this exact
+/// `file` whose own `alias` is `None` (an aliased `using Foo = X;` is a
+/// symbol alias, already handled exclusively by the zero-candidate
+/// alias path, and is deliberately excluded here to avoid double-
+/// counting the same fact two different ways). `module_path` is used
+/// AS WRITTEN (the real dotted/qualified namespace text), never
+/// truncated to its own last segment — unlike `resolve_raw_import_statements`'s
+/// own `lookup_name` derivation (which exists to find a SYMBOL, not a
+/// namespace), this function's own job is namespace-string EQUALITY
+/// against `CSharpTypeDeclarationContext::namespace`'s own canonical
+/// dotted form, which the full `module_path` text already matches
+/// exactly for a real `using Polly.Bulkhead;` directive.
+fn bare_using_namespaces_in_file(import_facts: &[ImportFact], file: &codegraph_domain::FileIdentity) -> std::collections::HashSet<String> {
+    import_facts.iter().filter(|f| &f.importing_file == file && f.alias.is_none()).map(|f| f.module_path.clone()).collect()
+}
+
+/// Excludes every candidate whose own namespace is DEFINITELY not
+/// visible from `caller_namespace`'s own position: a namespace was
+/// actually determined for the candidate (never `None` — an unknown
+/// namespace is NEVER treated as "not visible," per this checkpoint's
+/// own three-way visibility discipline), AND that namespace differs
+/// from both `caller_namespace` itself and every entry in
+/// `used_namespaces`. If filtering would remove EVERY candidate (every
+/// one has a determined, definitely-wrong namespace), the ORIGINAL,
+/// unfiltered list is returned instead — this function narrows toward a
+/// smaller honest ambiguity, it never manufactures a zero-candidate
+/// outcome out of a real `>= 2` ambiguity that this filter's own
+/// evidence cannot fully explain (e.g. every real candidate living in a
+/// namespace this file never actually imports would be a sign this
+/// filter's own namespace data is incomplete or wrong for this case,
+/// not genuine proof that NONE of them could possibly be the target).
+fn exclude_definitely_not_visible_by_namespace<'a>(snapshots: &[SymbolSnapshot], csharp_contexts: &[CSharpTypeDeclarationContext], candidates: &[&'a SymbolSnapshot], caller_namespace: Option<&str>, used_namespaces: &std::collections::HashSet<String>) -> Vec<&'a SymbolSnapshot> {
+    if candidates.len() < 2 {
+        return candidates.to_vec();
+    }
+    let filtered: Vec<&SymbolSnapshot> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| match namespace_of_snapshot(snapshots, csharp_contexts, candidate) {
+            None => true, // Unknown namespace -- never excluded.
+            Some(candidate_ns) => Some(candidate_ns.as_str()) == caller_namespace || used_namespaces.contains(&candidate_ns),
+        })
+        .collect();
+    if filtered.is_empty() {
+        candidates.to_vec()
+    } else {
+        filtered
+    }
 }
 
 /// Task 9.5, Priority 5(A): the `Class` snapshot that structurally
@@ -3582,6 +3862,241 @@ mod tests {
 
             assert_eq!(edges_before, edges_after, "A4 must produce a BYTE-FOR-BYTE IDENTICAL result to the pre-A4 baseline for this exact CRC-002 shape -- confirms no new FP was introduced by A4 on this case");
             let _ = unrelated_file;
+        }
+    }
+
+    /// CALL-RES-A4 — C# namespace-aware candidate filtering
+    /// (`resolve_calls_with_namespace_context`). Every fixture uses REAL
+    /// extraction (`extract_symbols_reporting_rejections` + `promote`
+    /// for snapshots, `extract_csharp_type_declaration_contexts` +
+    /// `resolve_csharp_type_declaration_contexts` for namespace
+    /// contexts, `resolve_import_facts` for `using` directives), never
+    /// hand-built structs, per this project's own evidence-before-claims
+    /// discipline.
+    mod call_res_a4_namespace {
+        use super::*;
+        use crate::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts};
+        use crate::extract::extract_symbols_reporting_rejections;
+        use crate::imports::resolve_import_facts;
+
+        fn real_snapshots_contexts_and_tree(repo: codegraph_domain::RepositoryId, path: &str, source: &str) -> (FileIdentity, crate::parse::ParseTree, Vec<SymbolSnapshot>, Vec<(FileIdentity, crate::csharp_declarations::RawCSharpTypeDeclarationContext)>) {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = parser_for(&file).expect("a supported extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("fixture source must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture source must not trigger any extraction rejection: {rejections:?}");
+            let snapshots: Vec<SymbolSnapshot> = candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect();
+            let raw_contexts: Vec<_> = extract_csharp_type_declaration_contexts(&tree).into_iter().map(|c| (file.clone(), c)).collect();
+            (file, tree, snapshots, raw_contexts)
+        }
+
+        fn find<'a>(snapshots: &'a [SymbolSnapshot], name: &str) -> &'a SymbolSnapshot {
+            snapshots.iter().find(|s| s.name().as_str() == name).unwrap_or_else(|| panic!("no snapshot named {name:?} among {:?}", snapshots.iter().map(|s| s.name().as_str()).collect::<Vec<_>>()))
+        }
+
+        /// Local copy of the sibling `call_res_a4_import_alias` module's
+        /// own helper (that module's own version is private to it) --
+        /// used only by this module's two CRC-regression tests, which
+        /// deliberately reuse the Python CRC-001 shape to confirm this
+        /// new entry point does not perturb it.
+        fn real_snapshots_and_tree(repo: codegraph_domain::RepositoryId, path: &str, source: &str) -> (FileIdentity, crate::parse::ParseTree, Vec<SymbolSnapshot>) {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = parser_for(&file).expect("a supported extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("fixture source must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture source must not trigger any extraction rejection: {rejections:?}");
+            let snapshots = candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect();
+            (file, tree, snapshots)
+        }
+
+        /// Case: same simple method name declared on two classes in two
+        /// DIFFERENT namespaces; the caller's own file `using`s ONE of
+        /// them. The candidate in the non-`using`'d namespace must be
+        /// excluded, leaving exactly one real candidate -- a genuine
+        /// ambiguity resolved via real namespace evidence, never a
+        /// guess.
+        #[test]
+        fn namespace_import_excludes_the_non_imported_namespace_candidate() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw);
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+            assert_eq!(import_facts.len(), 1, "fixture premise: one real using directive");
+            assert!(import_facts[0].alias.is_none(), "fixture premise: a BARE using directive, not an alias");
+
+            let run_method = find(&caller_snapshots, "Run");
+            let target_in_a = find(&a_snapshots, "Target");
+            let target_in_b = find(&b_snapshots, "Target");
+            let all_targets = all_snapshots.iter().filter(|s| s.name().as_str() == "Target").count();
+            assert_eq!(all_targets, 2, "fixture premise: two real, same-named candidates");
+
+            let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+
+            let recovered = edges.iter().find(|e| e.from == run_method.id() && e.to == target_in_a.id());
+            assert!(recovered.is_some(), "the caller's own using NsA; must exclude NsB::Foo::Target, leaving exactly one real candidate in NsA");
+            assert!(edges.iter().all(|e| e.to != target_in_b.id()), "the non-imported namespace's candidate must never be chosen");
+            assert!(attempts.iter().all(|a| a.callee_name != "Target"), "a recovered namespace-filtered call must produce an Edge, never ALSO a CallAttempt");
+            let _ = (a_file, b_file);
+        }
+
+        /// Case: same simple method name on two classes in two
+        /// different namespaces; the caller is ITSELF declared inside
+        /// one of those namespaces (no `using` directive needed -- the
+        /// caller's own namespace is always in scope for itself).
+        #[test]
+        fn callers_own_namespace_is_in_scope_without_any_using_directive() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Caller.cs", "namespace NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw.clone());
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+
+            // No import facts at all -- the caller's own namespace
+            // membership alone must be enough.
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &csharp_contexts).unwrap();
+
+            let run_method = find(&all_snapshots, "Run");
+            let target = find(&a_snapshots, "Target");
+            assert!(edges.iter().any(|e| e.from == run_method.id() && e.to == target.id()), "a candidate in the caller's own namespace must be considered visible with zero using directives");
+            let _ = (a_file, b_file);
+        }
+
+        /// Required negative test: wildcard-equivalent case -- a using
+        /// directive exists for a namespace that is NEITHER candidate's
+        /// own namespace. Both real candidates must stay excluded from
+        /// nothing (namespace filtering finds no match for either), so
+        /// filtering must fall back to the ORIGINAL unfiltered set
+        /// rather than manufacturing a false zero-candidate outcome --
+        /// the real ambiguity must remain honestly Ambiguous.
+        #[test]
+        fn using_an_unrelated_third_namespace_never_manufactures_a_false_resolution() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsC;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw);
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+
+            let run_method = find(&caller_snapshots, "Run");
+            assert!(edges.iter().all(|e| e.from != run_method.id()), "a using directive for an unrelated third namespace must never resolve a real cross-namespace ambiguity -- the real ambiguity must remain Ambiguous, never silently narrowed to zero via a filter whose own evidence does not actually explain either candidate");
+            assert!(
+                attempts.iter().any(|a| a.caller == run_method.id() && a.callee_name == "Target" && a.tier == codegraph_domain::EvidenceTier::Ambiguous && a.candidates.len() == 2),
+                "both real candidates must be preserved in the honest Ambiguous record"
+            );
+            let _ = (a_file, b_file);
+        }
+
+        /// Required negative test: the caller is a NON-C# language --
+        /// confirms `resolve_calls_with_namespace_context` behaves
+        /// identically to `resolve_calls_with_imports` when
+        /// `csharp_contexts` is genuinely empty (the real condition for
+        /// any non-C# corpus, since only C# ever produces
+        /// `CSharpTypeDeclarationContext` entries at all).
+        #[test]
+        fn empty_csharp_contexts_is_byte_for_byte_identical_to_resolve_calls_with_imports() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots) = real_snapshots_and_tree(repo, "models/a.py", "class RNNModel:\n    pass\n");
+            let (caller_file, caller_tree, caller_snapshots) = real_snapshots_and_tree(repo, "models/trainer.py", "def _run_trainer():\n    return RNNModel()\n");
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(caller_snapshots.clone());
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges_via_imports, attempts_via_imports) = resolve_calls_with_imports(&all_snapshots, &[], &import_facts).unwrap();
+            let (edges_via_namespace, attempts_via_namespace) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &[]).unwrap();
+
+            assert_eq!(edges_via_imports, edges_via_namespace, "with empty csharp_contexts, the namespace-aware entry point must be byte-for-byte identical to resolve_calls_with_imports");
+            assert_eq!(attempts_via_imports, attempts_via_namespace);
+            let _ = a_file;
+        }
+
+        /// Required negative test: a candidate whose namespace is
+        /// genuinely UNKNOWN (no `CSharpTypeDeclarationContext` entry
+        /// exists for its own enclosing class -- simulated here by
+        /// giving the resolver csharp_contexts that do not cover one of
+        /// the two real candidate classes at all) must never be
+        /// excluded merely because its namespace could not be
+        /// determined -- "unknown" is never collapsed into
+        /// "not-visible."
+        #[test]
+        fn a_candidate_with_an_undetermined_namespace_is_never_excluded() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, _b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            // Deliberately only resolve contexts for NsA::Foo -- NsB::Foo's
+            // own class has NO CSharpTypeDeclarationContext entry at all,
+            // simulating "namespace undetermined" for that one candidate.
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&a_raw, &all_snapshots);
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+
+            let run_method = find(&caller_snapshots, "Run");
+            // NsA::Foo::Target is visible (caller's own used namespace);
+            // NsB::Foo::Target has an UNDETERMINED namespace (never
+            // excluded) -- so BOTH candidates survive filtering, and the
+            // real ambiguity (2 candidates) must remain honestly Ambiguous
+            // rather than falsely narrowed to the one determined match.
+            assert!(edges.iter().all(|e| e.from != run_method.id()), "an undetermined-namespace candidate must never be silently excluded -- the real ambiguity (one determined-visible, one undetermined) must stay Ambiguous, never falsely resolved");
+            assert!(
+                attempts.iter().any(|a| a.caller == run_method.id() && a.callee_name == "Target" && a.tier == codegraph_domain::EvidenceTier::Ambiguous && a.candidates.len() == 2),
+                "both candidates (one determined-visible, one undetermined) must be preserved in the honest Ambiguous record"
+            );
+            let _ = (a_file, b_file);
+        }
+
+        /// CRC-001/CRC-002 non-regression, re-confirmed against this
+        /// specific new entry point: the Python CRC-001/CRC-002 shapes
+        /// must behave identically whether called via
+        /// `resolve_calls_with_imports` or
+        /// `resolve_calls_with_namespace_context` with empty
+        /// `csharp_contexts` -- confirms this new code path introduces
+        /// no cross-language interference.
+        #[test]
+        fn crc_001_and_crc_002_unaffected_by_the_new_namespace_entry_point() {
+            let repo = test_repo_calls();
+            let (a_file, _a_tree, a_snapshots) = real_snapshots_and_tree(repo, "models/a.py", "class RNNModel:\n    pass\n");
+            let (b_file, _b_tree, b_snapshots) = real_snapshots_and_tree(repo, "models/b.py", "class RNNModel:\n    pass\n");
+            let (caller_file, caller_tree, caller_snapshots) = real_snapshots_and_tree(repo, "models/trainer.py", "import os\n\n\ndef _run_trainer():\n    return RNNModel()\n");
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges_via_imports, attempts_via_imports) = resolve_calls_with_imports(&all_snapshots, &[], &import_facts).unwrap();
+            let (edges_via_namespace, attempts_via_namespace) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &[]).unwrap();
+
+            assert_eq!(edges_via_imports, edges_via_namespace, "CRC-001's own Python shape must be unaffected by the new namespace-aware entry point when csharp_contexts is empty");
+            assert_eq!(attempts_via_imports, attempts_via_namespace);
+            let _ = (a_file, b_file);
         }
     }
 }

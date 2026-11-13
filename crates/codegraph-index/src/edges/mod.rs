@@ -68,7 +68,7 @@ mod instantiates;
 mod resolution;
 mod tests_for;
 
-pub use calls::{resolve_calls, resolve_calls_with_extraction_rejections, resolve_calls_with_negative_knowledge};
+pub use calls::{resolve_calls, resolve_calls_with_extraction_rejections, resolve_calls_with_imports, resolve_calls_with_namespace_context, resolve_calls_with_negative_knowledge};
 pub use contains::resolve_contains;
 pub use extends_implements::{resolve_extends_implements, resolve_extends_implements_with_csharp_contexts};
 pub use instantiates::resolve_instantiates;
