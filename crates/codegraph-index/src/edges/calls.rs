@@ -4240,6 +4240,35 @@ mod tests {
             assert!(edges.iter().any(|e| e.from == run_method.id() && e.to == generic_foo.id()), "the generic call site's own arity must narrow 2 same-named overloads down to the one real arity-1 target through this entry point's own duplicated arity-narrowing logic");
         }
 
+        /// Closes the `caller.span().start + call_site.fragment_relative_start_byte`
+        /// `+` vs `-`/`*` mutant: this entry point's own duplicated copy
+        /// of the nested-caller-ownership check (B2-ID-006's own
+        /// invariant) must correctly compute a call site's ABSOLUTE
+        /// file position, not a corrupted one, or a nested caller's own
+        /// call would be wrongly attributed to its outer container. Two
+        /// top-level C# methods in the same class, one calling the
+        /// other directly, confirm the position arithmetic is correct
+        /// through this specific entry point (a corrupted `-`/`*`
+        /// mutant would miscompute the position and could cause EITHER
+        /// a spurious extra edge from the outer method or a missing
+        /// edge from the inner one, depending on which direction the
+        /// corruption skews).
+        #[test]
+        fn absolute_call_site_position_is_computed_correctly_through_the_namespace_aware_entry_point() {
+            let repo = test_repo_calls();
+            let (_file, _tree, snapshots, _raw) = real_snapshots_contexts_and_tree(
+                repo,
+                "src/Caller.cs",
+                "namespace NsA;\nclass Caller {\n    public void Outer() {\n        Inner();\n    }\n    public void Inner() {\n    }\n}\n",
+            );
+            let outer = find(&snapshots, "Outer");
+            let inner = find(&snapshots, "Inner");
+
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&snapshots, &[], &[], &[]).unwrap();
+
+            assert!(edges.iter().any(|e| e.from == outer.id() && e.to == inner.id()), "Outer's own direct call to Inner must resolve correctly -- a corrupted absolute-position computation would miscompute call-site ownership");
+        }
+
         /// CRC-001/CRC-002 non-regression, re-confirmed against this
         /// specific new entry point: the Python CRC-001/CRC-002 shapes
         /// must behave identically whether called via
