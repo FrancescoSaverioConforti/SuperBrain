@@ -4073,6 +4073,173 @@ mod tests {
             let _ = (a_file, b_file);
         }
 
+        // --- Mutation-closure tests: direct unit tests on the two
+        // small helper functions, plus end-to-end tests exercising the
+        // shared-loop-body mutants `cargo mutants` found unreached by
+        // the 6 tests above (each of which happened to only exercise
+        // ONE path through the duplicated loop body, not every
+        // branch/condition combination cargo-mutants can flip).
+
+        #[test]
+        fn exclude_definitely_not_visible_returns_the_single_candidate_unfiltered_when_fewer_than_two() {
+            // Closes the `candidates.len() < 2` guard's own `<` vs `>`
+            // mutant: with exactly ONE candidate, the function must
+            // short-circuit and return it unfiltered -- never reach the
+            // namespace-matching logic below at all (which, for a
+            // single real candidate with an UNRELATED namespace, would
+            // otherwise behave identically anyway via the `None` branch,
+            // making the two code paths behavior-equivalent unless this
+            // exact single-candidate case is tested directly).
+            let repo = test_repo_calls();
+            let (_file, _tree, snapshots, _raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let target = find(&snapshots, "Target");
+            let candidates = vec![target];
+            let used = std::collections::HashSet::new();
+            let result = exclude_definitely_not_visible_by_namespace(&snapshots, &[], &candidates, Some("CompletelyUnrelatedNs"), &used);
+            assert_eq!(result, vec![target], "fewer than 2 candidates must short-circuit to the original, unfiltered list");
+        }
+
+        #[test]
+        fn exclude_definitely_not_visible_excludes_only_the_namespace_mismatched_candidate_among_three() {
+            // Direct unit test on the filtering predicate itself (not
+            // via the full resolver), confirming the `||` in
+            // `Some(candidate_ns.as_str()) == caller_namespace || used_namespaces.contains(...)`
+            // genuinely combines TWO independent ways a namespace can be
+            // visible (closes the real `&&`-vs-`||` mutant at this
+            // exact line): one candidate matches the caller's OWN
+            // namespace, one matches a USED namespace, one matches
+            // neither and must be excluded.
+            let repo = test_repo_calls();
+            let (_a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (_b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Bar.cs", "namespace NsB;\nclass Bar { public void Target() {} }\n");
+            let (_c_file, _c_tree, c_snapshots, c_raw) = real_snapshots_contexts_and_tree(repo, "src/NsC/Baz.cs", "namespace NsC;\nclass Baz { public void Target() {} }\n");
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(c_snapshots.clone());
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw);
+            all_raw.extend(c_raw);
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+
+            let target_a = find(&a_snapshots, "Target");
+            let target_b = find(&b_snapshots, "Target");
+            let target_c = find(&c_snapshots, "Target");
+            let candidates = vec![target_a, target_b, target_c];
+            let mut used = std::collections::HashSet::new();
+            used.insert("NsB".to_string());
+
+            // caller_namespace = NsA (matches target_a directly);
+            // used_namespaces = {NsB} (matches target_b via the OR
+            // branch, NOT the caller-namespace branch); target_c
+            // matches neither and must be excluded.
+            let result = exclude_definitely_not_visible_by_namespace(&all_snapshots, &csharp_contexts, &candidates, Some("NsA"), &used);
+            let result_ids: std::collections::HashSet<_> = result.iter().map(|s| s.id()).collect();
+            assert!(result_ids.contains(&target_a.id()), "the caller's-own-namespace match must survive");
+            assert!(result_ids.contains(&target_b.id()), "the used-namespace match must survive -- this is what the || (not &&) must preserve");
+            assert!(!result_ids.contains(&target_c.id()), "the candidate matching NEITHER condition must be excluded");
+            assert_eq!(result.len(), 2);
+        }
+
+        #[test]
+        fn bare_using_namespaces_in_file_excludes_aliased_usings_and_other_files() {
+            // Direct unit test on `bare_using_namespaces_in_file` itself,
+            // closing the real `&&` (file match AND alias-is-none) vs
+            // `||` mutant: builds import facts for TWO files (only one
+            // of which is the file under test) where ONE import in the
+            // target file is aliased (`using Foo = NsReal.Thing;`) and
+            // one is bare (`using NsBare;`) -- only the bare one in the
+            // CORRECT file must be returned.
+            let repo = test_repo_calls();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let target_file = FileIdentity::parse(repo, commit.clone(), "src/Caller.cs").unwrap();
+            let other_file = FileIdentity::parse(repo, commit, "src/Other.cs").unwrap();
+            let bare_fact = crate::imports::ImportFact {
+                importing_file: target_file.clone(),
+                module_path: "NsBare".to_string(),
+                imported_symbol: None,
+                alias: None,
+                span: crate::extract::ByteSpan { start: 0, end: 1 },
+                resolution: crate::imports::ImportResolution::External,
+            };
+            let aliased_fact_same_file = crate::imports::ImportFact {
+                importing_file: target_file.clone(),
+                module_path: "NsReal.Thing".to_string(),
+                imported_symbol: None,
+                alias: Some("Foo".to_string()),
+                span: crate::extract::ByteSpan { start: 2, end: 3 },
+                resolution: crate::imports::ImportResolution::External,
+            };
+            let bare_fact_other_file = crate::imports::ImportFact {
+                importing_file: other_file,
+                module_path: "NsOtherFile".to_string(),
+                imported_symbol: None,
+                alias: None,
+                span: crate::extract::ByteSpan { start: 4, end: 5 },
+                resolution: crate::imports::ImportResolution::External,
+            };
+            let facts = vec![bare_fact, aliased_fact_same_file, bare_fact_other_file];
+            let result = bare_using_namespaces_in_file(&facts, &target_file);
+            assert_eq!(result, std::collections::HashSet::from(["NsBare".to_string()]), "only the bare (non-aliased) using in the CORRECT file must be returned -- the aliased one and the other file's own bare using must both be excluded");
+        }
+
+        /// Closes the receiver-field match-guard mutant at this
+        /// function's own copy of the `self.field.method()` restriction
+        /// logic: a `self.src_mask.size(0)`-shaped call where
+        /// `src_mask` IS a real field of the caller's own class must
+        /// restrict candidates to that SAME class, never resolving to
+        /// an unrelated same-named method elsewhere -- re-confirms this
+        /// pre-existing Task-9.5 behavior holds unchanged through this
+        /// new entry point's own duplicated loop body.
+        #[test]
+        fn receiver_field_restriction_is_preserved_through_the_namespace_aware_entry_point() {
+            let repo = test_repo_calls();
+            let (_a_file, _a_tree, a_snapshots, _a_raw) = real_snapshots_contexts_and_tree(repo, "src/Unrelated.cs", "class Unrelated { public int Size(int x) { return x; } }\n");
+            let (_b_file, b_tree, b_snapshots, _b_raw) = real_snapshots_contexts_and_tree(
+                repo,
+                "src/Caller.cs",
+                "class Caller { private Unrelated src_mask; public int Run() { return src_mask.Size(0); } }\n",
+            );
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            let _ = b_tree;
+
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &[]).unwrap();
+            let run_method = find(&b_snapshots, "Run");
+            // With zero csharp_contexts, this call goes through the
+            // byte-identical resolve_calls_with_imports fallback path --
+            // re-run with a non-empty (but irrelevant) context list to
+            // force this function's OWN loop body to execute instead.
+            let (_f, _t, dummy_snapshots, dummy_raw) = real_snapshots_contexts_and_tree(repo, "src/Dummy.cs", "namespace NsDummy;\nclass Dummy {}\n");
+            let dummy_contexts = resolve_csharp_type_declaration_contexts(&dummy_raw, &dummy_snapshots);
+            let (edges2, _attempts2) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &dummy_contexts).unwrap();
+            assert_eq!(edges, edges2, "a non-matching dummy csharp_contexts set must not change this call's own resolution");
+            assert!(edges2.iter().any(|e| e.from == run_method.id()), "the receiver-restricted call must still resolve through the namespace-aware entry point's own duplicated loop body");
+        }
+
+        /// Closes the generic-arity narrowing mutants (`&&` vs `||`,
+        /// `==` vs `!=`) in this function's own duplicated copy of the
+        /// Priority-1 arity-narrowing logic: a real generic call site
+        /// with a known arity, narrowing 2 same-arity-irrelevant
+        /// candidates down to exactly one, must still resolve correctly
+        /// through THIS entry point specifically (not just through
+        /// `resolve_calls_with_imports`, which the Semantic Resolution
+        /// checkpoint's own tests already cover).
+        #[test]
+        fn generic_arity_narrowing_is_preserved_through_the_namespace_aware_entry_point() {
+            let repo = test_repo_calls();
+            let (_a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/Container.cs", "namespace NsA;\nclass Container { public void Foo() {} public void Foo<T>() {} }\n");
+            let (_b_file, b_tree, b_snapshots, _b_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "namespace NsA;\nclass Caller { public void Run() { Foo<int>(); } }\n");
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&a_raw, &all_snapshots);
+            let _ = b_tree;
+
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &csharp_contexts).unwrap();
+            let run_method = find(&b_snapshots, "Run");
+            let generic_foo = all_snapshots.iter().find(|s| s.name().as_str() == "Foo" && s.signature().as_str().contains("Foo<T>")).expect("the generic Foo<T> overload must exist");
+            assert!(edges.iter().any(|e| e.from == run_method.id() && e.to == generic_foo.id()), "the generic call site's own arity must narrow 2 same-named overloads down to the one real arity-1 target through this entry point's own duplicated arity-narrowing logic");
+        }
+
         /// CRC-001/CRC-002 non-regression, re-confirmed against this
         /// specific new entry point: the Python CRC-001/CRC-002 shapes
         /// must behave identically whether called via
