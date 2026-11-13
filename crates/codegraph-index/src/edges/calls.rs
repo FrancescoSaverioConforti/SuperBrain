@@ -4256,15 +4256,26 @@ mod tests {
         #[test]
         fn absolute_call_site_position_is_computed_correctly_through_the_namespace_aware_entry_point() {
             let repo = test_repo_calls();
-            let (_file, _tree, snapshots, _raw) = real_snapshots_contexts_and_tree(
+            let (_file, _tree, snapshots, raw) = real_snapshots_contexts_and_tree(
                 repo,
                 "src/Caller.cs",
                 "namespace NsA;\nclass Caller {\n    public void Outer() {\n        Inner();\n    }\n    public void Inner() {\n    }\n}\n",
             );
             let outer = find(&snapshots, "Outer");
             let inner = find(&snapshots, "Inner");
+            // A non-empty csharp_contexts is REQUIRED here: with an
+            // empty slice, resolve_calls_with_namespace_context takes
+            // its own early-return fallback straight to
+            // resolve_calls_with_imports, never executing this
+            // function's OWN duplicated loop body (and its own copy of
+            // the absolute-position arithmetic) at all -- confirmed
+            // directly by `cargo mutants` still reporting this exact
+            // mutant as genuine-missed against an earlier, incorrect
+            // version of this test that passed `&[]`.
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw, &snapshots);
+            assert!(!csharp_contexts.is_empty(), "fixture premise: non-empty csharp_contexts, so this function's own loop body actually executes");
 
-            let (edges, _attempts) = resolve_calls_with_namespace_context(&snapshots, &[], &[], &[]).unwrap();
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&snapshots, &[], &[], &csharp_contexts).unwrap();
 
             assert!(edges.iter().any(|e| e.from == outer.id() && e.to == inner.id()), "Outer's own direct call to Inner must resolve correctly -- a corrupted absolute-position computation would miscompute call-site ownership");
         }
