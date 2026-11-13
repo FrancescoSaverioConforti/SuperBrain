@@ -52,6 +52,7 @@ use codegraph_domain::{Confidence, EdgeKind, SymbolKind};
 
 use super::resolution::{heuristic_evidence, resolved_evidence, Edge, EdgeResolutionError, TargetLookup};
 pub(crate) use crate::parse::parser_for;
+use crate::imports::{ImportFact, ImportResolution};
 use crate::negative_knowledge::CallAttempt;
 use crate::parse::Language;
 use crate::snapshot::SymbolSnapshot;
@@ -122,7 +123,70 @@ pub fn resolve_calls_with_negative_knowledge(snapshots: &[SymbolSnapshot]) -> Re
 /// wrapper calling this with an empty `signature_too_long_names` slice
 /// — byte-for-byte identical behavior for every existing call site,
 /// confirmed by a dedicated equivalence test.
+///
+/// Also a thin compatibility wrapper (CALL-RES-A4): calls
+/// [`resolve_calls_with_imports`] with an empty `import_facts` slice.
+/// Byte-for-byte identical behavior for every existing call site,
+/// confirmed by a dedicated equivalence test.
 pub fn resolve_calls_with_extraction_rejections(snapshots: &[SymbolSnapshot], signature_too_long_names: &[String]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
+    resolve_calls_with_imports(snapshots, signature_too_long_names, &[])
+}
+
+/// CALL-RES-A4 — Import/Namespace/Visibility-aware Resolution. Identical
+/// to [`resolve_calls_with_extraction_rejections`] in every way EXCEPT:
+/// when a call site's own callee name matches ZERO real candidates
+/// directly (the exact failure shape CRC-003 documented — the resolver
+/// is honestly uncertain, not ambiguous), this function additionally
+/// checks whether `import_facts` contains a real `ImportFact`, from the
+/// SAME file as `caller`, whose own `alias` field equals this exact
+/// callee name. If so, it re-resolves using that alias's own ALREADY-
+/// COMPUTED `resolution` (never re-derived here — `ImportFact`'s own
+/// resolution is computed once, globally, by `resolve_raw_import_statements`,
+/// and this function only CONSUMES that result, per this crate's
+/// "resolvers never re-derive another resolver's own determination"
+/// discipline):
+///
+/// - `ImportResolution::Internal(target_id)`: produces a real `Edge`
+///   (`ResolutionMethod::NameHeuristic`, since the alias mapping is a
+///   real structural fact but this is still name-based linking, not
+///   full semantic resolution) pointing at `target_id` directly — no
+///   re-scanning the snapshot pool by name at all, since the alias
+///   fact ALREADY names the exact target unambiguously.
+/// - `ImportResolution::External`: produces a `CallAttempt::unresolved_import_target_external`
+///   — a MORE SPECIFIC, honest claim than plain `Unknown`: the alias
+///   is real and its target is confirmed external, not merely absent
+///   for an unknown reason.
+/// - `ImportResolution::Ambiguous`: produces a `CallAttempt::ambiguous_import_target`.
+///
+/// If NO import fact in the caller's own file has a matching `alias`,
+/// this function records `CallAttempt::unresolved_no_matching_import_alias`
+/// instead of the plain `Unknown` a caller passing an empty
+/// `import_facts` slice would get — distinguishing "I checked import
+/// evidence and found nothing" from "I never checked."
+///
+/// # Never invents a target from incomplete import information
+///
+/// This function NEVER falls back to name-similarity matching, and
+/// NEVER treats a wildcard/star import, an unresolvable relative
+/// import, or any other incomplete import fact as license to guess —
+/// the ONLY signal this function acts on is an EXACT, already-resolved
+/// `ImportFact.alias` match. An import whose own `alias` field is
+/// `None` (the ordinary, non-aliased case) is never consulted here at
+/// all; `ImportFact`'s own `imported_symbol`/`module_path` fields are
+/// deliberately NOT used to widen the match, since this function's
+/// whole purpose (per CRC-003) is the exact-alias case, not a general
+/// import-based rename.
+///
+/// # Scope: zero-candidate case only — never touches the `>= 2` path
+///
+/// This function's own import-alias check runs ONLY when the direct
+/// by-name candidate lookup found exactly ZERO candidates. It NEVER
+/// runs when `candidates.len() >= 2` (the ambiguity path CRC-001/
+/// CRC-002 occupy) — those two challenge cases are structurally
+/// unreachable from this function's own new code path, by construction,
+/// not merely by convention; see the dedicated CRC-001/CRC-002
+/// non-regression tests.
+pub fn resolve_calls_with_imports(snapshots: &[SymbolSnapshot], signature_too_long_names: &[String], import_facts: &[ImportFact]) -> Result<(Vec<Edge>, Vec<CallAttempt>), EdgeResolutionError> {
     let lookup = TargetLookup::new(snapshots)?;
     let mut edges = Vec::new();
     let mut attempts = Vec::new();
@@ -247,6 +311,42 @@ pub fn resolve_calls_with_extraction_rejections(snapshots: &[SymbolSnapshot], si
                 };
                 upsert_preferring_stronger_evidence(&mut per_target, edge);
                 continue;
+            }
+
+            // CALL-RES-A4: the zero-candidate case ONLY — a direct
+            // by-name lookup found nothing at all (CRC-003's own exact
+            // failure shape: `_get_features_targets` matches zero
+            // candidates because the real target is named
+            // `get_features_targets`). This check is structurally
+            // unreachable when `candidates.len() >= 2` (the
+            // CRC-001/CRC-002 ambiguity territory): it lives entirely
+            // inside the `candidates.is_empty()` branch, never touching
+            // the already-resolved-to-one or already-ambiguous paths.
+            if candidates.is_empty() {
+                if let Some(outcome) = resolve_via_import_alias(caller, &callee_name, import_facts, lookup.snapshots()) {
+                    match outcome {
+                        ImportAliasOutcome::Resolved(target_id) => {
+                            let (evidence, _confidence) = heuristic_evidence(
+                                codegraph_domain::ResolutionMethod::NameHeuristic,
+                                Confidence::Likely,
+                                &format!("call to {callee_name:?} matches no candidate directly, but resolves via a real import alias in the caller's own file to exactly one candidate"),
+                            );
+                            let edge = Edge { from: caller.id(), to: target_id, kind: EdgeKind::Calls, evidence };
+                            upsert_preferring_stronger_evidence(&mut per_target, edge);
+                            continue;
+                        }
+                        ImportAliasOutcome::External => {
+                            let attempt = CallAttempt::unresolved_import_target_external(caller.id(), callee_name.clone());
+                            per_attempt_name.entry(callee_name).or_insert(attempt);
+                            continue;
+                        }
+                        ImportAliasOutcome::Ambiguous(candidate_ids) => {
+                            let attempt = CallAttempt::ambiguous_import_target(caller.id(), callee_name.clone(), candidate_ids);
+                            per_attempt_name.entry(callee_name).or_insert(attempt);
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Semantic Resolution & Reliability Checkpoint, Priority 1:
@@ -386,8 +486,27 @@ pub fn resolve_calls_with_extraction_rejections(snapshots: &[SymbolSnapshot], si
                 // confirms it.
                 if rejected_names.contains(callee_name.as_str()) {
                     CallAttempt::unresolved_with_extraction_rejection(caller.id(), callee_name.clone(), "SignatureTooLong")
-                } else {
+                } else if import_facts.is_empty() {
+                    // No import evidence was given to this call AT ALL
+                    // (the old entry points, or a real run against a
+                    // language/corpus with zero import facts) — `Unknown`
+                    // is the correct, honest classification: import
+                    // evidence was never consulted, not consulted-and-
+                    // found-nothing. Confirmed by the dedicated
+                    // equivalence test that `resolve_calls_with_imports`
+                    // called with `&[]` is byte-for-byte identical to
+                    // the pre-A4 behavior.
                     CallAttempt::unresolved(caller.id(), callee_name.clone())
+                } else {
+                    // CALL-RES-A4: real import facts WERE given to this
+                    // call, `resolve_via_import_alias` was actually
+                    // invoked above (the `candidates.is_empty()` branch
+                    // already ran it) and returned `None` — i.e. import
+                    // evidence was genuinely checked for this exact
+                    // callee name and found no matching alias. This is
+                    // a more specific, honest claim than plain
+                    // `Unknown`, never a guess.
+                    CallAttempt::unresolved_no_matching_import_alias(caller.id(), callee_name.clone())
                 }
             } else {
                 CallAttempt::ambiguous(caller.id(), callee_name.clone(), candidates.iter().map(|c| c.id()).collect())
@@ -488,6 +607,86 @@ fn span_len(snapshot: &SymbolSnapshot) -> usize {
 /// structurally (e.g. a dynamically-added attribute, or simply wrong
 /// input), so no restriction is applied for it — "no behavior change"
 /// is the safe default when the structural premise does not hold.
+/// CALL-RES-A4: the three real outcomes a caller's own callee name can
+/// have once matched against a real `ImportFact.alias` in the SAME
+/// file. Mirrors `ImportResolution`'s own three-way shape exactly
+/// (`Internal`/`External`/`Ambiguous`) — this is deliberately a
+/// SEPARATE type, not a re-export of `ImportResolution`, because this
+/// one additionally carries the Ambiguous case's own candidate-id list
+/// (needed to build `CallAttempt::ambiguous_import_target`'s own
+/// `candidates` field; `ImportResolution::Ambiguous` itself carries no
+/// ids, since `ImportFact`'s own resolution step intentionally never
+/// stores the ambiguous set — see `imports.rs`'s own "no edge beats a
+/// false edge" discipline).
+enum ImportAliasOutcome {
+    Resolved(codegraph_domain::SymbolSnapshotId),
+    External,
+    Ambiguous(Vec<codegraph_domain::SymbolSnapshotId>),
+}
+
+/// CALL-RES-A4's own core: looks up whether `callee_name` matches a
+/// real import ALIAS (never a bare `imported_symbol`/`module_path`
+/// match — see this function's own caller,
+/// [`resolve_calls_with_imports`], for exactly why only the alias field
+/// is consulted) in one of `import_facts` whose own `importing_file`
+/// is the SAME file as `caller`. Returns `None` when no `ImportFact`
+/// in the caller's own file has a matching `alias` at all — the caller
+/// must then fall through to its own existing `Unknown`/
+/// `NoMatchingImportAlias` classification, never guessed here.
+///
+/// If MORE THAN ONE `ImportFact` in the caller's own file happens to
+/// share the exact same `alias` text (a syntactically unusual but
+/// parseable shape — two separate import statements aliasing to the
+/// same local name, which would itself be a real naming collision in
+/// the SOURCE file, not a defect in this resolver), this function
+/// deterministically prefers the import fact appearing EARLIEST in
+/// `import_facts` (stable, order-independent of HOW `import_facts` was
+/// assembled upstream, since `imports.rs`'s own extraction already
+/// produces one fact per real import statement in source order) —
+/// mirroring `prefer_edge`'s own "never order-dependent on iteration,
+/// but a stable, explicit tie-break" discipline. This is NOT a new
+/// ambiguity-resolution policy; re-aliasing the same local name twice
+/// in one real file is itself a rare, degenerate input this function
+/// does not need to resolve "correctly" beyond being deterministic
+/// about it.
+fn resolve_via_import_alias(caller: &SymbolSnapshot, callee_name: &str, import_facts: &[ImportFact], snapshots: &[SymbolSnapshot]) -> Option<ImportAliasOutcome> {
+    let matching_fact = import_facts.iter().find(|fact| fact.importing_file == *caller.file() && fact.alias.as_deref() == Some(callee_name))?;
+    match matching_fact.resolution {
+        ImportResolution::Internal(target_id) => {
+            // Defensive re-confirmation, not a re-derivation: `ImportFact`'s
+            // own resolution was already computed once, globally, by
+            // `resolve_raw_import_statements` against the SAME kind of
+            // snapshot pool — but that resolution could, in principle,
+            // have been computed against a DIFFERENT (e.g. stale)
+            // snapshot slice than the one this exact `resolve_calls_with_imports`
+            // call was given (the two are passed as independent
+            // parameters by the caller — see this module's own
+            // `TargetLookup` doc comment on never silently trusting a
+            // cross-call invariant). Confirm `target_id` is still a
+            // real member of THIS call's own `snapshots` before
+            // producing an edge that points at it, never assuming.
+            if snapshots.iter().any(|s| s.id() == target_id) {
+                Some(ImportAliasOutcome::Resolved(target_id))
+            } else {
+                None
+            }
+        }
+        ImportResolution::External => Some(ImportAliasOutcome::External),
+        ImportResolution::Ambiguous => {
+            // `ImportResolution::Ambiguous` itself carries no candidate
+            // ids (see this function's own doc comment) — re-derive the
+            // real candidate set by the SAME lookup key
+            // `resolve_raw_import_statements` used (`imported_symbol`,
+            // falling back to the module path's own last segment),
+            // mirroring that module's own matching convention exactly
+            // rather than inventing a second one.
+            let lookup_name = matching_fact.imported_symbol.clone().unwrap_or_else(|| matching_fact.module_path.rsplit(&['.', ':'][..]).next().unwrap_or(&matching_fact.module_path).to_string());
+            let candidate_ids: Vec<codegraph_domain::SymbolSnapshotId> = snapshots.iter().filter(|s| s.name().as_str() == lookup_name).map(|s| s.id()).collect();
+            Some(ImportAliasOutcome::Ambiguous(candidate_ids))
+        }
+    }
+}
+
 fn receiver_field_is_a_known_member(snapshots: &[SymbolSnapshot], caller: &SymbolSnapshot, field_name: &str) -> bool {
     let Some(class) = enclosing_class_of(snapshots, caller) else {
         return false;

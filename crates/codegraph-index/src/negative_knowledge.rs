@@ -84,6 +84,35 @@ pub enum UnresolvedReason {
     /// reason enum (without separately checking `tier`) still sees an
     /// honest, non-`Unknown` explanation for why no edge resulted.
     AmbiguousCandidates,
+    /// CALL-RES-A4: the call site's own callee name matched a real
+    /// import-alias mapping in the caller's own file (an `ImportFact`
+    /// whose `alias` field equals this exact callee name), AND that
+    /// alias's own real imported-symbol name was independently
+    /// confirmed, via the SAME `ImportFact`, to resolve to
+    /// `ImportResolution::External` (a standard-library/third-party/
+    /// not-yet-indexed target — never guessed). This is a DIFFERENT,
+    /// more specific claim than plain `Unknown`: the resolver did not
+    /// merely fail to find a match — it found the real alias mapping
+    /// and confirmed the aliased target is genuinely outside the given
+    /// snapshot pool.
+    ImportTargetExternal,
+    /// CALL-RES-A4: the call site's own callee name matched a real
+    /// import-alias mapping in the caller's own file, but that alias's
+    /// own `ImportFact` resolution was `Ambiguous` (2+ same-named
+    /// candidates) rather than a single real target — the alias exists
+    /// and names a real symbol, but WHICH symbol cannot be determined
+    /// from import evidence alone.
+    ImportedSymbolAmbiguous,
+    /// CALL-RES-A4: the call site's own callee name does not match any
+    /// real candidate directly, AND it does not match any import
+    /// alias in the caller's own file's `ImportFact`s either — i.e.
+    /// import evidence was consulted and found NOTHING relevant to
+    /// this exact name, as opposed to `Unknown`, where import evidence
+    /// was never consulted at all (a caller using the A4-aware entry
+    /// point should prefer this reason over `Unknown` once it has
+    /// confirmed the negative — see `resolve_calls_with_imports`'s own
+    /// doc comment for exactly when this applies).
+    NoMatchingImportAlias,
 }
 
 impl UnresolvedReason {
@@ -96,6 +125,9 @@ impl UnresolvedReason {
             Self::Unknown => "zero candidates matched this callee name in the given snapshot pool, for a reason this resolver does not further distinguish".to_string(),
             Self::ExtractionRejected { rejection_kind } => format!("a real candidate sharing this exact callee name was found in the source but rejected at extraction time ({rejection_kind}), never reaching the snapshot pool this resolver was given"),
             Self::AmbiguousCandidates => "name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing".to_string(),
+            Self::ImportTargetExternal => "the callee name matched a real import alias in the caller's own file, and that alias's own real target was confirmed to be external (standard-library/third-party/not-yet-indexed), never guessed".to_string(),
+            Self::ImportedSymbolAmbiguous => "the callee name matched a real import alias in the caller's own file, but the alias's own real target name matches 2+ candidates in the given pool -- the alias is real, its target is not uniquely determinable from import evidence alone".to_string(),
+            Self::NoMatchingImportAlias => "the callee name matched no real candidate directly AND no import alias in the caller's own file -- import evidence was consulted and found nothing relevant to this exact name".to_string(),
         }
     }
 }
@@ -156,6 +188,35 @@ impl CallAttempt {
 
     pub fn ambiguous(caller: SymbolSnapshotId, callee_name: String, candidates: Vec<SymbolSnapshotId>) -> Self {
         let reason = UnresolvedReason::AmbiguousCandidates;
+        let provenance = Provenance::new("resolve_calls", candidates.clone(), None, vec![reason.description()]).expect("built short, within bounds");
+        Self { caller, callee_name, tier: EvidenceTier::Ambiguous, candidates, provenance, reason }
+    }
+
+    /// CALL-RES-A4: builds an `Unresolved` attempt with
+    /// [`UnresolvedReason::ImportTargetExternal`] — the caller (not this
+    /// module) must have already confirmed, against a real `ImportFact`
+    /// from the SAME file, that this exact callee name is a real import
+    /// alias whose own target resolved to `ImportResolution::External`.
+    pub fn unresolved_import_target_external(caller: SymbolSnapshotId, callee_name: String) -> Self {
+        Self::unresolved_with_reason(caller, callee_name, UnresolvedReason::ImportTargetExternal)
+    }
+
+    /// CALL-RES-A4: builds an `Unresolved` attempt with
+    /// [`UnresolvedReason::NoMatchingImportAlias`] — the caller must
+    /// have already confirmed that this exact callee name matches
+    /// neither a direct candidate nor any import alias in the caller's
+    /// own file.
+    pub fn unresolved_no_matching_import_alias(caller: SymbolSnapshotId, callee_name: String) -> Self {
+        Self::unresolved_with_reason(caller, callee_name, UnresolvedReason::NoMatchingImportAlias)
+    }
+
+    /// CALL-RES-A4: builds an `Ambiguous` attempt with
+    /// [`UnresolvedReason::ImportedSymbolAmbiguous`] — the caller must
+    /// have already confirmed, via a real `ImportFact`, that this exact
+    /// callee name is a real import alias whose own target resolved to
+    /// `ImportResolution::Ambiguous` (2+ same-named candidates).
+    pub fn ambiguous_import_target(caller: SymbolSnapshotId, callee_name: String, candidates: Vec<SymbolSnapshotId>) -> Self {
+        let reason = UnresolvedReason::ImportedSymbolAmbiguous;
         let provenance = Provenance::new("resolve_calls", candidates.clone(), None, vec![reason.description()]).expect("built short, within bounds");
         Self { caller, callee_name, tier: EvidenceTier::Ambiguous, candidates, provenance, reason }
     }
@@ -230,5 +291,52 @@ mod tests {
         assert_ne!(unknown, rejected);
         assert_ne!(unknown, ambiguous);
         assert_ne!(rejected, ambiguous);
+    }
+
+    // --- CALL-RES-A4: import-alias reason taxonomy ---
+
+    #[test]
+    fn import_target_external_attempt_is_unresolved_with_the_correct_reason() {
+        let attempt = CallAttempt::unresolved_import_target_external(test_id("caller"), "install_package".to_string());
+        assert_eq!(attempt.tier, EvidenceTier::Unresolved, "a confirmed-external alias target is still an Unresolved TIER -- this reason refines WHY, it never promotes to a stronger tier than the evidence supports");
+        assert_eq!(attempt.reason, UnresolvedReason::ImportTargetExternal);
+        assert!(attempt.candidates.is_empty());
+    }
+
+    #[test]
+    fn no_matching_import_alias_attempt_is_distinguishable_from_plain_unknown() {
+        let plain_unknown = CallAttempt::unresolved(test_id("caller"), "mystery".to_string());
+        let checked_no_alias = CallAttempt::unresolved_no_matching_import_alias(test_id("caller"), "mystery".to_string());
+        assert_eq!(plain_unknown.reason, UnresolvedReason::Unknown);
+        assert_eq!(checked_no_alias.reason, UnresolvedReason::NoMatchingImportAlias);
+        assert_ne!(
+            plain_unknown.reason, checked_no_alias.reason,
+            "a caller that actually checked import evidence and found nothing must report a DIFFERENT, more specific reason than a caller that never checked at all"
+        );
+    }
+
+    #[test]
+    fn ambiguous_import_target_attempt_preserves_every_real_candidate() {
+        let candidates = vec![test_id("a"), test_id("b")];
+        let attempt = CallAttempt::ambiguous_import_target(test_id("caller"), "install_package".to_string(), candidates.clone());
+        assert_eq!(attempt.tier, EvidenceTier::Ambiguous);
+        assert_eq!(attempt.reason, UnresolvedReason::ImportedSymbolAmbiguous);
+        assert_eq!(attempt.candidates, candidates);
+    }
+
+    #[test]
+    fn all_four_unresolved_reasons_produce_pairwise_distinguishable_provenance_text() {
+        let unknown = UnresolvedReason::Unknown.description();
+        let rejected = UnresolvedReason::ExtractionRejected { rejection_kind: "SignatureTooLong" }.description();
+        let external = UnresolvedReason::ImportTargetExternal.description();
+        let no_alias = UnresolvedReason::NoMatchingImportAlias.description();
+        let all = [&unknown, &rejected, &external, &no_alias];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "reason texts at index {i} and {j} must be distinguishable");
+                }
+            }
+        }
     }
 }

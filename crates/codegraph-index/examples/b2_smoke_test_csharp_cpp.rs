@@ -318,6 +318,9 @@ fn main() {
                 codegraph_index::negative_knowledge::UnresolvedReason::Unknown => "Unknown",
                 codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { .. } => "ExtractionRejected",
                 codegraph_index::negative_knowledge::UnresolvedReason::AmbiguousCandidates => "AmbiguousCandidates",
+                codegraph_index::negative_knowledge::UnresolvedReason::ImportTargetExternal => "ImportTargetExternal",
+                codegraph_index::negative_knowledge::UnresolvedReason::ImportedSymbolAmbiguous => "ImportedSymbolAmbiguous",
+                codegraph_index::negative_knowledge::UnresolvedReason::NoMatchingImportAlias => "NoMatchingImportAlias",
             };
             *reason_counts.entry(label).or_insert(0) += 1;
             if let codegraph_index::negative_knowledge::UnresolvedReason::ExtractionRejected { .. } = &attempt.reason {
