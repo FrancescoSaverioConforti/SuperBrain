@@ -547,3 +547,166 @@ fn golden_corpus_ground_truth_and_the_real_resolver_agree_on_the_generic_arity_c
         "a genuinely ambiguous case with no predicted edge is AmbiguousCorrect per the schema's own status table -- never a silent FalseNegative for the resolver correctly declining to guess"
     );
 }
+
+// ===========================================================================
+// CommonJS Extraction Checkpoint: B2-ID-013 (require() -> ImportFact),
+// B2-ID-014 (exports.X/module.exports.X = function(){}), B2-ID-015
+// (Foo.prototype.X = function(){} ownership). Minimized from the real
+// B2-EVAL-010 findings against request/request.
+// ===========================================================================
+
+#[test]
+fn b2_id_013_require_simple_aliased_and_destructured_bindings_all_produce_import_facts() {
+    let source = CorpusSource::load("javascript", &["commonjs_require_shapes.js", "helper.js"]);
+    let outcome = index(&source);
+
+    let facts: Vec<_> = outcome.import_facts.iter().filter(|f| f.importing_file.relative_path().ends_with("commonjs_require_shapes.js")).collect();
+
+    assert!(facts.iter().any(|f| f.alias.as_deref() == Some("helper")), "the simple require('./helper') binding must produce an ImportFact");
+    assert!(facts.iter().any(|f| f.alias.as_deref() == Some("utils")), "the var-bound require('./utils') aliased binding must produce an ImportFact");
+    assert!(facts.iter().any(|f| f.imported_symbol.as_deref() == Some("a")), "the destructured require('./destructured') binding must produce one ImportFact per name (a)");
+    assert!(facts.iter().any(|f| f.imported_symbol.as_deref() == Some("b")), "the destructured require('./destructured') binding must produce one ImportFact per name (b)");
+    assert!(facts.iter().any(|f| f.alias.as_deref() == Some("extend")), "a package (non-relative) require('extend') must still produce an ImportFact");
+}
+
+#[test]
+fn b2_id_013_require_alias_binding_itself_resolves_external_not_internal() {
+    let source = CorpusSource::load("javascript", &["commonjs_require_shapes.js", "helper.js"]);
+    let outcome = index(&source);
+
+    let run_snapshot = find_one_by_name_in_file(&outcome, "run", "helper.js");
+    let helper_import = outcome
+        .import_facts
+        .iter()
+        .find(|f| f.importing_file.relative_path().ends_with("commonjs_require_shapes.js") && f.alias.as_deref() == Some("helper"))
+        .expect("expected an ImportFact for the helper.js require");
+
+    // The require() binding's own alias ("helper") does not itself
+    // match any real snapshot name (the real exported symbol is named
+    // "run", not "helper") -- this ImportFact's own resolution is
+    // therefore External, not Internal, which is CORRECT: `module_path`-
+    // based matching only looks up the bare alias/imported_symbol name,
+    // never a property later accessed on it (`helper.run()` is a
+    // receiver-qualified call, resolved separately by Calls, not by
+    // ImportFact). This test documents that real, honest limitation
+    // rather than asserting an Internal resolution that would be false.
+    assert_eq!(helper_import.resolution, codegraph_index::imports::ImportResolution::External, "a require() alias binding does not itself match any single exported symbol name by construction -- this is the same honest limitation import resolution already has for every other language's bare module alias");
+    let _ = run_snapshot;
+}
+
+#[test]
+fn b2_id_014_exports_and_module_exports_property_functions_are_extracted_and_cross_file_calls_resolve() {
+    let source = CorpusSource::load("javascript", &["commonjs_exports_property_function.js", "commonjs_exports_property_function_caller.js"]);
+    let outcome = index(&source);
+
+    let jar = find_one_by_name_in_file(&outcome, "jar", "commonjs_exports_property_function.js");
+    let parse = find_one_by_name_in_file(&outcome, "parse", "commonjs_exports_property_function.js");
+    assert_eq!(jar.kind(), codegraph_domain::SymbolKind::Function, "exports.jar = function() {{}} must be extracted as a real Function snapshot (B2-ID-014)");
+    assert_eq!(parse.kind(), codegraph_domain::SymbolKind::Function, "module.exports.parse = function() {{}} must be extracted as a real Function snapshot (B2-ID-014)");
+
+    let caller = find_one_by_name_in_file(&outcome, "useBoth", "commonjs_exports_property_function_caller.js");
+    let callees: Vec<String> = outcome.graph.outgoing_edges(caller.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).map(|s| s.name().as_str().to_string()).collect();
+
+    assert!(callees.contains(&"jar".to_string()), "the real cross-file cookies.jar()-shaped call site must now resolve to the exports.jar Function (B2-ID-014 fixed, vs. B2-EVAL-010's own total-silence finding)");
+    assert!(callees.contains(&"parse".to_string()), "the real cross-file cookies.parse()-shaped call site must now resolve to the module.exports.parse Function (B2-ID-014 fixed)");
+}
+
+#[test]
+fn b2_id_015_prototype_method_is_extracted_and_owned_by_its_real_constructor() {
+    let source = CorpusSource::load("javascript", &["commonjs_prototype_method.js"]);
+    let outcome = index(&source);
+
+    let request = find_one_by_name_in_file(&outcome, "Request", "commonjs_prototype_method.js");
+    let init = find_one_by_name_in_file(&outcome, "init", "commonjs_prototype_method.js");
+    let start = find_one_by_name_in_file(&outcome, "start", "commonjs_prototype_method.js");
+
+    assert_eq!(init.kind(), codegraph_domain::SymbolKind::Method, "Request.prototype.init = function() {{}} must be extracted as a real Method snapshot (B2-ID-015)");
+
+    let contains_targets: Vec<_> = outcome.graph.outgoing_edges(request.id(), Some(EdgeKind::Contains)).iter().map(|e| e.to).collect();
+    assert!(contains_targets.contains(&init.id()), "Request must Contain its own real prototype method init (B2-ID-015 ownership, vs. B2-EVAL-010's own 27/27-invisible finding)");
+    assert!(contains_targets.contains(&start.id()), "Request must Contain its own real prototype method start too");
+
+    // this.init(this.options) inside Request.prototype.start -- a real
+    // internal call between two prototype methods, now both visible,
+    // so Calls resolution should find it too (same-file, same-class
+    // receiver-qualified call, resolved by the pre-existing Calls
+    // mechanism once both ends exist as real candidates).
+    let callees: Vec<String> = outcome.graph.outgoing_edges(start.id(), Some(EdgeKind::Calls)).iter().filter_map(|e| outcome.graph.snapshot(e.to)).map(|s| s.name().as_str().to_string()).collect();
+    assert!(callees.contains(&"init".to_string()), "start's own internal this.init(...) call must resolve now that init is a real, visible candidate");
+}
+
+#[test]
+fn commonjs_prototype_ownership_fails_closed_when_the_owner_is_only_a_require_binding() {
+    let source = CorpusSource::load("javascript", &["commonjs_prototype_ownership_ambiguous.js"]);
+    let outcome = index(&source);
+
+    let bar = find_one_by_name_in_file(&outcome, "bar", "commonjs_prototype_ownership_ambiguous.js");
+    assert_eq!(bar.kind(), codegraph_domain::SymbolKind::Method, "Foo.prototype.bar must still be extracted as a Method candidate even when Foo's own ownership cannot be resolved");
+
+    let incoming_contains = outcome.graph.incoming_edges(bar.id(), Some(EdgeKind::Contains));
+    assert!(incoming_contains.is_empty(), "Foo bound only via require() is never a real Function/Class snapshot -- ownership must fail closed, never inventing a Contains edge (this checkpoint's own explicit ambiguous-owner requirement)");
+}
+
+#[test]
+fn commonjs_prototype_method_reassignment_produces_two_distinct_owned_methods() {
+    let source = CorpusSource::load("javascript", &["commonjs_prototype_method_reassignment.js"]);
+    let outcome = index(&source);
+
+    let foo = find_one_by_name_in_file(&outcome, "Foo", "commonjs_prototype_method_reassignment.js");
+    let bars = find_snapshot_by_name(&outcome, "bar");
+    assert_eq!(bars.len(), 2, "both Foo.prototype.bar assignments must be extracted as distinct Method snapshots, never collapsed");
+
+    let contains_targets: Vec<_> = outcome.graph.outgoing_edges(foo.id(), Some(EdgeKind::Contains)).iter().map(|e| e.to).collect();
+    for bar in &bars {
+        assert!(contains_targets.contains(&bar.id()), "both re-assigned bar methods must be owned by the same real Foo constructor, not just the first or last one");
+    }
+}
+
+// ===========================================================================
+// B2-ID-018: TypeScript `interface_declaration` was never extracted as a
+// symbol, so every `implements` edge toward a LOCAL interface was silently
+// lost (the resolver side was already correct and tested in isolation --
+// only the extractor had the gap). This drives the real fixture through
+// the full `observe_commit` pipeline, the exact level B2-EVAL-012 found
+// the gap at on a real corpus (0/18 interfaces, 0/10 local implements
+// edges on `Sairyss/domain-driven-hexagon@5c2d15a`).
+// ===========================================================================
+
+#[test]
+fn b2_id_018_typescript_interfaces_are_extracted_and_implements_edges_resolve() {
+    let source = CorpusSource::load("typescript", &["b2_id_018_interface_implements.ts"]);
+    let outcome = index(&source);
+
+    let ifoo = find_one_by_name_in_file(&outcome, "IFoo", "b2_id_018_interface_implements.ts");
+    let ibar = find_one_by_name_in_file(&outcome, "IBar", "b2_id_018_interface_implements.ts");
+    let impl_class = find_one_by_name_in_file(&outcome, "Impl", "b2_id_018_interface_implements.ts");
+
+    assert_eq!(ifoo.kind(), codegraph_domain::SymbolKind::Interface, "export interface IFoo must be extracted as a real Interface snapshot (B2-ID-018)");
+    assert_eq!(ibar.kind(), codegraph_domain::SymbolKind::Interface, "export interface IBar must be extracted as a real Interface snapshot (B2-ID-018)");
+
+    let implements_targets: Vec<_> = outcome.graph.outgoing_edges(impl_class.id(), Some(EdgeKind::Implements)).iter().map(|e| e.to).collect();
+    assert!(implements_targets.contains(&ifoo.id()), "class Impl implements IFoo must resolve to a real Implements edge now that IFoo exists as a snapshot (B2-ID-018)");
+    assert!(implements_targets.contains(&ibar.id()), "class Impl implements IFoo, IBar must resolve BOTH interfaces, not just the first one");
+    assert_eq!(implements_targets.len(), 2, "exactly two Implements edges must exist -- one per interface, no duplicates and no spillover to Extends");
+
+    let extends_targets: Vec<_> = outcome.graph.outgoing_edges(impl_class.id(), Some(EdgeKind::Extends)).iter().map(|e| e.to).collect();
+    assert!(extends_targets.is_empty(), "an `implements`-only clause must never also produce an Extends edge");
+
+    // Each interface's own method_signature (foo/bar) is still extracted
+    // as its own real MethodSignature-kind snapshot in the same file --
+    // confirmed by kind lookup rather than a Contains edge:
+    // `resolve_contains` is explicitly scoped to `A.kind() == Class` only
+    // (see `edges::contains`'s own module doc comment, "Scope: Class ->
+    // Method and Class -> Field only", a pre-existing, documented design
+    // decision), so Interface -> its own members is a known, out-of-scope
+    // residual limitation this fix does not change -- B2-ID-018 only
+    // wires `interface_declaration` into extraction and
+    // Extends/Implements resolution. There are TWO snapshots named "foo"
+    // in this fixture (IFoo's own signature and Impl's own
+    // implementation) and kind is what distinguishes them.
+    let foo_signature = find_snapshot_by_name(&outcome, "foo")
+        .into_iter()
+        .find(|s| s.kind() == codegraph_domain::SymbolKind::MethodSignature)
+        .expect("IFoo's own foo() method signature must still be extracted as a real MethodSignature snapshot (this already worked pre-fix; only the enclosing interface_declaration itself was invisible)");
+    assert!(foo_signature.file().relative_path().ends_with("b2_id_018_interface_implements.ts"));
+}

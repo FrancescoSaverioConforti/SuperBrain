@@ -982,15 +982,14 @@ mod tests {
 
         #[test]
         fn typescript_nested_class_extends_is_owned_by_inner_not_outer() {
-            // TypeScript's own `interface` declarations are not
-            // extracted as symbols by this pipeline's current
-            // extractor (no TS `interface_declaration` mapping exists
-            // in `snapshot::kind_mapping::map_kind_hint`'s table), so
-            // this test uses a class-extends-class shape instead of
+            // This test uses a class-extends-class shape rather than
             // implements-an-interface, exercising the exact same
             // `class_heritage`/boundary code path
             // `collect_ts_heritage_tagged` shares with the JS
-            // collector.
+            // collector; the nested-class boundary behavior this test
+            // targets is identical either way, and B2-ID-018's
+            // interface-specific coverage lives in
+            // `extract::javascript`'s own test module instead.
             let snapshots = real_snapshots(
                 repo(),
                 "src/nested.ts",

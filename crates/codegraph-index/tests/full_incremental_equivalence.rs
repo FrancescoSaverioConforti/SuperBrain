@@ -281,3 +281,78 @@ fn full_equals_incremental_for_python_nested_class_ownership() {
 
     assert_full_equals_incremental(&full, &incremental, "Python nested-class ownership, full vs. incremental");
 }
+
+// ===========================================================================
+// Real gate, applied to a third case: CommonJS Extraction Checkpoint's
+// own Foo.prototype.X ownership resolver (B2-ID-015), through an
+// incremental edit that adds a SECOND prototype method on an
+// unrelated, untouched constructor file.
+// ===========================================================================
+
+#[test]
+fn full_equals_incremental_for_commonjs_prototype_method_ownership() {
+    let repo = test_repo();
+    let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+    let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+    const CTOR: &[u8] = b"function Request(options) {\n  this.options = options;\n}\n\nRequest.prototype.init = function (options) {\n  return options;\n};\n";
+    const CTOR_WITH_SECOND_METHOD: &[u8] =
+        b"function Request(options) {\n  this.options = options;\n}\n\nRequest.prototype.init = function (options) {\n  return options;\n};\n\nRequest.prototype.start = function () {\n  return this.init(this.options);\n};\n";
+
+    let incremental_source_a = MultiCommitSource::new().with_file(FileIdentity::parse(repo, commit_a.clone(), "request.js").unwrap(), CTOR);
+    let incremental_indexer = CodeGraphIndexer::new();
+    incremental_indexer.observe_commit(&incremental_source_a, repo, &commit_a, None, &[]).unwrap();
+
+    let incremental_source_b = incremental_source_a.with_file(FileIdentity::parse(repo, commit_b.clone(), "request.js").unwrap(), CTOR_WITH_SECOND_METHOD);
+    let incremental = incremental_indexer.observe_commit(&incremental_source_b, repo, &commit_b, Some(&commit_a), &["request.js".to_string()]).unwrap();
+
+    let full_repo = test_repo();
+    let full_source = MultiCommitSource::new().with_file(FileIdentity::parse(full_repo, commit_b.clone(), "request.js").unwrap(), CTOR_WITH_SECOND_METHOD);
+    let full_indexer = CodeGraphIndexer::new();
+    let full = full_indexer.observe_commit(&full_source, full_repo, &commit_b, None, &[]).unwrap();
+
+    assert_full_equals_incremental(&full, &incremental, "CommonJS Foo.prototype.X ownership, full vs. incremental");
+
+    // Sanity: confirm both sides actually produced the real Contains
+    // edge for BOTH prototype methods, not just an equally-empty result.
+    let request_in_full = full.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Request").unwrap();
+    let contains_in_full = full.graph.outgoing_edges(request_in_full.id(), Some(EdgeKind::Contains));
+    assert_eq!(contains_in_full.len(), 2, "the equivalence check above must not be vacuously true -- both real prototype methods must be owned by Request");
+}
+
+// ===========================================================================
+// Real gate, applied to a fourth case: B2-ID-018's new TypeScript
+// `interface_declaration` extraction + Implements resolution, through an
+// incremental edit that adds a SECOND `implements` interface to an
+// already-indexed class.
+// ===========================================================================
+
+#[test]
+fn full_equals_incremental_for_typescript_interface_implements() {
+    let repo = test_repo();
+    let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+    let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+    const SOURCE_A: &[u8] = b"export interface IFoo {\n    foo(): void;\n}\n\nexport interface IBar {\n    bar(): void;\n}\n\nexport class Impl implements IFoo {\n    foo(): void {}\n}\n";
+    const SOURCE_B: &[u8] = b"export interface IFoo {\n    foo(): void;\n}\n\nexport interface IBar {\n    bar(): void;\n}\n\nexport class Impl implements IFoo, IBar {\n    foo(): void {}\n    bar(): void {}\n}\n";
+
+    let incremental_source_a = MultiCommitSource::new().with_file(FileIdentity::parse(repo, commit_a.clone(), "impl.ts").unwrap(), SOURCE_A);
+    let incremental_indexer = CodeGraphIndexer::new();
+    incremental_indexer.observe_commit(&incremental_source_a, repo, &commit_a, None, &[]).unwrap();
+
+    let incremental_source_b = incremental_source_a.with_file(FileIdentity::parse(repo, commit_b.clone(), "impl.ts").unwrap(), SOURCE_B);
+    let incremental = incremental_indexer.observe_commit(&incremental_source_b, repo, &commit_b, Some(&commit_a), &["impl.ts".to_string()]).unwrap();
+
+    let full_repo = test_repo();
+    let full_source = MultiCommitSource::new().with_file(FileIdentity::parse(full_repo, commit_b.clone(), "impl.ts").unwrap(), SOURCE_B);
+    let full_indexer = CodeGraphIndexer::new();
+    let full = full_indexer.observe_commit(&full_source, full_repo, &commit_b, None, &[]).unwrap();
+
+    assert_full_equals_incremental(&full, &incremental, "TypeScript interface_declaration + Implements, full vs. incremental");
+
+    // Sanity: confirm both sides actually produced both real Implements
+    // edges, not just an equally-empty result.
+    let impl_in_full = full.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Impl").unwrap();
+    let implements_in_full = full.graph.outgoing_edges(impl_in_full.id(), Some(EdgeKind::Implements));
+    assert_eq!(implements_in_full.len(), 2, "the equivalence check above must not be vacuously true -- both IFoo and IBar must be real Implements targets");
+}
