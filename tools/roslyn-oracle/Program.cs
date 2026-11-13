@@ -78,6 +78,14 @@ var fixtureGroups = new (string Name, string[] Files)[]
     // the original unit-test fixture's bare-call syntax does not
     // compile and could not be reused as written).
     ("namespace_aware_resolution", new[] { "namespace_aware_resolution_ns_a.cs", "namespace_aware_resolution_ns_b.cs", "namespace_aware_resolution_caller.cs" }),
+    // CALL-RES-A4 Roslyn differential extension (this pass): the
+    // remaining three A4-relevant C# shapes not yet covered by
+    // namespace_aware_resolution above (same-simple-name/different-
+    // namespace and imported-namespace are already covered there) --
+    // namespace alias, fully-qualified name, and real ambiguity.
+    ("namespace_alias_resolution", new[] { "namespace_alias_target.cs", "namespace_alias_caller.cs" }),
+    ("qualified_name_resolution", new[] { "qualified_name_target.cs", "qualified_name_caller.cs" }),
+    ("real_ambiguity_resolution", new[] { "real_ambiguity_ns_a.cs", "real_ambiguity_ns_b.cs", "real_ambiguity_caller.cs" }),
 };
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = false };

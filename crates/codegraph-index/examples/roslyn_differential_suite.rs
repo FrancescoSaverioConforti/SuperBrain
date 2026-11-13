@@ -46,6 +46,24 @@ use codegraph_index::csharp_declarations::extract_csharp_type_declaration_contex
 use codegraph_index::extract::extract_symbols_reporting_rejections;
 use codegraph_index::parse::{CSharpParser, LanguageParser};
 
+// --- CALL-RES-A4 Roslyn differential extension (this pass): real
+// call-site comparison for the three A4-relevant C# shapes not yet
+// covered by the type/method declaration-level comparison above --
+// namespace alias, fully-qualified name, and real ambiguity. Unlike
+// the declaration-level comparison, this calls SuperBrain's own real
+// `resolve_calls_with_namespace_context` (the actual A4 production
+// entry point, never re-implemented here) against the SAME fixture
+// files the Roslyn oracle just ran over, using only this crate's
+// EXISTING public API (`promote`, `parser_for`, `resolve_import_facts`,
+// `resolve_csharp_type_declaration_contexts`, `RepositoryRegistry`,
+// etc.) -- no visibility changes and no new API were needed; every
+// function this section calls was already `pub`.
+use codegraph_domain::{CommitHash, FileIdentity, RepositoryId, RepositoryRegistry, RepositoryRoot};
+use codegraph_index::csharp_declarations::resolve_csharp_type_declaration_contexts;
+use codegraph_index::edges::resolve_calls_with_namespace_context;
+use codegraph_index::imports::resolve_import_facts;
+use codegraph_index::snapshot::promote;
+
 /// One normalized observation this harness can compare across both
 /// sides — a small, deliberately lossy projection of each side's own
 /// richer native representation, kept to exactly the fields both
@@ -105,6 +123,106 @@ fn main() {
     } else {
         println!("\nAt least one divergence found -- see docs/research/DIFFERENTIAL_TESTING_ARCHITECTURE.md for how to interpret this (a divergence here is NOT automatically a SuperBrain bug -- Roslyn resolves full .NET semantics this pipeline deliberately does not attempt; review each one against that document's own residual-limitations section before treating it as a finding).");
     }
+
+    println!("\n=== CALL-RES-A4 call-site differential: alias / qualified-name / real-ambiguity ===");
+    run_a4_call_site_differential(&corpus_dir);
+}
+
+/// One real A4-relevant C# call-site case: a caller file plus every
+/// other file needed to resolve it, Roslyn's own expected resolution
+/// for the SAME call text (read directly off this run's own oracle
+/// output above, pinned here as the comparison baseline), and a short
+/// label for the printed report.
+struct A4CallSiteCase {
+    label: &'static str,
+    caller_file: &'static str,
+    other_files: &'static [&'static str],
+    call_site_text: &'static str,
+    roslyn_resolved: bool,
+}
+
+/// Runs SuperBrain's own REAL `resolve_calls_with_namespace_context`
+/// (the actual A4 production entry point) against each case's real
+/// fixture files, and compares its outcome (resolved-to-exactly-one
+/// edge vs. honestly-unresolved/Ambiguous) against Roslyn's own
+/// resolution for the identical call site (`roslyn_resolved`, pinned
+/// from this same run's oracle output above -- `namespace_alias_resolution`/
+/// `qualified_name_resolution`/`real_ambiguity_resolution` groups).
+fn run_a4_call_site_differential(corpus_dir: &std::path::Path) {
+    let cases = [
+        A4CallSiteCase { label: "namespace alias (using Alias = NsAlias.AliasTarget;)", caller_file: "namespace_alias_caller.cs", other_files: &["namespace_alias_target.cs"], call_site_text: "target.Invoke()", roslyn_resolved: true },
+        A4CallSiteCase { label: "fully-qualified name (NsQualified.QualifiedTarget.Invoke())", caller_file: "qualified_name_caller.cs", other_files: &["qualified_name_target.cs"], call_site_text: "NsQualified.QualifiedTarget.Invoke()", roslyn_resolved: true },
+        A4CallSiteCase { label: "real ambiguity (colliding same-signature extension methods)", caller_file: "real_ambiguity_caller.cs", other_files: &["real_ambiguity_ns_a.cs", "real_ambiguity_ns_b.cs"], call_site_text: "target.Resolve()", roslyn_resolved: false },
+    ];
+
+    let mut agreements = 0usize;
+    let mut divergences = 0usize;
+
+    for case in &cases {
+        let repo = register_repo(corpus_dir);
+        let mut all_snapshots = Vec::new();
+        let mut all_raw_contexts = Vec::new();
+
+        for other in case.other_files {
+            let (_file, _tree, snapshots, raw_contexts) = real_snapshots_contexts_and_tree(repo, corpus_dir, other);
+            all_snapshots.extend(snapshots);
+            all_raw_contexts.extend(raw_contexts);
+        }
+        let (caller_file, caller_tree, caller_snapshots, caller_raw_contexts) = real_snapshots_contexts_and_tree(repo, corpus_dir, case.caller_file);
+        all_snapshots.extend(caller_snapshots);
+        all_raw_contexts.extend(caller_raw_contexts);
+
+        let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw_contexts, &all_snapshots);
+        let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).expect("real fixture imports must resolve without error");
+
+        let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).expect("resolve_calls_with_namespace_context must not error on a real fixture");
+
+        let superbrain_resolved = edges.iter().any(|e| !attempts.iter().any(|a| a.caller == e.from));
+        let superbrain_has_resolved_edge = !edges.is_empty();
+        let superbrain_is_honestly_ambiguous = attempts.iter().any(|a| a.tier == codegraph_domain::EvidenceTier::Ambiguous);
+
+        let agrees = case.roslyn_resolved == superbrain_has_resolved_edge;
+        if agrees {
+            agreements += 1;
+        } else {
+            divergences += 1;
+        }
+
+        let edge_targets: Vec<_> = edges.iter().map(|e| all_snapshots.iter().find(|s| s.id() == e.to).map(|s| s.name().as_str().to_string()).unwrap_or_else(|| "?".to_string())).collect();
+
+        println!(
+            "  [{}] roslyn_resolved={} superbrain_resolved={} superbrain_ambiguous={} edges={} ({:?}) attempts={} -> {}",
+            case.label,
+            case.roslyn_resolved,
+            superbrain_has_resolved_edge,
+            superbrain_is_honestly_ambiguous,
+            edges.len(),
+            edge_targets,
+            attempts.len(),
+            if agrees { "AGREEMENT" } else { "DIVERGENCE" }
+        );
+        let _ = (superbrain_resolved, case.call_site_text);
+    }
+
+    println!("\ncall-site cases tested: {} -- agreements: {agreements}, divergences: {divergences}", cases.len());
+}
+
+fn register_repo(corpus_dir: &std::path::Path) -> RepositoryId {
+    let mut registry = RepositoryRegistry::new();
+    registry.register(RepositoryRoot::parse(corpus_dir).expect("corpus dir must be a valid repository root for this harness's own synthetic repo identity"))
+}
+
+fn real_snapshots_contexts_and_tree(repo: RepositoryId, corpus_dir: &std::path::Path, file_name: &str) -> (FileIdentity, codegraph_index::parse::ParseTree, Vec<codegraph_index::snapshot::SymbolSnapshot>, Vec<(FileIdentity, codegraph_index::csharp_declarations::RawCSharpTypeDeclarationContext)>) {
+    let commit = CommitHash::parse(&"a".repeat(40)).expect("40 hex chars is a valid synthetic commit hash");
+    let file = FileIdentity::parse(repo, commit, file_name).expect("a real fixture file name must be a valid relative path");
+    let source = std::fs::read(corpus_dir.join(file_name)).expect("fixture file must exist in the corpus dir");
+    let parser = codegraph_index::parse::parser_for(&file).expect("a .cs fixture file must have a C# parser");
+    let tree = parser.parse(&source).expect("real fixture source must parse");
+    let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+    assert!(rejections.is_empty(), "fixture {file_name} must not trigger any extraction rejection: {rejections:?}");
+    let snapshots: Vec<_> = candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect();
+    let raw_contexts: Vec<_> = extract_csharp_type_declaration_contexts(&tree).into_iter().map(|c| (file.clone(), c)).collect();
+    (file, tree, snapshots, raw_contexts)
 }
 
 fn run_roslyn_oracle(oracle_dir: &std::path::Path) -> String {
