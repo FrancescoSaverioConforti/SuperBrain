@@ -853,3 +853,161 @@ finding already documents as its own independent ambiguity (not an
 A5-shaped gap), and beyond the already-separately-tracked generic-
 arity-collision gap (B2-ID-010's own closing report) that remains
 Moderate backlog, untouched by this checkpoint.
+
+## Performance measurement — A4's specific cost on the real indexer
+
+**Status: done, measurement only, nothing optimized.** Measures A4's
+own real wall-clock cost through the real, now-wired
+`CodeGraphIndexer::observe_commit` (not a resolver function called in
+isolation), comparing the pre-wiring commit `8584cb1` (BASELINE: the
+indexer still calls the pre-A4 `resolve_calls_with_extraction_rejections`)
+against current HEAD `468f770` (A4-LIVE: the indexer calls A4's own
+`resolve_calls_with_namespace_context`, per the `ffd0295` wiring).
+
+**Scope boundary, explicit:** this is NOT a re-investigation of
+[B2-ID-012](../findings/B2-ID-012.md) (`resolve_lineage`'s O(n²)
+similarity-scoring cost) or the separate, already-tracked
+`LocalGitRepositorySource::read_file` per-file git-reopen finding.
+Both stay exactly as previously documented, unfixed, unchanged by this
+measurement. Nothing was optimized in this pass, in A4's own code or
+anywhere else.
+
+### Methodology
+
+New example binary `call_res_a4_perf_measurement.rs`: calls the real,
+public `CodeGraphIndexer::observe_commit` only (never a resolver
+function directly) for a full-reindex of `commit_a` followed by an
+incremental `observe_commit` of `commit_b` against `commit_a`'s own
+state, using the real `git diff --name-only` changed-file list between
+them — the exact same entry point and commit-pair convention
+`b2_smoke_test_csharp_cpp.rs`'s own Section F and B2-ID-012's own
+measurement already use. The SAME binary source is built once at the
+baseline commit and once at current HEAD (via a separate, disposable
+git worktree for the baseline build — no branch history rewritten,
+main worktree's pre-existing uncommitted files untouched throughout),
+so any timing difference is attributable only to what changed inside
+the real indexer between those two commits.
+
+Per-corpus: **1 discarded warm-up run, then 10 timed runs**, same
+machine, same release build profile, same two git worktrees used for
+both the baseline and A4-live binary across both corpora. **Median**
+reported as the headline number (not mean, per this project's own
+B2-ID-012 precedent); **dispersion reported as min/max range**
+(simpler than stddev/IQR for a 10-sample set, and B2-ID-012's own
+report uses the same convention: "range 107-183µs" style). Edge-count
+output was also captured on every run and confirmed byte-identical
+across all 10 runs on both sides, before vs. after — confirming
+timing variance is not masking a hidden correctness difference.
+
+### Corpora
+
+- **Polly** (C#, `App-vNext/Polly`): same commit pair B2-ID-012 itself
+  used, `32064ed5` (commit_a, full-index target) →
+  `1f232caf9672e515751ba2df76d82bfbbb62e016` (commit_b, incremental
+  target against commit_a's state, 41 real changed files).
+- **pyjanitor** (Python, `pyjanitor-devs/pyjanitor`): already available
+  without new setup (same repo/pinned-commit prior A4 passes used,
+  `1247923ff01dd9a74f40f55d55f108e503e4b218`, as commit_b); commit_a
+  is that same repo's own immediately-prior real commit
+  (`8e3cb118888e4b94acafd58392ef5e69138d976a`, 3 real changed files) —
+  B2-ID-012 itself never established a pyjanitor pair, so this is a
+  new but equally real commit pair from the same already-cloned repo,
+  not a new corpus.
+
+### Results: Polly
+
+| | full-index (median, min-max) | incremental-index (median, min-max) |
+|---|---|---|
+| BASELINE (pre-A4, `8584cb1`) | 5.510s (5.454-5.561s) | 8.386s (8.295-8.492s) |
+| A4-LIVE (`468f770`) | 6.528s (6.503-6.675s) | 9.438s (9.399-9.636s) |
+| **overhead** | **+1.018s (+18.47%)** | **+1.052s (+12.55%)** |
+
+Edge counts stable across all 10 runs on both sides (baseline:
+3415/3415 full/incremental; A4-live: 3746/3752 full/incremental — the
+A4-live counts are higher because A4 genuinely recovers real edges,
+consistent with commits `ab0591d`/`468f770`'s own resolver-level and
+live-indexer correctness numbers; this measurement did not re-verify
+those counts beyond confirming their own run-to-run stability, which
+is this task's own job, not re-litigating correctness already closed
+elsewhere).
+
+### Results: pyjanitor
+
+| | full-index (median, min-max) | incremental-index (median, min-max) |
+|---|---|---|
+| BASELINE (pre-A4, `8584cb1`) | 1.490s (1.462-1.516s) | 0.811s (0.798-0.833s) |
+| A4-LIVE (`468f770`) | 1.548s (1.500-1.576s) | 0.856s (0.845-0.889s) |
+| **overhead** | **+0.058s (+3.91%)** | **+0.045s (+5.55%)** |
+
+Edge counts stable across all 10 runs on both sides (1563/1565
+full/incremental, identical before vs. after — consistent with
+`ab0591d`/`468f770`'s own finding that A4 produces 0 corpus-level
+alias recoveries on pyjanitor, so no edge-count difference is expected
+here, unlike Polly).
+
+### Stage-level attribution (Polly, 3-run confirmation sample)
+
+A temporary, ephemeral `Instant`-based probe (env-var-gated via
+`A4_PERF_PROBE`, never committed, fully reverted after this
+measurement — confirmed via `git diff` showing zero net change to
+`incremental/pipeline.rs`, same "ephemeral probe, delete after
+confirming" convention B2-ID-012 itself documents) was added around
+two points in `incremental::pipeline::index_files`'s own full-reindex
+path: `resolve_raw_import_statements` (import-facts assembly) and
+`resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`
+(the function containing the actual call-resolution stage, both
+before and after wiring).
+
+```
+import_facts_resolution (A4-live only; did not exist pre-wiring):      ~1.7-1.8ms   (negligible)
+resolve_all_typed_edges stage, BASELINE (resolve_calls_with_extraction_rejections): median ~3.507s (3.493-3.522s)
+resolve_all_typed_edges stage, A4-LIVE  (resolve_calls_with_namespace_context):      median ~4.631s (4.607-4.713s)
+stage-level overhead: +1.124s (+32.05%% of the stage's OWN cost)
+```
+
+**The overhead is concentrated almost entirely inside the
+call-resolution stage itself** (the `resolve_calls_with_namespace_context`
+mechanism A4 wires in) — the stage-level delta (+1.124s) closely
+matches the full-index total delta (+1.018s) measured independently
+above (same order of magnitude, same corpus, consistent given this is
+a 3-run confirmation sample vs. the 10-run headline figure). Import-facts
+assembly itself is negligible (low-single-digit milliseconds) — it is
+NOT where the cost lives, despite being the part of the wiring change
+that moved earlier in the pipeline. This is consistent with, and does
+NOT overlap with, the already-tracked B2-ID-012 (`resolve_lineage`,
+measured separately, a different function entirely) or the
+`LocalGitRepositorySource::read_file` finding (file I/O, not
+call-resolution) — neither is implicated by this measurement.
+
+### Classification
+
+**Moderate overhead, real but not negligible, worth tracking but not
+blocking.** On Polly (the corpus where A4's namespace-aware filtering
+actually does real narrowing work — 366 real cases), A4 adds roughly
+**12-18% to real-indexer wall-clock time** (full and incremental
+respectively), concentrated in the call-resolution stage's own
+namespace-visibility-filtering work across Polly's real ~8,345
+ambiguous call sites. On pyjanitor (where A4's Python alias mechanism
+finds 0 corpus-level recoveries, per `ab0591d`/`468f770`), the
+overhead is much smaller (4-6%) — consistent with there being
+structurally less filtering work to do when the zero-candidate alias
+path rarely engages. The overhead scales with how much real
+ambiguity-narrowing work A4 actually performs on a given corpus, not
+with corpus size alone (pyjanitor's own baseline full-index, at 1.49s,
+is far faster than Polly's 5.51s, yet pyjanitor's own A4 overhead
+percentage is smaller, not larger — consistent with the mechanism's
+own cost being proportional to real ambiguous-candidate-set size and
+candidate-filtering operations performed, not file/snapshot count).
+**Not** classified Negligible (it is a reproducible double-digit
+percentage on the corpus where the mechanism does real work) and
+**not** classified Significant (it does not double indexing time,
+remains well under half the baseline cost on both corpora, and
+dispersion on every measured number is tight — under 5% spread on
+every median reported above — so this is a real, confirmed cost, not
+noise).
+
+**Commit:** `1ff6425` on `b2-code-graph` (new example binary
+`call_res_a4_perf_measurement.rs` + this section). No merge/tag/push.
+Pre-existing uncommitted files in the worktree untouched throughout.
+No performance optimization performed, in A4's own code or elsewhere,
+per this task's own explicit scope.
