@@ -246,15 +246,74 @@ fn collect_python_import(node: tree_sitter::Node, source: &[u8], out: &mut Vec<R
             // with imported_symbol "nn". `from torch import nn as N` ->
             // alias "N". `from torch import nn, functional` -> two
             // separate facts, one per imported name.
+            //
+            // CALL-RES-A4 (follow-on fix): a RELATIVE import (`from
+            // .ml import X`, `from ..pkg.mod import Y`) wraps its own
+            // module path in a `relative_import` node — `import_prefix`
+            // (the leading dot(s)) followed by an OPTIONAL `dotted_name`
+            // (absent for a bare `from . import X`, confirmed via
+            // direct grammar probe). CRITICALLY, confirmed via the SAME
+            // probe: whenever a `relative_import` node is present, the
+            // statement's OWN imported name(s) are ALSO direct
+            // `dotted_name` children of `import_from_statement` itself
+            // (`from .ml import helper` -> a direct `dotted_name`
+            // "helper" sibling of `relative_import`) — the exact same
+            // shape an ABSOLUTE import's own module-path `dotted_name`
+            // has. A naive "first direct `dotted_name` child wins" check
+            // (this module's OWN earlier, incorrect fix attempt,
+            // confirmed wrong by this exact test suite before this
+            // comment was written) would misidentify the IMPORTED NAME
+            // as the module path whenever a relative import also names
+            // something — the fix is to check for `relative_import`
+            // FIRST and unconditionally prefer it as the module-path
+            // source whenever it exists at all, falling back to a
+            // direct `dotted_name` child ONLY for a genuine absolute
+            // import (no `relative_import` node present). Before THIS
+            // fix, a relative import's own `module_node` search found
+            // NOTHING (no direct `dotted_name` child existed for the
+            // module itself in that shape) and the WHOLE statement
+            // silently produced zero facts — the exact real-repository
+            // shape CRC-003 documents (`from .ml import
+            // get_features_targets as _get_features_targets`).
+            // `module_path` for a relative import is the inner
+            // `dotted_name`'s own text when present (`"ml"`), or the
+            // dot prefix alone (`"."`/`".."`) for a bare `from . import
+            // X`/`from .. import Y` — never fabricated, always exactly
+            // what the real `import_prefix` text reads, so a caller can
+            // still tell "this was a relative import" from the leading
+            // dot(s) in `module_path` even though this module does not
+            // yet resolve a relative path against the importing file's
+            // own package location (a separate, NOT-yet-implemented
+            // feature — this fix only makes the STATEMENT extractable
+            // at all, never claims to resolve `.` relative to anything).
             let mut cursor = node.walk();
             let children: Vec<_> = node.children(&mut cursor).collect();
-            let Some(module_node) = children.iter().find(|c| c.kind() == "dotted_name") else {
-                return;
+            let relative_import_node = children.iter().find(|c| c.kind() == "relative_import").copied();
+            let module_node = if let Some(relative) = relative_import_node {
+                let mut rel_cursor = relative.walk();
+                let found = relative.children(&mut rel_cursor).find(|c| c.kind() == "dotted_name");
+                found
+            } else {
+                children.iter().find(|c| c.kind() == "dotted_name").copied()
             };
-            let module_path = text_of(*module_node, source);
+            let module_path = match module_node {
+                Some(node) => text_of(node, source),
+                None => {
+                    // A bare `from . import X`/`from .. import Y` (no
+                    // module name after the dots at all) — fall back to
+                    // the `relative_import` node's own full text (the
+                    // dot prefix alone), never silently dropping the
+                    // statement the way the pre-fix code did.
+                    let Some(relative) = relative_import_node else {
+                        return;
+                    };
+                    text_of(relative, source)
+                }
+            };
+            let module_node_id = module_node.map(|n| n.id());
             for child in &children {
                 match child.kind() {
-                    "dotted_name" if child.id() != module_node.id() => {
+                    "dotted_name" if Some(child.id()) != module_node_id => {
                         out.push(RawImportStatement {
                             module_path: module_path.clone(),
                             imported_symbol: Some(text_of(*child, source)),
@@ -467,6 +526,57 @@ mod tests {
 
 
     // --- Raw extraction (syntax only) ---
+
+    // --- CALL-RES-A4 follow-on fix: relative import extraction,
+    // previously silently dropped entirely ---
+
+    #[test]
+    fn python_relative_import_with_module_and_alias_is_extracted() {
+        // The exact real CRC-003 shape: before this fix, this entire
+        // statement produced ZERO facts (the pre-fix `module_node`
+        // search only recognized a DIRECT `dotted_name` child, never
+        // the `relative_import` wrapper a relative import actually
+        // uses).
+        let tree = parse_python("from .ml import get_features_targets as _get_features_targets\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1, "a relative import must no longer be silently dropped");
+        assert_eq!(facts[0].module_path, "ml");
+        assert_eq!(facts[0].imported_symbol, Some("get_features_targets".to_string()));
+        assert_eq!(facts[0].alias, Some("_get_features_targets".to_string()));
+    }
+
+    #[test]
+    fn python_relative_import_with_multiple_dots_is_extracted() {
+        let tree = parse_python("from ..pkg.sub import helper\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].module_path, "pkg.sub");
+        assert_eq!(facts[0].imported_symbol, Some("helper".to_string()));
+    }
+
+    #[test]
+    fn python_relative_import_with_no_module_name_falls_back_to_the_dot_prefix() {
+        // `from . import X` -- the relative_import node carries ONLY
+        // the dot prefix, no inner dotted_name at all. Must still
+        // extract a fact (never silently dropped), with module_path
+        // honestly reflecting the dot prefix itself, never a guessed
+        // real module name.
+        let tree = parse_python("from . import helper\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].module_path, ".");
+        assert_eq!(facts[0].imported_symbol, Some("helper".to_string()));
+    }
+
+    #[test]
+    fn python_relative_import_with_multiple_names_produces_one_fact_per_name() {
+        let tree = parse_python("from .ml import a, b\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 2, "a relative import with multiple named imports must still produce one fact per name, same as an absolute import");
+        let names: Vec<_> = facts.iter().filter_map(|f| f.imported_symbol.clone()).collect();
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
+    }
 
     #[test]
     fn python_bare_import_is_extracted_with_no_imported_symbol() {
