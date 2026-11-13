@@ -3806,6 +3806,57 @@ mod tests {
             assert_eq!(baseline, via_a4_with_empty_imports, "A4 called with zero import facts must be byte-for-byte identical to the pre-A4 baseline");
         }
 
+        /// Mutation-testing-driven addition: `resolve_via_import_alias`'s
+        /// own doc comment explicitly describes a DEFENSIVE
+        /// re-confirmation step for the `Internal(target_id)` case --
+        /// `ImportFact.resolution` was computed once, globally, against
+        /// a snapshot pool that is a SEPARATE parameter from the one
+        /// THIS exact `resolve_calls_with_imports` call receives, so
+        /// `target_id` is re-checked against the live `snapshots` slice
+        /// before an edge is ever built pointing at it. No existing
+        /// test exercised the branch where that re-confirmation actually
+        /// FAILS (a stale `target_id` no longer present in the given
+        /// pool) -- every real fixture so far always included the real
+        /// target, so `cargo mutants` found `s.id() == target_id` could
+        /// be mutated to `!=` with zero observable difference. This
+        /// test constructs that exact stale-target shape directly (a
+        /// hand-built `ImportFact` naming a `target_id` deliberately
+        /// excluded from the snapshot slice) and confirms the call
+        /// falls through to the generic unresolved path, never a
+        /// dangling edge pointing at a snapshot that is not actually in
+        /// the given pool.
+        #[test]
+        fn resolve_via_import_alias_never_builds_an_edge_to_a_stale_target_missing_from_the_given_pool() {
+            let repo = test_repo_calls();
+            let (caller_file, _caller_tree, caller_snapshots) = real_snapshots_and_tree(repo, "pkg/user.py", "def run():\n    return _helper()\n");
+            let caller = find(&caller_snapshots, "run");
+            // A real snapshot that EXISTS (so it has a real, valid id),
+            // but is deliberately NOT included in the `snapshots` slice
+            // passed to `resolve_calls_with_imports` below -- simulating
+            // exactly the "resolved against a different pool" case the
+            // defensive re-confirmation guards against.
+            let (_stale_file, _stale_tree, stale_snapshots) = real_snapshots_and_tree(repo, "pkg/helper.py", "def helper():\n    pass\n");
+            let stale_target = find(&stale_snapshots, "helper");
+
+            let stale_import_fact = crate::imports::ImportFact {
+                importing_file: caller_file.clone(),
+                module_path: "pkg.helper".to_string(),
+                imported_symbol: Some("helper".to_string()),
+                alias: Some("_helper".to_string()),
+                span: crate::extract::ByteSpan { start: 0, end: 1 },
+                resolution: crate::imports::ImportResolution::Internal(stale_target.id()),
+            };
+
+            // Deliberately only the CALLER's own snapshot is given --
+            // `stale_target` is real (confirmed to exist in its own
+            // extraction above) but absent from THIS pool.
+            let only_caller_snapshots = caller_snapshots.clone();
+            let (edges, attempts) = resolve_calls_with_imports(&only_caller_snapshots, &[], &[stale_import_fact]).unwrap();
+
+            assert!(edges.iter().all(|e| e.to != stale_target.id()), "must never produce an edge pointing at a target absent from the given snapshot pool, even when a real ImportFact claims Internal resolution to it");
+            assert!(attempts.iter().any(|a| a.caller == caller.id() && a.callee_name == "_helper"), "the call must still be recorded as a negative-knowledge attempt, not silently dropped");
+        }
+
         // --- Explicit CRC-001/CRC-002/CRC-003 regression report ---
 
         /// CRC-001 non-regression: the real documented case (two
