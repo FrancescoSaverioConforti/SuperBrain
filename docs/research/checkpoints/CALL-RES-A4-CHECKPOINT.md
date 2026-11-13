@@ -483,6 +483,100 @@ against the SAME real snapshots, and reports the real delta.
 - NO-GO condition (`A4 recovers CRC-003 but introduces a new FP on CRC-002` → NO-GO) — **confirmed NOT triggered**, directly re-verified by `no_go_condition_is_confirmed_not_triggered_across_all_four_crc_rows` against the real computed `Status` of every row.
 - See `ground_truth_schema.rs` tests and `call-res-a4-crc-regression.jsonl` for the machine-checked source of these numbers.
 
+## Reliability-policy / full-incremental-parity re-check (agent_policy.rs / conformance.rs)
+
+**Status: done, with one major finding.** Prior to this pass, a grep
+across this crate's own `src/` confirmed `agent_policy::evaluate`/
+`evaluate_high_impact_modification` were called ONLY from their own
+module's hand-built-`EvidenceTier` unit tests — never from any real A4
+resolver path. This pass adds `agent_policy::tests::call_res_a4_policy_recheck`
+(6 new tests, real extraction, real A4 resolver calls, real policy
+evaluation — never hand-asserted) and one new test in
+`conformance.rs`, and confirms the following against REAL data:
+
+1. **Deterministic narrowing increases reliability only as far as
+   justified**: a real namespace-narrowed-to-one edge carries
+   `ResolutionMethod::NameHeuristic`, which `EvidenceTier::from_resolution_method`
+   maps to `Heuristic`, never `Resolved` — confirmed against a real
+   resolved edge, then routed through `agent_policy::evaluate`:
+   `PermittedWithDisclosedUncertainty` for display, `Forbidden` for
+   assert-as-fact and high-impact modification. Policy-correct.
+2. **`unknown visibility` never becomes `not visible`**: re-confirmed
+   at the real resolver-entry-point level (not just the
+   `exclude_definitely_not_visible_by_namespace` unit `edges::calls`
+   already covers) — an undetermined-namespace candidate survives
+   filtering, the real ambiguity stays `Ambiguous`, and the policy
+   layer correctly still forbids it for every intended use.
+3. **`Ambiguous` stays `Forbidden`**: confirmed against a real A4
+   cross-namespace ambiguity `CallAttempt` (not a hand-built one) —
+   forbidden for every intended use including mere display.
+4. **Unresolved-external vs. local-resolution-failure — FINDING, not a
+   clean "yes"**: `ImportTargetExternal` and plain `Unknown` are
+   genuinely distinct `UnresolvedReason` values (different prose,
+   different provenance), but both carry `EvidenceTier::Unresolved`,
+   and `agent_policy::evaluate` dispatches purely on `tier` — it is
+   `UnresolvedReason`-blind. The two therefore produce an IDENTICAL
+   `Forbidden` verdict with identical reason text. The distinction A4
+   adds is real at the reason/provenance layer but does NOT currently
+   change what an agent is permitted to do with either outcome. Safe
+   (both correctly stay Forbidden), but not actually "routed to
+   different policy outcomes" — reported honestly rather than forced.
+5. **CRC-002 does not regress under policy re-evaluation**: re-run
+   through the real policy layer this time (not just the resolver
+   level `edges::calls` already proved byte-identical) — the real
+   tier sequence and every real policy verdict for CRC-002's call
+   sites are identical before/after A4.
+6. **The 366 real Polly recoveries are policy-coherent**: every
+   `NameHeuristic`-tier edge A4 produces (the exact mechanism behind
+   commit `ab0591d`'s 366-case Polly recovery count) maps to
+   `Heuristic`, confirmed structurally rather than by inspecting all
+   366 individually — `EvidenceTier::from_resolution_method` has no
+   path from `NameHeuristic` to anything but `Heuristic`, and the
+   dedicated real-fixture test above exercises that exact mapping
+   end-to-end. `ImportedSymbolAmbiguous` (A4's own new ambiguity
+   reason) is separately confirmed exactly as `Forbidden` as a plain
+   name-based `Ambiguous` — A4's new code paths do not bypass the
+   "Ambiguous is always Forbidden" rule.
+7. **Still-ambiguous cases remain non-actionable**: confirmed directly
+   — every real `Ambiguous` `CallAttempt` this pass produced or
+   inspected is `Forbidden` for every `IntendedUse`, including
+   display.
+
+**MAJOR FINDING — A4 is not wired into the real indexer at all.**
+Reading `crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`
+(the one function `incremental/indexer.rs:687` calls for ITS
+call-resolution pass, identically for both the full-reindex and the
+incremental path) shows it hard-codes a call to
+`resolve_calls_with_extraction_rejections` — the PRE-A4 entry point —
+never `resolve_calls_with_imports`/`resolve_calls_with_namespace_context`,
+even though the real `csharp_contexts` (and, elsewhere in the same
+pipeline, real `import_facts`) are already computed and available at
+that exact call site. Confirmed with a new, passing, real-data test
+(`conformance::tests::call_res_a4_not_wired_into_the_real_indexer::the_real_indexer_still_reports_the_pre_a4_ambiguous_outcome_for_a_case_a4_itself_resolves`):
+the real `CodeGraphIndexer::observe_commit`, given the EXACT fixture
+`edges::calls`'s own unit test proves A4 resolves to one candidate,
+still reports `Ambiguous(2)` — the pre-A4 outcome. A4's own mechanisms
+are real, tested, mutation-closed, and separately measured on real
+corpora (commit `ab0591d`) only via standalone example binaries and
+unit tests that call the A4 functions directly — they contribute
+NOTHING to what `CodeGraphIndexer` actually produces on any real repo
+today. Consequently, **"full/incremental parity for A4" is vacuously
+true against the real indexer** (both paths call the same, non-A4,
+function) — not because A4's own mechanism has been parity-checked,
+but because it never runs there. This is the first new finding this
+checkpoint doc records that is NOT merely a residual limitation of a
+built mechanism, but a wiring gap preventing every already-built,
+already-tested A4 mechanism from having any real effect. Not fixed in
+this pass (wiring A4 into the real pipeline was not this pass's own
+scope — a policy/conformance RE-CHECK, not an implementation change);
+reported as a finding for the user's own next decision.
+
+**Tests added this pass**: 6 in `agent_policy.rs`
+(`call_res_a4_policy_recheck` module), 1 in `conformance.rs`
+(`call_res_a4_not_wired_into_the_real_indexer` module). Full lib suite:
+602/602 passing (up from 595). Full workspace `codegraph-index` test
+run (lib + 6 integration binaries): 680/680 passing, 0 failures.
+
 ## Recommendation
 
 **GO** for merging both passes' work as a discrete, net-positive
@@ -496,13 +590,16 @@ full 594-test lib suite) — subject to the remaining directive sections below b
 follow-up pass before CALL-RES-A4 itself is declared fully complete.
 
 **NO-GO** on treating CALL-RES-A4 as closed. Oracle/ground-truth
-extension (DONE, see above) and full corpus-level evaluation metrics
-(DONE, see above) are now closed, but policy/conformance re-checks,
-full/incremental parity extension, performance measurement, Python
-candidate-filtering beyond alias matching, and TS/JS module-visibility
-filtering all remain open — this metrics-only pass deliberately did
-not touch `agent_policy.rs`/`conformance.rs` or performance, per its
-own explicit scope.
+extension (DONE), full corpus-level evaluation metrics (DONE), and
+policy/conformance re-checks (DONE, see above — with the wiring-gap
+finding) are now closed. Still open: performance measurement, Python
+candidate-filtering beyond alias matching, TS/JS module-visibility
+filtering, and — newly surfaced by this pass, more significant than
+any of those — **A4 is not wired into the real `CodeGraphIndexer`
+pipeline at all**, so none of its tested, mutation-closed mechanisms
+have any effect on a real indexing run today. Wiring it in was not
+this pass's own scope (a re-check, not an implementation change) and
+is not done here.
 
 **NO-GO** on resuming B2-EVAL-009 until CALL-RES-A4 is either
 completed or explicitly descoped by the user/coordinator — consistent

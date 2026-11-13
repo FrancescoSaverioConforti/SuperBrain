@@ -259,4 +259,278 @@ mod tests {
             panic!("expected Forbidden");
         }
     }
+
+    // --- CALL-RES-A4 reliability-policy re-check ---
+    //
+    // Everything above this point only ever exercised `evaluate`/
+    // `evaluate_high_impact_modification` against hand-built
+    // `EvidenceTier` values -- a grep across this crate's own `src/`
+    // confirms NEITHER function is called from any real A4 resolver
+    // path (`calls.rs`, `negative_knowledge.rs`) or from any
+    // production pipeline entry point. This module closes that gap:
+    // real A4 output (from `resolve_calls_with_namespace_context`/
+    // `resolve_calls_with_imports`, using the exact same real-
+    // extraction fixture shapes the sibling `call_res_a4_namespace`/
+    // `call_res_a4_import_alias` test modules in `edges::calls` already
+    // proved produce A4's own real mechanisms) is now actually routed
+    // through this policy layer and checked, rather than merely
+    // reasoned about in prose.
+    mod call_res_a4_policy_recheck {
+        use codegraph_domain::{CommitHash, EvidenceTier, FileIdentity, RepositoryRegistry, RepositoryRoot, ResolutionMethod};
+
+        use super::*;
+        use crate::csharp_declarations::{extract_csharp_type_declaration_contexts, resolve_csharp_type_declaration_contexts};
+        use crate::edges::{resolve_calls_with_imports, resolve_calls_with_namespace_context};
+        use crate::extract::extract_symbols_reporting_rejections;
+        use crate::imports::resolve_import_facts;
+        use crate::negative_knowledge::UnresolvedReason;
+        use crate::parse::parser_for;
+        use crate::snapshot::{promote, SymbolSnapshot};
+
+        fn test_repo() -> codegraph_domain::RepositoryId {
+            let mut registry = RepositoryRegistry::new();
+            registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+        }
+
+        /// Same convention `negative_knowledge.rs`'s own test module
+        /// uses for a plain, real-shaped `SymbolSnapshotId` where the
+        /// test only needs policy to inspect `tier` (never the id's own
+        /// identity) -- used by the two tests below that construct a
+        /// `CallAttempt` directly rather than through a full real-file
+        /// resolver run.
+        fn policy_recheck_test_id(name: &str) -> codegraph_domain::SymbolSnapshotId {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, "src/lib.rs").unwrap();
+            codegraph_domain::SymbolSnapshotId::derive(&file, codegraph_domain::SymbolKind::Function, name, "fn x() {}", 0, 10)
+        }
+
+        fn real_snapshots_contexts_and_tree(
+            repo: codegraph_domain::RepositoryId,
+            path: &str,
+            source: &str,
+        ) -> (FileIdentity, crate::parse::ParseTree, Vec<SymbolSnapshot>, Vec<(FileIdentity, crate::csharp_declarations::RawCSharpTypeDeclarationContext)>) {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let file = FileIdentity::parse(repo, commit, path).unwrap();
+            let parser = parser_for(&file).expect("a supported extension must have a parser");
+            let tree = parser.parse(source.as_bytes()).expect("fixture source must parse");
+            let (candidates, rejections) = extract_symbols_reporting_rejections(&tree);
+            assert!(rejections.is_empty(), "fixture source must not trigger any extraction rejection: {rejections:?}");
+            let snapshots: Vec<SymbolSnapshot> = candidates.into_iter().map(|c| promote(&c, file.clone()).expect("a real extracted candidate must always promote")).collect();
+            let raw_contexts: Vec<_> = extract_csharp_type_declaration_contexts(&tree).into_iter().map(|c| (file.clone(), c)).collect();
+            (file, tree, snapshots, raw_contexts)
+        }
+
+        fn find<'a>(snapshots: &'a [SymbolSnapshot], name: &str) -> &'a SymbolSnapshot {
+            snapshots.iter().find(|s| s.name().as_str() == name).unwrap_or_else(|| panic!("no snapshot named {name:?} among {:?}", snapshots.iter().map(|s| s.name().as_str()).collect::<Vec<_>>()))
+        }
+
+        /// Verification point 1: a real namespace-narrowed-to-one call
+        /// (the exact `namespace_import_excludes_the_non_imported_namespace_candidate`
+        /// shape from `edges::calls`'s own A4 test module -- reused here
+        /// rather than re-derived, since that module already proves
+        /// this fixture produces a real narrowed edge) must map to
+        /// `EvidenceTier::Heuristic`, never `Resolved` -- i.e. deterministic
+        /// import/namespace narrowing increases confidence ONLY as far as
+        /// the evidence actually supports (NameHeuristic), never silently
+        /// promoted to the StaticAnalysis/Resolved tier that real syntactic
+        /// certainty (e.g. exactly one candidate existed with no ambiguity
+        /// at all) alone earns.
+        #[test]
+        fn namespace_narrowed_edge_is_heuristic_tier_never_resolved_and_policy_gates_it_accordingly() {
+            let repo = test_repo();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw);
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+            let run_method = find(&caller_snapshots, "Run");
+            let target_in_a = find(&a_snapshots, "Target");
+            let edge = edges.iter().find(|e| e.from == run_method.id() && e.to == target_in_a.id()).expect("fixture premise: A4 narrows this real ambiguity to exactly one candidate");
+
+            assert_eq!(edge.evidence.method(), ResolutionMethod::NameHeuristic, "A4's own namespace-narrowing mechanism must record NameHeuristic -- it is a judgment call among same-named candidates using a visibility fact, not syntactic certainty");
+            let tier = EvidenceTier::from_resolution_method(edge.evidence.method());
+            assert_eq!(tier, EvidenceTier::Heuristic, "a namespace-narrowed-to-one edge must map to Heuristic, never Resolved -- confirms reliability is increased only as far as the real evidence (a visibility fact, not a syntactic certainty) supports");
+
+            // Route the real tier through the actual policy layer: must
+            // be forbidden for high-impact use without disclosed
+            // uncertainty/independent confirmation, permitted-with-
+            // disclosure for mere display.
+            assert_eq!(evaluate(tier, IntendedUse::InformationalDisplay), PolicyVerdict::PermittedWithDisclosedUncertainty);
+            assert!(matches!(evaluate(tier, IntendedUse::AssertAsFactOrSoleJustification), PolicyVerdict::Forbidden { .. }));
+            assert!(matches!(evaluate(tier, IntendedUse::HighImpactModification), PolicyVerdict::Forbidden { .. }));
+            assert!(matches!(evaluate_high_impact_modification(&[tier]), PolicyVerdict::Forbidden { .. }), "a blast radius containing even one real A4-recovered NameHeuristic edge must block an autonomous high-impact modification");
+            let _ = (a_file, b_file);
+        }
+
+        /// Verification point 3 + 7: the real cross-namespace ambiguity
+        /// that A4 deliberately declines to resolve (reusing
+        /// `using_an_unrelated_third_namespace_never_manufactures_a_false_resolution`'s
+        /// own fixture shape) must carry `EvidenceTier::Ambiguous`, and
+        /// the policy layer must forbid EVERY intended use for it,
+        /// including mere informational display -- confirms "Ambiguous
+        /// stays Forbidden" and "still-ambiguous cases remain
+        /// non-actionable" against real A4-produced data, not a
+        /// hand-built `EvidenceTier::Ambiguous` value.
+        #[test]
+        fn real_a4_ambiguous_attempt_is_forbidden_for_every_intended_use_including_display() {
+            let repo = test_repo();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsC;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            let mut all_raw = a_raw;
+            all_raw.extend(b_raw);
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&all_raw, &all_snapshots);
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (_edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+            let run_method = find(&caller_snapshots, "Run");
+            let attempt = attempts.iter().find(|a| a.caller == run_method.id() && a.callee_name == "Target").expect("fixture premise: a real, undecidable cross-namespace ambiguity");
+            assert_eq!(attempt.tier, EvidenceTier::Ambiguous);
+            assert_eq!(attempt.candidates.len(), 2, "both real candidates must be preserved, never silently dropped to one");
+
+            assert!(matches!(evaluate(attempt.tier, IntendedUse::InformationalDisplay), PolicyVerdict::Forbidden { .. }), "a real Ambiguous CallAttempt must be forbidden even for mere display -- never surfaced as a single chosen candidate");
+            assert!(matches!(evaluate(attempt.tier, IntendedUse::AssertAsFactOrSoleJustification), PolicyVerdict::Forbidden { .. }));
+            assert!(matches!(evaluate(attempt.tier, IntendedUse::HighImpactModification), PolicyVerdict::Forbidden { .. }));
+            let _ = (a_file, b_file);
+        }
+
+        /// Verification point 2: re-confirms, through the REAL resolver
+        /// entry point (not the `exclude_definitely_not_visible_by_namespace`
+        /// unit directly, which `edges::calls`'s own test module already
+        /// covers), that an undetermined-namespace candidate is never
+        /// collapsed into "not visible" -- and additionally that the
+        /// resulting real `Ambiguous` outcome is, as always, Forbidden
+        /// under policy for every intended use. This closes the policy-
+        /// layer side of the same invariant `edges::calls::call_res_a4_namespace::a_candidate_with_an_undetermined_namespace_is_never_excluded`
+        /// already closes at the resolver level.
+        #[test]
+        fn unknown_visibility_never_collapses_to_not_visible_and_the_resulting_ambiguity_is_still_forbidden() {
+            let repo = test_repo();
+            let (a_file, _a_tree, a_snapshots, a_raw) = real_snapshots_contexts_and_tree(repo, "src/NsA/Foo.cs", "namespace NsA;\nclass Foo { public void Target() {} }\n");
+            let (b_file, _b_tree, b_snapshots, _b_raw) = real_snapshots_contexts_and_tree(repo, "src/NsB/Foo.cs", "namespace NsB;\nclass Foo { public void Target() {} }\n");
+            let (caller_file, caller_tree, caller_snapshots, _caller_raw) = real_snapshots_contexts_and_tree(repo, "src/Caller.cs", "using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let mut all_snapshots = a_snapshots.clone();
+            all_snapshots.extend(b_snapshots.clone());
+            all_snapshots.extend(caller_snapshots.clone());
+            // Deliberately only resolve contexts for NsA::Foo -- NsB::Foo
+            // has NO CSharpTypeDeclarationContext entry, simulating a
+            // genuinely undetermined namespace for that one candidate.
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&a_raw, &all_snapshots);
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges, attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &import_facts, &csharp_contexts).unwrap();
+            let run_method = find(&caller_snapshots, "Run");
+
+            assert!(edges.iter().all(|e| e.from != run_method.id()), "an undetermined-namespace candidate must never be silently excluded -- confirmed again here at the entry point this policy re-check exercises");
+            let attempt = attempts.iter().find(|a| a.caller == run_method.id() && a.callee_name == "Target").expect("the real ambiguity (one determined-visible, one undetermined) must remain Ambiguous");
+            assert_eq!(attempt.tier, EvidenceTier::Ambiguous);
+            assert_eq!(attempt.candidates.len(), 2);
+            assert!(matches!(evaluate(attempt.tier, IntendedUse::InformationalDisplay), PolicyVerdict::Forbidden { .. }), "the policy layer must still forbid this, since an undetermined-namespace candidate surviving filtering correctly produces a real, honest Ambiguous outcome, not a false Resolved one");
+            let _ = (a_file, b_file);
+        }
+
+        /// Verification point 4: `ImportTargetExternal` (A4's own
+        /// specific "checked the alias, confirmed external" reason) and
+        /// plain `Unknown` (a generic local-resolution failure, never
+        /// having consulted import evidence at all) are DIFFERENT
+        /// `UnresolvedReason` values with different prose, but this test
+        /// confirms, against the real policy layer rather than by
+        /// reading the enum definitions, that they are NOT distinguished
+        /// at the `EvidenceTier`/policy-outcome level: both are
+        /// `EvidenceTier::Unresolved`, and `agent_policy::evaluate`
+        /// forbids both identically for every intended use, with
+        /// IDENTICAL reason text (the policy's own `Unresolved` arm is
+        /// blind to `UnresolvedReason` entirely -- it only ever sees
+        /// `tier`). Reported as a finding below, not forced into a
+        /// false "yes, distinct" answer.
+        #[test]
+        fn import_target_external_and_plain_unknown_share_the_same_tier_and_identical_policy_outcome() {
+            let caller = policy_recheck_test_id("caller");
+            let external = crate::negative_knowledge::CallAttempt::unresolved_import_target_external(caller, "t".to_string());
+            let unknown = crate::negative_knowledge::CallAttempt::unresolved(caller, "missing".to_string());
+
+            assert_eq!(external.tier, EvidenceTier::Unresolved);
+            assert_eq!(unknown.tier, EvidenceTier::Unresolved);
+            assert_ne!(external.reason, unknown.reason, "the REASON values are genuinely distinct -- ImportTargetExternal vs. Unknown");
+
+            let verdict_external = evaluate(external.tier, IntendedUse::InformationalDisplay);
+            let verdict_unknown = evaluate(unknown.tier, IntendedUse::InformationalDisplay);
+            assert_eq!(verdict_external, verdict_unknown, "FINDING: the policy layer's own evaluate() takes only EvidenceTier, never UnresolvedReason -- ImportTargetExternal (checked, confirmed external) and plain Unknown (never checked) are POLICY-IDENTICAL (same Forbidden verdict, same reason text), even though their own UnresolvedReason/provenance text differs. The distinction A4 adds is real at the reason/provenance layer but does NOT currently change what an agent is permitted to do -- both remain uniformly Forbidden, which is the SAFE default, but means 'unresolved-external' and 'local-resolution failure' are not routed to different policy outcomes today.");
+        }
+
+        /// Verification point 5: CRC-002 (local-binding shadowing) must
+        /// not regress under THIS policy-layer re-evaluation either --
+        /// re-runs the exact CRC-002 fixture shape already proven byte-
+        /// identical at the resolver level in `edges::calls`'s own
+        /// `crc_002_local_binding_shadowing_regression_check`, and
+        /// additionally confirms the real resulting tiers/policy verdicts
+        /// for this call site are themselves identical before/after A4.
+        #[test]
+        fn crc_002_shadowing_does_not_regress_under_policy_reevaluation() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let other_file = FileIdentity::parse(repo, commit.clone(), "components/other.py").unwrap();
+            let other_parser = parser_for(&other_file).unwrap();
+            let other_tree = other_parser.parse(b"def Button():\n    pass\n").unwrap();
+            let (other_candidates, _) = extract_symbols_reporting_rejections(&other_tree);
+            let unrelated_snapshots: Vec<SymbolSnapshot> = other_candidates.into_iter().map(|c| promote(&c, other_file.clone()).unwrap()).collect();
+
+            let caller_file = FileIdentity::parse(repo, commit, "components/card.py").unwrap();
+            let caller_parser = parser_for(&caller_file).unwrap();
+            let caller_tree = caller_parser.parse(b"import os\n\n\ndef render(Button):\n    return Button()\n").unwrap();
+            let (caller_candidates, _) = extract_symbols_reporting_rejections(&caller_tree);
+            let caller_snapshots: Vec<SymbolSnapshot> = caller_candidates.into_iter().map(|c| promote(&c, caller_file.clone()).unwrap()).collect();
+
+            let mut all_snapshots = unrelated_snapshots;
+            all_snapshots.extend(caller_snapshots.clone());
+            let import_facts = resolve_import_facts(&caller_file, &caller_tree, &all_snapshots).unwrap();
+
+            let (edges_before, attempts_before) = crate::edges::resolve_calls_with_extraction_rejections(&all_snapshots, &[]).unwrap();
+            let (edges_after, attempts_after) = resolve_calls_with_imports(&all_snapshots, &[], &import_facts).unwrap();
+
+            assert_eq!(edges_before, edges_after, "CRC-002 must stay byte-identical at the resolver level under this re-check too");
+
+            let tiers_before: Vec<EvidenceTier> = edges_before.iter().map(|e| EvidenceTier::from_resolution_method(e.evidence.method())).chain(attempts_before.iter().map(|a| a.tier)).collect();
+            let tiers_after: Vec<EvidenceTier> = edges_after.iter().map(|e| EvidenceTier::from_resolution_method(e.evidence.method())).chain(attempts_after.iter().map(|a| a.tier)).collect();
+            assert_eq!(tiers_before, tiers_after, "the real tier sequence for CRC-002 must be identical before/after A4");
+
+            let verdicts_before: Vec<PolicyVerdict> = tiers_before.iter().map(|t| evaluate(*t, IntendedUse::InformationalDisplay)).collect();
+            let verdicts_after: Vec<PolicyVerdict> = tiers_after.iter().map(|t| evaluate(*t, IntendedUse::InformationalDisplay)).collect();
+            assert_eq!(verdicts_before, verdicts_after, "every real policy verdict for CRC-002's own call sites must be identical before/after A4 -- no regression at the policy layer");
+        }
+
+        /// Verification point 6: spot-checks that A4's own
+        /// `ImportedSymbolAmbiguous` outcome -- the real "found the
+        /// alias, but its target is still 2+ candidates" case that the
+        /// Polly/pyjanitor metrics pass (commit `ab0591d`) separately
+        /// counted at corpus scale -- is itself `EvidenceTier::Ambiguous`
+        /// and therefore Forbidden under policy for every intended use,
+        /// exactly like a plain name-based ambiguity. Confirms A4's own
+        /// NEW ambiguity-reason variant does not accidentally bypass the
+        /// policy's "Ambiguous is always Forbidden" rule by virtue of
+        /// being a different code path.
+        #[test]
+        fn import_alias_ambiguous_target_is_policy_coherent_with_plain_ambiguous() {
+            let caller = policy_recheck_test_id("caller");
+            let candidates = vec![policy_recheck_test_id("candidate")]; // any real-shaped id; policy only inspects tier
+            let attempt = crate::negative_knowledge::CallAttempt::ambiguous_import_target(caller, "t".to_string(), candidates);
+            assert_eq!(attempt.tier, EvidenceTier::Ambiguous);
+            assert_eq!(attempt.reason, UnresolvedReason::ImportedSymbolAmbiguous);
+            assert!(matches!(evaluate(attempt.tier, IntendedUse::InformationalDisplay), PolicyVerdict::Forbidden { .. }), "ImportedSymbolAmbiguous must be exactly as Forbidden as a plain name-based Ambiguous -- the policy layer is reason-blind by design, so A4's own new ambiguity source cannot accidentally slip past the Ambiguous-is-always-Forbidden rule");
+        }
+    }
 }

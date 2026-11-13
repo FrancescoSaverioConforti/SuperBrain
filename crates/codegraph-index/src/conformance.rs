@@ -823,4 +823,70 @@ mod tests {
             );
         }
     }
+
+    /// CALL-RES-A4 reliability-policy re-check, "Full/incremental parity
+    /// extension (§15)" item. The honest, surprising finding this test
+    /// exists to pin down with real evidence rather than prose: the
+    /// REAL production entry point this module's own
+    /// `assert_full_and_incremental_agree` helper exercises
+    /// (`CodeGraphIndexer::observe_commit`, via
+    /// `resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`
+    /// at `incremental/indexer.rs`'s own call-resolution step) calls
+    /// `resolve_calls_with_extraction_rejections` — the PRE-A4 entry
+    /// point — for ITS call-resolution pass, never
+    /// `resolve_calls_with_imports`/`resolve_calls_with_namespace_context`,
+    /// even though the SAME real `csharp_contexts` (and, elsewhere in
+    /// the same pipeline, real `import_facts`) are already computed and
+    /// available at that exact call site (confirmed by reading
+    /// `crate::edges::resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`'s
+    /// own body directly: it hard-codes the pre-A4 function, full stop).
+    /// A4's own Python-alias and C#-namespace mechanisms are therefore
+    /// real, tested, mutation-closed, and separately measured on real
+    /// corpora via standalone example binaries and unit tests — but are
+    /// NOT reachable from `CodeGraphIndexer` at all, in either the full
+    /// or the incremental path (both paths call the exact same
+    /// function). "Full/incremental parity for A4" is consequently
+    /// VACUOUSLY true against the real indexer today, for the
+    /// uninteresting reason that A4 never runs there at all, not
+    /// because its real mechanism has been parity-checked.
+    mod call_res_a4_not_wired_into_the_real_indexer {
+        use super::*;
+        use crate::incremental::CodeGraphIndexer;
+
+        /// Demonstrates the gap directly with real data, rather than
+        /// merely asserting it from reading source: builds the EXACT
+        /// real-corpus shape `edges::calls`'s own
+        /// `namespace_import_excludes_the_non_imported_namespace_candidate`
+        /// test proves A4's namespace mechanism DOES resolve (two
+        /// same-named candidates in different namespaces, caller `using`s
+        /// one of them) and runs it through the REAL
+        /// `CodeGraphIndexer::observe_commit` entry point. If A4 were
+        /// wired in, this call site would be `Resolved`-tier (well,
+        /// `Heuristic`, per A4's own `NameHeuristic` evidence) with
+        /// `candidate_count == 1`. It is not: the real indexer still
+        /// reports it as the pre-A4 outcome, `Ambiguous` with 2
+        /// candidates — confirming A4's own real mechanism contributes
+        /// NOTHING to what `CodeGraphIndexer` actually produces today.
+        #[test]
+        fn the_real_indexer_still_reports_the_pre_a4_ambiguous_outcome_for_a_case_a4_itself_resolves() {
+            let repo = test_repo();
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            let source = FakeSource::new()
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/NsA/Foo.cs").unwrap(), b"namespace NsA;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/NsB/Foo.cs").unwrap(), b"namespace NsB;\nclass Foo { public void Target() {} }\n")
+                .with_file(FileIdentity::parse(repo, commit.clone(), "src/Caller.cs").unwrap(), b"using NsA;\nclass Caller { public void Run() { Target(); } }\n");
+
+            let indexer = CodeGraphIndexer::new();
+            let outcome = indexer.observe_commit(&source, repo, &commit, None, &[]).unwrap();
+
+            let keys = call_attempt_keys(&outcome);
+            let run_attempt = keys.iter().find(|k| k.callee_name == "Target");
+            assert!(
+                run_attempt.is_some_and(|k| k.tier_debug == "Ambiguous" && k.candidate_count == 2),
+                "FINDING, confirmed with real data: the real indexer must still report this call site as the PRE-A4 Ambiguous(2) outcome, because resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge calls resolve_calls_with_extraction_rejections, never A4's own resolve_calls_with_namespace_context -- A4's real recovery mechanism (proven in edges::calls's own unit tests to resolve this EXACT shape to a single candidate) is unreachable from CodeGraphIndexer today. Got: {run_attempt:?}"
+            );
+            let edges = edge_keys(&outcome);
+            assert!(edges.iter().all(|e| e.kind_debug != "Calls" || e.to.name != "Target"), "confirms no Calls edge to Target exists either -- A4 did not silently resolve this through some other path");
+        }
+    }
 }
