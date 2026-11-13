@@ -498,6 +498,117 @@ against the SAME real snapshots, and reports the real delta.
 - NO-GO condition (`A4 recovers CRC-003 but introduces a new FP on CRC-002` → NO-GO) — **confirmed NOT triggered**, directly re-verified by `no_go_condition_is_confirmed_not_triggered_across_all_four_crc_rows` against the real computed `Status` of every row.
 - See `ground_truth_schema.rs` tests and `call-res-a4-crc-regression.jsonl` for the machine-checked source of these numbers.
 
+## Live-indexer re-measurement (CALL-RES-A4, post-wiring)
+
+**The resolver-level numbers in "Final multi-corpus metrics" above are
+NOT deleted or overwritten — they remain exactly as recorded, now
+explicitly labeled experimental/resolver-level (see that section's own
+caveat, added by the wiring pass).** This section adds a SEPARATE,
+clearly distinct set of numbers: the SAME Polly/pyjanitor corpora, at
+the SAME pinned commits, measured by actually running the real,
+now-wired `CodeGraphIndexer::observe_commit` end to end (two new
+standalone harnesses, `call_res_a4_live_indexer_csharp.rs` /
+`call_res_a4_live_indexer_python.rs`) — not by calling either resolver
+function directly. "Before" in this section is reproduced by calling
+`resolve_calls_with_extraction_rejections` on the exact same
+snapshot/signature-too-long-names pool each harness itself extracts
+the same way the real pipeline does; this is mechanically equivalent
+to what the real indexer did before commit `ffd0295`, since that
+commit's only change at the real call site was swapping which resolver
+function is invoked on an otherwise-identical pool (confirmed directly
+by reading the pre/post-`ffd0295` diff of
+`resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge`)
+— no separate pre-`ffd0295` checkout was needed or performed to
+reproduce this baseline.
+
+### Polly (C#), live-indexer
+
+- **AFTER (live, real `observe_commit`)**: calls_edges 2415
+  (StaticAnalysis 1498, NameHeuristic 917); call_attempts 16178
+  (Ambiguous 8008, Unresolved 8170). total_snapshots 5190;
+  real_import_facts_published 725.
+- **BEFORE (real-indexer-equivalent baseline, same pool)**: calls_edges
+  2078 (StaticAnalysis 1498, NameHeuristic 580); call_attempts 16515
+  (Ambiguous 8345, Unresolved 8170).
+- **Snapshot-count parity**: baseline (5190) and live indexer (5190)
+  agree exactly — the before/after comparison is apples-to-apples.
+- Of the 8345 real pre-A4 ambiguous call sites: **366 narrowed to
+  exactly one candidate through the LIVE wired path** (a real `Edge`
+  via `observe_commit`), 3985 narrowed but still 2+ candidates, 3994
+  unchanged.
+- **Comparison to the `ab0591d` resolver-level figure: EXACT MATCH.**
+  366 (resolver-level) == 366 (live-indexer). Every other number above
+  (edges, tier breakdown, call_attempts) also matches `ab0591d`'s own
+  "after" figures exactly. The resolver-level measurement and the real
+  live indexing run produce byte-identical results for this corpus —
+  confirms the wiring in `ffd0295` did not introduce any real-world
+  divergence (e.g. from incremental assembly or file-ordering effects)
+  for this case.
+- Invariant re-check on this run's own live data (every genuinely new
+  live edge's key was a real pre-A4 candidate-pool member, never
+  manufactured): **0 violations**.
+- Precision/recall/F1/TP/FP/FN: **N/A**, same reasoning as the
+  resolver-level section — no corpus-level ground-truth label set
+  exists for Polly beyond CRC-001/002/003's own rows.
+- Full raw output: `docs/research/evidence/polly-live-run.txt` (scratchpad-run; also reproducible via `cargo run --release --example call_res_a4_live_indexer_csharp -- <polly_repo_path> 1f232caf9672e515751ba2df76d82bfbbb62e016`).
+
+### pyjanitor (Python), live-indexer
+
+- **AFTER (live, real `observe_commit`)**: calls_edges 1485
+  (StaticAnalysis 1430, NameHeuristic 55); call_attempts 8340
+  (Ambiguous 159, Unresolved 8181). total_snapshots 2822;
+  real_import_facts_published 1752.
+- **BEFORE (real-indexer-equivalent baseline, same pool)**: calls_edges
+  1485 (unchanged); call_attempts 8341 (Ambiguous 158, Unresolved
+  8183).
+- **Snapshot-count parity**: baseline (2822) and live indexer (2822)
+  agree exactly.
+- Of the 8183 real pre-A4 zero-candidate call sites, through the LIVE
+  wired path: **0 recovered to a real edge**; 1 `ImportTargetExternal`;
+  1 `ImportedSymbolAmbiguous` (the real CRC-003 second-collision shape);
+  7224 `NoMatchingImportAlias`; 956 `ExtractionRejected` (pre-existing
+  `SignatureTooLong` names, never reaching the alias path by the
+  resolver's own branch order); 1 residual unaccounted — byte-for-byte
+  identical breakdown to the resolver-level run.
+- **Comparison to the `ab0591d` resolver-level figure: EXACT MATCH.**
+  0 (resolver-level) == 0 (live-indexer). Every other number above also
+  matches `ab0591d`'s own figures exactly (including the Ambiguous
+  158→159 / Unresolved 8183→8181 shift, which is the same genuine
+  `ImportedSymbolAmbiguous` conversion already documented in the
+  resolver-level section, not a new effect of wiring).
+- Invariant re-check: **0 violations**.
+- Precision/recall/F1/TP/FP/FN: **N/A**, same reasoning as the
+  resolver-level section.
+- Full raw output: `docs/research/evidence/pyjanitor-live-run.txt` (scratchpad-run; also reproducible via `cargo run --release --example call_res_a4_live_indexer_python -- <pyjanitor_repo_path> 1247923ff01dd9a74f40f55d55f108e503e4b218`).
+
+### CRC-001/002/003, live-indexer
+
+Re-confirmed through the real wired path directly (not just the
+resolver-level/ground-truth-schema tests already covering these):
+`golden_corpus.rs`'s own `crc_003_import_alias_blindness_is_fixed_by_call_res_a4`
+(Python, real `index()` → real `observe_commit`, asserts the clean
+alias call now resolves to `real_target`) and
+`crc_002_prop_shadowing_false_positive_is_the_current_documented_gap`
+(TSX, same real path, asserts the pre-existing shadowing gap is
+unchanged — both already added and passing as of `ffd0295`, re-run
+clean here). CRC-001 has no dedicated golden-corpus test (A4
+structurally never touches its `>=2`-ambiguity branch for unrelated
+reasons), and its non-regression is already covered by
+`ground_truth_schema.rs`'s `crc_001_computes_as_a_false_negative_never_a_false_positive`
+plus this section's own Polly Ambiguous-tier numbers behaving as
+expected — no additional live test was judged necessary. All CRC tests
+pass: 8/8 in `ground_truth_schema.rs`+`golden_corpus.rs` combined CRC
+coverage.
+
+### Findings (live-indexer re-measurement)
+
+No divergence found between resolver-level and live-indexer numbers on
+either corpus — the wiring in `ffd0295` reproduces `ab0591d`'s own
+numbers exactly, including the headline 366-case Polly figure. This is
+itself a confirmed, not assumed, result (both harnesses independently
+re-derive the baseline from a fresh real-corpus parse rather than
+reusing any cached resolver-level output).
+
 ## Reliability-policy / full-incremental-parity re-check (agent_policy.rs / conformance.rs)
 
 **Status: done, with one major finding.** Prior to this pass, a grep

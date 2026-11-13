@@ -1,0 +1,43 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 3.92s
+     Running `target\release\examples\call_res_a4_live_indexer_csharp.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/80b6b526-cf17-4c5a-9e7f-6184261532a3/scratchpad/call-res-a4-metrics/polly-repo' 1f232caf9672e515751ba2df76d82bfbbb62e016`
+=== CALL-RES-A4 live-indexer re-measurement: C# namespace-aware mechanism, real App-vNext/Polly corpus ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\80b6b526-cf17-4c5a-9e7f-6184261532a3\scratchpad\call-res-a4-metrics\polly-repo
+commit: 1f232caf9672e515751ba2df76d82bfbbb62e016
+
+--- AFTER (live, real CodeGraphIndexer::observe_commit, HEAD) ---
+total_snapshots: 5190
+total_edges_all_kinds: 3752
+calls_edges: 2415
+  StaticAnalysis: 1498, NameHeuristic: 917
+call_attempts_total: 16178
+  Ambiguous: 8008, Unresolved: 8170
+real_import_facts_published: 725
+
+--- BEFORE (real-indexer-equivalent: resolve_calls_with_extraction_rejections on the SAME real pool) ---
+snapshots_for_baseline: 5190 (live indexer reports 5190 -- any difference is a real finding, checked below)
+calls_edges: 2078
+  StaticAnalysis: 1498, NameHeuristic: 580
+call_attempts_total: 16515
+  Ambiguous: 8345, Unresolved: 8170
+
+snapshot_count_parity: baseline and live indexer agree exactly (5190 snapshots) -- before/after comparison below is apples-to-apples.
+
+--- Delta (live after - real-indexer-equivalent before) ---
+calls_edges: +337
+NameHeuristic: +337
+call_attempts_total: -337
+Ambiguous: -337
+
+--- A4 namespace-filtering effect, measured through the LIVE wired indexer ---
+real_ambiguous_call_sites_before_a4 (baseline): 8345
+  narrowed_to_exactly_one_candidate_by_a4 (LIVE, now a real Edge via observe_commit): 366
+  narrowed_but_still_2_plus_candidates: 3985
+  unchanged_or_untouched: 3994
+comparison_to_ab0591d_resolver_level_figure: ab0591d reported 366 narrowed-to-one on this same corpus/commit via the DIRECT resolver call; this run reports 366 via the LIVE wired indexer -- EXACT MATCH, confirms resolver-level and live-indexer figures agree for this corpus.
+invariant_check (every genuinely new live edge's (caller,name) key was a real pre-A4 ambiguous candidate-pool member, never manufactured): 0 violations found
+
+--- Precision/Recall/F1/TP/FP/FN on this corpus, live-indexer ---
+N/A, same reasoning as ab0591d: no ground-truth label set exists for Polly's full call graph beyond CRC-001/002/003's own rows. FP risk is covered by the invariant check above (0 violations means 0 manufactured targets); FN is not separately quantifiable without a labeled sample.
+
+import_alias_ambiguous_attempts_live (A4 found evidence but target still has 2+ real candidates, honestly Ambiguous): 0

@@ -1,0 +1,47 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 0.71s
+     Running `target\release\examples\call_res_a4_live_indexer_python.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/80b6b526-cf17-4c5a-9e7f-6184261532a3/scratchpad/call-res-a4-metrics/pyjanitor-repo' 1247923ff01dd9a74f40f55d55f108e503e4b218`
+=== CALL-RES-A4 live-indexer re-measurement: Python import-alias mechanism, real pyjanitor-devs/pyjanitor corpus ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\80b6b526-cf17-4c5a-9e7f-6184261532a3\scratchpad\call-res-a4-metrics\pyjanitor-repo
+commit: 1247923ff01dd9a74f40f55d55f108e503e4b218
+
+--- AFTER (live, real CodeGraphIndexer::observe_commit, HEAD) ---
+total_snapshots: 2822
+calls_edges: 1485
+  StaticAnalysis: 1430, NameHeuristic: 55
+call_attempts_total: 8340
+  Ambiguous: 159, Unresolved: 8181
+real_import_facts_published: 1752
+
+--- BEFORE (real-indexer-equivalent: resolve_calls_with_extraction_rejections on the SAME real pool) ---
+snapshots_for_baseline: 2822 (live indexer reports 2822 -- any difference is a real finding, checked below)
+calls_edges: 1485
+  StaticAnalysis: 1430, NameHeuristic: 55
+call_attempts_total: 8341
+  Ambiguous: 158, Unresolved: 8183
+
+snapshot_count_parity: baseline and live indexer agree exactly (2822 snapshots) -- before/after comparison below is apples-to-apples.
+
+--- Delta (live after - real-indexer-equivalent before) ---
+calls_edges: +0
+call_attempts_total: -1
+Ambiguous: +1
+Unresolved: -2
+
+--- A4 import-alias effect on real pre-A4 zero-candidate call sites, measured through the LIVE wired indexer ---
+real_zero_candidate_call_sites_before_a4 (distinct caller+name keys): 8183
+real_zero_candidate_call_occurrences_before_a4 (multiset total): 8183
+  recovered_to_a_real_edge (LIVE, via observe_commit): 0
+  import_target_external: 1
+  imported_symbol_ambiguous (real CRC-003 second-collision shape, recurring at corpus scale): 1
+  no_matching_import_alias: 7224
+  extraction_rejected (pre-existing SignatureTooLong, resolver branch order never routes these through the alias path): 956
+  still_unknown_or_other: 1
+comparison_to_ab0591d_resolver_level_figure: ab0591d reported 0 corpus-level recoveries on this same corpus/commit via the DIRECT resolver call; this run reports 0 via the LIVE wired indexer -- EXACT MATCH, confirms resolver-level and live-indexer figures agree for this corpus.
+
+--- Precision/Recall/F1/TP/FP/FN on this corpus, live-indexer ---
+N/A, same reasoning as ab0591d: no ground-truth label set exists for pyjanitor's full call graph beyond CRC-003's own already-retrofitted row. FP risk is covered by the invariant check below; FN is not separately quantifiable without a labeled sample.
+invariant_check (every genuinely NEW live edge's (caller,name) key was a real pre-A4 zero-candidate site, never manufactured): 0 violations found
+
+--- Ambiguities resolved without type information (summary) ---
+real_count_on_pyjanitor_live: 0 (same figure as 'recovered_to_a_real_edge' above)
