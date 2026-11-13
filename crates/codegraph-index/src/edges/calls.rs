@@ -4183,37 +4183,47 @@ mod tests {
         }
 
         /// Closes the receiver-field match-guard mutant at this
-        /// function's own copy of the `self.field.method()` restriction
-        /// logic: a `self.src_mask.size(0)`-shaped call where
-        /// `src_mask` IS a real field of the caller's own class must
-        /// restrict candidates to that SAME class, never resolving to
-        /// an unrelated same-named method elsewhere -- re-confirms this
-        /// pre-existing Task-9.5 behavior holds unchanged through this
-        /// new entry point's own duplicated loop body.
+        /// function's own copy of the `this.field.method()` restriction
+        /// logic. An earlier version of this test used a bare
+        /// `src_mask.Size(0)` receiver (no `this.` prefix) -- which
+        /// `self_or_this_receiver_field_name` never recognizes as
+        /// receiver-qualified at all (confirmed by reading that
+        /// function: it requires a dedicated `this`/`self` node kind, or
+        /// Python's literal `"self"` text fallback), so
+        /// `call_site.self_receiver_field` was always `None` and the
+        /// match always took the `_ => all_candidates` arm regardless
+        /// of the guard's truth value -- the guard was never actually
+        /// evaluated against real data, making the mutant unobservable
+        /// by construction. Fixed by using `this.src_mask.Size(0)`, and
+        /// by giving `Caller` its OWN `Size` method too, so the guard's
+        /// two outcomes genuinely diverge: guard true (real behavior)
+        /// restricts to `Caller`'s own `Size`, resolving unambiguously;
+        /// guard false (the `true`/`false` mutants) would instead use
+        /// the UNRESTRICTED `all_candidates` (both `Caller.Size` and the
+        /// unrelated `Unrelated.Size`), which is ambiguous and produces
+        /// NO edge at all -- a directly observable difference.
         #[test]
         fn receiver_field_restriction_is_preserved_through_the_namespace_aware_entry_point() {
             let repo = test_repo_calls();
             let (_a_file, _a_tree, a_snapshots, _a_raw) = real_snapshots_contexts_and_tree(repo, "src/Unrelated.cs", "class Unrelated { public int Size(int x) { return x; } }\n");
-            let (_b_file, b_tree, b_snapshots, _b_raw) = real_snapshots_contexts_and_tree(
+            let (_b_file, _b_tree, b_snapshots, b_raw) = real_snapshots_contexts_and_tree(
                 repo,
                 "src/Caller.cs",
-                "class Caller { private Unrelated src_mask; public int Run() { return src_mask.Size(0); } }\n",
+                "class Caller { private Unrelated src_mask; public int Size(int x) { return x; } public int Run() { return this.src_mask.Size(0); } }\n",
             );
             let mut all_snapshots = a_snapshots.clone();
             all_snapshots.extend(b_snapshots.clone());
-            let _ = b_tree;
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&b_raw, &all_snapshots);
+            assert!(!csharp_contexts.is_empty(), "fixture premise: non-empty csharp_contexts, so this function's own loop body actually executes");
 
-            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &[]).unwrap();
+            let (edges, _attempts) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &csharp_contexts).unwrap();
             let run_method = find(&b_snapshots, "Run");
-            // With zero csharp_contexts, this call goes through the
-            // byte-identical resolve_calls_with_imports fallback path --
-            // re-run with a non-empty (but irrelevant) context list to
-            // force this function's OWN loop body to execute instead.
-            let (_f, _t, dummy_snapshots, dummy_raw) = real_snapshots_contexts_and_tree(repo, "src/Dummy.cs", "namespace NsDummy;\nclass Dummy {}\n");
-            let dummy_contexts = resolve_csharp_type_declaration_contexts(&dummy_raw, &dummy_snapshots);
-            let (edges2, _attempts2) = resolve_calls_with_namespace_context(&all_snapshots, &[], &[], &dummy_contexts).unwrap();
-            assert_eq!(edges, edges2, "a non-matching dummy csharp_contexts set must not change this call's own resolution");
-            assert!(edges2.iter().any(|e| e.from == run_method.id()), "the receiver-restricted call must still resolve through the namespace-aware entry point's own duplicated loop body");
+            let callers_own_size = all_snapshots.iter().find(|s| s.name().as_str() == "Size" && s.file() == run_method.file()).expect("Caller's own Size method must exist");
+
+            assert!(
+                edges.iter().any(|e| e.from == run_method.id() && e.to == callers_own_size.id()),
+                "this.src_mask.Size(0) must resolve specifically to Caller's OWN Size method -- a bypassed restriction (the guard-false mutants) would instead see 2 unrestricted candidates (Caller.Size and Unrelated.Size) and produce no edge at all"
+            );
         }
 
         /// Closes the generic-arity narrowing mutants (`&&` vs `||`,
@@ -4241,43 +4251,44 @@ mod tests {
         }
 
         /// Closes the `caller.span().start + call_site.fragment_relative_start_byte`
-        /// `+` vs `-`/`*` mutant: this entry point's own duplicated copy
-        /// of the nested-caller-ownership check (B2-ID-006's own
-        /// invariant) must correctly compute a call site's ABSOLUTE
-        /// file position, not a corrupted one, or a nested caller's own
-        /// call would be wrongly attributed to its outer container. Two
-        /// top-level C# methods in the same class, one calling the
-        /// other directly, confirm the position arithmetic is correct
-        /// through this specific entry point (a corrupted `-`/`*`
-        /// mutant would miscompute the position and could cause EITHER
-        /// a spurious extra edge from the outer method or a missing
-        /// edge from the inner one, depending on which direction the
-        /// corruption skews).
+        /// `+` vs `-`/`*` mutant. This requires a fixture where the
+        /// computed ABSOLUTE position actually changes which snapshot
+        /// owns the call site -- a sibling-methods fixture (tried in an
+        /// earlier, broken version of this test) does NOT do this: with
+        /// no snapshot nested inside `caller`,
+        /// `call_site_belongs_to_a_more_nested_caller` returns `false`
+        /// regardless of whether the position arithmetic is corrupted,
+        /// so the mutant is unobservable there. The proven shape (reused
+        /// from B2-ID-006's own
+        /// `python_nested_function_call_is_owned_by_the_inner_function_not_the_outer`)
+        /// is a function nested inside another: `outer`'s own re-parsed
+        /// body textually contains `inner`'s call to `target`, and a
+        /// corrupted `-`/`*` would miscompute whether that call site's
+        /// absolute position falls inside `inner`'s span, wrongly
+        /// attributing the call to `outer` instead of (or in addition
+        /// to) `inner`. Python is used for the nested-function shape
+        /// itself (C# has no local-function extraction support in this
+        /// codebase); a real, non-empty (but otherwise irrelevant) C#
+        /// `csharp_contexts` is still supplied so this specific entry
+        /// point's own duplicated loop body actually executes instead of
+        /// falling through its early-return guard to
+        /// `resolve_calls_with_imports`.
         #[test]
         fn absolute_call_site_position_is_computed_correctly_through_the_namespace_aware_entry_point() {
             let repo = test_repo_calls();
-            let (_file, _tree, snapshots, raw) = real_snapshots_contexts_and_tree(
-                repo,
-                "src/Caller.cs",
-                "namespace NsA;\nclass Caller {\n    public void Outer() {\n        Inner();\n    }\n    public void Inner() {\n    }\n}\n",
-            );
-            let outer = find(&snapshots, "Outer");
-            let inner = find(&snapshots, "Inner");
-            // A non-empty csharp_contexts is REQUIRED here: with an
-            // empty slice, resolve_calls_with_namespace_context takes
-            // its own early-return fallback straight to
-            // resolve_calls_with_imports, never executing this
-            // function's OWN duplicated loop body (and its own copy of
-            // the absolute-position arithmetic) at all -- confirmed
-            // directly by `cargo mutants` still reporting this exact
-            // mutant as genuine-missed against an earlier, incorrect
-            // version of this test that passed `&[]`.
-            let csharp_contexts = resolve_csharp_type_declaration_contexts(&raw, &snapshots);
+            let (_file, _tree, snapshots) = real_snapshots_and_tree(repo, "src/nested.py", "def outer():\n    def inner():\n        target()\n    return inner\n\n\ndef target():\n    pass\n");
+            let target = find(&snapshots, "target");
+            let inner = find(&snapshots, "inner");
+            let outer = find(&snapshots, "outer");
+
+            let (_dummy_file, _dummy_tree, dummy_snapshots, dummy_raw) = real_snapshots_contexts_and_tree(repo, "src/Dummy.cs", "namespace NsDummy;\nclass Dummy {}\n");
+            let csharp_contexts = resolve_csharp_type_declaration_contexts(&dummy_raw, &dummy_snapshots);
             assert!(!csharp_contexts.is_empty(), "fixture premise: non-empty csharp_contexts, so this function's own loop body actually executes");
 
             let (edges, _attempts) = resolve_calls_with_namespace_context(&snapshots, &[], &[], &csharp_contexts).unwrap();
 
-            assert!(edges.iter().any(|e| e.from == outer.id() && e.to == inner.id()), "Outer's own direct call to Inner must resolve correctly -- a corrupted absolute-position computation would miscompute call-site ownership");
+            assert!(edges.iter().any(|e| e.from == inner.id() && e.to == target.id()), "inner's own direct call to target must resolve");
+            assert!(!edges.iter().any(|e| e.from == outer.id() && e.to == target.id()), "outer must NOT also own target's call site -- a corrupted absolute-position computation would misattribute inner's nested call site to outer (or vice versa)");
         }
 
         /// CRC-001/CRC-002 non-regression, re-confirmed against this
