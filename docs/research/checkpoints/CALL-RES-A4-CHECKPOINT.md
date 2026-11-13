@@ -1006,7 +1006,7 @@ dispersion on every measured number is tight — under 5% spread on
 every median reported above — so this is a real, confirmed cost, not
 noise).
 
-**Commit:** `1ff6425` on `b2-code-graph` (new example binary
+**Commit:** `59510ae` on `b2-code-graph` (new example binary
 `call_res_a4_perf_measurement.rs` + this section). No merge/tag/push.
 Pre-existing uncommitted files in the worktree untouched throughout.
 No performance optimization performed, in A4's own code or elsewhere,
