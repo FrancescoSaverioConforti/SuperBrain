@@ -356,3 +356,41 @@ fn full_equals_incremental_for_typescript_interface_implements() {
     let implements_in_full = full.graph.outgoing_edges(impl_in_full.id(), Some(EdgeKind::Implements));
     assert_eq!(implements_in_full.len(), 2, "the equivalence check above must not be vacuously true -- both IFoo and IBar must be real Implements targets");
 }
+
+// ===========================================================================
+// Real gate, applied to a fifth case: B2-ID-019's generic-heritage-name
+// unwrapping (`implements Bar<T>`), through an incremental edit that
+// adds a SECOND generic `implements` interface to an already-indexed
+// class.
+// ===========================================================================
+
+#[test]
+fn full_equals_incremental_for_typescript_generic_heritage() {
+    let repo = test_repo();
+    let commit_a = CommitHash::parse(&"a".repeat(40)).unwrap();
+    let commit_b = CommitHash::parse(&"b".repeat(40)).unwrap();
+
+    const SOURCE_A: &[u8] = b"export interface IFoo<T> {\n    foo(x: T): void;\n}\n\nexport interface IBar<U> {\n    bar(x: U): void;\n}\n\nexport class Impl implements IFoo<string> {\n    foo(x: string): void {}\n}\n";
+    const SOURCE_B: &[u8] = b"export interface IFoo<T> {\n    foo(x: T): void;\n}\n\nexport interface IBar<U> {\n    bar(x: U): void;\n}\n\nexport class Impl implements IFoo<string>, IBar<number> {\n    foo(x: string): void {}\n    bar(x: number): void {}\n}\n";
+
+    let incremental_source_a = MultiCommitSource::new().with_file(FileIdentity::parse(repo, commit_a.clone(), "impl.ts").unwrap(), SOURCE_A);
+    let incremental_indexer = CodeGraphIndexer::new();
+    incremental_indexer.observe_commit(&incremental_source_a, repo, &commit_a, None, &[]).unwrap();
+
+    let incremental_source_b = incremental_source_a.with_file(FileIdentity::parse(repo, commit_b.clone(), "impl.ts").unwrap(), SOURCE_B);
+    let incremental = incremental_indexer.observe_commit(&incremental_source_b, repo, &commit_b, Some(&commit_a), &["impl.ts".to_string()]).unwrap();
+
+    let full_repo = test_repo();
+    let full_source = MultiCommitSource::new().with_file(FileIdentity::parse(full_repo, commit_b.clone(), "impl.ts").unwrap(), SOURCE_B);
+    let full_indexer = CodeGraphIndexer::new();
+    let full = full_indexer.observe_commit(&full_source, full_repo, &commit_b, None, &[]).unwrap();
+
+    assert_full_equals_incremental(&full, &incremental, "TypeScript generic heritage names, full vs. incremental");
+
+    // Sanity: confirm both sides actually produced both real Implements
+    // edges toward the generic interfaces by their simple names, not
+    // just an equally-empty result.
+    let impl_in_full = full.graph.all_snapshots().into_iter().find(|s| s.name().as_str() == "Impl").unwrap();
+    let implements_in_full = full.graph.outgoing_edges(impl_in_full.id(), Some(EdgeKind::Implements));
+    assert_eq!(implements_in_full.len(), 2, "the equivalence check above must not be vacuously true -- both IFoo<T> and IBar<U> must be real Implements targets");
+}

@@ -551,31 +551,74 @@ fn collect_js_heritage(node: tree_sitter::Node, source: &[u8], out: &mut Vec<Str
 /// syntactic tag with a kind lookup.
 fn collect_ts_heritage_tagged(node: tree_sitter::Node, source: &[u8], out: &mut Vec<(String, Option<EdgeKind>)>) {
     // Confirmed against this workspace's real tree-sitter-typescript
-    // output: `class_heritage`'s direct children are themselves wrapper
-    // nodes — `extends_clause` (containing one `identifier`/
-    // `type_identifier`) and/or `implements_clause` (containing one or
-    // more `type_identifier`s) — never a bare identifier directly.
-    for_each_node_not_inside_a_nested_boundary(node, &["class_declaration"], |n| {
-        if !matches!(n.kind(), "class_heritage") {
-            return;
-        }
-        let mut cursor = n.walk();
-        for child in n.children(&mut cursor) {
-            let tag = match child.kind() {
-                "extends_clause" => Some(EdgeKind::Extends),
-                "implements_clause" => Some(EdgeKind::Implements),
-                _ => None,
-            };
-            if let Some(tag) = tag {
-                let mut clause_cursor = child.walk();
-                for grandchild in child.children(&mut clause_cursor) {
-                    if matches!(grandchild.kind(), "identifier" | "type_identifier") {
-                        out.push((text_of(grandchild, source), Some(tag)));
+    // output: `class_declaration`/`abstract_class_declaration`'s
+    // `class_heritage` direct children are wrapper nodes —
+    // `extends_clause` (containing one `identifier`/`type_identifier`,
+    // optionally generic) and/or `implements_clause` (containing one or
+    // more `type_identifier`s, each optionally generic) — never a bare
+    // identifier directly. `interface_declaration` has its OWN distinct
+    // wrapper, `extends_type_clause` (no `implements_clause` exists for
+    // interfaces in this grammar), attached directly under the
+    // interface node rather than under a `class_heritage`.
+    //
+    // B2-ID-019: a heritage name can ALSO be wrapped one level deeper in
+    // a `generic_type` node (`Bar<T>`'s child is `generic_type`, whose
+    // own first child is the plain `type_identifier` "Bar", followed by
+    // a `type_arguments` node this resolver has no use for — B2-ID-019's
+    // scope is the simple target name, never the type arguments
+    // themselves, so `type_arguments` is never descended into). Confirmed
+    // against this workspace's real tree-sitter-typescript output for
+    // `implements Bar<T>`, `extends Bar<T>` and comma-separated mixes of
+    // generic/non-generic names in both `implements_clause` and
+    // `extends_type_clause`. Any wrapper shape other than a bare
+    // `identifier`/`type_identifier` or a `generic_type` whose own first
+    // named child is one of those is NOT unwrapped — fail closed, no
+    // guessed name, per "no edge beats a false edge".
+    for_each_node_not_inside_a_nested_boundary(node, &["class_declaration", "abstract_class_declaration", "interface_declaration"], |n| {
+        match n.kind() {
+            "class_heritage" => {
+                let mut cursor = n.walk();
+                for child in n.children(&mut cursor) {
+                    let tag = match child.kind() {
+                        "extends_clause" => Some(EdgeKind::Extends),
+                        "implements_clause" => Some(EdgeKind::Implements),
+                        _ => None,
+                    };
+                    if let Some(tag) = tag {
+                        collect_ts_heritage_names(child, source, tag, out);
                     }
                 }
             }
+            "extends_type_clause" => {
+                collect_ts_heritage_names(n, source, EdgeKind::Extends, out);
+            }
+            _ => {}
         }
     });
+}
+
+/// Collects every heritage target name directly under `clause` (an
+/// `extends_clause`, `implements_clause`, or `extends_type_clause`
+/// node), unwrapping one level of `generic_type` where present. See
+/// `collect_ts_heritage_tagged`'s own doc comment for the confirmed node
+/// shapes this relies on.
+fn collect_ts_heritage_names(clause: tree_sitter::Node, source: &[u8], tag: EdgeKind, out: &mut Vec<(String, Option<EdgeKind>)>) {
+    let mut cursor = clause.walk();
+    for child in clause.children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "type_identifier" => {
+                out.push((text_of(child, source), Some(tag)));
+            }
+            "generic_type" => {
+                if let Some(name_node) = child.child(0) {
+                    if matches!(name_node.kind(), "identifier" | "type_identifier") {
+                        out.push((text_of(name_node, source), Some(tag)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn text_of(node: tree_sitter::Node, source: &[u8]) -> String {
@@ -741,6 +784,66 @@ mod tests {
         assert_eq!(extends_edge.to, base.id());
         let implements_edge = edges.iter().find(|e| e.kind == EdgeKind::Implements).expect("an Implements edge must exist");
         assert_eq!(implements_edge.to, interface.id());
+    }
+
+    // B2-ID-019: `implements`/`extends` naming a generic interface/base
+    // (`Bar<T>`) must resolve identically to the non-generic case — the
+    // resolver extracts only the simple target name, never the type
+    // argument, and never attempts type inference.
+
+    #[test]
+    fn typescript_generic_implements_resolves_by_simple_name() {
+        let interface = test_snapshot("src/ifoo.ts", "Bar", "interface_declaration", "interface Bar<T> {}");
+        let implementor = test_snapshot("src/c.ts", "C", "class_declaration", "class C implements Bar<T> {}");
+        let snapshots = vec![interface.clone(), implementor.clone()];
+
+        let edges = resolve_extends_implements(&snapshots).unwrap();
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, EdgeKind::Implements);
+        assert_eq!(edges[0].to, interface.id());
+    }
+
+    #[test]
+    fn typescript_generic_extends_resolves_by_simple_name() {
+        let base_interface = test_snapshot("src/ibar.ts", "IBar", "interface_declaration", "interface IBar<T> {}");
+        let derived_interface = test_snapshot("src/ifoo.ts", "IFoo", "interface_declaration", "interface IFoo extends IBar<T> {}");
+        let snapshots = vec![base_interface.clone(), derived_interface.clone()];
+
+        let edges = resolve_extends_implements(&snapshots).unwrap();
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, EdgeKind::Extends);
+        assert_eq!(edges[0].to, base_interface.id());
+    }
+
+    #[test]
+    fn typescript_multiple_generic_interfaces_all_resolve() {
+        let a = test_snapshot("src/a.ts", "A", "interface_declaration", "interface A<T> {}");
+        let b = test_snapshot("src/b.ts", "B", "interface_declaration", "interface B<U> {}");
+        let implementor = test_snapshot("src/c.ts", "C", "class_declaration", "class C implements A<T>, B<U> {}");
+        let snapshots = vec![a.clone(), b.clone(), implementor.clone()];
+
+        let edges = resolve_extends_implements(&snapshots).unwrap();
+
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.kind == EdgeKind::Implements));
+        assert!(edges.iter().any(|e| e.to == a.id()));
+        assert!(edges.iter().any(|e| e.to == b.id()));
+    }
+
+    #[test]
+    fn typescript_mixed_generic_and_non_generic_heritage_both_resolve() {
+        let a = test_snapshot("src/a.ts", "A", "interface_declaration", "interface A {}");
+        let b = test_snapshot("src/b.ts", "B", "interface_declaration", "interface B<T> {}");
+        let implementor = test_snapshot("src/c.ts", "C", "class_declaration", "class C implements A, B<T> {}");
+        let snapshots = vec![a.clone(), b.clone(), implementor.clone()];
+
+        let edges = resolve_extends_implements(&snapshots).unwrap();
+
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|e| e.to == a.id()));
+        assert!(edges.iter().any(|e| e.to == b.id()));
     }
 
     #[test]
