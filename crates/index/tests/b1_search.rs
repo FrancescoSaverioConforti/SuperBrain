@@ -906,3 +906,97 @@ fn new_with_text_normalizer_applies_the_hook_before_indexing_text() {
         "the text normalizer hook must apply to indexed text before it reaches trigram/bm25 insertion"
     );
 }
+
+// --- B3-TUNE-v2 Priority 3 Stage 1, P1: exact structural-identifier boost. ---
+
+#[test]
+fn identifier_boost_fires_on_exact_whole_token_match_against_source_fragment() {
+    let f = Fixture::new();
+    // Both notes share a body term so both are real BM25 candidates for
+    // the query regardless of the boost (candidate generation is
+    // unaffected by P1) — note-a's source additionally contains
+    // "...#SEC-001" per the frozen extraction rule, note-b's does not,
+    // so only the boost (not candidate membership) decides which ranks
+    // first once the query also contains the literal token "sec-001".
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "shared_probe_term extra filler words so note-b scores higher on shared_probe_term alone") }, 0);
+    f.write(&Note::new("note-b", "shared_probe_term shared_probe_term shared_probe_term"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    let plain_first = |outcome: index::search::SearchOutcome| match outcome {
+        index::search::SearchOutcome::Matches { first, .. } => first.note_id.as_str().to_string(),
+        index::search::SearchOutcome::NotPresent => panic!("expected a match"),
+    };
+    // Sanity check: without the boost, note-b's higher term frequency
+    // on "shared_probe_term" alone must outrank note-a (the query's
+    // "sec-001" token has zero BM25/trigram overlap with either note's
+    // indexed text on its own, since neither note's source token is an
+    // exact whole-token match for "sec-001" by itself).
+    let plain_outcome = plain.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
+    assert_eq!(plain_first(plain_outcome), "note-b", "sanity check: without the boost, note-b's term frequency must win");
+
+    let boosted_outcome = boosted.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
+    assert_eq!(plain_first(boosted_outcome), "note-a", "the exact identifier match's boost must outrank note-b's higher term frequency");
+}
+
+#[test]
+fn identifier_boost_never_fires_on_a_substring_or_prefix_match() {
+    let f = Fixture::new();
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "distinctive_filler_term_alpha") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    // "sec" is a substring/prefix of "SEC-001" but must never match it.
+    let response = idx.search("what does sec mean", Default::default(), 10);
+
+    // "sec" has no BM25/trigram overlap with note-a's body or structured
+    // fields either, so with the boost correctly NOT firing this must be
+    // NotPresent, not a boosted hit on note-a.
+    assert!(matches!(response.unwrap().outcome, index::search::SearchOutcome::NotPresent));
+}
+
+#[test]
+fn identifier_boost_never_applies_to_a_sensitive_candidates_withheld_source() {
+    let f = Fixture::new();
+    // Sensitive: source is withheld by the existing pipeline (search.rs:345-349)
+    // before identifier_boost's logic can see it at all.
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", classification: "sensitive", ..Note::new("note-a", "sensitive project-x bug draft internal") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    let response = idx.search("sec-001", Default::default(), 10).unwrap();
+
+    // No term/trigram overlap and no boost possible (source withheld) ->
+    // the Sensitive note must not be boosted into a match it otherwise
+    // would not earn on text alone.
+    assert!(matches!(response.outcome, index::search::SearchOutcome::NotPresent));
+}
+
+#[test]
+fn identifier_boost_does_not_change_the_candidate_set() {
+    let f = Fixture::new();
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "a note about sec-001 topic") }, 0);
+    f.write(&Note::new("note-b", "a note about sec-001 topic too"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
+        match outcome {
+            index::search::SearchOutcome::NotPresent => Default::default(),
+            index::search::SearchOutcome::Matches { first, rest } => {
+                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                s.insert(first.note_id.as_str().to_string());
+                s
+            }
+        }
+    };
+    let plain_ids = ids(plain.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
+    let boosted_ids = ids(boosted.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
+    assert_eq!(plain_ids, boosted_ids, "identifier_boost must only reorder, never change membership");
+}

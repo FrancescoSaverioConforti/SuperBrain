@@ -172,6 +172,23 @@ impl std::fmt::Display for SearchError {
 }
 impl std::error::Error for SearchError {}
 
+/// B3-TUNE-v2 Priority 3 Stage 1, Lever P1: a fixed additive bonus
+/// applied to a candidate's BM25 score when `Index::with_identifier_boost`
+/// is enabled and its frozen exact-identifier rule fires (see
+/// `apply_identifier_boost`). Pinned well above any realistically
+/// achievable BM25 score on this corpus: with `N` = 53 indexed notes
+/// (`eval/results/B3/calibration-20261114T123333Z-e613edd.json`'s
+/// `corpus_manifest_note_count`), the IDF ceiling for a term unique to
+/// one document is `ln((53 - 1 + 0.5) / (1 + 0.5) + 1) ≈ 4.07`, and the
+/// BM25 term-frequency factor saturates toward `k1 + 1 = 2.2` as `tf`
+/// grows — so a single term's score ceiling is in the ~9 range, and a
+/// multi-term query summing several such terms could in principle reach
+/// into the tens, but not into the hundreds on a corpus this small.
+/// `100.0` is chosen as a round constant comfortably above that
+/// ceiling, so the boost reliably promotes a matching candidate to the
+/// top of the ranking rather than merely nudging it.
+const IDENTIFIER_BOOST: f64 = 100.0;
+
 pub struct Index<'a> {
     vault: &'a Vault,
     indexer: &'a RealIndexer,
@@ -183,6 +200,10 @@ pub struct Index<'a> {
     /// unaffected.
     bm25_k1: f64,
     bm25_b: f64,
+    /// B3-TUNE-v2 Priority 3 Stage 1 Lever P1 (ablation use only — see
+    /// `with_identifier_boost`'s own doc comment). Defaults to `false`
+    /// in `new()`; every existing call site is unaffected.
+    identifier_boost: bool,
 }
 
 impl<'a> Index<'a> {
@@ -199,6 +220,7 @@ impl<'a> Index<'a> {
             reference_date,
             bm25_k1: 1.2,
             bm25_b: 0.75,
+            identifier_boost: false,
         }
     }
 
@@ -210,6 +232,19 @@ impl<'a> Index<'a> {
     pub fn with_bm25_params(mut self, k1: f64, b: f64) -> Self {
         self.bm25_k1 = k1;
         self.bm25_b = b;
+        self
+    }
+
+    /// Additive builder for B3-TUNE-v2 Priority 3 Stage 1 Lever P1
+    /// (ablation use only): when enabled, a candidate whose
+    /// `source:`-extracted `#<IDENTIFIER>` fragment exactly matches one
+    /// of the query's whitespace tokens (case-insensitive, never a
+    /// substring/prefix match) gets `IDENTIFIER_BOOST` added to its
+    /// final BM25 score before sorting. Never changes candidate
+    /// membership — only reorders candidates already present. Default
+    /// `false`; every existing call site of `new()` is unaffected.
+    pub fn with_identifier_boost(mut self) -> Self {
+        self.identifier_boost = true;
         self
     }
 
@@ -392,8 +427,16 @@ impl<'a> Index<'a> {
             .query_ranked(query, usize::MAX)
             .into_iter()
             .collect();
+        let query_tokens: HashSet<String> =
+            query.split_whitespace().map(|t| t.to_lowercase()).collect();
         for result in &mut fresh_results {
-            result.score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+            let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+            let boost = if self.identifier_boost && identifier_boost_applies(&result.provenance.source, &query_tokens) {
+                IDENTIFIER_BOOST
+            } else {
+                0.0
+            };
+            result.score = base_score + boost;
         }
         fresh_results.sort_by(|a, b| {
             b.score
@@ -418,6 +461,39 @@ impl<'a> Index<'a> {
             outcome,
         })
     }
+}
+
+/// B3-TUNE-v2 Priority 3 Stage 1 Lever P1: true only if `source` has a
+/// `#<IDENTIFIER>` fragment that exactly equals (case-insensitive) one
+/// of `query_tokens`. `source: None` (withheld for `Sensitive` results,
+/// see `search_impl`'s redaction at lines above) always returns `false`
+/// — the boost never applies to a candidate whose source is withheld.
+fn identifier_boost_applies(source: &Option<String>, query_tokens: &HashSet<String>) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let Some(identifier) = extract_structural_identifier(source) else {
+        return false;
+    };
+    query_tokens.contains(&identifier.to_lowercase())
+}
+
+/// Reads `source`'s trailing `#<IDENTIFIER>` fragment (e.g.
+/// `docs/technical-debt.md#SEC-001` -> `Some("SEC-001")`), read up to
+/// the first non-identifier character. Returns `None` if `source` has
+/// no `#` fragment, or the fragment is empty. Same extraction rule as
+/// `b3_tune_v2_lever_c_alias_table.rs`'s `extract_structural_candidates`
+/// (duplicated here, not shared, since that function lives in an
+/// example binary this crate cannot depend on and additionally parses
+/// a whole note's frontmatter rather than a bare `source` string).
+fn extract_structural_identifier(source: &str) -> Option<String> {
+    let fragment_start = source.find('#')?;
+    let fragment = &source[fragment_start + 1..];
+    let identifier: String = fragment
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!identifier.is_empty()).then_some(identifier)
 }
 
 /// Same literal matching as trigram's confirmation, or any BM25 token overlap.
