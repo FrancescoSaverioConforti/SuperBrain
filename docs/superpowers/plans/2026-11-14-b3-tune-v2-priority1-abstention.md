@@ -5,11 +5,16 @@
 **Goal:** Measure which score-derived signal best discriminates
 answerable from abstention-expected queries on the B3 corpus's dev split,
 propose and freeze one global (not per-category) threshold from
-calibration, build and freeze a brand-new held-out final-test set
-**before** that threshold is chosen, and report a KEEP/REJECT ablation
-decision for "B1 + abstention threshold" versus the official B1 baseline
-— without running the new final-test yet (that is this plan's own final
-authorized step, same two-stop discipline B3.4/B3.5 used).
+calibration, and report a KEEP/REJECT ablation decision for "B1 +
+abstention threshold" versus the official B1 baseline. A brand-new
+held-out final-test set is built and frozen **before** that threshold
+is chosen, by a separate, dedicated subagent whose context never
+carries into this plan's own tuning work (Task 0) — this plan's own
+session never reads that set's content, only its hash and non-semantic
+metadata, and does not run it (that is a separate, later authorization,
+same two-stop discipline B3.4/B3.5 used, and only after the P1→P2→P3→
+(P4?) stop/proceed decision has already been made from dev/calibration/
+ablation/resource evidence alone).
 
 **Architecture:** A new diagnostic Rust binary reads `SearchResult::score`
 (already present in `index::search`, no production code change needed)
@@ -46,10 +51,20 @@ Builds on the accepted B1 baseline recorded in
   scope for this plan (design doc correction #2).
 - The new held-out final-test set is built, committed, and hashed
   **before** any threshold is chosen from calibration — not designed or
-  adjusted after seeing tuning results. Its content is not read again
-  after this plan's build step until this plan's own final authorized
-  run (if and when separately authorized — see "What this plan stops
-  short of" below).
+  adjusted after seeing tuning results.
+- **The held-out set is authored by a separate, dedicated subagent
+  (Task 0), not by whichever session/agent executes the rest of this
+  plan.** That subagent's context — including the query text, answers,
+  and `relevant_note_ids` it writes — never carries into this plan's own
+  tuning tasks (Tasks 1-5). This plan's own execution only ever receives
+  the held-out set's SHA-256, query count, category distribution, and
+  difficulty distribution from `eval/rag/v2-heldout/manifest.json` — it
+  must not read `eval/rag/v2-heldout/labels.jsonl`'s content at any
+  point, and no task in this plan does.
+- The held-out set is not run by this plan at all (not just "not yet
+  chosen when to run" — literally out of this plan's scope). Running it
+  is a separate, later authorization, after a final v2 configuration is
+  chosen from dev/calibration/ablation evidence alone.
 - B3's existing `dev`/`calibration`/`test` splits and `eval/results/B3/`
   reports are read-only inputs to this plan. Nothing in `eval/rag/` or
   `eval/results/B3/` from the B3 phase is modified.
@@ -67,29 +82,29 @@ Builds on the accepted B1 baseline recorded in
   actual distributions overlap — with only ~17 abstention-expected
   queries across dev+calibration, a mean-only comparison could look
   decisive while hiding heavy overlap that would make any single
-  threshold perform poorly. Task 2's analysis must report the full
+  threshold perform poorly. Task 1's analysis must report the full
   sorted value lists (or histograms), not just means, for the final
   signal choice to be defensible.
 - A threshold chosen by eyeballing dev's own numbers, then verified only
   on the same dev data, producing a threshold that is really fit-to-dev
-  rather than independently calibrated — Task 3's proposal must be
+  rather than independently calibrated — Task 2's proposal must be
   evaluated against calibration, not re-justified against dev after the
   fact.
 - The new held-out set's queries accidentally resembling the already-
   consumed B3 test split's queries closely enough that it isn't really
   independent evidence (e.g. reusing the same note as a near-duplicate
-  target) — Task 1's construction must check this against B3's own
-  corpus the same way B3.1 checked for cross-split duplication.
+  target) — Task 0's dispatched subagent must check this against B3's
+  own corpus the same way B3.1 checked for cross-split duplication.
 - The threshold-override logic silently applying to abstain-expected
   AND answerable rows differently than intended, or double-counting a
   query that was already `NotPresent` from `index::search` itself
   (should pass through unchanged, not get re-evaluated against the
-  threshold a second time) — Task 4's tests must cover both an
+  threshold a second time) — Task 3's tests must cover both an
   already-`NotPresent` row and a `Matches`-but-below-threshold row
   explicitly.
 - Reporting the threshold's effect on Recall@10/nDCG@10 using only the
   aggregate number, hiding that the degradation might be concentrated in
-  one or two categories — Task 5's report must include the by_category/
+  one or two categories — Task 4's report must include the by_category/
   by_difficulty breakdown under the threshold override, same as B3's
   own reports did, not just the aggregate delta.
 
@@ -126,9 +141,20 @@ Builds on the accepted B1 baseline recorded in
 
 ---
 
-### Task 1: Build, commit, and hash the new v2 held-out final-test set
+### Task 0: Dispatch a separate subagent to build, commit, and hash the new v2 held-out final-test set
 
-**Files:**
+**This task is executed by dispatching a fresh subagent — never by the
+session/agent that will execute Tasks 1-5.** This is the mechanism that
+makes the held-out set genuinely blind during tuning (design doc
+correction #2): the authoring agent's context, including the query
+text, answers, and `relevant_note_ids` it writes, must not carry into
+this plan's own tuning work. Whoever executes Task 0 does so via a
+fresh dispatch (a new agent invocation with no memory of this plan's
+later tasks) and does not bring that dispatch's full output back into
+this plan's own conversation — only the four non-semantic facts listed
+in "Produces" below are retained.
+
+**Files (written by the dispatched subagent, not read back in full by this plan):**
 - Create: `eval/rag/v2-heldout/labels.jsonl`
 - Create: `eval/rag/v2-heldout/manifest.json`
 
@@ -137,65 +163,67 @@ Builds on the accepted B1 baseline recorded in
   notes, unchanged, reused as the document collection — same "one
   frozen corpus, split only at the query/labels level" design B3 itself
   used, per the design doc's correction that this is built before any
-  tuning, not newly authored corpus content).
-- Produces: `eval/rag/v2-heldout/labels.jsonl` in the exact schema
-  `eval/rag/runner.py::load_labels` already validates (category,
-  difficulty, abstain_expected, relevant_note_ids, graded_relevance,
-  citation_spans — identical rules), and
-  `eval/rag/v2-heldout/manifest.json` recording its SHA-256, build date,
-  build commit, and query count — consumed by Task 3 (threshold
-  proposal, metadata only) and this plan's own final step (content read
-  only once, if and when authorized).
+  tuning, not newly authored corpus content); the existing
+  `eval/rag/{dev,calibration,test}/labels.jsonl` question text, read
+  only to check for near-duplicates (the dispatched subagent needs this
+  to do its job; this plan's own later tasks do not need it again).
+- Produces, for this plan's own tuning tasks to receive back: **only**
+  `eval/rag/v2-heldout/manifest.json`'s four non-semantic fields —
+  `sha256`, `query_count`, `category_counts`, `difficulty_counts` (plus
+  `build_date`/`build_commit` for traceability). Tasks 1-5 read this
+  manifest file directly from disk when they need these facts; they
+  never receive the dispatch's own conversation output, and never open
+  `eval/rag/v2-heldout/labels.jsonl`.
 
-- [ ] **Step 1: Author new queries against the existing 53-note corpus**
+- [ ] **Step 1: Dispatch the subagent with a self-contained brief**
 
-Write ~20-30 new queries (a smaller held-out set is acceptable here —
-this validates one threshold choice, not a full corpus re-benchmark),
-stratified across the same 6 categories and 3 difficulties B3 used,
-including several abstention-expected queries (proportionally similar
-to B3's ~17%). Each query must be independently formulated (never a
-substring of its target note, same B3.1 rule), and none may be a
-near-duplicate of any question already in `eval/rag/{dev,calibration,test}/labels.jsonl`
-(check this explicitly against all three existing files' `question`
-fields before finalizing — the Review Focus risk above).
+Dispatch a fresh general-purpose agent (not a fork — a fork would
+inherit this session's context, defeating the whole point) with a brief
+that includes: the existing corpus's note list and content (same access
+B3.1's authoring work had), the exact label schema
+(`eval/rag/runner.py::load_labels`'s rules), the instruction to write
+~20-30 new queries stratified across the same 6 categories/3
+difficulties B3 used, including several abstention-expected queries
+(proportionally similar to B3's ~17%), each independently formulated
+(never a substring of its target note), and explicitly checked for
+near-duplication against the existing `eval/rag/{dev,calibration,test}/labels.jsonl`
+question text (the Review Focus risk — this check happens inside the
+dispatched agent's own work, using its own read access to those files).
+The brief also instructs the subagent to: validate with
+`eval/rag/validate_corpus.py` (making the same small path-generalization
+fix this task's earlier draft identified, if `validate_corpus.py`
+doesn't already accept an arbitrary `eval_root`/corpus pair — it
+currently hardcodes `SPLITS = ("dev", "calibration", "test")`); commit
+the result; compute and write `eval/rag/v2-heldout/manifest.json` with
+`sha256` (of `labels.jsonl`'s raw bytes), `build_date`, `build_commit`
+(git rev-parse HEAD), `query_count`, `category_counts`,
+`difficulty_counts`, `abstain_count` — metadata only, never copying
+`question`/`answer`/`relevant_note_ids` content into the manifest; and
+finally report back **only** a short confirmation (files committed,
+manifest written, validation passed) — explicitly instructed not to
+quote or summarize any query text, answer, or relevant_note_ids in its
+final report back to this session.
 
-- [ ] **Step 2: Write `eval/rag/v2-heldout/labels.jsonl` in the existing schema**
+- [ ] **Step 2: Read back only the manifest's non-semantic fields**
 
-Full schema per B3.2's extended `load_labels` rules: `id`, `question`,
-`answer`, `category`, `difficulty`, `abstain_expected`,
-`relevant_note_ids`, `graded_relevance`, `citation_spans`. Validate with
-the existing `eval/rag/validate_corpus.py` (it already works against
-any `eval_root`/corpus pair — point it at this new directory) before
-committing.
+Once the subagent reports completion, this plan's own session reads
+`eval/rag/v2-heldout/manifest.json` directly from disk (not the
+subagent's conversational report) and confirms it contains valid
+`sha256`/`query_count`/`category_counts`/`difficulty_counts` values.
+**Do not open or read `eval/rag/v2-heldout/labels.jsonl` at this point,
+or at any later point in this plan.**
 
-Run: `python -c "import sys; sys.path.insert(0, 'eval/rag'); from validate_corpus import validate_corpus; from pathlib import Path; print(validate_corpus(Path('eval/rag/corpus'), Path('eval/rag/v2-heldout').parent / 'v2-heldout'))"` —
-adjust the path arguments to point `validate_corpus` at the new
-directory as its `eval_root`, confirming `[]` (no problems) before
-proceeding. If `validate_corpus` needs a small path-handling adjustment
-to accept a directory outside `eval/rag/`'s existing three split names,
-make that adjustment now (it currently hardcodes `SPLITS = ("dev",
-"calibration", "test")` — this will need generalizing to accept an
-arbitrary directory, a small, mechanical change, not a design change).
+- [ ] **Step 3: Confirm the commit exists and matches the manifest's hash**
 
-- [ ] **Step 3: Compute and record the manifest**
-
-Write `eval/rag/v2-heldout/manifest.json` with: `sha256` (of
-`labels.jsonl`'s raw bytes), `build_date`, `build_commit` (git rev-parse
-HEAD), `query_count`, `category_counts`, `difficulty_counts`,
-`abstain_count`. This is metadata only — never copy any `question`,
-`answer`, or `relevant_note_ids` content into this file, so it remains
-safe to read at any point without touching the held-out content itself.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add eval/rag/v2-heldout/
-git commit -m "feat(eval): build and freeze the v2 held-out final-test set, unread"
-```
+Run: `sha256sum eval/rag/v2-heldout/labels.jsonl` and compare against
+the manifest's own `sha256` field — this confirms the frozen hash
+matches the real committed file, the same discipline B3's own freeze
+step used, without requiring this session to read the file's content to
+do so (hashing is not reading for meaning).
 
 ---
 
-### Task 2: Signal analysis — which discriminator separates answerable from abstention best
+### Task 1: Signal analysis — which discriminator separates answerable from abstention best
 
 **Files:**
 - Create: `crates/api/examples/b3_tune_v2_signal_analysis.rs`
@@ -217,7 +245,7 @@ git commit -m "feat(eval): build and freeze the v2 held-out final-test set, unre
   Review Focus risk above) and a simple separation measure (e.g. the gap
   between the highest abstain-expected value and the lowest answerable
   value, or their rank overlap) for each of the three signals. Consumed
-  by Task 3 (human/report-driven threshold proposal — this task
+  by Task 2 (human/report-driven threshold proposal — this task
   produces evidence, not an automated threshold choice).
 
 - [ ] **Step 1: Write the failing test for score extraction**
@@ -237,7 +265,7 @@ fn extracts_top1_and_top2_scores_from_a_real_matches_outcome() {
 reusable across the two example binaries, duplicate the minimal
 fixture-building code into this new file rather than refactoring
 `b3_metric_runner.rs` — this plan does not touch that file's own
-frozen-adjacent logic except in Task 4.)
+frozen-adjacent logic except in Task 3.)
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -272,7 +300,7 @@ duplicating the small amount of parsing code, or, if it's already
 `examples/`, confirm whether Rust's example-binary visibility allows
 sharing code between them without a `src/`-level refactor; if not,
 duplicate rather than refactor, to avoid touching the frozen runner's
-file more than Task 4 already requires), computes `QueryScores` for
+file more than Task 3 already requires), computes `QueryScores` for
 every non-canary row via `run_one_query`-equivalent search calls, splits
 by `abstain_expected`, and writes the full sorted value lists and
 separation summary described in the Interfaces block to
@@ -304,13 +332,13 @@ git commit -m "feat(eval): B3-TUNE-v2 Priority 1 signal analysis (top1 score, ma
 
 ---
 
-### Task 3: Propose one global threshold from calibration — STOP for approval
+### Task 2: Propose one global threshold from calibration — STOP for approval
 
 **Files:**
 - Create: `eval/results/B3-TUNE-v2/priority1-threshold-proposal.md`
 
 **Interfaces:**
-- Consumes: Task 2's signal analysis conclusion (which signal to
+- Consumes: Task 1's signal analysis conclusion (which signal to
   threshold), the calibration split's real labels/search results (same
   `top_scores` function, rerun against `eval/rag/calibration/labels.jsonl`
   instead of dev).
@@ -322,15 +350,15 @@ git commit -m "feat(eval): B3-TUNE-v2 Priority 1 signal analysis (top1 score, ma
 
 Add a `--split calibration` argument to
 `b3_tune_v2_signal_analysis.rs`'s `main` (defaulting to `dev` to keep
-Task 2's existing invocation working unchanged), run it, and write a
+Task 1's existing invocation working unchanged), run it, and write a
 second report,
 `eval/results/B3-TUNE-v2/priority1-signal-analysis-calibration.json`.
 
 - [ ] **Step 2: Propose one global threshold value for the winning signal**
 
 Using calibration's own distribution (never re-deriving the threshold
-from dev a second time — dev already did its diagnostic job in Task 2),
-propose a single cutoff value for the signal Task 2 identified, chosen
+from dev a second time — dev already did its diagnostic job in Task 1),
+propose a single cutoff value for the signal Task 1 identified, chosen
 so it would correctly flag calibration's own abstention-expected queries
 as `NotPresent` while flagging as few answerable queries as possible as
 false negatives. Write this proposal, with its rationale and the
@@ -350,24 +378,24 @@ git commit -m "docs(eval): B3-TUNE-v2 Priority 1 threshold proposal from calibra
 
 Per the design doc's two-stop discipline (same as B3.4): report the
 proposed signal, threshold value, and rationale; do not implement the
-threshold override in the runner (Task 4) until the user approves this
+threshold override in the runner (Task 3) until the user approves this
 specific proposal. This task's own deliverable is the proposal, not a
 working override.
 
 ---
 
-### Task 4: Implement the threshold override as a runner option (only after Task 3's approval)
+### Task 3: Implement the threshold override as a runner option (only after Task 2's approval)
 
 **Files:**
 - Modify: `crates/api/src/metrics.rs`
 - Modify: `crates/api/examples/b3_metric_runner.rs`
 
 **Interfaces:**
-- Consumes: Task 3's approved signal + threshold value.
+- Consumes: Task 2's approved signal + threshold value.
 - Produces: `pub fn apply_abstention_threshold(top1_score: f64, top2_score: Option<f64>, signal: AbstentionSignal, threshold: f64) -> bool`
   (returns `true` if the query should be overridden to `NotPresent`) in
   `metrics.rs`, where `AbstentionSignal` is a small enum
-  (`Top1Score`, `Margin`, `Ratio`) matching Task 2's three candidates.
+  (`Top1Score`, `Margin`, `Ratio`) matching Task 1's three candidates.
   `b3_metric_runner.rs` gains a `--abstention-threshold <signal>:<value>`
   CLI argument (e.g. `--abstention-threshold margin:0.42`) that, when
   present, applies this function to every `Matches` outcome's top-1/
@@ -396,7 +424,7 @@ fn apply_abstention_threshold_never_flags_when_top2_is_absent() {
 }
 ```
 
-(Exact test cases depend on which signal Task 3 proposed; adapt the
+(Exact test cases depend on which signal Task 2 proposed; adapt the
 test names/values to the actually-approved signal, keeping the
 three distinct cases: triggers, doesn't trigger, and the no-second-
 candidate edge case.)
@@ -412,7 +440,7 @@ Straightforward per-signal match: `Top1Score` compares `top1_score`
 directly; `Margin`/`Ratio` require `top2_score` to be `Some` (return
 `false` — never override — if it's `None`, per the test above); compute
 the signal value and compare against `threshold` with the direction
-Task 3's proposal specifies (below threshold → abstain).
+Task 2's proposal specifies (below threshold → abstain).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -450,7 +478,7 @@ git commit -m "feat(api): abstention threshold override as an optional runner pa
 
 ---
 
-### Task 5: Run the dev and calibration ablation, log per the experimental rule, propose KEEP/REJECT
+### Task 4: Run the dev and calibration ablation, log per the experimental rule, propose KEEP/REJECT
 
 **Files:**
 - Create: `eval/results/B3-TUNE-v2/priority1-dev-ablation.json`
@@ -458,7 +486,7 @@ git commit -m "feat(api): abstention threshold override as an optional runner pa
 - Create: `eval/results/B3-TUNE-v2/priority1-ablation-summary.md`
 
 **Interfaces:**
-- Consumes: Task 4's `--abstention-threshold` flag.
+- Consumes: Task 3's `--abstention-threshold` flag.
 - Produces: the two ablation report files (same schema as B3's own
   `dev-*.json`/`calibration-*.json` reports plus the
   `abstention_threshold` field) and a written summary comparing this
@@ -469,7 +497,7 @@ git commit -m "feat(api): abstention threshold override as an optional runner pa
 - [ ] **Step 1: Run the runner against dev with the approved threshold**
 
 Run: `cargo run --release -p api --example b3_metric_runner -- dev --abstention-threshold <signal>:<value>`
-(using Task 3's approved signal/value). Expected: exits 0, writes a
+(using Task 2's approved signal/value). Expected: exits 0, writes a
 report with `abstention_threshold` populated.
 
 - [ ] **Step 2: Run the runner against calibration with the same threshold**
@@ -505,20 +533,28 @@ git commit -m "docs(eval): B3-TUNE-v2 Priority 1 dev/calibration ablation and KE
 - [ ] **Step 5: STOP and report to the user**
 
 Report the ablation results, the KEEP/REJECT recommendation and its
-rationale, and explicitly confirm: the new v2 held-out final-test
-(Task 1) has still not been read for its content. Do not run it. Running
-it against this ablation (or any accepted/rejected variant) is a
-separate, later authorization — same two-stop discipline as B3.5 — and
-is NOT part of this plan's own scope.
+rationale, and explicitly confirm: this plan's own session has still
+never read the new v2 held-out final-test's content (Task 0 was
+dispatched to a separate subagent precisely so this session couldn't).
+Do not run it. Running it against this ablation (or any accepted/
+rejected variant) is a separate, later authorization — same two-stop
+discipline as B3.5 — and is NOT part of this plan's own scope. It is
+also not how the P1→P2→P3→(P4?) stop/proceed decision gets made at all
+(design doc correction: that decision comes from dev/calibration/
+ablation/resource evidence alone, never from the held-out set).
 
 ---
 
 ## What this plan stops short of
 
-This plan ends at Task 5's KEEP/REJECT proposal for Priority 1's own
+This plan ends at Task 4's KEEP/REJECT proposal for Priority 1's own
 ablation. It does **not** include:
-- Running the new v2 held-out final-test (Task 1 only builds and
-  freezes it).
+- Running the new v2 held-out final-test (Task 0 only dispatches a
+  separate subagent to build and freeze it; this plan's own session
+  never reads its content).
+- Using the new held-out set's result to decide whether to proceed to
+  Priority 2/3/4 — that decision, when it comes, is made from dev/
+  calibration/ablation/resource evidence alone (design doc correction).
 - Priority 2 (lexical tuning), Priority 3 (reranking), or Priority 4
   (hybrid retrieval) — each remains design-only until separately
   planned and authorized.
@@ -528,37 +564,43 @@ ablation. It does **not** include:
 
 ## Self-Review Notes
 
-- **Spec coverage**: the design doc's 5 corrections map directly to
-  this plan's tasks — held-out-first ordering (Task 1), multi-signal
-  measurement before tuning (Task 2), global-only threshold (Task 3's
-  single proposed value, no per-category logic anywhere), the
-  multi-objective trade-off (Task 5's KEEP/REJECT criterion), and the
-  experimental logging rule (Task 5 Step 3's explicit field list).
-  Priority 1's own two-stop points (Task 3 before implementing, Task 5
-  before running the new held-out set) mirror B3.4/B3.5's discipline.
-- **Step scan**: Task 2 Step 5 and Task 2 Step 7 both flag real
+- **Spec coverage**: the design doc's 7 corrections (5 from the first
+  approval round, 2 from this revision) map directly to this plan's
+  tasks — held-out-first ordering (Task 0), held-out/tuning context
+  separation via subagent dispatch (Task 0 itself), held-out never
+  gates the P1-P4 stop/proceed decision (explicit in Task 4 Step 5 and
+  "What this plan stops short of"), multi-signal measurement before
+  tuning (Task 1), global-only threshold (Task 2's single proposed
+  value, no per-category logic anywhere), the multi-objective
+  trade-off (Task 4's KEEP/REJECT criterion), and the experimental
+  logging rule (Task 4 Step 3's explicit field list). Priority 1's own
+  two-stop points (Task 2 before implementing, Task 4 before any
+  future held-out run) mirror B3.4/B3.5's discipline.
+- **Step scan**: Task 1 Step 5 and Task 1 Step 7 both flag real
   uncertainty (whether code can be shared between the two example
   binaries without a refactor; that the "which signal wins" conclusion
   is a judgment call, not an automated decision) and give the
   implementer an explicit, safe default (duplicate rather than
   refactor; write the conclusion as data, not logic) rather than
   assuming either answer.
-- **Type consistency**: `QueryScores`, `AbstentionSignal`, and
-  `apply_abstention_threshold`'s signature are each defined once (Task
-  2, Task 4) and referenced consistently afterward; `run_one_query`'s
-  extension to return scores (Task 4 Step 5) is the one existing-type
-  change this plan makes, and it's scoped to exactly that task.
+- **Type consistency**: `QueryScores` is defined once (Task 1);
+  `AbstentionSignal` and `apply_abstention_threshold`'s signature are
+  defined once (Task 3) and referenced consistently afterward;
+  `run_one_query`'s extension to return scores (Task 3 Step 5) is the
+  one existing-type change this plan makes, and it's scoped to exactly
+  that task.
 - **Review Focus**: each of the 5 named risks has an owning
-  task/step — full-distribution signal comparison (Task 2 Step 5/7),
-  calibration-not-dev threshold verification (Task 3 Step 2's explicit
+  task/step — full-distribution signal comparison (Task 1 Step 5/7),
+  calibration-not-dev threshold verification (Task 2 Step 2's explicit
   "never re-deriving from dev a second time"), held-out/existing-split
-  duplication check (Task 1 Step 1), the already-NotPresent passthrough
-  and no-second-candidate edge cases (Task 4 Step 1's three test cases),
-  and the by_category/by_difficulty breakdown requirement (Task 5 Step
-  3, via the reused B3 report schema which already includes these
-  breakdowns).
-- **Proportion**: 5 tasks, mostly small Rust additions (a diagnostic
-  binary, one pure function, one CLI flag) plus two measurement/
-  analysis steps that are inherently judgment calls rather than code —
-  proportionate to a plan whose main risk is measurement/statistical
-  rigor, not code volume.
+  duplication check (Task 0 Step 1, inside the dispatched subagent's
+  own brief), the already-NotPresent passthrough and no-second-candidate
+  edge cases (Task 3 Step 1's three test cases), and the by_category/
+  by_difficulty breakdown requirement (Task 4 Step 3, via the reused B3
+  report schema which already includes these breakdowns).
+- **Proportion**: 6 tasks (one of them a subagent dispatch, not code),
+  mostly small Rust additions (a diagnostic binary, one pure function,
+  one CLI flag) plus two measurement/analysis steps that are inherently
+  judgment calls rather than code — proportionate to a plan whose main
+  risk is measurement/statistical rigor and context isolation
+  discipline, not code volume.
