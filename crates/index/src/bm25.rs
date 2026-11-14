@@ -69,16 +69,16 @@ use std::collections::HashMap;
 
 use storage::NoteId;
 
-/// BM25 tuning constants (conventional defaults; see the module doc comment
-/// for the formula they appear in).
-const K1: f64 = 1.2;
-const B: f64 = 0.75;
-
 /// A BM25 postings/scoring index: per-note term-frequency maps, the
 /// corpus-wide document-frequency count per term (how many documents
-/// contain each term at least once, for IDF), and each note's own token
-/// count (for `|D|` and `avgdl`).
-#[derive(Debug, Default)]
+/// contain each term at least once, for IDF), each note's own token
+/// count (for `|D|` and `avgdl`), and this instance's own `k1`/`b`
+/// tuning constants (see the module doc comment for the formula they
+/// appear in). `new()` uses the conventional defaults (1.2, 0.75);
+/// `new_with_params` is an additive constructor for ablation work that
+/// needs different values — every existing call site of `new()` keeps
+/// its current behavior unchanged.
+#[derive(Debug)]
 pub struct Bm25Index {
     /// note id -> (term -> raw term frequency in that note's indexed text).
     term_freqs: HashMap<NoteId, HashMap<String, u32>>,
@@ -88,11 +88,25 @@ pub struct Bm25Index {
     /// it at least once (`n(t)`), maintained incrementally by `insert` /
     /// `remove` rather than recomputed from `term_freqs` on every query.
     doc_freqs: HashMap<String, u32>,
+    k1: f64,
+    b: f64,
+}
+
+impl Default for Bm25Index {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bm25Index {
     pub fn new() -> Self {
-        Self { term_freqs: HashMap::new(), doc_lengths: HashMap::new(), doc_freqs: HashMap::new() }
+        Self::new_with_params(1.2, 0.75)
+    }
+
+    /// Additive constructor for custom `k1`/`b` (ablation use only — see
+    /// the struct doc comment). `new()`'s own behavior is unchanged.
+    pub fn new_with_params(k1: f64, b: f64) -> Self {
+        Self { term_freqs: HashMap::new(), doc_lengths: HashMap::new(), doc_freqs: HashMap::new(), k1, b }
     }
 
     /// Indexes `text` under `note_id`, replacing any previous entry for the
@@ -177,8 +191,8 @@ impl Bm25Index {
                 let Some(&tf) = freqs.get(term) else { continue };
                 let doc_len = *self.doc_lengths.get(note_id).unwrap_or(&0) as f64;
                 let tf = tf as f64;
-                let denom = tf + K1 * (1.0 - B + B * doc_len / avgdl.max(1.0));
-                let term_score = idf * (tf * (K1 + 1.0)) / denom;
+                let denom = tf + self.k1 * (1.0 - self.b + self.b * doc_len / avgdl.max(1.0));
+                let term_score = idf * (tf * (self.k1 + 1.0)) / denom;
                 *scores.entry(note_id.clone()).or_insert(0.0) += term_score;
             }
         }
@@ -230,6 +244,17 @@ mod tests {
 
     fn id(s: &str) -> NoteId {
         NoteId::parse(s).unwrap()
+    }
+
+    #[test]
+    fn new_and_new_with_params_default_values_score_identically() {
+        let mut a = Bm25Index::new();
+        let mut b = Bm25Index::new_with_params(1.2, 0.75);
+        a.insert(id("note-a"), "rust rust systems");
+        b.insert(id("note-a"), "rust rust systems");
+        a.insert(id("note-b"), "rust coding is fun with tests");
+        b.insert(id("note-b"), "rust coding is fun with tests");
+        assert_eq!(a.query_ranked("rust systems", 10), b.query_ranked("rust systems", 10));
     }
 
     // --- Step 1: a note containing ALL query terms ranks above a note

@@ -177,6 +177,12 @@ pub struct Index<'a> {
     indexer: &'a RealIndexer,
     active_project: String,
     reference_date: NaiveDate,
+    /// Final-scoring BM25 params, defaulted to the conventional (1.2,
+    /// 0.75) in `new()`. Overridable only via `with_bm25_params` — see
+    /// its own doc comment; every existing call site of `new()` is
+    /// unaffected.
+    bm25_k1: f64,
+    bm25_b: f64,
 }
 
 impl<'a> Index<'a> {
@@ -191,7 +197,20 @@ impl<'a> Index<'a> {
             indexer,
             active_project: active_project.to_owned(),
             reference_date,
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
         }
+    }
+
+    /// Additive builder for custom final-scoring BM25 `k1`/`b` (ablation
+    /// use only — the "A-score" variant: this overrides only the
+    /// per-query `fresh_scores` index built inside `search`, never
+    /// `indexer`'s own persistent candidate-prefilter `Bm25Index`, which
+    /// stays at whatever params `indexer` itself was constructed with).
+    pub fn with_bm25_params(mut self, k1: f64, b: f64) -> Self {
+        self.bm25_k1 = k1;
+        self.bm25_b = b;
+        self
     }
 
     pub fn search(
@@ -273,7 +292,7 @@ impl<'a> Index<'a> {
             })
             .transpose()?;
 
-        let mut fresh_scores = Bm25Index::new();
+        let mut fresh_scores = Bm25Index::new_with_params(self.bm25_k1, self.bm25_b);
         let mut fresh_results = Vec::new();
         let candidates = {
             let _timer =

@@ -834,3 +834,23 @@ fn profiling_preserves_response_and_counts_both_accepted_and_filtered_candidates
     );
     assert!(!format!("{profile:?}").contains("needle"));
 }
+
+#[test]
+fn with_bm25_params_changes_real_search_scores() {
+    let f = Fixture::new();
+    f.write(&Note::new("short-note", "rust"), 0);
+    f.write(&Note::new("long-note", &"rust ".repeat(50)), 0);
+
+    let default_scores = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .search("rust", SearchFilters::default(), 10)
+        .unwrap();
+    let b_zero_scores = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_bm25_params(1.2, 0.0) // b=0 disables length normalization entirely
+        .search("rust", SearchFilters::default(), 10)
+        .unwrap();
+
+    assert_ne!(
+        default_scores, b_zero_scores,
+        "b=0.0 must change real search scores vs the default b=0.75"
+    );
+}
