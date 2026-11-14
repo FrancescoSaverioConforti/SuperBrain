@@ -1,7 +1,9 @@
 {
   "split": "calibration",
-  "run_commit": "ec96891823a21cd7d3baea5b7288d4a1f07ed3fe",
+  "run_commit": "2312ac6e4781cf2e908ff422c16eabba9a8ec74e",
   "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+  "expansions_fired": 0,
+  "query_count": 30,
   "aggregate": {
     "recall_at_10": 0.9166666666666666,
     "ndcg_at_10": 0.7090535447985884,

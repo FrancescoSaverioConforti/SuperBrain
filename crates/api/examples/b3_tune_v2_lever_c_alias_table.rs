@@ -260,6 +260,19 @@ fn run_one_query(idx: &index::Index<'_>, question: &str, k: usize) -> QueryOutco
 /// query-term coverage. Matches whole tokens only, never a substring
 /// inside a different token (e.g. "SEC" never matches inside
 /// "SECTION").
+/// True if `query` contains at least one whitespace-delimited token
+/// (case-insensitive) present in `table` — i.e. whether
+/// `apply_alias_expansion` would actually change `query`. Added after
+/// an independent review found the frozen 7-entry table never fired on
+/// a single dev or calibration query (see
+/// `priority2-stage1-summary.md`'s Lever C correction): this lets an
+/// ablation report count real activations, rather than only reporting
+/// metrics that stay identical to B1 whether the table fired zero
+/// times or many.
+fn alias_expansion_fired(query: &str, table: &HashMap<String, String>) -> bool {
+    query.split_whitespace().any(|token| table.contains_key(&token.to_lowercase()))
+}
+
 fn apply_alias_expansion(query: &str, table: &HashMap<String, String>) -> String {
     let mut expansions: Vec<&str> = Vec::new();
     for token in query.split_whitespace() {
@@ -383,6 +396,15 @@ struct AblationReport {
     split: String,
     run_commit: String,
     labels_sha256: String,
+    /// How many of this split's non-canary queries had the alias table
+    /// actually fire (at least one whitespace token matched a frozen
+    /// short form). A report with `expansions_fired: 0` means the
+    /// aggregate metrics below are identical to B1 by construction —
+    /// the table was never exercised, not that it was tried and found
+    /// unhelpful. Added after independent review found this
+    /// distinction missing (see `priority2-stage1-summary.md`).
+    expansions_fired: usize,
+    query_count: usize,
     aggregate: MetricBreakdown,
     abstention: AbstentionReport,
 }
@@ -422,8 +444,12 @@ fn run_ablation_for_split(split: &str) -> AblationReport {
     let mut ndcg_values: Vec<f64> = Vec::new();
     let mut abstain_expected_flags: Vec<bool> = Vec::new();
     let mut predicted_not_present_flags: Vec<bool> = Vec::new();
+    let mut expansions_fired = 0usize;
 
     for row in &rows {
+        if alias_expansion_fired(&row.question, &table) {
+            expansions_fired += 1;
+        }
         let outcome = run_one_query_with_aliases(&idx, &row.question, K, &table);
         abstain_expected_flags.push(row.abstain_expected);
         predicted_not_present_flags.push(matches!(outcome, QueryOutcome::NotPresent));
@@ -459,6 +485,8 @@ fn run_ablation_for_split(split: &str) -> AblationReport {
         split: split.to_string(),
         run_commit: git_rev_parse_head(),
         labels_sha256: sha256_hex_of_file(&labels_path),
+        expansions_fired,
+        query_count: rows.len(),
         aggregate,
         abstention,
     }
@@ -482,8 +510,9 @@ fn main() {
             let split = args.get(2).cloned().unwrap_or_else(|| panic!("--ablate requires a split (dev|calibration)"));
             let report = run_ablation_for_split(&split);
             println!(
-                "{split}: Recall@10={:.4} nDCG@10={:.4}",
-                report.aggregate.recall_at_10, report.aggregate.ndcg_at_10
+                "{split}: Recall@10={:.4} nDCG@10={:.4} expansions_fired={}/{}",
+                report.aggregate.recall_at_10, report.aggregate.ndcg_at_10,
+                report.expansions_fired, report.query_count
             );
             std::fs::create_dir_all(RESULTS_DIR).unwrap();
             let out_path = format!("{RESULTS_DIR}/priority2-lever-c-{split}-ablation.json");
@@ -516,6 +545,13 @@ mod tests {
         let candidates = extract_structural_candidates(&note_text);
         assert!(candidates.iter().any(|c| c.short_form == "SEC-002"));
         assert!(!candidates.iter().any(|c| c.short_form.contains('(')));
+    }
+
+    #[test]
+    fn alias_expansion_fired_is_true_only_when_a_token_matched() {
+        let table = HashMap::from([("sec-001".to_string(), "symlink toctou bug".to_string())]);
+        assert!(alias_expansion_fired("what is sec-001 about", &table));
+        assert!(!alias_expansion_fired("what is section about", &table));
     }
 
     #[test]

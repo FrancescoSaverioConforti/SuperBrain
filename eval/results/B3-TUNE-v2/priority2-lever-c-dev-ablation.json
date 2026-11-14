@@ -1,7 +1,9 @@
 {
   "split": "dev",
-  "run_commit": "ec96891823a21cd7d3baea5b7288d4a1f07ed3fe",
+  "run_commit": "2312ac6e4781cf2e908ff422c16eabba9a8ec74e",
   "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "expansions_fired": 0,
+  "query_count": 60,
   "aggregate": {
     "recall_at_10": 0.8367346938775511,
     "ndcg_at_10": 0.7139021585460019,

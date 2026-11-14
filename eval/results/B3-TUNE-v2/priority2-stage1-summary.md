@@ -30,15 +30,39 @@ tie-break uniquely, no further tie-break needed — see
 `priority2-lever-a-selection.md`).
 
 **Variants measured:** `A-score` (custom params reach only final
-scoring; informational) and `A-full` (custom params reach the entire
-real pipeline including the candidate prefilter; this is the decision
-variant). At this specific grid point, the two variants agreed exactly
-on both splits — no candidate-set drift observed (not evidence drift
-never happens at other grid points, just that it didn't happen here).
+scoring) and `A-full` (custom params also reach the candidate
+prefilter). **Correction (post-review):** these two variants are
+identical by construction on this corpus, not merely "no drift observed
+at this grid point." The candidate prefilter's own `Bm25Index` is only
+used for candidate *membership* via `query_ranked(query, usize::MAX)`
+filtered to score > 0; since IDF is `ln(... + 1) > 0` and the BM25 term
+score is strictly positive for any `k1 ≥ 0`, `b ∈ [0, 1]` whenever a
+query term overlaps a document at all, the candidate SET can never
+change across this grid — only each candidate's downstream re-ranking
+score can, and that re-ranking always happens through the `Index`-level
+`fresh_scores` (`A-score`'s own mechanism) regardless of which variant
+is run. The grid's invariant Recall@10 (0.836735 at all 16 points,
+`priority2-lever-a-grid.json`) is the direct evidence of this: a
+changing candidate set would show up as a changing Recall@10, and it
+never does. The `A-score`/`A-full` plumbing itself (Task 1b) is correct
+and real — it is exercised and does take effect — but the two variants
+cannot diverge in their RESULT on this corpus under additive,
+non-negative BM25 scoring; a construction that could make them diverge
+(e.g. a smoothing floor letting a zero-overlap document enter the
+candidate set) does not exist in this codebase's BM25 implementation.
 
-**Commit:** `efd4ccf` (constructor path), `5d4196a` (grid),
-`efd4ccf4` (ablation — commit `efd4ccf`). Corpus manifest/labels
-hashes: see individual ablation reports.
+**Commit provenance (correction post-review):** each ablation JSON's
+`run_commit` field reflects `git rev-parse HEAD` at the moment the
+binary RAN, which in several cases was a commit prior to the one that
+added the code producing that exact report (the binary was built and
+run, then its sources were committed afterward in the same task) — the
+`run_commit` field in these reports should be read as "the code's last
+commit was no earlier than this," not as the exact commit. The grid
+ran under code committed at `5d4196a`; the dev/calibration ablation at
+the selected point ran under code committed at `efd4ccf`. Corpus
+manifest hash is not recorded in these reports (only `labels_sha256`
+is) — a gap versus the design doc's logging rule, noted but not
+re-run to fix retroactively, since it does not change any verdict.
 
 | | Recall@10 | Δ vs B1 | nDCG@10 | Δ vs B1 |
 |---|---|---|---|---|
@@ -71,35 +95,85 @@ call, type annotation, or complexity notation rather than a sentence —
 see `priority2-lever-b-token-diagnostic.json` and commit `ee5c6a4`).
 
 **Variants measured:** `B-query` (normalization applied to the query
-only; informational) and `B-symmetric` (normalization applied to both
-indexed text — via a standalone `Bm25Index`/`TrigramIndex` pair that
-bypasses `RealIndexer`, since the frozen production tokenizer is never
-modified — and the query; this is the decision variant).
+only, against the real `Index::search` pipeline unmodified) and
+`B-symmetric` (normalization applied to both indexed text and the
+query, via a **standalone** `Bm25Index`/`TrigramIndex` pair that
+bypasses `RealIndexer`/`Index::search` entirely, since the frozen
+production tokenizer is never modified).
+
+**Correction (post-review): `B-symmetric`'s numbers are NOT directly
+"B1 + normalization" — they come from a substitute scorer that differs
+from the real pipeline in three ways, confirmed in review:**
+1. IDF and `avgdl` are computed over the WHOLE 53-note corpus, not over
+   the per-query eligible-candidate subset the real `Index::search`
+   uses for its own `fresh_scores` (`search.rs`'s per-query re-scoring
+   index is scoped to candidates only, after project/type/status/trust/
+   time filtering — the standalone scorer has none of that scoping).
+2. The standalone scorer's `TrigramIndex` candidates are computed but
+   never actually unioned into the returned ranking — only BM25's own
+   `query_ranked` output is returned, so the trigram side is a no-op
+   past an emptiness check.
+3. `NotPresent` semantics differ slightly as a result, so the
+   abstention tripwire under `B-symmetric` is a weaker check than under
+   the real-pipeline-based Levers A and C.
+
+A post-review control run (same normalization rule, but through the
+standalone scorer WITHOUT normalization, as a matched baseline) found
+the standalone scorer alone already differs from real B1 by about
+−0.015 nDCG@10 on calibration (0.6937 vs. B1's real 0.7091) — the
+substitution is a bias AGAINST this lever, not in its favor. Measured
+against its own matched control rather than against real B1, Lever B's
+actual normalization effect is **+0.019 nDCG@10** on calibration, larger
+than the +0.0036 reported below against real B1. The KEEP verdict is
+robust to this — if anything the true effect is understated — but the
+exact calibration numbers in the table below describe "standalone
+scorer + normalization" vs. "real B1", not "real B1 + normalization vs.
+real B1". **Confirming this lever's effect inside the real `Index::search`
+pipeline (which requires actually modifying tokenization symmetrically,
+not a standalone scorer) remains open and should happen before this
+lever is composed with anything else in a future Stage 2.**
+
+Also note: the SAME control run found `B-query` (query-side-only
+normalization, run through the REAL pipeline, no substitute scorer)
+*regresses* calibration nDCG@10 to 0.6877 (−0.0214 vs. real B1) — one-
+sided normalization hurts in the real pipeline. This is additional
+evidence that the symmetric effect genuinely depends on the indexed
+side changing too, not an artifact of the substitute scorer.
 
 **Commit:** `ee5c6a4` (rule + diagnostic), `c191b21` (ablation).
 
 | | Recall@10 | Δ vs B1 | nDCG@10 | Δ vs B1 |
 |---|---|---|---|---|
-| Dev (`B-query`) | 0.8776 | — (diagnostic only) | 0.7503 | — |
-| Dev (`B-symmetric`) | 0.9592 | — (diagnostic only) | 0.7969 | — |
-| Calibration (`B-symmetric`) | 0.9167 | **+0.0000** | 0.7126 | **+0.0036** |
+| Dev (`B-query`, real pipeline) | 0.8776 | — (diagnostic only) | 0.7503 | — |
+| Dev (`B-symmetric`, standalone scorer) | 0.9592 | — (diagnostic only) | 0.7969 | — |
+| Calibration (`B-query`, real pipeline) | 0.9167 | +0.0000 | 0.6877 | **−0.0214** |
+| Calibration (`B-symmetric`, standalone scorer) | 0.9167 | **+0.0000** | 0.7126 | **+0.0036** |
 
 **Abstention (calibration, `B-symmetric`):** TP=0, TN=24, FP=0, FN=6 —
-unchanged from B1's own pattern.
+unchanged from B1's own pattern. (Per the correction above, this check
+is weaker under the standalone scorer than under the real pipeline.)
 
 **Latency/resource:** not measured.
 
 **KEEP/REJECT rationale:** Recall@10 regression (0.0000, a flat tie —
-not a regression) passes. nDCG@10 **improves** by +0.0036 — a genuine,
-if small, improvement, not a regression. At least one metric improves
-(nDCG@10). Abstention pattern unchanged.
+not a regression) passes. nDCG@10 **improves** by +0.0036 — a small but
+genuine improvement over real B1, not a regression. At least one metric
+improves (nDCG@10). Abstention pattern unchanged (weak-check caveat
+above). **This margin is noise-level at n=24** — the bootstrap CI on
+calibration nDCG@10 is wide relative to the +0.0036 delta; the frozen
+rule's "at least one metric improves, no regression beyond tolerance"
+criterion is satisfied, but this is a KEEP for a real, if small and
+imprecisely measured, effect, not a decisive win.
 
-**Verdict: KEEP.**
+**Verdict: KEEP** — but real-pipeline confirmation (not a standalone
+scorer) is recommended before this lever is composed with anything
+else in a future, separately-authorized Stage 2.
 
 (Note: dev's own `B-symmetric` improvement — 0.9592 vs. B1's 0.8367 —
-is much larger than calibration's. Dev is diagnostic only per the
-frozen discipline; the calibration number above is what decided this
-lever, and it is a smaller but still real, non-negative improvement.)
+is much larger than calibration's, and is itself measured through the
+same standalone-scorer substitute, so it overstates the real-pipeline
+effect for the same reason above. Dev is diagnostic only per the frozen
+discipline; the calibration number is what decided this lever.)
 
 ---
 
@@ -125,18 +199,45 @@ expansion, whole-token matching only, appends rather than replaces.
 
 **Latency/resource:** not measured.
 
-**KEEP/REJECT rationale:** Both regression tolerances pass trivially
-(exact zero delta on both metrics, both splits). Abstention pattern
-unchanged. **Neither metric improves** — the table had zero measurable
-effect on either split, most likely because neither dev's nor
-calibration's query set happens to invoke any of the 7 frozen short
-forms by their exact literal identifier often enough to move the
-aggregate (dev's own numbers are identical to B1's, which is itself
-notable: the 7 queries that originally justified these entries already
-retrieved their target notes correctly without the alias expansion,
-so the expansion added redundant terms rather than rescuing a miss).
+**Correction (post-review): this REJECT is a no-op, not a tested-and-
+tied result.** Independent verification (whole-token match of all 7
+frozen short forms, case-insensitive, against every dev and calibration
+question): **zero of 59 dev queries and zero of 30 calibration queries
+contain any of the 7 short forms as a literal whitespace token.** The
+alias table's `apply_alias_expansion` never fired on a single query in
+either split — the identical-to-B1 numbers above are not evidence the
+table "didn't help because the target notes were already found," they
+are evidence the table was **never exercised at all**. Root cause: Task
+6's diagnostic cross-referenced whether a dev query TARGETS a
+candidate's note (via `relevant_note_ids`), never whether a dev query
+actually USES the short form's exact literal text — a query can
+legitimately target `bug-2026-10-27-sec001-toctou` while phrasing the
+question entirely in plain English, with no occurrence of the string
+"SEC-001" at all (confirmed: that is exactly what happened for all 7
+entries). Two near-misses were found during verification, both
+correctly non-matches: q069 contains `SEC-001/2/3?` as one token
+(punctuation-fused, doesn't equal any single short form), and q079
+contains a commit-hash substring `...f50c634` (substring `c6` inside
+it, correctly rejected by whole-token matching — confirming
+`apply_alias_expansion`'s substring-safety is sound, Review Focus #4,
+even though it had no opportunity to fire here).
 
-**Verdict: REJECT.**
+**KEEP/REJECT rationale:** Both regression tolerances pass trivially
+(exact zero delta, both metrics, both splits, because the harness ran
+and scored every query with the expansion function present and it
+never activated). Abstention pattern unchanged. Neither metric improves
+— but not because the alias table was tried and found useless; because
+it was never triggered. **Verdict stands as REJECT on the frozen rule's
+own terms** (no improvement observed), but the correct characterization
+is "REJECT (no-op: zero activations on dev and calibration)," not "the
+table didn't help." A future round of this lever, if ever reattempted,
+would need its candidate-identification step to check literal short-form
+occurrence in dev's actual question text (not just target-note
+reference), and to count `expansions_fired` explicitly in the ablation
+report so a future "REJECT" can be told apart from a future "no-op"
+without a manual audit.
+
+**Verdict: REJECT (no-op — zero activations on dev and calibration).**
 
 ---
 
@@ -163,11 +264,23 @@ document depends on this diagnostic.
 
 | Lever | Decision variant | Verdict |
 |---|---|---|
-| A (BM25 k1/b) | `A-full` | **REJECT** |
-| B (punctuation normalization) | `B-symmetric` | **KEEP** |
-| C (alias table) | — | **REJECT** |
+| A (BM25 k1/b) | `A-full` (identical to `A-score` by construction) | **REJECT** |
+| B (punctuation normalization) | `B-symmetric` (measured via a standalone scorer, not the real pipeline — see correction above) | **KEEP** (small margin, real-pipeline confirmation recommended) |
+| C (alias table) | — | **REJECT (no-op: zero activations on dev and calibration)** |
 
-**Only Lever B is accepted** from this Stage 1 round.
+**Only Lever B is accepted** from this Stage 1 round, with the caveat
+that its measured effect used a standalone scorer rather than the real
+`Index::search` pipeline, and its calibration margin (+0.0036 nDCG@10,
+n=24) is small relative to that split's bootstrap CI width. An
+independent whole-branch review (fresh context, 2026-11-14) confirmed
+all three verdicts are correct on the frozen rule's own terms, while
+finding these three characterization issues, now corrected above:
+Lever A's two variants are mathematically identical on this corpus, not
+merely "no drift observed"; Lever C never actually fired on a single
+query (a no-op, not a tested negative); and Lever B's numbers come from
+a substitute scorer whose own bias happens to run against this lever
+(so the real effect, confirmed by a matched control, is actually larger
+than reported: +0.019 vs. the standalone-scorer +0.0036).
 
 ## Explicit confirmations
 
