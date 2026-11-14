@@ -1,5 +1,14 @@
 # B3-TUNE-v2 Priority 2 Stage 1 — KEEP/REJECT Summary
 
+**STATUS: PRIORITY 2 CLOSED (2026-11-14).** Final verdicts: Lever A
+REJECT (confirmed, closed), Lever B REJECT (after real-pipeline
+verification), Lever C NOT EVALUATED / NO-OP. **No lever is promoted.
+Priority 2 Stage 2 (composition) does NOT run** — composition requires
+at least one Stage 1 KEEP to compose, and none exists. The active
+baseline for any future priority remains the official B1 configuration
+(`eval/results/B3/frozen-config.json`), unchanged, since neither
+Priority 1 nor Priority 2 produced a KEEP configuration.
+
 **Phase:** B3-TUNE-v2, Priority 2 (lexical tuning), Stage 1 (isolated
 ablations).
 **Date:** 2026-11-14.
@@ -404,3 +413,31 @@ standalone scorer suggested.
   started.**
 - No modification to the B3 frozen config, runner, corpus, or labels.
 - No MCP, no merge, no tag, no push.
+
+## Priority 2 closure (2026-11-14)
+
+**Priority 2 is CLOSED.** All three Stage 1 levers have final,
+user-confirmed verdicts (table above) and none is a KEEP. Per the
+project's own frozen rule, Stage 2 composition requires composing two
+or more Stage 1 KEEPs — with zero KEEPs, **there is nothing to compose,
+so Stage 2 does not run.** This is a closure, not a deferral: no further
+BM25 k1/b tuning (Lever A, user-confirmed closed), no new alias
+construction against dev/calibration (Lever C, would leak evaluation
+data into the table), and Lever B's real-pipeline regression stands as
+the decisive measurement unless a future, separately-authorized round
+chooses a different normalization policy from scratch.
+
+**Baseline going forward:** official B1 (`eval/results/B3/frozen-config.json`,
+commit `52d42ea`), unmodified. Priority 1 (closed REJECT) and Priority 2
+(closed, this document) leave B1 as the only configuration in active
+use.
+
+**Before any Priority 3 implementation:** a full audit of the current
+ranking pipeline is required (candidate generation, BM25 final scoring,
+trigram/substring role, `MatchKind`, tie-breaking, and use of any other
+signal — trust level, note type, status, recency, project/source
+metadata, exact identifier match) — see
+`docs/research/B3-TUNE-v2-PRIORITY3-RANKING-AUDIT.md` once produced.
+Priority 3 design proposes deterministic, auditable reranking only.
+Learned rerankers, embeddings, hybrid retrieval, and Priority 4 remain
+unauthorized.
