@@ -21,7 +21,10 @@ vice versa, is an automatic REJECT regardless of the other metrics.
 
 ---
 
-## Lever A — BM25 `k1`/`b` — **REJECT**
+## Lever A — BM25 `k1`/`b` — **REJECT (CONFIRMED, CLOSED)**
+
+**User review (2026-11-14): REJECT CONFIRMED. Closed. No further BM25
+k1/b sweep or tuning in any future round of this lever.**
 
 **Config:** `k1=1.8, b=0.75` (selected from a 16-point grid over dev via
 the frozen rule: max Recall@10 → tie-break max nDCG@10 → tie-break min
@@ -81,11 +84,20 @@ nDCG@10 regresses (does not improve). Per the frozen rule, "improves
 nothing but doesn't regress much either is not a reason to change a
 frozen baseline."
 
-**Verdict: REJECT.**
+**Verdict: REJECT (CONFIRMED, CLOSED).**
 
 ---
 
-## Lever B — Conservative Punctuation Normalization — **KEEP**
+## Lever B — Conservative Punctuation Normalization — **PROVISIONAL KEEP, pending real-pipeline verification**
+
+**User review (2026-11-14): verdict downgraded to PROVISIONAL KEEP.**
+The report below measured `B-symmetric` through a standalone scorer,
+not the real `Index::search` pipeline — a real-pipeline verification
+is required before this becomes `KEEP CONFIRMED` or `REJECT`. See
+"Real-pipeline verification" section below for that result. The
+criterion is NOT re-chosen after seeing the verification result — it is
+the same Frozen decision rules criterion already applied to every
+other lever in this document.
 
 **Config:** `strip_trailing_sentence_punctuation` — strips only trailing
 `. , ; : ! ? " '` (narrowed from the design doc's original candidate
@@ -165,9 +177,9 @@ rule's "at least one metric improves, no regression beyond tolerance"
 criterion is satisfied, but this is a KEEP for a real, if small and
 imprecisely measured, effect, not a decisive win.
 
-**Verdict: KEEP** — but real-pipeline confirmation (not a standalone
-scorer) is recommended before this lever is composed with anything
-else in a future, separately-authorized Stage 2.
+**Verdict (standalone scorer only): PROVISIONAL KEEP** — superseded by
+the real-pipeline verification result below, which is the one that
+decides `KEEP CONFIRMED` vs. `REJECT`.
 
 (Note: dev's own `B-symmetric` improvement — 0.9592 vs. B1's 0.8367 —
 is much larger than calibration's, and is itself measured through the
@@ -177,7 +189,19 @@ discipline; the calibration number is what decided this lever.)
 
 ---
 
-## Lever C — Deterministic Alias Table — **REJECT**
+## Lever C — Deterministic Alias Table — **NOT EVALUATED / NO-OP**
+
+**User review (2026-11-14): verdict corrected from `REJECT (no-op)` to
+`NOT EVALUATED / NO-OP`.** Rationale: `expansions_fired = 0` on both
+splits means the alias table's actual effectiveness was never measured
+at all — "REJECT" implies a tested hypothesis that failed, which
+overstates what happened. **This lever is closed here as inconclusive.
+No new aliases will be constructed to force activations on dev or
+calibration** — that would mean selecting the table's content by
+looking at the evaluation data it's supposed to be judged against,
+which is exactly the calibration-leakage risk the design doc's
+correction #1 exists to prevent, now generalized to dev as well once
+the table is being iterated specifically to produce hits.
 
 **Config:** 7-entry frozen table (`SEC-001`, `SEC-002`, `SEC-003`, `C1`,
 `C5`, `C6`, `Fase-B`), each entry a hand-reviewed expansion phrase read
@@ -237,7 +261,8 @@ reference), and to count `expansions_fired` explicitly in the ablation
 report so a future "REJECT" can be told apart from a future "no-op"
 without a manual audit.
 
-**Verdict: REJECT (no-op — zero activations on dev and calibration).**
+**Verdict: NOT EVALUATED / NO-OP (zero activations on dev and
+calibration; closed as inconclusive, not reattempted).**
 
 ---
 
@@ -260,27 +285,41 @@ document depends on this diagnostic.
 
 ---
 
+## Real-pipeline verification of Lever B (user-authorized checkpoint)
+
+See the dedicated section below, after "Overall Stage 1 result" — this
+verification runs `B-symmetric`'s already-frozen normalization policy
+through an opt-in real-pipeline path (not the standalone scorer), and
+its result is what moves Lever B from `PROVISIONAL KEEP` to either
+`KEEP CONFIRMED` or `REJECT`, per the same Frozen decision rules
+criterion already applied to every other lever — not a new or
+re-chosen criterion.
+
 ## Overall Stage 1 result
 
 | Lever | Decision variant | Verdict |
 |---|---|---|
-| A (BM25 k1/b) | `A-full` (identical to `A-score` by construction) | **REJECT** |
-| B (punctuation normalization) | `B-symmetric` (measured via a standalone scorer, not the real pipeline — see correction above) | **KEEP** (small margin, real-pipeline confirmation recommended) |
-| C (alias table) | — | **REJECT (no-op: zero activations on dev and calibration)** |
+| A (BM25 k1/b) | `A-full` (identical to `A-score` by construction) | **REJECT (CONFIRMED, CLOSED)** |
+| B (punctuation normalization) | `B-symmetric` | **PROVISIONAL KEEP → see real-pipeline verification below for the final verdict** |
+| C (alias table) | — | **NOT EVALUATED / NO-OP (closed, inconclusive)** |
 
-**Only Lever B is accepted** from this Stage 1 round, with the caveat
-that its measured effect used a standalone scorer rather than the real
-`Index::search` pipeline, and its calibration margin (+0.0036 nDCG@10,
-n=24) is small relative to that split's bootstrap CI width. An
-independent whole-branch review (fresh context, 2026-11-14) confirmed
-all three verdicts are correct on the frozen rule's own terms, while
-finding these three characterization issues, now corrected above:
-Lever A's two variants are mathematically identical on this corpus, not
-merely "no drift observed"; Lever C never actually fired on a single
-query (a no-op, not a tested negative); and Lever B's numbers come from
-a substitute scorer whose own bias happens to run against this lever
-(so the real effect, confirmed by a matched control, is actually larger
-than reported: +0.019 vs. the standalone-scorer +0.0036).
+An independent whole-branch review (fresh context, 2026-11-14) found
+the original draft's verdicts were defensible on the frozen rule's own
+terms but mischaracterized what was actually measured in three places,
+and the user's own review (2026-11-14, second pass) adjusted the
+verdict labels accordingly: Lever A's two variants are mathematically
+identical on this corpus (not merely "no drift observed") — **REJECT
+confirmed by the user, closed, no further BM25 k1/b tuning**. Lever C
+never actually fired a single alias on either split — relabeled
+**NOT EVALUATED / NO-OP** rather than REJECT, since REJECT implies a
+tested-and-failed hypothesis; **closed as inconclusive, not
+reattempted** (constructing new aliases now, with dev/calibration
+results in hand, would leak the evaluation data into the table's own
+construction). Lever B's numbers came from a substitute scorer whose
+own bias ran against this lever (matched-control effect +0.019 nDCG@10,
+larger than the standalone-scorer-vs-real-B1 reported +0.0036) —
+relabeled **PROVISIONAL KEEP pending the real-pipeline verification**
+below, which decides the lever's final status.
 
 ## Explicit confirmations
 
