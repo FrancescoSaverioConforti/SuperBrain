@@ -126,6 +126,13 @@ impl Indexer for SkeletonIndexer {
 /// Process-aborting allocation failures are outside Rust unwind recovery.
 pub struct RealIndexer {
     data: Mutex<IndexData>,
+    /// Candidate-prefilter BM25 params, defaulted to the conventional
+    /// (1.2, 0.75) in `new()`. Carried separately from `data`'s own
+    /// `Bm25Index` so the poisoned-mutex recovery path (`data()`'s
+    /// `Err` branch) can rebuild `data.bm25` with the SAME params
+    /// rather than silently resetting to the hardcoded defaults.
+    bm25_k1: f64,
+    bm25_b: f64,
     #[cfg(test)]
     poisoned: Mutex<HashSet<String>>,
     #[cfg(test)]
@@ -153,8 +160,24 @@ struct PublishedNote {
 
 impl RealIndexer {
     pub fn new() -> Self {
+        Self::new_with_bm25_params(1.2, 0.75)
+    }
+
+    /// Additive constructor for custom candidate-prefilter `k1`/`b`
+    /// (ablation use only — the "A-full" variant: this overrides
+    /// `RealIndexer`'s own persistent `Bm25Index`, used by
+    /// `candidate_ids`/`bm25_ranked`, in addition to whatever
+    /// `Index::with_bm25_params` separately overrides for final
+    /// scoring). `new()`'s own behavior is unchanged.
+    pub fn new_with_bm25_params(k1: f64, b: f64) -> Self {
         Self {
-            data: Mutex::new(IndexData::default()),
+            data: Mutex::new(IndexData {
+                trigram: TrigramIndex::new(),
+                bm25: Bm25Index::new_with_params(k1, b),
+                notes: HashMap::new(),
+            }),
+            bm25_k1: k1,
+            bm25_b: b,
             #[cfg(test)]
             poisoned: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -168,7 +191,7 @@ impl RealIndexer {
             Err(poisoned) => {
                 let mut data = poisoned.into_inner();
                 data.trigram = TrigramIndex::new();
-                data.bm25 = Bm25Index::new();
+                data.bm25 = Bm25Index::new_with_params(self.bm25_k1, self.bm25_b);
                 for note in data.notes.values_mut() {
                     note.published = None;
                 }

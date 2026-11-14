@@ -854,3 +854,23 @@ fn with_bm25_params_changes_real_search_scores() {
         "b=0.0 must change real search scores vs the default b=0.75"
     );
 }
+
+#[test]
+fn new_with_bm25_params_changes_candidate_prefilter_scores() {
+    let f = Fixture::new();
+    f.write(&Note::new("short-note", "rust"), 0);
+    f.write(&Note::new("long-note", &"rust ".repeat(50)), 0);
+
+    let default_indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &default_indexer).unwrap();
+    let default_ranked = default_indexer.bm25_ranked("rust", 10);
+
+    let b_zero_indexer = RealIndexer::new_with_bm25_params(1.2, 0.0);
+    index::indexer_impl::rebuild_index(&f.vault, &b_zero_indexer).unwrap();
+    let b_zero_ranked = b_zero_indexer.bm25_ranked("rust", 10);
+
+    assert_ne!(
+        default_ranked, b_zero_ranked,
+        "b=0.0 must change the candidate prefilter's own BM25 scores vs the default b=0.75"
+    );
+}
