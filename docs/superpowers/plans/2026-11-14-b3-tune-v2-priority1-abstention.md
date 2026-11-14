@@ -90,11 +90,16 @@ Builds on the accepted B1 baseline recorded in
   rather than independently calibrated — Task 2's proposal must be
   evaluated against calibration, not re-justified against dev after the
   fact.
-- The new held-out set's queries accidentally resembling the already-
-  consumed B3 test split's queries closely enough that it isn't really
+- The new held-out set's queries accidentally resembling existing
+  dev/calibration queries closely enough that it isn't really
   independent evidence (e.g. reusing the same note as a near-duplicate
   target) — Task 0's dispatched subagent must check this against B3's
-  own corpus the same way B3.1 checked for cross-split duplication.
+  dev and calibration splits the same way B3.1 checked for cross-split
+  duplication. The consumed B3 test split (`eval/rag/test/labels.jsonl`)
+  is explicitly NOT part of this check (user correction #1): it stays
+  unread by v2 entirely, so no direct semantic de-duplication against it
+  exists. This is an accepted gap, not an oversight — the stronger
+  constraint (never reopen the consumed final-test) wins.
 - The threshold-override logic silently applying to abstain-expected
   AND answerable rows differently than intended, or double-counting a
   query that was already `NotPresent` from `index::search` itself
@@ -134,7 +139,10 @@ Builds on the accepted B1 baseline recorded in
   before scoring, and includes the threshold's own value and signal
   name in the report for traceability.
 - Create: `eval/results/B3-TUNE-v2/priority1-signal-analysis.json` — Task
-  2's signal comparison output.
+  1's signal comparison output.
+- Create: `eval/results/B3-TUNE-v2/priority1-signal-analysis-calibration.json`,
+  `priority1-threshold-sweep.json` — Task 2's calibration rerun and
+  deterministic cutoff-by-cutoff sensitivity/Pareto table.
 - Create: `eval/results/B3-TUNE-v2/priority1-dev-ablation.json`,
   `priority1-calibration-ablation.json` — the threshold-override ablation
   reports, same schema as B3's own reports plus the KEEP/REJECT fields.
@@ -182,22 +190,32 @@ inherit this session's context, defeating the whole point) with a brief
 that includes: the existing corpus's note list and content (same access
 B3.1's authoring work had), the exact label schema
 (`eval/rag/runner.py::load_labels`'s rules), the instruction to write
-~20-30 new queries stratified across the same 6 categories/3
-difficulties B3 used, including several abstention-expected queries
-(proportionally similar to B3's ~17%), each independently formulated
-(never a substring of its target note), and explicitly checked for
-near-duplication against the existing `eval/rag/{dev,calibration,test}/labels.jsonl`
-question text (the Review Focus risk — this check happens inside the
-dispatched agent's own work, using its own read access to those files).
-The brief also instructs the subagent to: validate with
-`eval/rag/validate_corpus.py` (making the same small path-generalization
-fix this task's earlier draft identified, if `validate_corpus.py`
-doesn't already accept an arbitrary `eval_root`/corpus pair — it
-currently hardcodes `SPLITS = ("dev", "calibration", "test")`); commit
-the result; compute and write `eval/rag/v2-heldout/manifest.json` with
-`sha256` (of `labels.jsonl`'s raw bytes), `build_date`, `build_commit`
-(git rev-parse HEAD), `query_count`, `category_counts`,
-`difficulty_counts`, `abstain_count` — metadata only, never copying
+**approximately 60 new queries** stratified across the same 6
+categories/3 difficulties B3 used, with **at least 15 abstention-
+expected queries** (not ~17% of 60, which would be ~10 — the user's
+correction #2 sets an explicit floor of 15 because Priority 1 is
+specifically about abstention and needs enough abstention-expected
+queries to validate a threshold meaningfully), all 6 categories and all
+3 difficulties represented among both the answerable and abstention-
+expected queries, and enough answerable queries remaining (~45) to keep
+measuring Recall@10/nDCG@10 meaningfully. Each query independently
+formulated (never a substring of its target note), and explicitly
+checked for near-duplication against the existing
+`eval/rag/{dev,calibration}/labels.jsonl` question text ONLY — **the
+consumed B3 test split (`eval/rag/test/labels.jsonl`) must NOT be read
+by this subagent at all** (user correction #1: that split is CONSUMED
+per `docs/research/B3-CLOSURE-SUMMARY.md` and stays unread by v2
+entirely; the brief must say this explicitly as a hard constraint, not
+leave it to the subagent's judgment). The brief also instructs the
+subagent to: validate with `eval/rag/validate_corpus.py` (making the
+same small path-generalization fix this task's earlier draft identified,
+if `validate_corpus.py` doesn't already accept an arbitrary
+`eval_root`/corpus pair — it currently hardcodes
+`SPLITS = ("dev", "calibration", "test")`); commit the result; compute
+and write `eval/rag/v2-heldout/manifest.json` with `sha256` (of
+`labels.jsonl`'s raw bytes), `build_date`, `build_commit` (git rev-parse
+HEAD), `query_count` (~60), `category_counts`, `difficulty_counts`,
+`abstain_count` (≥15) — metadata only, never copying
 `question`/`answer`/`relevant_note_ids` content into the manifest; and
 finally report back **only** a short confirmation (files committed,
 manifest written, validation passed) — explicitly instructed not to
@@ -332,19 +350,24 @@ git commit -m "feat(eval): B3-TUNE-v2 Priority 1 signal analysis (top1 score, ma
 
 ---
 
-### Task 2: Propose one global threshold from calibration — STOP for approval
+### Task 2: Propose one global threshold from calibration via deterministic sweep — STOP for approval
 
 **Files:**
+- Create: `eval/results/B3-TUNE-v2/priority1-threshold-sweep.json`
 - Create: `eval/results/B3-TUNE-v2/priority1-threshold-proposal.md`
 
 **Interfaces:**
 - Consumes: Task 1's signal analysis conclusion (which signal to
   threshold), the calibration split's real labels/search results (same
   `top_scores` function, rerun against `eval/rag/calibration/labels.jsonl`
-  instead of dev).
-- Produces: a written proposal (not a frozen config — this task does
-  not freeze anything) for the user's approval, per the two-stop
-  discipline B3.4 used.
+  instead of dev), `metrics::recall_at_10`/`ndcg_at_10` (existing,
+  unchanged) to score each candidate cutoff, and the official B1 baseline
+  numbers in `docs/research/B3-CLOSURE-SUMMARY.md` for the delta column.
+- Produces: a full cutoff-by-cutoff sensitivity/Pareto table
+  (`priority1-threshold-sweep.json`) and a written proposal grounded in
+  it (not a frozen config — this task does not freeze anything, and does
+  not auto-select a "best" row) for the user's approval, per the
+  two-stop discipline B3.4 used.
 
 - [ ] **Step 1: Rerun the signal analysis binary against calibration**
 
@@ -354,33 +377,71 @@ Task 1's existing invocation working unchanged), run it, and write a
 second report,
 `eval/results/B3-TUNE-v2/priority1-signal-analysis-calibration.json`.
 
-- [ ] **Step 2: Propose one global threshold value for the winning signal**
+- [ ] **Step 2: Deterministic cutoff sweep over calibration's own distribution**
 
-Using calibration's own distribution (never re-deriving the threshold
-from dev a second time — dev already did its diagnostic job in Task 1),
-propose a single cutoff value for the signal Task 1 identified, chosen
-so it would correctly flag calibration's own abstention-expected queries
-as `NotPresent` while flagging as few answerable queries as possible as
-false negatives. Write this proposal, with its rationale and the
-resulting hypothetical confusion-matrix shift on calibration (computed
-by hand from the signal analysis report's own per-query values — no new
-code needed for this arithmetic), to
-`eval/results/B3-TUNE-v2/priority1-threshold-proposal.md`.
+Per the user's correction #3: do not eyeball a single cutoff or compute
+one confusion matrix by hand. Add a `sweep_cutoffs` function (in
+`b3_tune_v2_signal_analysis.rs`, or a small sibling module it calls)
+that, given the winning signal's calibration values from Step 1's
+report: builds the candidate cutoff set as every distinct observed
+value of that signal on calibration (the only cutoffs that can change
+any query's classification — values between two adjacent observations
+all produce the same confusion matrix, so the distinct-value set is
+already exhaustive over "sensible" cutoffs, not a sample of them), and
+for each candidate cutoff computes: TP/TN/FP/FN (reusing
+`metrics::confusion_matrix_metrics`'s tally logic against
+`apply_abstention_threshold`-equivalent classification at that cutoff —
+duplicate the small amount of logic needed here rather than depending on
+Task 3's not-yet-implemented function, since this task runs before
+Task 3), abstention precision/recall/F1 (`null` on undefined, same
+semantics as `metrics.rs`), the false-abstention rate on answerable rows
+(`FP / (FP + TN)`, i.e. the fraction of answerable queries this cutoff
+would incorrectly flag as abstain), Recall@10 and nDCG@10 recomputed
+under that cutoff's override (reusing `recall_at_10`/`ndcg_at_10` against
+the overridden retrieval lists), and the delta of each versus the
+official B1 baseline numbers in `docs/research/B3-CLOSURE-SUMMARY.md`.
+Write every candidate's full row to
+`eval/results/B3-TUNE-v2/priority1-threshold-sweep.json` as a sensitivity/
+Pareto table (one row per distinct cutoff, sorted by cutoff value) —
+this is the evidence Step 3 reads, not output for its own sake.
 
-- [ ] **Step 3: Commit the proposal document**
+- [ ] **Step 3: Run the sweep and inspect the Pareto table**
+
+Run: `cargo run --release -p api --example b3_tune_v2_signal_analysis -- --sweep calibration`
+Expected: exits 0, writes `priority1-threshold-sweep.json`, prints its
+path and the number of candidate cutoffs evaluated.
+
+- [ ] **Step 4: Propose ONE global threshold with rationale — do not auto-select "best"**
+
+Read the sweep table and propose a single cutoff value for the signal
+Task 1 identified, with written rationale referencing specific rows
+(e.g. "cutoff X gives abstention recall Y, false-abstention rate Z,
+Recall@10 delta W — chosen over neighboring cutoffs because..."). This
+is a judgment call informed by the full Pareto table, not a maximization
+of any single column — the proposal must name the trade-off it accepts
+(e.g. some false-abstention rate in exchange for non-zero abstention
+recall) rather than claim one cutoff dominates on every metric. Write
+this proposal, with the specific sweep rows it's grounded in, to
+`eval/results/B3-TUNE-v2/priority1-threshold-proposal.md`. **This step
+proposes; it does not select automatically and does not freeze anything**
+— the threshold is not applied anywhere until the user approves this
+specific proposal (Step 6).
+
+- [ ] **Step 5: Commit the sweep and proposal documents**
 
 ```bash
-git add eval/results/B3-TUNE-v2/priority1-signal-analysis-calibration.json eval/results/B3-TUNE-v2/priority1-threshold-proposal.md
-git commit -m "docs(eval): B3-TUNE-v2 Priority 1 threshold proposal from calibration"
+git add eval/results/B3-TUNE-v2/priority1-signal-analysis-calibration.json eval/results/B3-TUNE-v2/priority1-threshold-sweep.json eval/results/B3-TUNE-v2/priority1-threshold-proposal.md
+git commit -m "docs(eval): B3-TUNE-v2 Priority 1 deterministic threshold sweep and proposal from calibration"
 ```
 
-- [ ] **Step 4: STOP and report the proposal to the user**
+- [ ] **Step 6: STOP and report the proposal to the user**
 
 Per the design doc's two-stop discipline (same as B3.4): report the
-proposed signal, threshold value, and rationale; do not implement the
-threshold override in the runner (Task 3) until the user approves this
-specific proposal. This task's own deliverable is the proposal, not a
-working override.
+proposed signal, threshold value, and rationale, plus the Pareto
+sensitivity table's key rows; do not implement the threshold override in
+the runner (Task 3) until the user approves this specific proposal. This
+task's own deliverable is the sweep evidence plus the proposal, not a
+working override and not an automatically-selected "best" cutoff.
 
 ---
 
@@ -564,8 +625,11 @@ ablation. It does **not** include:
 
 ## Self-Review Notes
 
-- **Spec coverage**: the design doc's 7 corrections (5 from the first
-  approval round, 2 from this revision) map directly to this plan's
+- **Spec coverage**: the design doc's 7 corrections plus the 3 plan-level
+  corrections applied directly to this plan (never-reopen-the-consumed-
+  B3-test-split in Task 0 Step 1; the ~60-query/≥15-abstention held-out
+  size floor in Task 0 Step 1; the deterministic cutoff sweep replacing
+  hand-picked thresholds in Task 2 Steps 2-4) map directly to this plan's
   tasks — held-out-first ordering (Task 0), held-out/tuning context
   separation via subagent dispatch (Task 0 itself), held-out never
   gates the P1-P4 stop/proceed decision (explicit in Task 4 Step 5 and
