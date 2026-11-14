@@ -1,0 +1,8 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 0.65s
+     Running `target\release\examples\b2_eval_009_cpp_parity.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/d0963c5f-908d-4243-bcbc-0add1602b5af/scratchpad/cpp-eval/fmt-repo' 7856add61a38fcfead6636569d33e4bbf57881a5 208219daff58f2a7438f6931cc2ddc358acf33ef`
+changed_files (git diff A..B): 8 -> [".github/workflows/macos.yml", "ChangeLog.md", "include/fmt/compile.h", "include/fmt/format.h", "include/fmt/std.h", "test/compile-test.cc", "test/format-test.cc", "test/std-test.cc"]
+full_outcome: snapshots=4629 edges=3038 import_facts=36 impl_facts=0 call_attempts=4203
+incremental_outcome: snapshots=5343 edges=3038 import_facts=36 impl_facts=0 call_attempts=4203
+
+RESULT: PARITY CONFIRMED -- zero divergences across snapshots/edges/import_facts/impl_facts/call_attempts multisets (compare_full_incremental_state, the same gate the lib test suite's own gate_3_full_equals_incremental_exact_state uses).

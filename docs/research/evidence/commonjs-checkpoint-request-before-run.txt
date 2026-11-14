@@ -1,0 +1,106 @@
+=== B2-EVAL-010: JavaScript/CommonJS domain standalone evaluation (request/request) ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\commonjs-checkpoint\request
+commit: 3c0cddc7c8eb60b470e9519da85896ed7ee0081e
+
+--- A. Corpus metrics ---
+total_files_in_commit (scoped: request.js, index.js, lib/*.js): 13
+files_supported (parser available): 13
+files_parsed: 13
+files_with_error_nodes: 0
+parse_failures: 0
+total_loc (newline count, parsed files): 2991
+raw_candidates_total: 40
+rejections_total: 0
+snapshots_promoted: 40
+  Function: 40
+
+--- B. Raw-parse proxies: CommonJS shapes (real AST, not extraction-dependent) ---
+raw_total_call_expressions (every call_expression node, library files only): 670
+raw_require_calls (require(...) call sites, any shape): 61
+  raw_require_relative (require('./x') -- same-repo target): 15
+  raw_require_package (require('pkg') -- external/node_modules target): 46
+  raw_require_destructured (const { a, b } = require('x')): 0
+require_call_examples (first 10): ["index.js:143: require('./request')", "index.js:19: require('./lib/helpers')", "index.js:18: require('./lib/cookies')", "index.js:17: require('extend')", "lib/auth.js:5: require('./helpers')", "lib/auth.js:4: require('uuid/v4')", "lib/auth.js:3: require('caseless')", "lib/cookies.js:3: require('tough-cookie')", "lib/har.js:6: require('extend')", "lib/har.js:5: require('har-validator')"]
+raw_exports_property_function_expressions (exports.foo = function (...) {...}): 4
+raw_module_exports_function_expression (module.exports = function (...) {...}): 0
+raw_module_exports_whole_identifier (module.exports = SomeIdentifier -- resolvable via existing function_declaration/class_declaration extraction): 3
+invisible_exports_function_examples (exports.X = function(){} sites -- real functions, zero extracted candidate, first 10): ["lib/cookies.js:36: exports.jar", "lib/cookies.js:8: exports.parse", "lib/hawk.js:46: exports.header", "lib/hawk.js:21: exports.calculateMac"]
+dropped call-site callee kinds (callee_name()-equivalent returns None): []
+
+real_import_facts_extracted (ESM import_statement-based ONLY; collect_js_import has no require(...) handling, confirmed by direct source read of imports.rs): 0
+
+--- C. Structural edges ---
+  Calls: 12
+resolution_method breakdown (all edge kinds combined):
+  StaticAnalysis: 12
+
+--- D. Calls resolution taxonomy (EvidenceTier) ---
+resolved Calls edges by tier:
+  Resolved: 12
+total_call_attempts (negative knowledge): 68
+  Ambiguous: 0
+  Unresolved: 68
+
+--- D2. UnresolvedReason distribution ---
+  Unknown: 68
+
+--- E. require() call sites: do they produce a CallAttempt against a nonexistent 'require' snapshot? ---
+CallAttempts with callee_name == 'require': 0
+resolved Calls edges targeting a snapshot literally named 'require': 0 (must be 0 -- require is a host built-in, never declared in this corpus)
+
+--- F. Ground-truth ID of the invisible exports.X = function(){} gap: cross-file call sites targeting a never-extracted function ---
+  real call site: request.js:39 `cookies.jar()` (file=request.js) -> real_decl_count_for_"jar"=0 resolved_edges=0 call_attempts=0
+  real call site: index.js:76 `cookies.jar(store)` (file=index.js) -> real_decl_count_for_"jar"=0 resolved_edges=0 call_attempts=0
+  real call site: index.js:80 `cookies.parse(str)` (file=index.js) -> real_decl_count_for_"parse"=0 resolved_edges=0 call_attempts=0
+  real call site: request.js:1422 `hawk.header(self.uri, self.method, opts)` (file=request.js) -> real_decl_count_for_"header"=0 resolved_edges=0 call_attempts=0
+
+--- G. Full index timing ---
+full_index_elapsed: 44.9155ms
+real_instantiates_edges: 0
+real_contains_edges: 0
+real_extends_edges: 0
+
+--- H. Ground-truth spot checks (named helpers.js multi-export functions, resolvable without the require-alias gap since they share no name collisions) ---
+  name="paramsHaveRequestBody" real_decl_count=1 resolved_edges=1 call_attempts=0 attempt_tiers=[]
+  name="safeStringify" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="isReadStream" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="toBase64" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="copy" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="defer" real_decl_count=0 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="md5" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+
+--- H2. MAJOR finding: Request.prototype.X = function(){} (ES5 class-method idiom) is ALSO invisible, same root cause as section F, much larger magnitude ---
+real Request.prototype.X = function(){} declarations in request.js: 27
+invisible (zero extracted snapshot) out of 27: 27
+false_edge_count (edge resolved to a wrong target despite zero real decl): 0 (must be 0 for this to remain an honest silent-drop, not a correctness defect)
+snapshots_promoted total (for context -- the entire real Request class's own method surface is excluded from this count): 40
+
+--- H3. Ground-truth sample support: per-name decl/edge/attempt for index.js's own fully-enumerated call sites ---
+  name="initParams" real_decl_count=1 resolved_edges=3 call_attempts=0
+  name="paramsHaveRequestBody" real_decl_count=1 resolved_edges=1 call_attempts=0
+  name="verbFunc" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="wrapRequestMethod" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="extend" real_decl_count=0 resolved_edges=0 call_attempts=3
+  name="cookies.jar (as 'jar')" real_decl_count=0 resolved_edges=0 call_attempts=0
+  name="jar" real_decl_count=0 resolved_edges=0 call_attempts=0
+  name="parse" real_decl_count=0 resolved_edges=0 call_attempts=0
+  name="request" real_decl_count=1 resolved_edges=1 call_attempts=0
+  name="defaults" real_decl_count=0 resolved_edges=0 call_attempts=0
+  name="constructTunnelFnName" real_decl_count=1 resolved_edges=1 call_attempts=0
+  name="getTunnelFn" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="constructProxyHeaderWhiteList" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="constructProxyHost" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="constructTunnelOptions" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="Har" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="OAuth" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="Multipart" real_decl_count=1 resolved_edges=0 call_attempts=0
+  name="safeStringify" real_decl_count=1 resolved_edges=0 call_attempts=0
+
+--- I. Agent usefulness + reliability simulation (real data, real agent_policy::evaluate) ---
+Q1: 'who calls cookies.jar() (a real, repeatedly-called cross-file function)?' -> real answer, per the invisible-export gap: NO ANSWER AT ALL -- the function itself was never extracted as a candidate (exports.jar = function (store) {...} in lib/cookies.js), so it cannot appear as a call target, an Ambiguous CallAttempt, or an Unresolved CallAttempt. An agent asking this gets silent absence for a function that is REAL, EXPORTED, and CALLED TWICE in this corpus.
+
+Q2: 'does require("./helpers") get treated as an import I can trust for alias resolution?' -> real answer: NO -- confirmed 0 ImportFacts from any require() call in this corpus (collect_js_import only matches import_statement). A caller using `var helpers = require('./helpers')` then `helpers.foo()` falls through to plain NameHeuristic/ambiguous name-based resolution exactly as it would pre-CALL-RES-A4 (no regression, no false edge -- but also no alias-aware precision gain CommonJS code would benefit from).
+
+Q3: 'what helper functions exist with real multi-export files (e.g. helpers.js)?' -> real answer: for `named function`/`function_declaration`-style exports (not `exports.X = function(){}`-style), snapshot lookup by name works correctly and is reliable -- see section H above: all 7 sampled helpers.js functions are real, individually-declared, and correctly found. This shows the gap is SPECIFIC to anonymous function-expression-assigned-to-property, not a general CommonJS extraction failure.
+
+=== END ===

@@ -1,0 +1,31 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 0.60s
+     Running `target\release\examples\call_res_a4_perf_measurement.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\b2-eval-010\request' be7882b0bb6cdb0971f76c2a5b11d5a8767a22e1 df346d8531ac4b8c360df301f228d5767d0e374e 10`
+=== CALL-RES-A4 performance measurement ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\b2-eval-010\request
+commit_a (full-index target): be7882b0bb6cdb0971f76c2a5b11d5a8767a22e1
+commit_b (incremental target): df346d8531ac4b8c360df301f228d5767d0e374e
+timed_runs: 10 (plus 1 discarded warm-up run)
+changed_files (git diff A..B): 3 files
+
+--- warm-up run (discarded) ---
+warm-up full: 229.5747ms, incremental: 35.368ms, edges_a: 42, edges_b: 42
+
+--- 10 timed runs ---
+run 0: full=216.8141ms incremental=35.0992ms edges_a=42 edges_b=42
+run 1: full=212.7303ms incremental=35.1255ms edges_a=42 edges_b=42
+run 2: full=214.3296ms incremental=35.3267ms edges_a=42 edges_b=42
+run 3: full=212.1652ms incremental=35.4648ms edges_a=42 edges_b=42
+run 4: full=220.7061ms incremental=35.4398ms edges_a=42 edges_b=42
+run 5: full=210.7906ms incremental=35.4733ms edges_a=42 edges_b=42
+run 6: full=199.9852ms incremental=33.2384ms edges_a=42 edges_b=42
+run 7: full=196.4485ms incremental=33.301ms edges_a=42 edges_b=42
+run 8: full=194.8662ms incremental=33.3375ms edges_a=42 edges_b=42
+run 9: full=190.6825ms incremental=33.1419ms edges_a=42 edges_b=42
+
+--- Summary ---
+full_index: median=211.4779ms min=190.6825ms max=220.7061ms (range=30.0236ms)
+incremental_index: median=35.11235ms min=33.1419ms max=35.4733ms (range=2.3314ms)
+edge_count_a (full, all runs): [42, 42, 42, 42, 42, 42, 42, 42, 42, 42]
+edge_count_b (incremental, all runs): [42, 42, 42, 42, 42, 42, 42, 42, 42, 42]
+edge_count_stability: full=true, incremental=true (true means every run produced identical output, confirming timing variance is not masking a correctness difference)

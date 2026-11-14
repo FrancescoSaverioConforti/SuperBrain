@@ -1,0 +1,30 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `target\release\examples\call_res_a4_perf_measurement.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/d0963c5f-908d-4243-bcbc-0add1602b5af/scratchpad/cpp-eval/fmt-repo' 7856add61a38fcfead6636569d33e4bbf57881a5 208219daff58f2a7438f6931cc2ddc358acf33ef 10`
+=== CALL-RES-A4 performance measurement ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\d0963c5f-908d-4243-bcbc-0add1602b5af\scratchpad\cpp-eval\fmt-repo
+commit_a (full-index target): 7856add61a38fcfead6636569d33e4bbf57881a5
+commit_b (incremental target): 208219daff58f2a7438f6931cc2ddc358acf33ef
+timed_runs: 10 (plus 1 discarded warm-up run)
+changed_files (git diff A..B): 8 files
+
+--- warm-up run (discarded) ---
+warm-up full: 1.5005681s, incremental: 1.3096258s, edges_a: 3038, edges_b: 3038
+
+--- 10 timed runs ---
+run 0: full=1.4661036s incremental=1.3514302s edges_a=3038 edges_b=3038
+run 1: full=1.4450998s incremental=1.3188668s edges_a=3038 edges_b=3038
+run 2: full=1.4431821s incremental=1.2989163s edges_a=3038 edges_b=3038
+run 3: full=1.4829791s incremental=1.3049262s edges_a=3038 edges_b=3038
+run 4: full=1.4911943s incremental=1.3412347s edges_a=3038 edges_b=3038
+run 5: full=1.5123944s incremental=1.3183313s edges_a=3038 edges_b=3038
+run 6: full=1.4512218s incremental=1.3153539s edges_a=3038 edges_b=3038
+run 7: full=1.4536763s incremental=1.3300097s edges_a=3038 edges_b=3038
+run 8: full=1.4865081s incremental=1.3182361s edges_a=3038 edges_b=3038
+run 9: full=1.479187s incremental=1.2934126s edges_a=3038 edges_b=3038
+
+--- Summary ---
+full_index: median=1.4726453s min=1.4431821s max=1.5123944s (range=69.2123ms)
+incremental_index: median=1.3182837s min=1.2934126s max=1.3514302s (range=58.0176ms)
+edge_count_a (full, all runs): [3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038]
+edge_count_b (incremental, all runs): [3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038, 3038]
+edge_count_stability: full=true, incremental=true (true means every run produced identical output, confirming timing variance is not masking a correctness difference)

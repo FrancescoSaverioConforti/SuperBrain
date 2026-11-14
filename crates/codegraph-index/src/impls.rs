@@ -1,0 +1,1070 @@
+//! B2-ID-008, Task 1: raw `impl` block extraction — a non-symbol
+//! "structural fact," following exactly the same architectural pattern
+//! `imports.rs` already established for file-level import facts (see
+//! `imports.rs`'s own doc comment for the full rationale, which applies
+//! here unchanged): a real Rust `impl` block is not "owned" by any one
+//! symbol it contains, so it is modeled as its own fact type rather than
+//! forced into `Edge { from: SymbolSnapshotId, .. }`.
+//!
+//! # The exact defect this module fixes
+//!
+//! `docs/research/findings/B2-ID-008.md` found that Rust `impl` blocks
+//! are never extracted as symbols at all (`extract::rust` recognizes
+//! `struct_item`/`enum_item`/`trait_item`/`function_item`/
+//! `function_signature_item`, but no `impl_item`), so trait-implementation
+//! relationships are entirely invisible to this pipeline. This module
+//! does not change `extract::rust` or introduce a new `SymbolKind` —
+//! that would wrongly claim an `impl` block is itself a named,
+//! independently-addressable symbol, which it is not (it has no name of
+//! its own; `impl Trait for Type` is a relationship between two other
+//! symbols). Instead, [`extract_impl_statements`] extracts `impl_item`
+//! nodes directly from the whole-file tree, exactly the same
+//! file/module-level granularity `imports.rs` already uses for the same
+//! reason (see `imports.rs`'s own "Why a separate model, not an `Edge`"
+//! section) — an `impl` block is no more "owned" by one symbol in the
+//! file than an import statement is.
+//!
+//! # Named-field extraction only — never a positional search
+//!
+//! A grammar probe (confirmed by direct parse against this workspace's
+//! `tree_sitter_rust` version, not assumed) showed `impl_item` exposes
+//! two named fields: `"trait"` (present only for a trait impl, e.g.
+//! `impl Trait for Type`) and `"type"` (always present — the
+//! implementing type). The `"type"` field's own node kind varies: a
+//! plain type is a `type_identifier` directly; a parameterized type
+//! (`impl<T> Container<T>`) is a `generic_type` whose OWN first child is
+//! the base type's `type_identifier` (`generic_type`'s text is the full
+//! `"Container<T>"`; this module extracts only the base name
+//! `"Container"`). This module always reads these two fields via
+//! `child_by_field_name`, NEVER via a positional search for a
+//! `type_identifier` child — a positional search is exactly the bug
+//! class B2-ID-008 is scoped to fix (the same mistake, if made here,
+//! would misidentify the TRAIT's own `type_identifier` as the
+//! implementing type, or vice versa, whenever both are plain
+//! `type_identifier` nodes at the same syntactic depth).
+//!
+//! # Scope boundary: raw syntax only, Rust only
+//!
+//! [`extract_impl_statements`] itself is pure syntax extraction, like
+//! `extract_import_statements`: no resolution against a symbol-snapshot
+//! pool, no `Edge` construction. Only `Language::Rust` is wired into its
+//! language dispatch; generalizing to another language's own
+//! impl/trait-ish syntax is explicitly out of scope for B2-ID-008.
+//!
+//! # Task 2: `ImplFact` resolution and derived `Implements` edges
+//!
+//! [`ImplFact`] is [`RawImplStatement`]'s resolved counterpart, mirroring
+//! `imports.rs`'s own `RawImportStatement` -> `ImportFact` shape exactly:
+//! [`resolve_impl_facts`]/[`resolve_raw_impl_statements`] look up
+//! `self_type_text`/`trait_type_text` by name against a given
+//! `&[SymbolSnapshot]` pool, the same lookup convention every other
+//! resolver in this crate already uses (`s.name().as_str() == text`).
+//! [`ImplTargetResolution`] mirrors `ImportResolution`'s own
+//! Resolved/zero-candidates/ambiguous three-way shape, renamed from
+//! `ImportResolution`'s own vocabulary (`Internal`/`External`) because
+//! `ImplFact` is a different context: "External" specifically connotes
+//! "this import names something outside the repository" in `imports.rs`,
+//! which is not quite what "an impl's trait/self-type name was not found
+//! in the given pool" means here, so this module uses its own
+//! `Resolved`/`Unresolved`/`Ambiguous` names instead.
+//!
+//! An inherent impl (`impl Type { .. }`, no `for` clause) has
+//! `trait_type_text: None`, and `ImplFact::trait_resolution` is `None` to
+//! match — never `Some(Unresolved)`. There is no trait to resolve at all
+//! for an inherent impl, which is a different claim from "a trait was
+//! named but not found," so this module keeps the two distinguishable at
+//! the type level rather than collapsing "no trait" and "unresolved
+//! trait" into the same `Unresolved` representation.
+//!
+//! [`resolve_implements_from_impl_facts`] is the one piece with no
+//! `imports.rs` equivalent: imports never produce `Edge`s (see this
+//! module's own first section above, and `imports.rs`'s own "Why a
+//! separate model, not an `Edge`" section, for why), but a real `impl
+//! Trait for Type` block IS a genuine, syntactically certain
+//! trait-implementation relationship between two symbols, so — unlike
+//! `ImportFact` — `ImplFact` has a derived-edge step. It emits one
+//! `EdgeKind::Implements` edge per `ImplFact` whose self-type AND trait
+//! both resolved to exactly one candidate each, built with
+//! `ResolutionMethod::StaticAnalysis` evidence via the exact same
+//! underlying `codegraph_domain::Evidence::new` call
+//! `edges::resolution::resolved_evidence` wraps (that helper itself is
+//! `pub(super)` to the `edges` module and not reachable from here, so
+//! this module calls the domain constructor directly rather than
+//! widening that helper's visibility — see [`implements_evidence`]'s own
+//! doc comment). An inherent impl (`trait_resolution: None`) never
+//! reaches this function's edge-emitting branch at all, since there is
+//! no `Some(Resolved(trait_id))` to match — confirmed by a dedicated
+//! test, not just absence-by-omission in another test.
+
+use codegraph_domain::{Evidence, FileIdentity, ResolutionMethod, SymbolSnapshotId};
+use thiserror::Error;
+
+use crate::edges::Edge;
+use crate::extract::ByteSpan;
+use crate::imports::reject_duplicate_ids;
+use crate::parse::Language;
+use crate::snapshot::SymbolSnapshot;
+
+/// One syntactically-extracted `impl` block, before any resolution
+/// against a symbol-snapshot pool. `self_type_text` is always the base
+/// type name only (generic arguments stripped, e.g. `"Container"` for
+/// `impl<T> Container<T>`, never the full `"Container<T>"` text).
+/// `trait_type_text` is `None` for an inherent impl (`impl Type { .. }`)
+/// and `Some` for a trait impl (`impl Trait for Type { .. }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawImplStatement {
+    pub self_type_text: String,
+    pub trait_type_text: Option<String>,
+    pub has_generics: bool,
+    pub has_lifetime_params: bool,
+    pub span: ByteSpan,
+    pub associated_items: Vec<AssociatedItemFact>,
+}
+
+/// One item declared directly inside a specific `impl` block (not
+/// resolved against anything — just "this impl block's own
+/// `declaration_list` contains a function_item shaped like this").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociatedItemFact {
+    pub name: String,
+    pub kind: AssociatedItemKind,
+    pub span: ByteSpan,
+}
+
+/// Which of the two shapes this plan's scope distinguishes an
+/// associated `function_item` as. Deliberately only two variants: see
+/// this module's module-level doc comment and the plan's own Task 1
+/// brief for why a third "default trait method" variant is explicitly
+/// out of scope here (that distinction belongs to the trait's own
+/// declaration, not to what one specific impl block declares).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssociatedItemKind {
+    /// A `function_item` whose `parameters` child has a `self_parameter`
+    /// child — takes a receiver (`&self`, `&mut self`, or by-value
+    /// `self`).
+    Method,
+    /// A `function_item` with a body but no receiver parameter — the
+    /// `DirEntry::normal`/`CommandSet::new` constructor shape.
+    AssociatedFunction,
+}
+
+/// Extracts every `impl` block found anywhere in `tree` (the WHOLE
+/// file's own parse tree — not one symbol's signature text; see this
+/// module's doc comment for why that granularity matches
+/// `extract_import_statements`'s own). Pure syntax extraction: never
+/// resolves `self_type_text`/`trait_type_text` against anything: this
+/// function alone never consults a symbol-snapshot pool.
+pub fn extract_impl_statements(tree: &crate::parse::ParseTree) -> Vec<RawImplStatement> {
+    let mut out = Vec::new();
+    walk_for_impls(tree.tree().root_node(), tree.source(), tree.language(), &mut out);
+    out
+}
+
+fn walk_for_impls(node: tree_sitter::Node, source: &[u8], language: Language, out: &mut Vec<RawImplStatement>) {
+    if language == Language::Rust {
+        collect_rust_impl(node, source, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_impls(child, source, language, out);
+    }
+}
+
+fn collect_rust_impl(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawImplStatement>) {
+    if node.kind() != "impl_item" {
+        return;
+    }
+    let Some(type_field) = node.child_by_field_name("type") else {
+        // No "type" field at all is not a shape a well-formed
+        // `impl_item` can produce (confirmed by direct parse across
+        // every fixture this module's own tests cover); prefer omitting
+        // the fact over fabricating a self type, mirroring
+        // `extract::rust`'s own "prefer omit over false certainty"
+        // policy for a missing expected name.
+        return;
+    };
+    let Some(self_type_text) = base_type_name(type_field, source) else {
+        return;
+    };
+
+    let trait_type_text = node.child_by_field_name("trait").and_then(|trait_field| base_type_name(trait_field, source));
+
+    let type_parameters = node.children(&mut node.walk()).find(|c| c.kind() == "type_parameters");
+    let has_generics = type_parameters.is_some();
+    let has_lifetime_params = type_parameters.is_some_and(|tp| tp.children(&mut tp.walk()).any(|c| c.kind() == "lifetime_parameter"));
+
+    // The `.or_else` fallback below is defensive code for a hypothetical
+    // parse shape where `child_by_field_name("body")` is `None` but a
+    // `declaration_list` child still exists positionally. Task 5's own
+    // mutation-testing pass (B2-ID-008) directly probed this with
+    // tree-sitter-rust across five real shapes — an empty trait impl
+    // body (`impl Eq for D {}`), a syntactically malformed impl missing
+    // its body entirely, an `unsafe impl`, a `where`-clause impl, and an
+    // impl preceded by an attribute — and confirmed, in every case,
+    // EITHER `body` is `Some(declaration_list)` directly (the fallback
+    // is never reached) OR `body` is `None` AND no `declaration_list`
+    // sibling exists either (the fallback finds nothing, same
+    // `unwrap_or_default()` outcome as skipping straight to it). No
+    // input tree-sitter-rust can produce makes `.or_else`'s own `find`
+    // predicate (`c.kind() == "declaration_list"` vs. a mutated
+    // `!=`) observably different: this is why a `cargo mutants` run
+    // flipping that `==` to `!=` is a genuinely EQUIVALENT mutant, not a
+    // real test gap — confirmed by direct multi-shape probing, not
+    // asserted without evidence.
+    let associated_items = node
+        .child_by_field_name("body")
+        .or_else(|| node.children(&mut node.walk()).find(|c| c.kind() == "declaration_list"))
+        .map(|body| collect_associated_items(body, source))
+        .unwrap_or_default();
+
+    out.push(RawImplStatement {
+        self_type_text,
+        trait_type_text,
+        has_generics,
+        has_lifetime_params,
+        span: ByteSpan::from_node(&node),
+        associated_items,
+    });
+}
+
+/// Extracts the base type name out of a `type`-field or `trait`-field
+/// node: directly for a `type_identifier`; from its OWN first
+/// `type_identifier` child for a `generic_type` (never the full
+/// `"Name<Args>"` text); and, for a `scoped_type_identifier` (a path
+/// like `fmt::Display`, `clap::Args`, or `crate::patterns::Matcher`),
+/// the LAST segment only — the real trait/type name, e.g. `"Display"`
+/// out of `fmt::Display` — confirmed via a direct parse against this
+/// workspace's own `tree_sitter_rust` version: `scoped_type_identifier`
+/// always has its own final segment as a direct `type_identifier`
+/// child (`std::fmt::Display` parses as `scoped_type_identifier`
+/// containing a nested `scoped_identifier` ("std::fmt") followed by a
+/// `type_identifier` ("Display") — never positionally searched, since
+/// `children().last()`-of-kind is unambiguous here: exactly one
+/// `type_identifier` child exists at this node's own depth, the final
+/// path segment). This mirrors `imports.rs`'s own `last_segment` helper
+/// (used for Python/Rust dotted-or-scoped import paths) at the
+/// identical "take the last segment of a scoped name" need — before
+/// this fix, a `scoped_type_identifier` trait field (e.g. `impl
+/// fmt::Display for X`) returned `None` here, which incorrectly made a
+/// REAL trait impl look inherent (I1, final-review finding). Returns
+/// `None` for any other node kind (e.g. a primitive type used as a
+/// trait/self type) — prefer omitting the fact over guessing at an
+/// unconfirmed shape.
+fn base_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => Some(text_of(node, source)),
+        "generic_type" => {
+            let mut cursor = node.walk();
+            let base = node.children(&mut cursor).find(|c| c.kind() == "type_identifier")?;
+            Some(text_of(base, source))
+        }
+        "scoped_type_identifier" => {
+            let mut cursor = node.walk();
+            let last_segment = node.children(&mut cursor).filter(|c| c.kind() == "type_identifier").last()?;
+            Some(text_of(last_segment, source))
+        }
+        _ => None,
+    }
+}
+
+fn collect_associated_items(declaration_list: tree_sitter::Node, source: &[u8]) -> Vec<AssociatedItemFact> {
+    let mut out = Vec::new();
+    let mut cursor = declaration_list.walk();
+    for child in declaration_list.children(&mut cursor) {
+        if child.kind() != "function_item" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let name = text_of(name_node, source);
+        let kind = classify_associated_item(child);
+        out.push(AssociatedItemFact {
+            name,
+            kind,
+            span: ByteSpan::from_node(&child),
+        });
+    }
+    out
+}
+
+fn classify_associated_item(function_item: tree_sitter::Node) -> AssociatedItemKind {
+    let has_receiver = function_item
+        .child_by_field_name("parameters")
+        .is_some_and(|params| params.children(&mut params.walk()).any(|c| c.kind() == "self_parameter"));
+    if has_receiver {
+        AssociatedItemKind::Method
+    } else {
+        AssociatedItemKind::AssociatedFunction
+    }
+}
+
+fn text_of(node: tree_sitter::Node, source: &[u8]) -> String {
+    node.utf8_text(source).unwrap_or("").to_string()
+}
+
+/// One `impl` block's resolved, semantic shape — [`RawImplStatement`]'s
+/// counterpart after resolving its two name fields against a
+/// `&[SymbolSnapshot]` pool. `associated_items` is carried through
+/// unchanged from the raw statement (Task 1 already extracted it; this
+/// task does not re-derive or re-validate it). `trait_resolution` is
+/// `None` exactly when `trait_type_text` is `None` — an inherent impl has
+/// no trait to resolve at all, which is a distinct claim from "a trait
+/// was named but could not be resolved" ([`ImplTargetResolution::Unresolved`]).
+///
+/// # No separate identity/id field (I4, final-review finding)
+///
+/// Task 2's own original brief specified a `deterministic_impl_fact_id`
+/// function (a stable hash over `defining_file` + `span` +
+/// `self_type_text` + `trait_type_text`) for this struct's own
+/// identity/dedup needs. It is deliberately NOT implemented, as a
+/// considered decision rather than an oversight: a direct read of every
+/// place `ImplFact` is actually used (`impls.rs` itself,
+/// `incremental/indexer.rs`, `incremental/pipeline.rs` — confirmed by
+/// grep, no other call site exists) shows no identity-dependent
+/// operation on `ImplFact` as a whole anywhere in this codebase.
+/// - There is no cross-commit lineage for `ImplFact` (unlike
+///   `SymbolSnapshot`, which needs `SymbolLineageId` to link a renamed
+///   symbol's old and new snapshots across commits) — `impl_facts` is
+///   always fully recomputed from the raw-statement set on every
+///   `observe_commit` call (see `RepositoryState`'s own doc comment in
+///   `indexer.rs`), never diffed against a PRIOR commit's own
+///   `ImplFact`s by identity.
+/// - There is no `ImplFact`-level deduplication need beyond what
+///   `derive(PartialEq, Eq)` on this struct already gives for free: the
+///   one real dedup this module performs,
+///   [`resolve_implements_from_impl_facts`]'s own `seen_pairs` check, is
+///   keyed on the much narrower `(self_id, trait_id)` — the DERIVED
+///   edge's own identity, not the whole fact's — and does not need (or
+///   want) a hash over `span`/`defining_file`, since two syntactically
+///   distinct impl blocks for the same (type, trait) pair must still
+///   collapse to one edge regardless of where either impl block is
+///   textually located.
+///
+/// If a future caller ever needs stable cross-call `ImplFact` identity
+/// (e.g. a future incremental-reuse optimization for `impl_facts`
+/// itself, mirroring `ImportFact`'s own documented residual limitation),
+/// add `deterministic_impl_fact_id` then, driven by that caller's own
+/// real requirement — not preemptively here, where it would be dead
+/// code with no test that could ever meaningfully exercise it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplFact {
+    pub defining_file: FileIdentity,
+    pub span: ByteSpan,
+    pub self_type_text: String,
+    pub trait_type_text: Option<String>,
+    pub has_generics: bool,
+    pub has_lifetime_params: bool,
+    pub associated_items: Vec<AssociatedItemFact>,
+    pub self_type_resolution: ImplTargetResolution,
+    pub trait_resolution: Option<ImplTargetResolution>,
+}
+
+/// How one name field of an [`ImplFact`] (`self_type_text` or
+/// `trait_type_text`) resolves against a given candidate pool. Mirrors
+/// `ImportResolution`'s own three-way shape (see this module's own doc
+/// comment for why the variants are named differently here rather than
+/// reusing `Internal`/`External`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImplTargetResolution {
+    /// Exactly one candidate in the given pool matched this name.
+    Resolved(SymbolSnapshotId),
+    /// Zero candidates matched — e.g. the trait/type is external
+    /// (imported from another crate, or simply not in the given pool),
+    /// exactly like `ImportResolution::External`'s own meaning.
+    Unresolved,
+    /// More than one candidate in the given pool shares this name —
+    /// never arbitrarily picked, per this crate's "no edge beats a false
+    /// edge" discipline.
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ImplFactError {
+    #[error("duplicate SymbolSnapshotId in the candidate pool: a caller must never include the same snapshot twice")]
+    DuplicateSnapshotId,
+}
+
+/// Resolves every `impl` block extracted from `defining_file`'s own
+/// full-file `tree` against `snapshots` — the convenience wrapper over
+/// one file's tree, mirroring `resolve_import_facts`'s own shape exactly.
+pub fn resolve_impl_facts(defining_file: &FileIdentity, tree: &crate::parse::ParseTree, snapshots: &[SymbolSnapshot]) -> Result<Vec<ImplFact>, ImplFactError> {
+    let raw_statements: Vec<(FileIdentity, RawImplStatement)> = extract_impl_statements(tree).into_iter().map(|s| (defining_file.clone(), s)).collect();
+    resolve_raw_impl_statements(&raw_statements, snapshots)
+}
+
+/// The global semantic resolution phase: takes already-extracted,
+/// already-paired `(defining_file, RawImplStatement)` facts — possibly
+/// from many files — and resolves each one's `self_type_text`/
+/// `trait_type_text` against `snapshots`, the full current pool, by NAME
+/// (`s.name().as_str() == text`), the same lookup convention every other
+/// resolver in this crate and `imports.rs` already use. Mirrors
+/// `resolve_raw_import_statements`'s own two-function split for the same
+/// reason: extraction is per-file and can run incrementally; resolution
+/// always needs the complete, repository-wide pool.
+pub fn resolve_raw_impl_statements(raw_statements: &[(FileIdentity, RawImplStatement)], snapshots: &[SymbolSnapshot]) -> Result<Vec<ImplFact>, ImplFactError> {
+    reject_duplicate_ids(snapshots).map_err(|_| ImplFactError::DuplicateSnapshotId)?;
+
+    let mut facts = Vec::with_capacity(raw_statements.len());
+    for (defining_file, statement) in raw_statements {
+        let self_type_resolution = resolve_target_by_name(&statement.self_type_text, snapshots, TargetRole::SelfType);
+        let trait_resolution = statement.trait_type_text.as_ref().map(|trait_name| resolve_target_by_name(trait_name, snapshots, TargetRole::Trait));
+
+        facts.push(ImplFact {
+            defining_file: defining_file.clone(),
+            span: statement.span,
+            self_type_text: statement.self_type_text.clone(),
+            trait_type_text: statement.trait_type_text.clone(),
+            has_generics: statement.has_generics,
+            has_lifetime_params: statement.has_lifetime_params,
+            associated_items: statement.associated_items.clone(),
+            self_type_resolution,
+            trait_resolution,
+        });
+    }
+
+    Ok(facts)
+}
+
+/// Which of an `ImplFact`'s two name fields a given [`resolve_target_by_name`]
+/// call is resolving — I3 (final-review Important finding): resolving
+/// EITHER name field by text alone, with no `SymbolKind` check, risks a
+/// false match when an unrelated candidate of the WRONG kind happens to
+/// share the name (e.g. `impl Error for ParseError {}` in a crate that
+/// also defines `pub enum Error` — a plain by-name lookup would resolve
+/// the trait name to the enum). Each role narrows which `SymbolKind`s
+/// count as a real candidate at all for that field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetRole {
+    /// `trait_type_text`'s own field — only a `SymbolKind::Interface`
+    /// candidate (Rust's trait mapping, confirmed in
+    /// `extract::rust`/`snapshot::promote`) counts; anything else
+    /// sharing the name is treated as not a candidate at all, never as
+    /// a false match and never as a spurious `Ambiguous`.
+    Trait,
+    /// `self_type_text`'s own field — only a `SymbolKind::Struct` or
+    /// `SymbolKind::Enum` candidate counts, mirroring the trait role's
+    /// own discipline for the implementing type's two real Rust shapes.
+    SelfType,
+}
+
+impl TargetRole {
+    fn accepts(self, kind: codegraph_domain::SymbolKind) -> bool {
+        use codegraph_domain::SymbolKind;
+        match self {
+            TargetRole::Trait => kind == SymbolKind::Interface,
+            TargetRole::SelfType => matches!(kind, SymbolKind::Struct | SymbolKind::Enum),
+        }
+    }
+}
+
+/// Resolves `name` against `snapshots` by name AND `role`'s own
+/// `SymbolKind` filter (I3 fix): a same-named candidate whose
+/// `SymbolKind` does not match `role` is excluded from the candidate
+/// set entirely — never picked as a false match, and never counted
+/// towards `Ambiguous` either, since it is not a genuine candidate for
+/// this field at all. This can only ever narrow the result relative to
+/// the old by-name-only behavior (fewer or equal candidates survive the
+/// filter), so a name with exactly one correctly-kinded candidate still
+/// resolves `Resolved` exactly as before; only a name whose ONLY
+/// same-named match is the wrong kind now correctly reports
+/// `Unresolved` instead of silently matching it.
+fn resolve_target_by_name(name: &str, snapshots: &[SymbolSnapshot], role: TargetRole) -> ImplTargetResolution {
+    let candidates: Vec<&SymbolSnapshot> = snapshots.iter().filter(|s| s.name().as_str() == name && role.accepts(s.kind())).collect();
+    match candidates.len() {
+        1 => ImplTargetResolution::Resolved(candidates[0].id()),
+        0 => ImplTargetResolution::Unresolved,
+        _ => ImplTargetResolution::Ambiguous,
+    }
+}
+
+/// The derived-edge step with no `imports.rs` equivalent (see this
+/// module's own doc comment): for each `ImplFact` whose
+/// `trait_resolution` is `Some(ImplTargetResolution::Resolved(trait_id))`
+/// AND whose `self_type_resolution` is `ImplTargetResolution::Resolved(self_id)`,
+/// emits one `Edge { from: self_id, to: trait_id, kind: EdgeKind::Implements, .. }`.
+/// An inherent impl (`trait_resolution: None`) can never match the first
+/// condition, so it never reaches the `edges.push` below — confirmed by
+/// a dedicated test (`inherent_impl_produces_zero_implements_edges`), not
+/// just absence-by-omission in another test. Deduplicates by `(from,
+/// to)`: per [B2-ID-002](../../../docs/research/findings/B2-ID-002.md)'s
+/// "one edge per semantic relation, never one per syntactic occurrence"
+/// discipline, if the same type were to implement the same trait via more
+/// than one impl block (not valid Rust, but this pipeline parses source
+/// that may not compile, so defensive code does not assume the input is
+/// always compiler-valid), this collapses to one edge, not two.
+pub fn resolve_implements_from_impl_facts(facts: &[ImplFact]) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(SymbolSnapshotId, SymbolSnapshotId)> = std::collections::HashSet::new();
+
+    for fact in facts {
+        let Some(ImplTargetResolution::Resolved(trait_id)) = fact.trait_resolution else {
+            continue;
+        };
+        let ImplTargetResolution::Resolved(self_id) = fact.self_type_resolution else {
+            continue;
+        };
+        if !seen_pairs.insert((self_id, trait_id)) {
+            continue;
+        }
+        edges.push(Edge {
+            from: self_id,
+            to: trait_id,
+            kind: codegraph_domain::EdgeKind::Implements,
+            evidence: implements_evidence(&format!(
+                "real `impl {} for {}` block: both the trait and self type resolved to exactly one candidate each",
+                fact.trait_type_text.as_deref().unwrap_or(""),
+                fact.self_type_text
+            )),
+        });
+    }
+
+    edges
+}
+
+/// Builds `Evidence` for a resolved `Implements` edge derived from a real
+/// `impl Trait for Type` block, always `ResolutionMethod::StaticAnalysis`
+/// with no source span — calling `codegraph_domain::Evidence::new`
+/// directly rather than `crate::edges::resolution::resolved_evidence`,
+/// because that helper is `pub(super)` (visible only inside `edges` and
+/// its submodules) and this module lives outside `edges` entirely.
+/// Widening `resolved_evidence`'s visibility was the other option
+/// considered; calling the domain constructor directly here was chosen
+/// instead as the less invasive change — it touches nothing in the
+/// `edges` module (no risk to its own "one auditable path into
+/// `StaticAnalysis` evidence" invariant for every resolver already
+/// living there) and produces the IDENTICAL result `resolved_evidence`
+/// would: the same `ResolutionMethod::StaticAnalysis`, the same `None`
+/// source span, through the same underlying `Evidence::new` call. A
+/// reader cannot tell a Rust-sourced `Implements` edge built here apart
+/// from a TypeScript-sourced one built by `resolved_evidence` in
+/// `edges::extends_implements` by its evidence shape.
+///
+/// M1 fix (final-review Minor finding): `note` is truncated to
+/// [`codegraph_domain::Evidence`]'s own 512-byte note cap (via
+/// [`truncate_to_byte_limit`]) BEFORE the `Evidence::new` call below,
+/// rather than trusting the caller's template-plus-two-identifiers
+/// construction to always stay under it. `resolve_implements_from_impl_facts`'s
+/// own note interpolates a template (~115 bytes) plus BOTH
+/// `trait_type_text` and `self_type_text` — each legally up to the
+/// identifier length cap elsewhere in this pipeline (~512 bytes) — so
+/// two long-but-legal Rust identifiers could otherwise make this exact
+/// `.expect(...)` panic for the WHOLE `observe_commit` call, unlike
+/// `edges/resolution.rs`'s own `resolved_evidence`, whose call sites
+/// each interpolate only ONE name, not two, and so cannot realistically
+/// hit this cap. The cap itself (512, in `codegraph_domain::evidence`)
+/// is unrelated, existing infrastructure and is NOT changed here — only
+/// this one call site is made safe against it.
+fn implements_evidence(note: &str) -> Evidence {
+    let bounded_note = truncate_to_byte_limit(note, MAX_EVIDENCE_NOTE_BYTES);
+    Evidence::new(ResolutionMethod::StaticAnalysis, None, &bounded_note).expect("bounded by truncate_to_byte_limit to fit Evidence's own note cap")
+}
+
+/// Mirrors `codegraph_domain::evidence`'s own private `MAX_NOTE_LEN`
+/// (512) — not reachable from here (that constant is private to its own
+/// module), so this module keeps its own copy specifically for
+/// `truncate_to_byte_limit`'s bound. If `codegraph_domain::evidence`'s
+/// own cap ever changes, this module's own fallback truncation would
+/// drift from it; `implements_evidence`'s own `.expect(...)` would then
+/// surface that mismatch immediately as a test/call-site panic rather
+/// than silently miscounting, since `Evidence::new` independently
+/// re-validates the final length against the REAL (possibly-changed)
+/// cap regardless of what this constant assumes.
+const MAX_EVIDENCE_NOTE_BYTES: usize = 512;
+
+/// Truncates `text` to at most `max_bytes` UTF-8 BYTES, cutting at the
+/// nearest character boundary at or before `max_bytes` (never splitting
+/// a multi-byte UTF-8 character, even though every real caller in this
+/// module only ever interpolates ASCII Rust identifiers) — defensive
+/// against any future caller passing non-ASCII text, not just the
+/// identifiers this plan's own scope covers today.
+fn truncate_to_byte_limit(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{LanguageParser, RustParser};
+
+    fn parse_rust(source: &str) -> crate::parse::ParseTree {
+        RustParser.parse(source.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn trait_impl_is_extracted_with_both_type_names() {
+        let tree = parse_rust("trait Trait {} struct Type; impl Trait for Type { fn foo(&self) {} }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].trait_type_text, Some("Trait".to_string()));
+        assert_eq!(facts[0].self_type_text, "Type");
+    }
+
+    #[test]
+    fn inherent_impl_has_no_trait_type_text() {
+        let tree = parse_rust("struct Type; impl Type { fn new() -> Self { Type } }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].trait_type_text, None);
+        assert_eq!(facts[0].self_type_text, "Type");
+    }
+
+    #[test]
+    fn generic_impl_strips_generic_args_from_self_type_text_and_sets_has_generics() {
+        let tree = parse_rust("struct Container<T>(T); impl<T> Container<T> { fn get(&self) -> &T { &self.0 } }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].self_type_text, "Container");
+        assert!(facts[0].has_generics);
+        assert!(!facts[0].has_lifetime_params);
+    }
+
+    #[test]
+    fn impl_with_lifetime_parameter_sets_has_lifetime_params() {
+        let tree = parse_rust("struct Holder<'a>(&'a str); impl<'a> Holder<'a> { fn get(&self) -> &'a str { self.0 } }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].has_lifetime_params);
+        assert!(facts[0].has_generics, "a lifetime parameter is still a type_parameters child");
+    }
+
+    #[test]
+    fn multiple_impl_blocks_for_the_same_type_are_extracted_as_two_separate_facts() {
+        let tree = parse_rust(
+            "trait Bar {} struct Foo; impl Foo { fn inherent_method(&self) {} } impl Bar for Foo { fn bar_method(&self) {} }",
+        );
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 2, "expected two separate RawImplStatements, never merged into one");
+        assert!(facts.iter().any(|f| f.trait_type_text.is_none() && f.self_type_text == "Foo"));
+        assert!(facts.iter().any(|f| f.trait_type_text == Some("Bar".to_string()) && f.self_type_text == "Foo"));
+    }
+
+    #[test]
+    fn multiple_traits_implemented_by_the_same_type_across_separate_blocks_each_get_their_own_fact() {
+        let tree = parse_rust("trait A {} trait B {} struct Foo; impl A for Foo { fn a(&self) {} } impl B for Foo { fn b(&self) {} }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().any(|f| f.trait_type_text == Some("A".to_string()) && f.self_type_text == "Foo"));
+        assert!(facts.iter().any(|f| f.trait_type_text == Some("B".to_string()) && f.self_type_text == "Foo"));
+    }
+
+    #[test]
+    fn one_trait_implemented_by_multiple_different_types_each_get_their_own_fact() {
+        let tree = parse_rust(
+            "trait Shape {} struct Circle; struct Square; impl Shape for Circle { fn area(&self) {} } impl Shape for Square { fn area(&self) {} }",
+        );
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().any(|f| f.trait_type_text == Some("Shape".to_string()) && f.self_type_text == "Circle"));
+        assert!(facts.iter().any(|f| f.trait_type_text == Some("Shape".to_string()) && f.self_type_text == "Square"));
+    }
+
+    #[test]
+    fn associated_items_are_correctly_classified_as_method_or_associated_function() {
+        let tree = parse_rust("struct S; impl S { fn new() -> Self { S } fn bump(&mut self) {} }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        let items = &facts[0].associated_items;
+        assert_eq!(items.len(), 2);
+        let new_item = items.iter().find(|i| i.name == "new").unwrap();
+        assert_eq!(new_item.kind, AssociatedItemKind::AssociatedFunction);
+        let bump_item = items.iter().find(|i| i.name == "bump").unwrap();
+        assert_eq!(bump_item.kind, AssociatedItemKind::Method);
+    }
+
+    #[test]
+    fn generic_trait_impl_extracts_both_names_via_named_fields_not_positional_search() {
+        // The exact shape the OLD positional-search bug would have
+        // gotten wrong: `impl<T: Display> Describe for Wrapper<T>` has
+        // a `type_identifier` ("Describe") at the same syntactic depth
+        // as `generic_type`'s own `type_identifier` ("Wrapper"). A
+        // positional "find the first type_identifier child" search
+        // would conflate the trait name with the self type (or vice
+        // versa); only `child_by_field_name("trait")` /
+        // `child_by_field_name("type")` get both right.
+        let tree = parse_rust("use std::fmt::Display; trait Describe { fn describe(&self); } struct Wrapper<T>(T); impl<T: Display> Describe for Wrapper<T> { fn describe(&self) {} }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].trait_type_text, Some("Describe".to_string()));
+        assert_eq!(facts[0].self_type_text, "Wrapper".to_string());
+    }
+
+    #[test]
+    fn a_scoped_path_trait_name_extracts_its_last_segment_not_none() {
+        // I1 (final-review Important finding): `impl std::fmt::Display
+        // for X` has its `trait` field shaped as a `scoped_type_identifier`
+        // ("std::fmt::Display"), not a plain `type_identifier` — before
+        // this fix, `base_type_name` returned `None` for that node kind
+        // entirely, which incorrectly recorded a REAL trait impl as if
+        // it were inherent (`trait_type_text: None`). The fix extracts
+        // the LAST segment of the scoped path ("Display"), mirroring
+        // `imports.rs`'s own `last_segment` convention for the identical
+        // "take the final part of a scoped/dotted name" need.
+        let tree = parse_rust("struct X; impl std::fmt::Display for X { fn fmt(&self) {} }");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].trait_type_text,
+            Some("Display".to_string()),
+            "a scoped-path trait name must resolve to its last segment, never None (which would wrongly look inherent)"
+        );
+        assert_eq!(facts[0].self_type_text, "X");
+    }
+
+    #[test]
+    fn a_crate_relative_scoped_path_trait_name_also_extracts_its_last_segment() {
+        // A second, differently-shaped scoped path (three segments,
+        // starting with `crate::`) to confirm the fix is not narrowly
+        // tied to the two-segment `std::fmt::Display` shape alone.
+        let tree = parse_rust("mod patterns { pub trait Matcher {} } struct X; impl crate::patterns::Matcher for X {}");
+        let facts = extract_impl_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].trait_type_text, Some("Matcher".to_string()));
+        assert_eq!(facts[0].self_type_text, "X");
+    }
+
+    #[test]
+    fn parsing_the_same_tree_twice_produces_deterministic_identical_facts() {
+        let tree = parse_rust("trait Trait {} struct Type; impl Trait for Type { fn foo(&self) {} }\nimpl Type { fn new() -> Self { Type } }");
+
+        let first = extract_impl_statements(&tree);
+        let second = extract_impl_statements(&tree);
+
+        assert_eq!(first, second);
+    }
+
+    // --- Task 2: ImplFact resolution + derived Implements edges ---
+    mod resolution {
+        use super::*;
+        use codegraph_domain::{CommitHash, EdgeKind, RepositoryRegistry, RepositoryRoot};
+
+        use crate::extract::RawSymbolCandidate;
+        use crate::snapshot::promote;
+
+        fn test_repo() -> codegraph_domain::RepositoryId {
+            let mut registry = RepositoryRegistry::new();
+            registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+        }
+
+        fn test_file(repo: codegraph_domain::RepositoryId, path: &str) -> FileIdentity {
+            let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+            FileIdentity::parse(repo, commit, path).unwrap()
+        }
+
+        fn test_snapshot(repo: codegraph_domain::RepositoryId, path: &str, name: &str, kind_hint: &str, signature: &str) -> SymbolSnapshot {
+            let file = test_file(repo, path);
+            let candidate = RawSymbolCandidate::new(name.to_string(), kind_hint.to_string(), ByteSpan { start: 0, end: 10 }, signature.to_string()).unwrap();
+            promote(&candidate, file).unwrap()
+        }
+
+        fn raw_trait_impl(self_type: &str, trait_type: &str) -> RawImplStatement {
+            RawImplStatement {
+                self_type_text: self_type.to_string(),
+                trait_type_text: Some(trait_type.to_string()),
+                has_generics: false,
+                has_lifetime_params: false,
+                span: ByteSpan { start: 0, end: 10 },
+                associated_items: Vec::new(),
+            }
+        }
+
+        fn raw_inherent_impl(self_type: &str) -> RawImplStatement {
+            RawImplStatement {
+                self_type_text: self_type.to_string(),
+                trait_type_text: None,
+                has_generics: false,
+                has_lifetime_params: false,
+                span: ByteSpan { start: 0, end: 10 },
+                associated_items: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn trait_impl_with_both_names_resolved_produces_one_implements_edge() {
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", "Shape", "trait_item", "trait Shape { fn area(&self) -> f64; }");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file, raw_trait_impl("Circle", "Shape"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[trait_snapshot.clone(), self_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Resolved(self_snapshot.id()));
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Resolved(trait_snapshot.id())));
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0].from, self_snapshot.id());
+            assert_eq!(edges[0].to, trait_snapshot.id());
+            assert_eq!(edges[0].kind, EdgeKind::Implements);
+            assert_eq!(edges[0].evidence.method(), codegraph_domain::ResolutionMethod::StaticAnalysis);
+        }
+
+        #[test]
+        fn inherent_impl_produces_zero_implements_edges() {
+            // Dedicated test, not absence-by-omission: an inherent impl
+            // (no trait) must have trait_resolution == None, and must
+            // never reach resolve_implements_from_impl_facts's edge-
+            // emitting branch at all.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file, raw_inherent_impl("Circle"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[self_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].trait_resolution, None, "an inherent impl has no trait to resolve at all, not an unresolved one");
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Resolved(self_snapshot.id()));
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert!(edges.is_empty(), "an inherent impl must never produce an Implements edge");
+        }
+
+        #[test]
+        fn unresolved_external_trait_produces_no_edge() {
+            // impl Display for MyType where Display is never in the pool
+            // (e.g. it's from std::fmt).
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/mytype.rs");
+            let self_snapshot = test_snapshot(repo, "src/mytype.rs", "MyType", "struct_item", "struct MyType;");
+            let raw = vec![(defining_file, raw_trait_impl("MyType", "Display"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[self_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Unresolved));
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert!(edges.is_empty(), "an unresolved external trait must never produce an edge");
+        }
+
+        #[test]
+        fn unresolved_self_type_produces_no_edge() {
+            // impl MyTrait for String where String (the implementing
+            // type) is never in the pool.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/mytrait.rs");
+            let trait_snapshot = test_snapshot(repo, "src/mytrait.rs", "MyTrait", "trait_item", "trait MyTrait {}");
+            let raw = vec![(defining_file, raw_trait_impl("String", "MyTrait"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[trait_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Unresolved);
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert!(edges.is_empty(), "an unresolved self type must never produce an edge");
+        }
+
+        #[test]
+        fn ambiguous_trait_name_produces_no_edge() {
+            // Two different snapshots in the pool share the trait's name.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_a = test_snapshot(repo, "src/a.rs", "Shape", "trait_item", "trait Shape {}");
+            let trait_b = test_snapshot(repo, "src/b.rs", "Shape", "trait_item", "trait Shape {}");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file, raw_trait_impl("Circle", "Shape"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[trait_a, trait_b, self_snapshot]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Ambiguous));
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert!(edges.is_empty(), "an ambiguous trait name must never be arbitrarily picked into an edge");
+        }
+
+        #[test]
+        fn a_local_enum_sharing_a_name_with_the_referenced_trait_never_produces_a_false_implements_edge() {
+            // I3 (final-review Important finding): `impl Error for
+            // ParseError {}` in a crate that ALSO defines `pub enum
+            // Error` — a plain by-name lookup (the pre-fix behavior)
+            // would resolve the trait name "Error" to the enum
+            // snapshot, since by-name matching alone cannot tell a real
+            // trait apart from an unrelated same-named enum/struct. The
+            // fix requires the TRAIT field to match a `SymbolKind::Interface`
+            // candidate specifically: the enum is not a candidate for
+            // that field at all, so this must resolve Unresolved (no
+            // real trait named "Error" exists in this pool), never a
+            // false Resolved/Ambiguous match against the enum.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/parse_error.rs");
+            let self_snapshot = test_snapshot(repo, "src/parse_error.rs", "ParseError", "struct_item", "struct ParseError;");
+            let same_named_enum = test_snapshot(repo, "src/error.rs", "Error", "enum_item", "pub enum Error { A, B }");
+            let raw = vec![(defining_file, raw_trait_impl("ParseError", "Error"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[self_snapshot.clone(), same_named_enum.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(
+                facts[0].trait_resolution,
+                Some(ImplTargetResolution::Unresolved),
+                "a same-named enum must never be mistaken for the real trait \"Error\" — no Interface-kinded candidate exists, so this must be Unresolved, not Resolved(enum_id) nor Ambiguous"
+            );
+            assert_ne!(
+                facts[0].trait_resolution,
+                Some(ImplTargetResolution::Resolved(same_named_enum.id())),
+                "must never resolve the trait field to the enum's own snapshot id"
+            );
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert!(edges.is_empty(), "a trait name that only matches a same-named, wrong-kind candidate must never produce a false Implements edge");
+        }
+
+        #[test]
+        fn a_real_trait_resolves_correctly_even_when_a_same_named_struct_also_exists() {
+            // The companion positive case: when a REAL, Interface-kinded
+            // "Error" trait ALSO exists alongside the same-named enum
+            // from the test above, the trait field must still resolve
+            // to the real trait (not become falsely Ambiguous against
+            // the enum, since the enum is excluded from the trait role's
+            // own candidate set entirely).
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/parse_error.rs");
+            let self_snapshot = test_snapshot(repo, "src/parse_error.rs", "ParseError", "struct_item", "struct ParseError;");
+            let real_trait = test_snapshot(repo, "src/error.rs", "Error", "trait_item", "trait Error {}");
+            let same_named_enum = test_snapshot(repo, "src/other_error.rs", "Error", "enum_item", "pub enum Error { A, B }");
+            let raw = vec![(defining_file, raw_trait_impl("ParseError", "Error"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[self_snapshot.clone(), real_trait.clone(), same_named_enum]).unwrap();
+
+            assert_eq!(facts.len(), 1);
+            assert_eq!(
+                facts[0].trait_resolution,
+                Some(ImplTargetResolution::Resolved(real_trait.id())),
+                "the real Interface-kinded trait must resolve correctly; the same-named enum must not make this falsely Ambiguous"
+            );
+        }
+
+        #[test]
+        fn two_maximally_long_identifiers_never_panic_building_implements_evidence() {
+            // M1 (final-review Minor finding): the note template
+            // (~115 bytes) plus BOTH `trait_type_text` and
+            // `self_type_text` interpolated in — each legally up to
+            // `ValidatedName::MAX_NAME_BYTES` (512 bytes) — comfortably
+            // exceeds `Evidence`'s own 512-byte note cap. Before the
+            // fix, `implements_evidence`'s `.expect(...)` would panic
+            // the whole `observe_commit` call for this real, legal
+            // input; after the fix, the note is truncated to fit and
+            // `resolve_implements_from_impl_facts` must still succeed
+            // and still produce exactly one edge.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            // 512 == `snapshot::name::MAX_NAME_BYTES`, the real legal
+            // maximum for a validated symbol name in this pipeline (not
+            // re-exported from `snapshot`'s own public surface, so
+            // mirrored here as a literal rather than a fragile private
+            // path) — both names below are each legally AT the limit.
+            const MAX_NAME_BYTES: usize = 512;
+            let long_trait_name = "T".repeat(MAX_NAME_BYTES);
+            let long_self_name = "S".repeat(MAX_NAME_BYTES);
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", &long_trait_name, "trait_item", "trait T {}");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", &long_self_name, "struct_item", "struct S;");
+            let raw = vec![(defining_file, raw_trait_impl(&long_self_name, &long_trait_name))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[trait_snapshot.clone(), self_snapshot.clone()]).unwrap();
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Resolved(trait_snapshot.id())));
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Resolved(self_snapshot.id()));
+
+            // The real assertion: this must not panic.
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert_eq!(edges.len(), 1, "a real resolved impl with two maximally-long identifiers must still produce exactly one edge, not panic");
+            assert_eq!(edges[0].evidence.method(), codegraph_domain::ResolutionMethod::StaticAnalysis);
+        }
+
+        #[test]
+        fn duplicate_type_trait_pair_across_two_impl_facts_collapses_to_one_edge() {
+            // Defensive dedup: constructed directly (two ImplFacts with
+            // identical self/trait text), independent of whether real
+            // compiler-valid Rust could produce this input (it could
+            // not — one type cannot implement the same trait twice).
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", "Shape", "trait_item", "trait Shape {}");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file.clone(), raw_trait_impl("Circle", "Shape")), (defining_file, raw_trait_impl("Circle", "Shape"))];
+
+            let facts = resolve_raw_impl_statements(&raw, &[trait_snapshot.clone(), self_snapshot.clone()]).unwrap();
+            assert_eq!(facts.len(), 2, "two separate raw statements still produce two separate ImplFacts");
+
+            let edges = resolve_implements_from_impl_facts(&facts);
+            assert_eq!(edges.len(), 1, "the same (Type, Trait) pair across two facts must collapse to one edge, not two");
+            assert_eq!(edges[0].from, self_snapshot.id());
+            assert_eq!(edges[0].to, trait_snapshot.id());
+        }
+
+        #[test]
+        fn resolving_the_same_raw_statements_twice_produces_deterministic_identical_output() {
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", "Shape", "trait_item", "trait Shape {}");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file, raw_trait_impl("Circle", "Shape"))];
+            let pool = vec![trait_snapshot, self_snapshot];
+
+            let first_facts = resolve_raw_impl_statements(&raw, &pool).unwrap();
+            let second_facts = resolve_raw_impl_statements(&raw, &pool).unwrap();
+            assert_eq!(first_facts, second_facts);
+
+            let first_edges = resolve_implements_from_impl_facts(&first_facts);
+            let second_edges = resolve_implements_from_impl_facts(&second_facts);
+            assert_eq!(first_edges, second_edges);
+        }
+
+        #[test]
+        fn a_duplicate_snapshot_id_in_the_pool_is_a_typed_rejection() {
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+            let raw = vec![(defining_file, raw_inherent_impl("Circle"))];
+
+            let result = resolve_raw_impl_statements(&raw, &[self_snapshot.clone(), self_snapshot]);
+
+            assert_eq!(result.err(), Some(ImplFactError::DuplicateSnapshotId));
+        }
+
+        #[test]
+        fn resolve_impl_facts_the_one_file_tree_convenience_wrapper_actually_extracts_and_resolves() {
+            // B2-ID-008 Task 5 mutation triage: `resolve_impl_facts` (the
+            // one-file-tree convenience wrapper mirroring
+            // `resolve_import_facts`'s own shape) had no direct test
+            // anywhere in this module or the wider crate before this —
+            // `cargo mutants` caught this by replacing its entire body
+            // with `Ok(vec![])` and finding no test failed. This test
+            // closes that genuine gap: it parses a real tree containing
+            // one trait impl and asserts both that extraction found it
+            // AND that resolution against a real snapshot pool produced
+            // the expected Resolved outcome, so a mutant collapsing this
+            // function to always return an empty Vec would now fail
+            // here.
+            let repo = test_repo();
+            let defining_file = test_file(repo, "src/circle.rs");
+            let trait_snapshot = test_snapshot(repo, "src/shape.rs", "Shape", "trait_item", "trait Shape { fn area(&self) -> f64; }");
+            let self_snapshot = test_snapshot(repo, "src/circle.rs", "Circle", "struct_item", "struct Circle;");
+
+            let tree_with_impl = crate::parse::LanguageParser::parse(
+                &crate::parse::RustParser,
+                b"trait Shape { fn area(&self) -> f64; } struct Circle; impl Shape for Circle { fn area(&self) -> f64 { 1.0 } }",
+            )
+            .unwrap();
+
+            let facts = resolve_impl_facts(&defining_file, &tree_with_impl, &[trait_snapshot.clone(), self_snapshot.clone()]).unwrap();
+
+            assert_eq!(facts.len(), 1, "resolve_impl_facts must actually extract the one real impl block in this tree, not return an empty Vec");
+            assert_eq!(facts[0].self_type_text, "Circle");
+            assert_eq!(facts[0].trait_type_text, Some("Shape".to_string()));
+            assert_eq!(facts[0].self_type_resolution, ImplTargetResolution::Resolved(self_snapshot.id()));
+            assert_eq!(facts[0].trait_resolution, Some(ImplTargetResolution::Resolved(trait_snapshot.id())));
+        }
+    }
+}

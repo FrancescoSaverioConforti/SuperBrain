@@ -1,0 +1,5 @@
+changed_files (git diff A..B): 3 -> ["package.json", "request.js", "tests/test-timeout.js"]
+full_outcome: snapshots=158 edges=197 import_facts=292 impl_facts=0 call_attempts=498
+incremental_outcome: snapshots=191 edges=197 import_facts=292 impl_facts=0 call_attempts=498
+
+RESULT: PARITY CONFIRMED -- zero divergences across snapshots/edges/import_facts/impl_facts/call_attempts multisets (compare_full_incremental_state, the same gate the lib test suite's own gate_3_full_equals_incremental_exact_state uses).

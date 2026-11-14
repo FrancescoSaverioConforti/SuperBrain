@@ -1,0 +1,137 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 1.12s
+     Running `target\release\examples\b2_smoke_test_data_science.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-006\repo' 8e3cb118888e4b94acafd58392ef5e69138d976a 1247923ff01dd9a74f40f55d55f108e503e4b218`
+=== B2-EVAL-006: Data analysis / scientific Python domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-006\repo
+commit_b: 1247923ff01dd9a74f40f55d55f108e503e4b218
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 433
+files_supported_by_parser: 291
+files_parsed: 291
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 2822
+extraction_rejections (oversized name/signature): 53
+  of which signature_too_long (MEASURED, MAX_SIGNATURE_BYTES=4096): 53 -- ["examples/notebooks/pyjanitor_intro.py", "janitor/functions/_conditional_join/_aggregation_helpers.py", "janitor/functions/_conditional_join/_equi_join.py", "janitor/functions/_conditional_join/_equi_join.py", "janitor/functions/_conditional_join/_helpers.py", "janitor/functions/_conditional_join/_not_equals_only.py", "janitor/functions/_conditional_join/_not_equals_only.py", "janitor/functions/_conditional_join/_not_equals_only.py", "janitor/functions/_conditional_join/_range_join.py", "janitor/functions/_conditional_join/_range_join.py"]
+snapshots_promoted: 2822
+promotion_failures: 0
+python_files_with_at_least_one_import_statement: 287
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 20
+  Field: 10
+  Function: 2792
+
+--- C1. Module/File -> top-level-symbol gap (MAIN RESEARCH QUESTION of this evaluation) ---
+files_with_at_least_one_extracted_symbol: 277
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 2716
+files_with_more_than_one_top_level_symbol (MEASURED): 199
+percentage_of_files_with_multiple_top_level_symbols (MEASURED): 71.8%
+top 15 files by top-level-symbol count (file: count):
+  tests/functions/test_conditional_join.py: 257
+  examples/notebooks/pivoting_data_from_wide_to_long.py: 134
+  tests/functions/test_pivot_longer.py: 126
+  tests/functions/test_adorn.py: 57
+  tests/functions/test_conditional_join_aggregation_kernels.py: 55
+  examples/notebooks/anime.py: 52
+  tests/functions/test_complete.py: 50
+  tests/functions/test_select_columns.py: 48
+  tests/functions/test_pivot_wider.py: 45
+  tests/functions/test_select_rows.py: 36
+  tests/functions/test_rle_id.py: 35
+  examples/notebooks/normalize.py: 33
+  examples/notebooks/pyjanitor_intro.py: 32
+  examples/notebooks/pivot_data_from_long_to_wide_form.py: 31
+  tests/functions/test_mutate.py: 31
+files_with_exactly_one_top_level_symbol (MEASURED, the 'one-function-per-file' idiom this corpus is known for): 78
+
+--- C2. Data-flow vs. call-graph gap quantification (Inferred proxy, NOT resolver-grade) ---
+method_chain_call_sites (MEASURED, raw parse: attribute_call on a receiver, e.g. df.clean_names()): 10480
+decorated_functions (MEASURED, real parse: function_definition wrapped in decorated_definition): 1746
+note: method_chain_call_sites is a syntactic proxy for pandas-flavor-registered DataFrame methods (`df.some_fn()`), which this pipeline's Calls resolver treats as an ordinary attribute-call site resolved by the attribute's OWN name against the snapshot pool -- whether that resolution actually succeeds for a pandas-flavor-registered method is measured directly in Section D/H below, not assumed from this raw count alone.
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 1485
+extends_implements_edges: 0
+tests_for_edges: 53
+  by_kind Calls: 1485
+  by_kind Contains: 27
+  by_kind TestsFor: 53
+  by_resolution_method NameHeuristic: 108
+  by_resolution_method StaticAnalysis: 1457
+full_index_elapsed: 1.4543675s
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("scripts/validate_changelog.py::_parse_diff") [Calls/StaticAnalysis] -> Some("scripts/validate_changelog.py::ChangedLine") [StaticAnalysis] :: call to "ChangedLine" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/statistical_tests.py::chisq_test") [Calls/StaticAnalysis] -> Some("janitor/functions/statistical_tests.py::ChiSqTestResult") [StaticAnalysis] :: call to "ChiSqTestResult" resolves to exactly one candidate in the given snapshot pool
+Some("scripts/benchmark_pivot_longer_value_groups.py::_peak_rss_mib") [Calls/StaticAnalysis] -> Some("scripts/benchmark_pivot_longer_value_groups.py::Counters") [StaticAnalysis] :: call to "Counters" resolves to exactly one candidate in the given snapshot pool
+Some("scripts/validate_changelog.py::finish_hunk") [Calls/StaticAnalysis] -> Some("scripts/validate_changelog.py::DiffHunk") [StaticAnalysis] :: call to "DiffHunk" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/select.py::_index_dispatch") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_move.py::test_move_empty_targets") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_pivot_longer.py::test_empty_column_name_selectors") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_pivot_wider.py::test_empty_names_from_selectors") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_pivot_wider.py::test_empty_values_from_selectors") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select.py::test_empty_drop_label_selects_everything") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select.py::test_empty_dict_selects_nothing_on_flat_and_multiindex_columns") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select.py::test_empty_selectors_with_duplicate_labels_and_drop_label") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select.py::test_select_rows_and_columns") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select.py::test_select_rows_and_columns_expr") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select_columns.py::test_select_column_names_droplabel") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select_columns.py::test_select_column_names_droplabel_mix") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select_columns.py::test_select_column_names_droplabel_multiple") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_select_columns.py::test_select_groupby") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("tests/functions/test_summarise.py::test_summarise_tuple_empty_selectors") [Calls/StaticAnalysis] -> Some("janitor/functions/select.py::DropLabel") [StaticAnalysis] :: call to "DropLabel" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/statistical_tests.py::fisher_test") [Calls/StaticAnalysis] -> Some("janitor/functions/statistical_tests.py::FisherTestResult") [StaticAnalysis] :: call to "FisherTestResult" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/finance.py::convert_currency") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/clean_names.py::_change_case") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/clean_names.py::_strip_underscores_func") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/concatenate_columns.py::concatenate_columns") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/utils.py::_change_case") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/functions/utils.py::_strip_underscores_func") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/io.py::read_csvs") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/polars/clean_names.py::_change_case_expr") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/polars/clean_names.py::_strip_underscores_func_expr") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+Some("janitor/timeseries.py::_flag_jumps_single_col") [Calls/StaticAnalysis] -> Some("janitor/errors.py::JanitorError") [StaticAnalysis] :: call to "JanitorError" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_data_science.exe","2296","Console","22","13.208 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: 8e3cb118888e4b94acafd58392ef5e69138d976a
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 2821
+observe_commit(A) edge_count: 1563
+observe_commit(A) elapsed (full reindex): 1.5285284s
+changed_files (git diff A..B): ["janitor/functions/complete.py", "janitor/functions/expand_grid.py", "tests/functions/test_complete.py"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 3, files_reparsed: 3, snapshots_removed: 61, snapshots_added: 62, edges_rebuilt: 1626, raw_import_statements_extracted: 39, raw_import_statements_reused: 1617, import_facts_resolved: 1656, raw_impl_statements_extracted: 0, raw_impl_statements_reused: 0, impl_facts_resolved: 0 }
+observe_commit(B) elapsed (incremental): 843.1163ms
+observe_commit(B) final snapshot_count: 2883
+observe_commit(B) final edge_count: 1565
+observe_commit(B) final lineage_edge_count: 61
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_import_statements_in_python_files_at_commit_b (line-based count, MEASURED): 1473
+python_import_facts_extracted (MEASURED, ImportFact, file-level): 1656
+extraction_coverage: 1656/1473 (112.4%)
+total_import_facts_all_languages (MEASURED): 1656
+  resolution_internal (MEASURED): 270
+  resolution_external (MEASURED): 1368
+  resolution_ambiguous (MEASURED): 18
+  aliases_captured (MEASURED): 459
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 39
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 1617
+
+--- H. Data-science usefulness Q&A (pyjanitor, commit B) ---
+Q1 [needs: Calls] 'Does complete() call groupby_for_expand (cross-file)?' -> NOT ANSWERABLE: complete() itself is not a symbol in this graph at all (its real body is 9996 bytes, exceeding MAX_SIGNATURE_BYTES=4096 -- a measured, root-caused extraction limit, not a Calls-resolution defect)
+Q1b [needs: Calls] 'Who calls groupby_for_expand?' -> callers: [] (ground truth: BOTH real callers -- complete() and expand() -- are SignatureTooLong rejections, 9996 and 10391 bytes respectively; zero callers here is the CORRECT reflection of a measured extraction gap, not a false negative in Calls resolution itself)
+Q2 [needs: Calls, import-alias-aware resolution] 'Who calls get_features_targets?' -> callers: [] (ground truth: janitor/__init__.py's own deprecated wrapper calls it via the import alias `_get_features_targets`, which this resolver's pure by-name matching cannot connect back to the real `get_features_targets` symbol -- a genuine, measured import-alias call-resolution gap, zero false edges produced)
+Q3 [needs: Module/File structure] 'What does janitor/functions/complete.py contain?' -> 0 symbols found ONLY via file-path string matching (no graph edge represents 'this file contains these symbols'): []
+Q4 [needs: data-flow, NOT answerable via Calls] 'In df.clean_names().remove_empty(), does clean_names's output flow into remove_empty's input?' -> NOT ANSWERABLE, for two independent reasons: (1) clean_names itself is not a symbol in this graph (also SignatureTooLong, 9388 bytes), so there is no symbol to even query; (2) even where both ends of a chain ARE extracted, no EdgeKind this pipeline produces encodes 'value flows from A's return into B's argument' -- confirmed structurally, not by this one example alone (remove_empty's own outgoing-edges-exist: false, which is irrelevant to the data-flow question either way)
+Q5 [needs: Calls, receiver-qualified] 'Who calls remove_empty (including pandas-flavor method-chain call sites)?' -> callers: ["tests/functions/test_remove_empty.py::test_reset_index_false", "examples/notebooks/board_games.py::_", "examples/notebooks/dirty_data.py::_", "examples/notebooks/dirty_data.py::_", "examples/notebooks/dirty_data.py::_", "tests/functions/test_remove_empty.py::test_remove_empty", "examples/notebooks/board_games.py::_", "examples/notebooks/dirty_data.py::_", "tests/functions/test_remove_empty.py::test_index_after_remove_empty", "examples/notebooks/french_trains.py::_", "examples/notebooks/pyjanitor_intro.py::_", "examples/notebooks/pyjanitor_intro.py::_", "examples/notebooks/inflating_converting_currency.py::_", "examples/notebooks/french_trains.py::_"]
+Q6 [needs: TestsFor] 'Which tests cover complete()?' -> total TestsFor edges in corpus: 53
+Q7 [needs: Calls, impact analysis] 'If I modify groupby_for_expand, what is impacted?' -> callers: []
+
+=== done ===

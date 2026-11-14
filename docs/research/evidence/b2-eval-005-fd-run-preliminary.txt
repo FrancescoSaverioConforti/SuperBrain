@@ -1,0 +1,132 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 1.20s
+     Running `target\release\examples\b2_smoke_test_rust_systems.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-005\repo' b7a0a29d07c3d0e9e0a41155019acada08831a6c 23815624819c77ab665e19c8e6c28bddbcd96e1d`
+=== B2-EVAL-005: Rust/systems domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-005\repo
+commit_b: 23815624819c77ab665e19c8e6c28bddbcd96e1d
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 61
+files_supported_by_parser: 25
+files_parsed: 25
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 426
+extraction_rejections (oversized name/signature): 4
+snapshots_promoted: 426
+promotion_failures: 0
+rust_files_with_at_least_one_use_statement: 24
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Enum: 15
+  Function: 384
+  Interface: 2
+  MethodSignature: 2
+  Struct: 23
+
+--- C1. Macro-opacity quantification (Rust/systems domain stress case) ---
+macro_invocation_nodes (MEASURED, real parse): 263
+token_tree_nodes (MEASURED, the opaque argument bodies of those invocations): 1167
+macro_rules_definitions (MEASURED): 7
+call_shaped_substrings_inside_token_trees (Inferred, conservative text-based proxy, NOT resolver-grade): 793
+note: these call-shaped substrings are, BY CONSTRUCTION, never visible to resolve_calls's own tree-sitter walk (a token_tree is never a call_expression node) -- this is the quantified form of the known gap documented in codegraph-index::edges::calls's own module doc comment, not a new finding about the resolver's correctness.
+
+--- C2. Module/File -> top-level-symbol gap (Rust/systems domain stress case) ---
+files_with_at_least_one_extracted_symbol: 24
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 423
+files_with_more_than_one_top_level_symbol (MEASURED): 23
+top 10 files by top-level-symbol count (file: count):
+  tests/tests.rs: 118
+  src/walk.rs: 34
+  src/exec/mod.rs: 33
+  tests/testenv/mod.rs: 26
+  src/dir_entry.rs: 22
+  src/cli.rs: 20
+  src/sanitize.rs: 17
+  src/patterns.rs: 16
+  src/filesystem.rs: 15
+  src/filter/time.rs: 14
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 356
+extends_implements_edges: 0
+tests_for_edges: 0
+  by_kind Calls: 356
+  by_resolution_method NameHeuristic: 12
+  by_resolution_method StaticAnalysis: 344
+full_index_elapsed: 187.4812ms
+
+--- D1. All Extends/Implements (trait-impl) edges, full set ---
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("src/patterns.rs::build_patterns") [Calls/StaticAnalysis] -> Some("src/patterns.rs::ExactStrings") [StaticAnalysis] :: call to "ExactStrings" resolves to exactly one candidate in the given snapshot pool
+Some("src/patterns.rs::build_patterns") [Calls/StaticAnalysis] -> Some("src/patterns.rs::FixedStrings") [StaticAnalysis] :: call to "FixedStrings" resolves to exactly one candidate in the given snapshot pool
+Some("src/error.rs::sanitize") [Calls/StaticAnalysis] -> Some("src/error.rs::SanitizedError") [StaticAnalysis] :: call to "SanitizedError" resolves to exactly one candidate in the given snapshot pool
+Some("src/error.rs::sanitize") [Calls/StaticAnalysis] -> Some("src/error.rs::SanitizedError") [StaticAnalysis] :: call to "SanitizedError" resolves to exactly one candidate in the given snapshot pool
+Some("src/filter/time.rs::new") [Calls/StaticAnalysis] -> Some("src/filter/time.rs::TestTime") [StaticAnalysis] :: call to "TestTime" resolves to exactly one candidate in the given snapshot pool
+Some("src/regex_helper.rs::pattern_has_uppercase_char") [Calls/StaticAnalysis] -> Some("src/regex_helper.rs::UppercaseVisitor") [StaticAnalysis] :: call to "UppercaseVisitor" resolves to exactly one candidate in the given snapshot pool
+Some("src/hyperlink.rs::new") [Calls/StaticAnalysis] -> Some("src/filesystem.rs::absolute_path") [StaticAnalysis] :: call to "absolute_path" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_multi_file_with_missing") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_sanitize_exec_error_msg") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_sanitize_recursive_link_msg") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error") [StaticAnalysis] :: call to "assert_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_failure_with_error") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_failure") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/testenv/mod.rs::assert_error") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_error_subdirectory") [StaticAnalysis] :: call to "assert_error_subdirectory" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_bad_pattern") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_max_results") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_number_parsing_errors") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_error_if_hidden_not_set_and_pattern_starts_with_dot") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure") [StaticAnalysis] :: call to "assert_failure" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_multi_file_with_missing") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_pattern_with_forward_slash_is_rejected") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_pattern_with_forward_slash_is_rejected") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_exec_batch") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_exec_batch_multi") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_quiet") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_list_details") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_failure_with_error") [StaticAnalysis] :: call to "assert_failure_with_error" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_simple") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_basic") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_empty_pattern") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_pattern_starts_with_dash") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_plus_extension") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+Some("tests/tests.rs::test_and_plus_type") [Calls/StaticAnalysis] -> Some("tests/testenv/mod.rs::assert_output") [StaticAnalysis] :: call to "assert_output" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_rust_systems.exe","11908","Console","19","9.564 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: b7a0a29d07c3d0e9e0a41155019acada08831a6c
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 410
+observe_commit(A) edge_count: 338
+observe_commit(A) elapsed (full reindex): 131.4687ms
+changed_files (git diff A..B): ["CHANGELOG.md", "Cargo.lock", "Cargo.toml", "src/cli.rs", "src/config.rs", "src/filesystem.rs", "src/main.rs", "src/patterns.rs", "src/walk.rs", "tests/tests.rs"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 10, files_reparsed: 10, snapshots_removed: 204, snapshots_added: 220, edges_rebuilt: 557, raw_import_statements_extracted: 66, raw_import_statements_reused: 61, import_facts_resolved: 127 }
+observe_commit(B) elapsed (incremental): 580.8067ms
+observe_commit(B) final snapshot_count: 627
+observe_commit(B) final edge_count: 356
+observe_commit(B) final lineage_edge_count: 201
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_use_statements_in_rust_files_at_commit_b (line-based count, MEASURED): 193
+rust_import_facts_extracted (MEASURED, ImportFact, file-level): 127
+extraction_coverage: 127/193 (65.8%)
+total_import_facts_all_languages (MEASURED): 127
+  resolution_internal (MEASURED): 29
+  resolution_external (MEASURED): 89
+  resolution_ambiguous (MEASURED): 9
+  aliases_captured (MEASURED): 0
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 66
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 61
+
+--- H. Rust/systems usefulness Q&A (sharkdp/fd, commit B) ---
+Q1 'Which trait(s) does FixedStrings implement?' -> []
+Q2 'Which types implement the Matcher trait?' -> []
+Q3 'GlobMatcher' NOT FOUND as a local snapshot (expected -- GlobMatcher is defined in the external `globset` crate, not in this repository's own source; this pipeline has no symbol for it to attach a Contains edge to)
+Q4 'If I modify build_patterns, which call sites are impacted?' -> callers: ["src/main.rs::run"]
+Q5 'Which types implement the SanitizeErr trait?' -> []
+Q6 'Which tests cover the patterns module?' -> total TestsFor edges in corpus: 0
+Q7 'What is the call flow from main() into the walk subsystem?' -> main() calls: ["src/exit_codes.rs::exit", "src/main.rs::run"]
+
+=== done ===

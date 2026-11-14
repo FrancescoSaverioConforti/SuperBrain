@@ -673,6 +673,78 @@ decided unilaterally:
    request for a new decision — flagged here only so it isn't mistaken for
    an oversight.
 
+## 8b. `SymbolKind` coverage: baseline, not final taxonomy (decided at Task 5)
+
+`codegraph_domain::SymbolKind` (Task 1) is a **minimum baseline** sufficient
+to promote every `RawSymbolCandidate` Task 4's nine extractors actually
+produce today. It is explicitly **not** a complete taxonomy of what B2's
+Code Graph should eventually represent, and must not be treated as closed
+or final by any future task or session (Claude or Codex) that reads this
+plan.
+
+**Current baseline (post-Task 5):** `Function`, `Method`, `Class`, `Struct`,
+`Enum`, `Interface`, `Module`, `Const`, `Macro` (Task 1's original set,
+kept — not removed, even though Task 4's current extractors never produce
+`Module`/`Const`/`Macro` yet) plus `MethodSignature` (trait/interface
+method declarations without a body), `HtmlIdElement`, `CssRule`,
+`CssKeyframes` (added at Task 5 because Task 4's HTML/CSS extractors
+produce candidates with no existing variant to promote into). No `Other`/
+catch-all variant exists or will be added — an unrecognized `kind_hint`
+must always be a typed `PromotionError`, never silently absorbed.
+
+**First expansion set expected** (not implemented, not scheduled to a
+specific task yet — to be added only when a real-repository validation
+pass, per the requirement below, shows concrete need): `Field`/`Attribute`,
+`Property`, `TypeAlias`, `Namespace`, `Static`. Motivating example: a
+PyTorch-style `self.encoder = TransformerEncoder(...)` inside a model's
+`__init__` is exactly the shape a `Field`/`Attribute` kind would need to
+represent as a stable graph node, since it names a submodule/component
+other code and future edges would want to reference. Until such a kind
+exists, a plain local-variable assignment, a loop variable, a function
+parameter, or a pattern-binding destructuring target must **not** be
+promoted into a persistent symbol — extracting every local binding would
+flood the graph with noise, not signal.
+
+**How to decide whether `SymbolKind` needs a new variant** (for whoever
+does this next, Claude or Codex): maintain a per-language coverage matrix
+with columns — tree-sitter node kind observed, the semantic construct it
+represents, whether an extractor currently recognizes it, whether a
+`RawSymbolCandidate` is currently produced for it, whether an existing
+`SymbolKind` variant fits, what edge types would plausibly reference it,
+and a documentation/debugging/enhancement priority. Propose a new variant
+only when a construct (a) appears frequently in real repositories, (b) is
+useful for documentation/debugging/code-understanding, (c) has a
+relatively stable identity across commits, and (d) is something other
+entities would plausibly reference via an edge. Do not add a variant on
+intuition alone.
+
+**Real-repository validation — required before B2's final closure, not
+part of Task 5's scope.** Before B2 is considered done, run the full
+pipeline (parse → extract → promote, at minimum) against representative
+real repositories in at least these categories and produce a report:
+
+1. **Python / deep learning**: a repository with `nn.Module`-style
+   classes, `__init__`, `forward`, submodule/attribute assignments, and
+   training/evaluation loops. Explicitly verify: model class detected,
+   `__init__` detected, `forward` detected, training/evaluation functions
+   detected, inheritance from `nn.Module` visible in some form. Once
+   `Field`/`Attribute` exists, also verify `self.encoder`, `self.classifier`,
+   `self.dropout`, and other submodule/component assignments are captured.
+2. **Rust**: traits, impls, structs, modules, macros.
+3. **TypeScript/JavaScript**: classes, functions, imports, components.
+4. **C#/C++**: classes/interfaces, methods, cross-file references.
+
+For each repository, the report must include: files parsed, symbols
+extracted per kind, frequently-occurring node kinds the pipeline currently
+ignores, expected symbols that are missing, obvious false positives, the
+percentage of raw candidates with a valid `SymbolKind` mapping, worked
+examples of what a future `get_code_context` call would return, and any
+gap that would prevent genuinely understanding the codebase from the
+graph alone. This validation is **not** run as part of Task 5 — it is
+recorded here as a standing requirement for whichever task closes out B2's
+Phase B milestone, so it is not silently dropped between sessions or
+agents.
+
 ## 9. GO/NO-GO on starting Task 0
 
 **GO.** Task 0 (pin the ingestion seam) and the unblocked chain through

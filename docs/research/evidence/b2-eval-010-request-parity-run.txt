@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `target\release\examples\b2_eval_009_cpp_parity.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\b2-eval-010\request' be7882b0bb6cdb0971f76c2a5b11d5a8767a22e1 df346d8531ac4b8c360df301f228d5767d0e374e`
+changed_files (git diff A..B): 3 -> ["package.json", "request.js", "tests/test-timeout.js"]
+full_outcome: snapshots=92 edges=42 import_facts=0 impl_facts=0 call_attempts=329
+incremental_outcome: snapshots=102 edges=42 import_facts=0 impl_facts=0 call_attempts=329
+
+RESULT: PARITY CONFIRMED -- zero divergences across snapshots/edges/import_facts/impl_facts/call_attempts multisets (compare_full_incremental_state, the same gate the lib test suite's own gate_3_full_equals_incremental_exact_state uses).

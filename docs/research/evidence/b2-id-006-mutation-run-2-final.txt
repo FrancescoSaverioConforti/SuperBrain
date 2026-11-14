@@ -1,0 +1,48 @@
+B2-ID-006 fix — mutation testing run 2 (FINAL, calls.rs, full file, post boundary-test fix)
+Command: cargo mutants --no-shuffle -p codegraph-index -f crates/codegraph-index/src/edges/calls.rs -- --release
+Date: 2026-11-06
+Status: FINAL closure evidence for B2-ID-006's own fix code.
+
+Found 114 mutants to test
+ok       Unmutated baseline in 20s build + 28s test
+ INFO Auto-set test timeout to 145s
+MISSED   crates/codegraph-index/src/edges/calls.rs:397:9: delete match arm 0 in narrow_by_scope in 1s build + 6s test
+114 mutants tested in 15m: 1 missed, 107 caught, 6 unviable
+
+Comparison to run 1 (docs/research/evidence/b2-id-006-mutation-run-1.txt):
+  Run 1: 2 missed (span_contains_position's </<= boundary; narrow_by_scope arm 0)
+  Run 2: 1 missed (narrow_by_scope arm 0 only)
+  -> span_contains_position's missed mutant is now CAUGHT, closed by
+     rust_outer_call_immediately_adjacent_to_a_nested_functions_closing_brace_still_resolves
+     (crates/codegraph-index/src/edges/calls.rs, b2_id_006_nested_scope_ownership
+     test module) — a real, non-artificial regression test built from
+     real source (`fn outer(){fn inner(){}other();}`) that demonstrates
+     the end-exclusive ByteSpan boundary property directly: `inner`'s
+     span is [11, 23), `other()`'s call site starts at exactly byte 23
+     (= inner.span().end), and the correct `<` comparison keeps this
+     call owned by `outer` (the real caller) while a `<=` mutant wrongly
+     excludes it. Verified by manually flipping the operator and
+     confirming the test fails, then reverting and confirming it
+     passes.
+
+Remaining missed mutant classification (NOT part of B2-ID-006's own
+fix, pre-existing code, already documented as equivalent before this
+finding ever started):
+  calls.rs:397:9 (narrow_by_scope, the `0 =>` match arm) — the
+  function's own doc comment, present before B2-ID-006, already states:
+  "Task 9.5's closing mutation gate confirmed deleting the `0` arm is
+  an EQUIVALENT mutant BY CONSTRUCTION: with it gone, `0` falls into
+  `_ => None`, the exact same return value, so no input can ever tell
+  the two arms apart as written today." This is a genuinely equivalent
+  mutant (not a real test gap), already classified as such by a prior
+  task's own closing mutation gate, unrelated to and unmodified by
+  B2-ID-006's fix.
+
+Conclusion: 0 genuine (non-equivalent) missed mutants remain across
+B2-ID-006's own new/modified code in calls.rs. The single remaining
+missed mutant is a pre-existing, already-documented equivalent mutant
+outside this finding's own scope.
+
+6 unviable mutants: standard cargo-mutants outcome for mutants that
+fail to compile; not individually inspected (consistent across both
+runs, not newly introduced by this fix).

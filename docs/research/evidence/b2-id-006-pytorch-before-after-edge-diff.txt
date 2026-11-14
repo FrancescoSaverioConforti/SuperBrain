@@ -1,0 +1,449 @@
+1c1,3
+<     Finished `release` profile [optimized] target(s) in 0.26s
+---
+>    Compiling codegraph-domain v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-domain)
+>    Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+>     Finished `release` profile [optimized] target(s) in 3.53s
+6c8
+<   total Calls edges: 878
+---
+>   total Calls edges: 535
+8,11c10
+<     Class: 252
+<     Field: 81
+<     Function: 541
+<     Struct: 4
+---
+>     Function: 535
+14d12
+< Some("cpp/autograd/autograd.cpp::LinearFunction[Class]") -> Some("imagenet/main.py::sum[Field]")
+24d21
+< Some("cpp/custom-dataset/custom-dataset.cpp::CustomDataset[Class]") -> Some("cpp/custom-dataset/custom-dataset.cpp::size[Function]")
+26d22
+< Some("cpp/custom-dataset/custom-dataset.cpp::NetworkImpl[Struct]") -> Some("legacy/snli/model.py::Linear[Class]")
+33d28
+< Some("cpp/dcgan/dcgan.cpp::DCGANGeneratorImpl[Struct]") -> Some("super_resolution/model.py::conv4[Field]")
+35,36d29
+< Some("cpp/distributed/dist-mnist.cpp::Model[Struct]") -> Some("cpp/distributed/dist-mnist.cpp::forward[Function]")
+< Some("cpp/mnist/mnist.cpp::Net[Struct]") -> Some("cpp/mnist/mnist.cpp::forward[Function]")
+57,59d49
+< Some("cpp/transfer-learning/main.h::CustomDataset[Class]") -> Some("cpp/transfer-learning/main.cpp::process_images[Function]")
+< Some("cpp/transfer-learning/main.h::CustomDataset[Class]") -> Some("cpp/transfer-learning/main.cpp::process_labels[Function]")
+< Some("cpp/transfer-learning/main.h::CustomDataset[Class]") -> Some("cpp/transfer-learning/main.h::size[Function]")
+72,73d61
+< Some("distributed/FSDP/summarization_dataset.py::wikihow[Class]") -> Some("distributed/FSDP/summarization_dataset.py::clean_text[Function]")
+< Some("distributed/FSDP/summarization_dataset.py::wikihow[Class]") -> Some("distributed/FSDP/summarization_dataset.py::convert_to_features[Function]")
+78,80d65
+< Some("distributed/ddp-tutorial-series/multigpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu.py::_run_batch[Function]")
+< Some("distributed/ddp-tutorial-series/multigpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu.py::_run_epoch[Function]")
+< Some("distributed/ddp-tutorial-series/multigpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu.py::_save_checkpoint[Function]")
+91,94d75
+< Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::_load_snapshot[Function]")
+< Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::_run_batch[Function]")
+< Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::_run_epoch[Function]")
+< Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multigpu_torchrun.py::_save_snapshot[Function]")
+106,109d86
+< Some("distributed/ddp-tutorial-series/multinode.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multinode.py::_load_snapshot[Function]")
+< Some("distributed/ddp-tutorial-series/multinode.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multinode.py::_run_batch[Function]")
+< Some("distributed/ddp-tutorial-series/multinode.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multinode.py::_run_epoch[Function]")
+< Some("distributed/ddp-tutorial-series/multinode.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/multinode.py::_save_snapshot[Function]")
+121,124d97
+< Some("distributed/ddp-tutorial-series/single_gpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/single_gpu.py::_run_batch[Function]")
+< Some("distributed/ddp-tutorial-series/single_gpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/single_gpu.py::_run_epoch[Function]")
+< Some("distributed/ddp-tutorial-series/single_gpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/single_gpu.py::_save_checkpoint[Function]")
+< Some("distributed/ddp-tutorial-series/single_gpu.py::Trainer[Class]") -> Some("distributed/ddp-tutorial-series/single_gpu.py::model[Field]")
+135,139d107
+< Some("distributed/ddp/example.py::ToyModel[Class]") -> Some("distributed/ddp/example.py::__init__[Function]")
+< Some("distributed/ddp/example.py::ToyModel[Class]") -> Some("distributed/ddp/example.py::net1[Field]")
+< Some("distributed/ddp/example.py::ToyModel[Class]") -> Some("distributed/ddp/example.py::net2[Field]")
+< Some("distributed/ddp/example.py::ToyModel[Class]") -> Some("distributed/ddp/example.py::relu[Field]")
+< Some("distributed/ddp/example.py::ToyModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+146,147d113
+< Some("distributed/ddp/example.py::net1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/ddp/example.py::net2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+149,150d114
+< Some("distributed/ddp/main.py::ToyModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/ddp/main.py::ToyMpModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+173,177d136
+< Some("distributed/ddp/main.py::net1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/ddp/main.py::net1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/ddp/main.py::net2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/ddp/main.py::net2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/minGPT-ddp/mingpt/char_dataset.py::CharDataset[Class]") -> Some("vae/main.py::decode[Function]")
+187,197d145
+< Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::MultiheadAttentionLayer[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::ln1[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::ln2[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::mlp[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::EmbeddingStem[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::drop[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::EmbeddingStem[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::reset_parameters[Function]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::EmbeddingStem[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::tok_emb[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::MultiheadAttentionLayer[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::c_proj[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::MultiheadAttentionLayer[Class]") -> Some("distributed/minGPT-ddp/mingpt/model.py::resid_drop[Field]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::MultiheadAttentionLayer[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+207,210d154
+< Some("distributed/minGPT-ddp/mingpt/model.py::attn[Field]") -> Some("distributed/minGPT-ddp/mingpt/model.py::MultiheadAttentionLayer[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::blocks[Field]") -> Some("distributed/minGPT-ddp/mingpt/model.py::Block[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::c_proj[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::emb_stem[Field]") -> Some("distributed/minGPT-ddp/mingpt/model.py::EmbeddingStem[Class]")
+225,226d168
+< Some("distributed/minGPT-ddp/mingpt/model.py::head[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/minGPT-ddp/mingpt/model.py::mlp[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+234d175
+< Some("distributed/minGPT-ddp/mingpt/trainer.py::test_loader[Field]") -> Some("distributed/minGPT-ddp/mingpt/trainer.py::_prepare_dataloader[Function]")
+237,242d177
+< Some("distributed/minGPT-ddp/mingpt/trainer.py::train_loader[Field]") -> Some("distributed/minGPT-ddp/mingpt/trainer.py::_prepare_dataloader[Function]")
+< Some("distributed/rpc/batch/parameter_server.py::BatchUpdateParameterServer[Class]") -> Some("distributed/rpc/batch/parameter_server.py::timed_log[Function]")
+< Some("distributed/rpc/batch/parameter_server.py::Trainer[Class]") -> Some("distributed/rpc/batch/parameter_server.py::get_model[Function]")
+< Some("distributed/rpc/batch/parameter_server.py::Trainer[Class]") -> Some("distributed/rpc/batch/parameter_server.py::get_next_batch[Function]")
+< Some("distributed/rpc/batch/parameter_server.py::Trainer[Class]") -> Some("distributed/rpc/batch/parameter_server.py::loss_fn[Field]")
+< Some("distributed/rpc/batch/parameter_server.py::Trainer[Class]") -> Some("distributed/rpc/batch/parameter_server.py::timed_log[Function]")
+253,258d187
+< Some("distributed/rpc/batch/reinforce.py::Observer[Class]") -> Some("imagenet/main.py::reset[Function]")
+< Some("distributed/rpc/batch/reinforce.py::Policy[Class]") -> Some("distributed/rpc/batch/reinforce.py::affine1[Field]")
+< Some("distributed/rpc/batch/reinforce.py::Policy[Class]") -> Some("distributed/rpc/batch/reinforce.py::affine2[Field]")
+< Some("distributed/rpc/batch/reinforce.py::Policy[Class]") -> Some("distributed/rpc/batch/reinforce.py::dropout[Field]")
+< Some("distributed/rpc/batch/reinforce.py::Policy[Class]") -> Some("gat/main.py::softmax[Field]")
+< Some("distributed/rpc/batch/reinforce.py::Policy[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+261,262d189
+< Some("distributed/rpc/batch/reinforce.py::affine1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/rpc/batch/reinforce.py::affine2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+267d193
+< Some("distributed/rpc/batch/reinforce.py::policy[Field]") -> Some("distributed/rpc/batch/reinforce.py::Policy[Class]")
+273,276d198
+< Some("distributed/rpc/ddp_rpc/main.py::HybridModel[Class]") -> Some("distributed/rpc/ddp_rpc/main.py::__init__[Function]")
+< Some("distributed/rpc/ddp_rpc/main.py::HybridModel[Class]") -> Some("distributed/rpc/ddp_rpc/main.py::fc[Field]")
+< Some("distributed/rpc/ddp_rpc/main.py::HybridModel[Class]") -> Some("distributed/rpc/ddp_rpc/main.py::forward[Function]")
+< Some("distributed/rpc/ddp_rpc/main.py::HybridModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+281d202
+< Some("distributed/rpc/ddp_rpc/main.py::fc[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+283,292d203
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::conv1[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::conv2[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::dropout1[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::dropout2[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::fc1[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::fc2[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::ParameterServer[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::Net[Class]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::ParameterServer[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::model[Field]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::TrainerNet[Class]") -> Some("distributed/rpc/parameter_server/rpc_parameter_server.py::remote_method[Function]")
+295,296d205
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::fc1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/rpc/parameter_server/rpc_parameter_server.py::fc2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+314,319d222
+< Some("distributed/rpc/pipeline/main.py::ResNetBase[Class]") -> Some("distributed/rpc/pipeline/main.py::_block[Field]")
+< Some("distributed/rpc/pipeline/main.py::ResNetBase[Class]") -> Some("distributed/rpc/pipeline/main.py::conv1x1[Function]")
+< Some("distributed/rpc/pipeline/main.py::ResNetShard1[Class]") -> Some("distributed/rpc/pipeline/main.py::_make_layer[Function]")
+< Some("distributed/rpc/pipeline/main.py::ResNetShard2[Class]") -> Some("distributed/rpc/pipeline/main.py::_make_layer[Function]")
+< Some("distributed/rpc/pipeline/main.py::ResNetShard2[Class]") -> Some("distributed/rpc/pipeline/main.py::fc[Field]")
+< Some("distributed/rpc/pipeline/main.py::ResNetShard2[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+325d227
+< Some("distributed/rpc/pipeline/main.py::fc[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+333,344d234
+< Some("distributed/rpc/pipeline/main.py::seq[Field]") -> Some("distributed/rpc/pipeline/main.py::_make_layer[Function]")
+< Some("distributed/rpc/pipeline/main.py::seq[Field]") -> Some("distributed/rpc/pipeline/main.py::_make_layer[Function]")
+< Some("distributed/rpc/rl/main.py::Agent[Class]") -> Some("distributed/rpc/rl/main.py::Policy[Class]")
+< Some("distributed/rpc/rl/main.py::Agent[Class]") -> Some("distributed/rpc/rl/main.py::policy[Field]")
+< Some("distributed/rpc/rl/main.py::Agent[Class]") -> Some("imagenet/main.py::sum[Field]")
+< Some("distributed/rpc/rl/main.py::Observer[Class]") -> Some("distributed/rpc/rl/main.py::_remote_method[Function]")
+< Some("distributed/rpc/rl/main.py::Observer[Class]") -> Some("imagenet/main.py::reset[Function]")
+< Some("distributed/rpc/rl/main.py::Policy[Class]") -> Some("distributed/rpc/rl/main.py::affine1[Field]")
+< Some("distributed/rpc/rl/main.py::Policy[Class]") -> Some("distributed/rpc/rl/main.py::affine2[Field]")
+< Some("distributed/rpc/rl/main.py::Policy[Class]") -> Some("distributed/rpc/rl/main.py::dropout[Field]")
+< Some("distributed/rpc/rl/main.py::Policy[Class]") -> Some("gat/main.py::softmax[Field]")
+< Some("distributed/rpc/rl/main.py::Policy[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+347,348d236
+< Some("distributed/rpc/rl/main.py::affine1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/rpc/rl/main.py::affine2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+354d241
+< Some("distributed/rpc/rl/main.py::policy[Field]") -> Some("distributed/rpc/rl/main.py::Policy[Class]")
+363,367d249
+< Some("distributed/rpc/rnn/rnn.py::Decoder[Class]") -> Some("distributed/rpc/rnn/rnn.py::decoder[Field]")
+< Some("distributed/rpc/rnn/rnn.py::Decoder[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/rpc/rnn/rnn.py::RNNModel[Class]") -> Some("distributed/rpc/rnn/rnn.py::_parameter_rrefs[Function]")
+< Some("distributed/rpc/rnn/rnn.py::RNNModel[Class]") -> Some("distributed/rpc/rnn/rnn.py::_remote_method[Function]")
+< Some("distributed/rpc/rnn/rnn.py::RNNModel[Class]") -> Some("distributed/rpc/rnn/rnn.py::rnn[Field]")
+369d250
+< Some("distributed/rpc/rnn/rnn.py::decoder[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+380,384d260
+< Some("distributed/tensor_parallelism/utils.py::ToyModel[Class]") -> Some("distributed/tensor_parallelism/utils.py::__init__[Function]")
+< Some("distributed/tensor_parallelism/utils.py::ToyModel[Class]") -> Some("distributed/tensor_parallelism/utils.py::net1[Field]")
+< Some("distributed/tensor_parallelism/utils.py::ToyModel[Class]") -> Some("distributed/tensor_parallelism/utils.py::net2[Field]")
+< Some("distributed/tensor_parallelism/utils.py::ToyModel[Class]") -> Some("distributed/tensor_parallelism/utils.py::relu[Field]")
+< Some("distributed/tensor_parallelism/utils.py::ToyModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+389,390d264
+< Some("distributed/tensor_parallelism/utils.py::net1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("distributed/tensor_parallelism/utils.py::net2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+403,418d276
+< Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::UpsampleConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::conv3[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::deconv1[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::deconv2[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::deconv3[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::in3[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::in4[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::in5[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::res1[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::res2[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::res3[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::res4[Field]")
+< Some("fast_neural_style/neural_style/transformer_net.py::TransformerNet[Class]") -> Some("fast_neural_style/neural_style/transformer_net.py::res5[Field]")
+423,430d280
+< Some("fast_neural_style/neural_style/transformer_net.py::conv1[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::conv1[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::conv2[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::conv2[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::conv3[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::deconv1[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::UpsampleConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::deconv2[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::UpsampleConvLayer[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::deconv3[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ConvLayer[Class]")
+457,466d306
+< Some("fast_neural_style/neural_style/transformer_net.py::res1[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::res2[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::res3[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::res4[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/transformer_net.py::res5[Field]") -> Some("fast_neural_style/neural_style/transformer_net.py::ResidualBlock[Class]")
+< Some("fast_neural_style/neural_style/vgg.py::Vgg16[Class]") -> Some("fast_neural_style/neural_style/vgg.py::__init__[Function]")
+< Some("fast_neural_style/neural_style/vgg.py::Vgg16[Class]") -> Some("fast_neural_style/neural_style/vgg.py::slice1[Field]")
+< Some("fast_neural_style/neural_style/vgg.py::Vgg16[Class]") -> Some("fast_neural_style/neural_style/vgg.py::slice2[Field]")
+< Some("fast_neural_style/neural_style/vgg.py::Vgg16[Class]") -> Some("fast_neural_style/neural_style/vgg.py::slice3[Field]")
+< Some("fast_neural_style/neural_style/vgg.py::Vgg16[Class]") -> Some("fast_neural_style/neural_style/vgg.py::slice4[Field]")
+471,474d310
+< Some("fx/custom_tracer.py::LowerReluTracer[Class]") -> Some("fx/custom_tracer.py::is_leaf_module[Function]")
+< Some("fx/custom_tracer.py::M1[Class]") -> Some("fx/custom_tracer.py::__init__[Function]")
+< Some("fx/custom_tracer.py::M1[Class]") -> Some("fx/custom_tracer.py::relu[Field]")
+< Some("fx/custom_tracer.py::TaggingTracer[Class]") -> Some("fx/custom_tracer.py::create_node[Function]")
+477,478d312
+< Some("fx/inline_function.py::M[Class]") -> Some("fx/inline_function.py::__init__[Function]")
+< Some("fx/inline_function.py::M[Class]") -> Some("fx/inline_function.py::relu[Field]")
+480,481d313
+< Some("fx/module_tracer.py::ModulePathTracer[Class]") -> Some("fx/module_tracer.py::call_module[Function]")
+< Some("fx/module_tracer.py::ModulePathTracer[Class]") -> Some("fx/module_tracer.py::create_proxy[Function]")
+484d315
+< Some("fx/native_interpreter/use_interpreter.py::WrapperModule[Class]") -> Some("fx/native_interpreter/use_interpreter.py::__init__[Function]")
+487,490d317
+< Some("fx/native_interpreter/use_interpreter.py::lower_to_elementwise_interpreter[Function]") -> Some("fx/native_interpreter/use_interpreter.py::__init__[Function]")
+< Some("fx/primitive_library.py::Foo[Class]") -> Some("fx/primitive_library.py::add_lowp[Function]")
+< Some("fx/primitive_library.py::Foo[Class]") -> Some("fx/primitive_library.py::sigmoid_lowp[Function]")
+< Some("fx/primitive_library.py::InliningTracer[Class]") -> Some("fx/primitive_library.py::create_node[Function]")
+495,496d321
+< Some("fx/profiling_tracer.py::ProfilerTracer[Class]") -> Some("fx/module_tracer.py::create_proxy[Function]")
+< Some("fx/profiling_tracer.py::ProfilerTracer[Class]") -> Some("fx/profiling_tracer.py::trace[Function]")
+498,500d322
+< Some("fx/profiling_tracer.py::trace[Function]") -> Some("fx/module_tracer.py::create_proxy[Function]")
+< Some("fx/subgraph_rewriter_basic_use.py::M[Class]") -> Some("fx/subgraph_rewriter_basic_use.py::__init__[Function]")
+< Some("fx/subgraph_rewriter_basic_use.py::M[Class]") -> Some("imagenet/main.py::sum[Field]")
+503,505d324
+< Some("fx/wrap_output_dynamically.py::M[Class]") -> Some("fx/wrap_output_dynamically.py::__init__[Function]")
+< Some("gat/main.py::GAT[Class]") -> Some("gat/main.py::gat1[Field]")
+< Some("gat/main.py::GAT[Class]") -> Some("gat/main.py::gat2[Field]")
+520,523d338
+< Some("gcn/main.py::GCN[Class]") -> Some("gcn/main.py::GraphConv[Class]")
+< Some("gcn/main.py::GCN[Class]") -> Some("gcn/main.py::dropout[Field]")
+< Some("gcn/main.py::GCN[Class]") -> Some("gcn/main.py::gc1[Field]")
+< Some("gcn/main.py::GCN[Class]") -> Some("gcn/main.py::gc2[Field]")
+530,531d344
+< Some("gcn/main.py::gc1[Field]") -> Some("gcn/main.py::GraphConv[Class]")
+< Some("gcn/main.py::gc2[Field]") -> Some("gcn/main.py::GraphConv[Class]")
+537,540d349
+< Some("imagenet/main.py::AverageMeter[Class]") -> Some("imagenet/main.py::all_reduce[Function]")
+< Some("imagenet/main.py::AverageMeter[Class]") -> Some("imagenet/main.py::reset[Function]")
+< Some("imagenet/main.py::ProgressMeter[Class]") -> Some("imagenet/main.py::_get_batch_fmtstr[Function]")
+< Some("imagenet/main.py::ProgressMeter[Class]") -> Some("imagenet/main.py::summary[Function]")
+544d352
+< Some("imagenet/main.py::batch_fmtstr[Field]") -> Some("imagenet/main.py::_get_batch_fmtstr[Function]")
+558d365
+< Some("imagenet/main.py::validate[Function]") -> Some("imagenet/main.py::accuracy[Function]")
+560d366
+< Some("imagenet/main.py::validate[Function]") -> Some("imagenet/main.py::display[Function]")
+563,572d368
+< Some("imagenet/main.py::validate[Function]") -> Some("imagenet/main.py::update[Function]")
+< Some("imagenet/main.py::validate[Function]") -> Some("vision_transformer/main.py::criterion[Field]")
+< Some("legacy/snli/model.py::Encoder[Class]") -> Some("legacy/snli/model.py::rnn[Field]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::Encoder[Class]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::embed[Field]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::encoder[Field]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::out[Field]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::projection[Field]")
+< Some("legacy/snli/model.py::SNLIClassifier[Class]") -> Some("legacy/snli/model.py::relu[Field]")
+577d372
+< Some("legacy/snli/model.py::encoder[Field]") -> Some("legacy/snli/model.py::Encoder[Class]")
+584,593d378
+< Some("legacy/snli/model.py::out[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("legacy/snli/model.py::projection[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist/main.py::Net[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::__init__[Function]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::conv1[Field]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::conv2[Field]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::dropout1[Field]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::dropout2[Field]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::fc1[Field]")
+< Some("mnist/main.py::Net[Class]") -> Some("mnist/main.py::fc2[Field]")
+595,596d379
+< Some("mnist/main.py::fc1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist/main.py::fc2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+608,613d390
+< Some("mnist_forward_forward/main.py::Layer[Class]") -> Some("mnist_forward_forward/main.py::forward[Function]")
+< Some("mnist_forward_forward/main.py::Layer[Class]") -> Some("mnist_forward_forward/main.py::relu[Field]")
+< Some("mnist_forward_forward/main.py::Layer[Class]") -> Some("vision_transformer/main.py::norm[Field]")
+< Some("mnist_forward_forward/main.py::Net[Class]") -> Some("imagenet/main.py::sum[Field]")
+< Some("mnist_forward_forward/main.py::Net[Class]") -> Some("mnist_forward_forward/main.py::Layer[Class]")
+< Some("mnist_forward_forward/main.py::Net[Class]") -> Some("mnist_forward_forward/main.py::overlay_y_on_x[Function]")
+619d395
+< Some("mnist_forward_forward/main.py::layers[Field]") -> Some("mnist_forward_forward/main.py::Layer[Class]")
+624,630d399
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::__init__[Function]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::conv1[Field]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::conv2[Field]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::conv2_drop[Field]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::fc1[Field]")
+< Some("mnist_hogwild/main.py::Net[Class]") -> Some("mnist_hogwild/main.py::fc2[Field]")
+632,633d400
+< Some("mnist_hogwild/main.py::fc1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist_hogwild/main.py::fc2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+643,650d409
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::__init__[Function]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::batchnorm[Field]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::dropout1[Field]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::dropout2[Field]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::fc1[Field]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::fc2[Field]")
+< Some("mnist_rnn/main.py::Net[Class]") -> Some("mnist_rnn/main.py::rnn[Field]")
+652,653d410
+< Some("mnist_rnn/main.py::fc1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("mnist_rnn/main.py::fc2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+666,671d422
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("gat/main.py::softmax[Field]")
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("reinforcement_learning/actor_critic.py::__init__[Function]")
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("reinforcement_learning/actor_critic.py::action_head[Field]")
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("reinforcement_learning/actor_critic.py::affine1[Field]")
+< Some("reinforcement_learning/actor_critic.py::Policy[Class]") -> Some("reinforcement_learning/actor_critic.py::value_head[Field]")
+673,674d423
+< Some("reinforcement_learning/actor_critic.py::action_head[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("reinforcement_learning/actor_critic.py::affine1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+684,690d432
+< Some("reinforcement_learning/actor_critic.py::value_head[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("gat/main.py::softmax[Field]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("reinforcement_learning/reinforce.py::__init__[Function]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("reinforcement_learning/reinforce.py::affine1[Field]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("reinforcement_learning/reinforce.py::affine2[Field]")
+< Some("reinforcement_learning/reinforce.py::Policy[Class]") -> Some("reinforcement_learning/reinforce.py::dropout[Field]")
+692,693d433
+< Some("reinforcement_learning/reinforce.py::affine1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("reinforcement_learning/reinforce.py::affine2[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+703,706d442
+< Some("siamese_network/main.py::SiameseNetwork[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("siamese_network/main.py::SiameseNetwork[Class]") -> Some("siamese_network/main.py::fc[Field]")
+< Some("siamese_network/main.py::SiameseNetwork[Class]") -> Some("siamese_network/main.py::forward_once[Function]")
+< Some("siamese_network/main.py::SiameseNetwork[Class]") -> Some("siamese_network/main.py::sigmoid[Field]")
+711d446
+< Some("siamese_network/main.py::fc[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+733,737d467
+< Some("super_resolution/dataset.py::DatasetFromFolder[Class]") -> Some("super_resolution/dataset.py::__init__[Function]")
+< Some("super_resolution/dataset.py::DatasetFromFolder[Class]") -> Some("super_resolution/dataset.py::input_transform[Field]")
+< Some("super_resolution/dataset.py::DatasetFromFolder[Class]") -> Some("super_resolution/dataset.py::is_image_file[Function]")
+< Some("super_resolution/dataset.py::DatasetFromFolder[Class]") -> Some("super_resolution/dataset.py::load_img[Function]")
+< Some("super_resolution/dataset.py::DatasetFromFolder[Class]") -> Some("super_resolution/dataset.py::target_transform[Field]")
+742d471
+< Some("super_resolution/dataset.py::image_filenames[Field]") -> Some("super_resolution/dataset.py::is_image_file[Function]")
+745,752d473
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::__init__[Function]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::_initialize_weights[Function]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::conv1[Field]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::conv2[Field]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::conv3[Field]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::conv4[Field]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::pixel_shuffle[Field]")
+< Some("super_resolution/model.py::Net[Class]") -> Some("super_resolution/model.py::relu[Field]")
+760,764d480
+< Some("time_sequence_prediction/train.py::Sequence[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("time_sequence_prediction/train.py::Sequence[Class]") -> Some("time_sequence_prediction/train.py::__init__[Function]")
+< Some("time_sequence_prediction/train.py::Sequence[Class]") -> Some("time_sequence_prediction/train.py::linear[Field]")
+< Some("time_sequence_prediction/train.py::Sequence[Class]") -> Some("time_sequence_prediction/train.py::lstm1[Field]")
+< Some("time_sequence_prediction/train.py::Sequence[Class]") -> Some("time_sequence_prediction/train.py::lstm2[Field]")
+770,781d485
+< Some("time_sequence_prediction/train.py::linear[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::VAE[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::VAE[Class]") -> Some("siamese_network/main.py::sigmoid[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::__init__[Function]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::decode[Function]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::encode[Function]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::fc1[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::fc21[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::fc22[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::fc3[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::fc4[Field]")
+< Some("vae/main.py::VAE[Class]") -> Some("vae/main.py::reparameterize[Function]")
+789,793d492
+< Some("vae/main.py::fc1[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::fc21[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::fc22[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::fc3[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vae/main.py::fc4[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+801,819d499
+< Some("vision_transformer/main.py::EncoderBlock[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::EncoderBlock[Class]") -> Some("vision_transformer/main.py::attention[Field]")
+< Some("vision_transformer/main.py::EncoderBlock[Class]") -> Some("vision_transformer/main.py::enc_MLP[Field]")
+< Some("vision_transformer/main.py::EncoderBlock[Class]") -> Some("vision_transformer/main.py::norm[Field]")
+< Some("vision_transformer/main.py::InputEmbedding[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::InputEmbedding[Class]") -> Some("vision_transformer/main.py::LinearProjection[Field]")
+< Some("vision_transformer/main.py::InputEmbedding[Class]") -> Some("vision_transformer/main.py::PatchExtractor[Class]")
+< Some("vision_transformer/main.py::LinearProjection[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::MLPHead[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::TrainEval[Class]") -> Some("vision_transformer/main.py::criterion[Field]")
+< Some("vision_transformer/main.py::TrainEval[Class]") -> Some("vision_transformer/main.py::eval_fn[Function]")
+< Some("vision_transformer/main.py::TrainEval[Class]") -> Some("vision_transformer/main.py::model[Field]")
+< Some("vision_transformer/main.py::TrainEval[Class]") -> Some("vision_transformer/main.py::train[Function]")
+< Some("vision_transformer/main.py::TrainEval[Class]") -> Some("vision_transformer/main.py::train_fn[Function]")
+< Some("vision_transformer/main.py::ViT[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::ViT[Class]") -> Some("vision_transformer/main.py::EncoderBlock[Class]")
+< Some("vision_transformer/main.py::ViT[Class]") -> Some("vision_transformer/main.py::InputEmbedding[Class]")
+< Some("vision_transformer/main.py::ViT[Class]") -> Some("vision_transformer/main.py::MLPHead[Field]")
+< Some("vision_transformer/main.py::ViT[Class]") -> Some("vision_transformer/main.py::embedding[Field]")
+826,829d505
+< Some("vision_transformer/main.py::device[Field]") -> Some("vision_transformer/main.py::device[Field]")
+< Some("vision_transformer/main.py::embedding[Field]") -> Some("vision_transformer/main.py::InputEmbedding[Class]")
+< Some("vision_transformer/main.py::enc_MLP[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("vision_transformer/main.py::encoders[Field]") -> Some("vision_transformer/main.py::EncoderBlock[Class]")
+847,849d522
+< Some("word_language_model/data.py::Corpus[Class]") -> Some("word_language_model/data.py::Dictionary[Class]")
+< Some("word_language_model/data.py::Corpus[Class]") -> Some("word_language_model/data.py::add_word[Function]")
+< Some("word_language_model/data.py::Corpus[Class]") -> Some("word_language_model/data.py::tokenize[Function]")
+852,855d524
+< Some("word_language_model/data.py::dictionary[Field]") -> Some("word_language_model/data.py::Dictionary[Class]")
+< Some("word_language_model/data.py::test[Field]") -> Some("word_language_model/data.py::tokenize[Function]")
+< Some("word_language_model/data.py::train[Field]") -> Some("word_language_model/data.py::tokenize[Function]")
+< Some("word_language_model/data.py::valid[Field]") -> Some("word_language_model/data.py::tokenize[Function]")
+865,874d533
+< Some("word_language_model/model.py::PositionalEncoding[Class]") -> Some("word_language_model/model.py::dropout[Field]")
+< Some("word_language_model/model.py::RNNModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("word_language_model/model.py::RNNModel[Class]") -> Some("word_language_model/model.py::drop[Field]")
+< Some("word_language_model/model.py::RNNModel[Class]") -> Some("word_language_model/model.py::encoder[Field]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("word_language_model/model.py::PositionalEncoding[Class]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("word_language_model/model.py::_generate_square_subsequent_mask[Function]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("word_language_model/model.py::encoder[Field]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("word_language_model/model.py::input_emb[Field]")
+< Some("word_language_model/model.py::TransformerModel[Class]") -> Some("word_language_model/model.py::pos_encoder[Field]")
+880,881d538
+< Some("word_language_model/model.py::decoder[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+< Some("word_language_model/model.py::decoder[Field]") -> Some("legacy/snli/model.py::Linear[Class]")
+891,894c548,550
+< Some("word_language_model/model.py::pos_encoder[Field]") -> Some("word_language_model/model.py::PositionalEncoding[Class]")
+<   container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 256
+<   of those, confirmed duplicate of a same-file edge to the same target from a different caller: 227
+<   container-originated as % of total Calls edges: 29.2%
+---
+>   container-kind-originated Calls edges (Class/Struct/Interface/Enum as caller): 0
+>   of those, confirmed duplicate of a same-file edge to the same target from a different caller: 0
+>   container-originated as % of total Calls edges: 0.0%

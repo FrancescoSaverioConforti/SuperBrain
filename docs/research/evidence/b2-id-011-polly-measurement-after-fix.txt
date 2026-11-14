@@ -1,0 +1,20 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 3.16s
+     Running `target\release\examples\probe_b2_id_011_measurement.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-008\repo' 1f232caf9672e515751ba2df76d82bfbbb62e016`
+=== B2-ID-011 real-repo measurement (post-fix) ===
+total_invocation_expression_sites (raw-parse proxy, MEASURED): 26508
+generic_bare_call_sites (MEASURED): 166
+generic_receiver_qualified_call_sites (MEASURED): 4977
+non_generic_call_sites (MEASURED): 21365
+total_snapshots: 5190
+invocation_sites_within_caller_eligible_signatures_total (MEASURED): 29544
+  generic_bare: 181
+  generic_receiver_qualified: 5058
+  non_generic: 24305
+handle_generic_call_sites_within_signatures (MEASURED): 931
+total_calls_edges: 1928
+  by_resolution_method NameHeuristic: 430
+  by_resolution_method StaticAnalysis: 1498
+handle_snapshots_in_pool: 6
+calls_edges_targeting_any_handle_snapshot: 1
+  -> method=NameHeuristic note="call to \"Handle\" resolves to exactly one candidate once narrowed to the caller's own file"

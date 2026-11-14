@@ -1,0 +1,38 @@
+=== B2-EVAL-012: TypeScript backend/Node.js domain (Sairyss/domain-driven-hexagon) ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\d0cd18fd-4402-41e5-b0b1-365d42d1d592\scratchpad\b2-eval-012\repo
+commit: 5c2d15a7e2d69e83dfddf28468ee9f30e02c30de
+
+--- A. Corpus / symbol metrics (real production pipeline) ---
+snapshots: 236
+edges: 229
+import_facts: 441
+impl_facts: 0
+call_attempts: 245
+  Class: 68
+  Function: 18
+  Interface: 18
+  Method: 118
+  MethodSignature: 14
+
+--- B. Edge kind breakdown ---
+  Calls: 90
+  Contains: 107
+  Extends: 27
+  Implements: 5
+
+--- C. Negative knowledge: CallAttempt tier + reason breakdown ---
+by tier:
+  Ambiguous: 68
+  Unresolved: 177
+by reason:
+  AmbiguousCandidates: 68
+  ImportTargetExternal: 1
+  NoMatchingImportAlias: 176
+
+--- D. A5 (type inference) evidence ---
+CallAttempts with tier=Ambiguous (2+ real candidates, name-based matching cannot disambiguate -- the category A5 would target): 68/245
+(All other tiers reflect zero-candidate cases -- external targets, no import match, extraction rejection -- which A5/type-inference does not address; only Ambiguous reflects a real same-name overload/generic collision.)
+
+--- E. Full index timing ---
+full_index_elapsed: 245.7801ms
+(see b2_eval_012_ts_backend_parity for the real two-commit full/incremental parity check)
