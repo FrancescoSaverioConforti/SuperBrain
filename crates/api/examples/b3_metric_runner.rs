@@ -374,6 +374,33 @@ fn optional_metric_report(result: &api::metrics::OptionalMetricResult) -> Option
     }
 }
 
+/// An answerable row's Recall@10/Hit@10/nDCG@10, scored against whatever
+/// `index::search` actually returned. `QueryOutcome::NotPresent` scores
+/// exactly like an empty retrieved list — Recall@10 = 0.0, Hit@10 =
+/// false, nDCG@10 = 0.0 — and must be pushed into aggregation like any
+/// other answerable row, never dropped as if it had no score (final
+/// review Important #1: dropping it would let a retrieval regression
+/// that starts returning NotPresent on real answers silently INFLATE
+/// Recall@10/nDCG@10 instead of tanking them).
+struct ScoredRow {
+    recall_at_10: f64,
+    hit_at_10: bool,
+    ndcg_at_10: f64,
+}
+
+fn score_answerable_row(row: &LabelRow, outcome: &QueryOutcome) -> ScoredRow {
+    let empty: Vec<String> = Vec::new();
+    let retrieved_note_ids = match outcome {
+        QueryOutcome::NotPresent => &empty,
+        QueryOutcome::Matches { retrieved_note_ids } => retrieved_note_ids,
+    };
+    ScoredRow {
+        recall_at_10: api::metrics::recall_at_10(&row.relevant_note_ids, retrieved_note_ids),
+        hit_at_10: api::metrics::hit_at_10(&row.relevant_note_ids, retrieved_note_ids),
+        ndcg_at_10: api::metrics::ndcg_at_10(retrieved_note_ids, &row.graded_relevance),
+    }
+}
+
 fn run_split(split: &str, seed: u64, resamples: u32) -> Report {
     assert_ne!(split, "test", "B3.3/B3.4 never read the held-out test split's content");
 
@@ -416,24 +443,24 @@ fn run_split(split: &str, seed: u64, resamples: u32) -> Report {
         abstain_expected_flags.push(row.abstain_expected);
         predicted_not_present_flags.push(matches!(outcome, QueryOutcome::NotPresent));
 
-        let (recall, hit, ndcg, outcome_str) = match &outcome {
-            QueryOutcome::NotPresent => (None, None, None, "NotPresent".to_string()),
-            QueryOutcome::Matches { retrieved_note_ids } => {
-                if row.abstain_expected {
-                    (None, None, None, "Matches".to_string())
-                } else {
-                    let recall = api::metrics::recall_at_10(&row.relevant_note_ids, retrieved_note_ids);
-                    let hit = api::metrics::hit_at_10(&row.relevant_note_ids, retrieved_note_ids);
-                    let ndcg = api::metrics::ndcg_at_10(retrieved_note_ids, &row.graded_relevance);
-                    recall_values.push(recall);
-                    ndcg_values.push(ndcg);
-                    by_category_recall.entry(row.category.clone()).or_default().push(recall);
-                    by_category_ndcg.entry(row.category.clone()).or_default().push(ndcg);
-                    by_difficulty_recall.entry(row.difficulty.clone()).or_default().push(recall);
-                    by_difficulty_ndcg.entry(row.difficulty.clone()).or_default().push(ndcg);
-                    (Some(recall), Some(hit), Some(ndcg), "Matches".to_string())
-                }
-            }
+        let outcome_str = match &outcome {
+            QueryOutcome::NotPresent => "NotPresent".to_string(),
+            QueryOutcome::Matches { .. } => "Matches".to_string(),
+        };
+        let (recall, hit, ndcg) = if row.abstain_expected {
+            (None, None, None)
+        } else {
+            // Scored for EVERY answerable row regardless of outcome —
+            // NotPresent scores 0.0/false/0.0 via score_answerable_row,
+            // never dropped from aggregation (final review Important #1).
+            let scored = score_answerable_row(row, &outcome);
+            recall_values.push(scored.recall_at_10);
+            ndcg_values.push(scored.ndcg_at_10);
+            by_category_recall.entry(row.category.clone()).or_default().push(scored.recall_at_10);
+            by_category_ndcg.entry(row.category.clone()).or_default().push(scored.ndcg_at_10);
+            by_difficulty_recall.entry(row.difficulty.clone()).or_default().push(scored.recall_at_10);
+            by_difficulty_ndcg.entry(row.difficulty.clone()).or_default().push(scored.ndcg_at_10);
+            (Some(scored.recall_at_10), Some(scored.hit_at_10), Some(scored.ndcg_at_10))
         };
 
         per_query.push(PerQueryReport {
@@ -686,6 +713,31 @@ mod tests {
         let idx = fixture.build_index();
         let outcome = run_one_query(&idx, "ZZZ_NO_SUCH_TERM_EVER_QQQ", 10);
         assert!(matches!(outcome, QueryOutcome::NotPresent));
+    }
+
+    #[test]
+    fn score_answerable_row_scores_not_present_as_zero_not_excluded() {
+        // Final review Important #1: an answerable query that comes back
+        // NotPresent must score exactly like "nothing relevant retrieved"
+        // (Recall@10 = 0.0, Hit@10 = false, nDCG@10 = 0.0), never be
+        // dropped from aggregation as if it had no score at all.
+        let row = make_row(false, "bugs-fixes", "easy", vec!["note-a"], HashMap::from([("note-a", 2u8)]));
+        let scored = score_answerable_row(&row, &QueryOutcome::NotPresent);
+        assert_eq!(scored.recall_at_10, 0.0);
+        assert!(!scored.hit_at_10);
+        assert_eq!(scored.ndcg_at_10, 0.0);
+    }
+
+    #[test]
+    fn score_answerable_row_scores_matches_via_the_real_metric_functions() {
+        let row = make_row(false, "bugs-fixes", "easy", vec!["note-a"], HashMap::from([("note-a", 2u8)]));
+        let outcome = QueryOutcome::Matches {
+            retrieved_note_ids: vec!["note-a".to_string()],
+        };
+        let scored = score_answerable_row(&row, &outcome);
+        assert_eq!(scored.recall_at_10, 1.0);
+        assert!(scored.hit_at_10);
+        assert_eq!(scored.ndcg_at_10, 1.0);
     }
 
     #[test]

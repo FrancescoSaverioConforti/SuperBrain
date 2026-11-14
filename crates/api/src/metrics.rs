@@ -289,6 +289,21 @@ mod tests {
     }
 
     #[test]
+    fn recall_and_ndcg_at_10_are_zero_on_an_empty_retrieved_list() {
+        // Pins the NotPresent-on-an-answerable-query case: an empty
+        // retrieved list must score exactly like "nothing relevant found",
+        // never be excluded from aggregation (final review Important #1).
+        let relevant = vec!["note-a".to_string()];
+        let retrieved: Vec<String> = vec![];
+        assert_eq!(recall_at_10(&relevant, &retrieved), 0.0);
+        assert!(!hit_at_10(&relevant, &retrieved));
+
+        let mut graded = HashMap::new();
+        graded.insert("note-a".to_string(), 2u8);
+        assert_eq!(ndcg_at_10(&retrieved, &graded), 0.0);
+    }
+
+    #[test]
     fn ndcg_at_10_matches_the_frozen_exponential_gain_formula() {
         // graded_relevance: note-a=2, note-b=1. Retrieved order: note-b, note-a (note-a is NOT first).
         let mut graded = HashMap::new();
@@ -376,15 +391,37 @@ mod tests {
 
     #[test]
     fn confusion_matrix_bootstrap_reports_valid_resamples_per_metric() {
+        // Only 2 of 10 queries are predicted-abstain, so a meaningful share
+        // of 500 resamples draw none of them, leaving precision undefined
+        // on that resample. valid_resamples must be strictly less than
+        // total_resamples — asserting `<= 500` (always true) proves
+        // nothing (final review Important #2); this must actually catch a
+        // regression that treats an undefined 0/0 resample as 0.0 instead
+        // of skipping it.
         let abstain_expected = vec![true, true, true, false, false, false, false, false, false, false];
         let predicted_not_present = vec![true, true, false, false, false, false, false, false, false, false];
         let result = confusion_matrix_bootstrap(&abstain_expected, &predicted_not_present, 123, 500);
-        assert!(result.precision.valid_resamples <= 500);
-        assert!(result.recall.valid_resamples <= 500);
+        assert!(
+            result.precision.valid_resamples < result.precision.total_resamples,
+            "expected some resamples to leave precision undefined, got {}/{}",
+            result.precision.valid_resamples,
+            result.precision.total_resamples
+        );
         assert_eq!(result.accuracy.valid_resamples, 500);
-        if (result.precision.valid_resamples as usize) < LOW_CONFIDENCE_FLOOR {
-            assert!(result.precision.ci.is_none());
-        }
+    }
+
+    #[test]
+    fn confusion_matrix_bootstrap_ci_is_none_when_precision_is_never_defined() {
+        // All queries are predicted-NOT-abstain (predicted_not_present all
+        // false), so TP+FP = 0 on every possible resample: precision is
+        // undefined everywhere, valid_resamples must be exactly 0, and the
+        // CI must be None, not computed from zero values.
+        let abstain_expected = vec![true, true, false, false, false];
+        let predicted_not_present = vec![false, false, false, false, false];
+        let result = confusion_matrix_bootstrap(&abstain_expected, &predicted_not_present, 7, 500);
+        assert_eq!(result.precision.valid_resamples, 0);
+        assert!(result.precision.ci.is_none());
+        assert_eq!(result.precision.point_estimate, None);
     }
 
     #[test]
