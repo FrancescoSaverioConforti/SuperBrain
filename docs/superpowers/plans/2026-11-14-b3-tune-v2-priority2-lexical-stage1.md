@@ -11,16 +11,28 @@ authorization.
 
 **Architecture:** Three independent diagnostic/ablation binaries, one
 per lever, each running the real `api::search` path against dev then
-calibration. Lever A adds an additive, default-preserving constructor
-path through `Bm25Index`/`Index` so custom `k1`/`b` values reach the
-real scoring code with zero change to any existing call site. Lever B
-adds one small, narrowly-scoped tokenizer function, tested in isolation
-before being wired into an ablation binary (never modifying
-`bm25::tokenize` itself, which stays the frozen B3/Priority-1-era
-production tokenizer — see Task 4's own note on this). Lever C is a
-static `HashMap`-backed query-time expansion applied only inside its own
-ablation binary, built from a diagnostic pass over the corpus + dev
-only, frozen before calibration ever sees it.
+calibration. Lever A has two variants: `A-score` (custom `k1`/`b` reaches
+only `Index::search`'s final-scoring `Bm25Index`, candidate prefilter
+stays at defaults — diagnostic, isolates ranking-only effect) and
+`A-full` (custom `k1`/`b` reaches every `Bm25Index` in the real pipeline,
+including `RealIndexer`'s own persistent candidate-prefilter index —
+this is what Lever A's KEEP/REJECT decision is actually about). Both are
+additive, default-preserving constructor paths through `Bm25Index`/
+`Index`/`RealIndexer`; zero change to any existing call site. Lever B
+also has two variants: `B-query` (conservative punctuation stripping
+applied to the query text only — diagnostic) and `B-symmetric` (the same
+rule applied to both the indexed corpus text and the query — this is
+what Lever B's KEEP/REJECT decision is actually about), both via an
+opt-in ablation path that never modifies `bm25::tokenize` itself, so B1's
+own frozen tokenizer is untouched. Lever C is a static `HashMap`-backed
+query-time expansion applied only inside its own ablation binary, built
+from a diagnostic pass over the corpus + dev only, frozen before
+calibration ever sees it.
+
+**Decision rules are frozen in this plan, before any grid/ablation run**
+(see "Frozen decision rules" below) — Lever A's grid-point selection and
+every lever's Stage 1 KEEP/REJECT criterion are fixed here, not chosen
+after seeing results.
 
 **Tech Stack:** Rust (existing `index`/`api` crates), the existing B3
 corpus/dev/calibration label files. No new dependencies.
@@ -31,6 +43,65 @@ the accepted B1 baseline recorded in `eval/results/B3/frozen-config.json`
 (commit `52d42ea`) and `docs/research/B3-CLOSURE-SUMMARY.md`. Priority 1
 is CLOSED as REJECT (`docs/research/B3-TUNE-v2-PRIORITY1-CLOSURE.md`) —
 this plan does not build on it, only on the official B1 baseline.
+
+## Frozen decision rules (fixed before any grid/ablation run — correction #3)
+
+These rules are fixed here, in the plan, before Task 2's grid or any of
+the three levers' calibration ablations run. They are never adjusted
+after seeing a result.
+
+**Lever A grid-point selection (dev, diagnostic — selects, does not
+approve):**
+1. Maximize Recall@10 on dev.
+2. Tie-break: maximize nDCG@10 on dev.
+3. Further tie-break: minimize Euclidean distance `sqrt((k1-1.2)^2 +
+   (b-0.75)^2)` to the current defaults `(1.2, 0.75)` — prefers a
+   conservative change over an extreme grid edge when dev's own numbers
+   don't clearly distinguish candidates.
+4. If the selected point IS `(1.2, 0.75)` (current defaults win or tie),
+   that is reported as a valid outcome, not discarded in favor of a
+   different pick.
+
+This rule selects ONE `(k1, b)` pair, used identically for both
+`A-score` and `A-full`'s calibration ablation (Task 3) — dev selects via
+this rule, calibration decides KEEP/REJECT via the rule below, dev never
+itself approves anything.
+
+**Stage 1 KEEP/REJECT criterion (calibration decides; applies
+identically to Lever A's `A-full`, Lever B's `B-symmetric`, and Lever
+C — the three configurations each lever's KEEP/REJECT decision is
+actually about, per corrections #1/#2 below):**
+
+A lever's calibration ablation is **KEEP** if, versus the official B1
+baseline's calibration numbers (Recall@10 = 0.9167, nDCG@10 = 0.7091,
+from `docs/research/B3-CLOSURE-SUMMARY.md`), **all** of the following
+hold:
+- Recall@10 regression is **≤ 0.05** absolute (i.e. calibration
+  Recall@10 ≥ 0.8667), OR Recall@10 improves.
+- nDCG@10 regression is **≤ 0.05** absolute (i.e. calibration nDCG@10 ≥
+  0.6591), OR nDCG@10 improves.
+- At least one of Recall@10 or nDCG@10 **improves** (even slightly) —
+  a lever that sits inside the allowed regression band on both metrics
+  but improves neither is a **REJECT** (a "sufficient improvement" floor
+  of "nonzero positive delta on at least one of the two metrics," since
+  this corpus's small size means requiring a specific minimum magnitude
+  of improvement would itself be a form of overfitting to noise; the
+  regression tolerances above are the real guardrail, and "improves
+  nothing but doesn't regress much either" is not a reason to change a
+  frozen baseline).
+- The abstention confusion matrix's pattern is unchanged from B1's own
+  (TP=0, FP=0, constant non-abstaining) — any lever that causes even one
+  `NotPresent` where B1 didn't (or vice versa) is flagged explicitly and
+  treated as **REJECT regardless of the metrics above**, since that is a
+  retrieval-behavior change this plan did not set out to measure or
+  validate, not a lexical-quality win.
+
+If a lever's calibration numbers fail any of these, it is **REJECT**,
+with the specific failing criterion named in the report. Dev (Task 2's
+grid, and each lever's own dev-split ablation) is diagnostic only — it
+selects which single candidate reaches calibration (Lever A) or
+confirms a rule is worth ablating at all (Lever B/C's diagnostics), but
+never itself produces a KEEP/REJECT decision.
 
 ## Global Constraints
 
@@ -51,9 +122,15 @@ this plan does not build on it, only on the official B1 baseline.
   tokens by an explicit diagnostic pass before being finalized.
 - `index::search`'s production behavior changes **only** via the
   additive constructor paths each task below specifies — no existing
-  call site of `Bm25Index::new()`, `Index::new()`, or `bm25::tokenize`
-  changes behavior. Every ablation binary opts in explicitly; nothing
-  B3's own frozen runner does changes.
+  call site of `Bm25Index::new()`, `Index::new()`, `RealIndexer::new()`,
+  or `bm25::tokenize` changes behavior. Every ablation binary opts in
+  explicitly; nothing B3's own frozen runner does changes.
+- **Candidate-set drift under `A-full` is expected, not a bug** — a
+  different `k1`/`b` in the candidate prefilter's own `Bm25Index` can
+  change which notes are even considered before final scoring, and that
+  is part of the real effect this variant measures, not noise to
+  suppress. It must be measured and reported explicitly (Task 3), not
+  treated as an error or filtered out.
 - The new v2 held-out set (`eval/rag/v2-heldout/`) stays completely
   unread. Nothing in this plan opens `eval/rag/v2-heldout/labels.jsonl`.
 - No new held-out final-test run of any kind.
@@ -72,18 +149,37 @@ this plan does not build on it, only on the official B1 baseline.
 
 ## Review Focus
 
-- Lever A's k1/b override accidentally also changing the candidate
-  pre-filter's behavior (`RealIndexer::candidate_ids`'s own, separate
-  `Bm25Index`), making the ablation's Recall@10 change attributable to
-  candidate-set drift rather than re-ranking — Task 1's own test must
-  confirm the override touches only `Index::search`'s final-scoring
-  `Bm25Index`, never `RealIndexer`'s internal one.
+- Conflating `A-score`'s ranking-only effect with `A-full`'s combined
+  ranking+candidate-set effect, so a KEEP/REJECT decision can't actually
+  say whether a Recall@10 change came from re-ranking or from different
+  notes entering the candidate set at all — Task 1's tests must confirm
+  `A-score`'s override touches only `Index::search`'s final-scoring
+  `Bm25Index` (never `RealIndexer`'s internal one), Task 1b's tests must
+  confirm `A-full`'s override reaches `RealIndexer`'s own `Bm25Index`
+  too (including its poisoned-mutex recovery path, which rebuilds a
+  fresh `Bm25Index` and must rebuild it with the same custom params, not
+  silently fall back to the hardcoded defaults), and Task 3's report
+  keeps both variants' numbers visible side by side, never collapsed
+  into one.
 - Lever B's punctuation rule silently corrupting a real corpus token
   this plan didn't anticipate (beyond the illustrative list in the
   design doc) — Task 4's diagnostic pass over every distinct token in
   corpus+dev is the actual safety net, not the illustrative examples
   alone; a cutoff that still collides on a real token must narrow the
   rule, not proceed.
+- `B-symmetric`'s indexed-side normalization silently diverging from its
+  query-side normalization (e.g. applying the rule at index-build time
+  via one code path and at query time via a different, hand-duplicated
+  one that could drift) — Task 5's indexed-text normalization and
+  query-text normalization must call the exact same
+  `strip_trailing_sentence_punctuation` function Task 4 already tested,
+  never a second implementation.
+- Choosing Lever A's grid-point-selection rule or any lever's Stage 1
+  KEEP/REJECT tolerance only after seeing calibration's numbers, which
+  would make the "decision rule" a post-hoc rationalization rather than
+  a real guardrail — both are fixed in this plan's own "Frozen decision
+  rules" section, before Task 2 or any calibration ablation runs; no
+  task revisits or tightens/loosens them after seeing a result.
 - Lever C's alias expansion firing on a query substring inside a
   different, unrelated word (e.g. expanding "SEC" inside "SECTION") —
   Task 7's alias-application function must match whole tokens only, not
@@ -112,11 +208,24 @@ this plan does not build on it, only on the official B1 baseline.
   carrying the BM25 params (defaulted in `Index::new`), a builder method
   `with_bm25_params(k1, b)`, and switch the one `fresh_scores =
   Bm25Index::new()` call (line 276) to use the stored params. No
-  existing call site of `Index::new` changes.
+  existing call site of `Index::new` changes. This is `A-score`'s whole
+  mechanism (final-scoring only).
+- Modify: `crates/index/src/indexer_impl.rs` — add `bm25_k1: f64,
+  bm25_b: f64` fields to `RealIndexer`, a `RealIndexer::new_with_bm25_params(k1,
+  b)` constructor (alongside unchanged `new()`), construct `IndexData`
+  manually with `Bm25Index::new_with_params(k1, b)` instead of via
+  `IndexData::default()` when these params differ from the defaults,
+  and fix the poisoned-mutex recovery path (`data()`'s `Err(poisoned)`
+  branch) to rebuild `data.bm25` with `self.bm25_k1`/`self.bm25_b`
+  rather than the bare `Bm25Index::new()` it uses today — this is
+  `A-full`'s additional mechanism (candidate prefilter too).
 - Create: `crates/api/examples/b3_tune_v2_lever_a_bm25_params.rs` —
-  Lever A's ablation binary: runs dev then calibration through
-  `Index::new(...).with_bm25_params(k1, b)` for each grid point, reusing
-  `api::metrics::recall_at_10`/`ndcg_at_10`/confusion-matrix logic.
+  Lever A's ablation binary: runs dev then calibration through both
+  `A-score` (`Index::new(...).with_bm25_params(k1, b)`, `RealIndexer::new()`
+  unchanged) and `A-full` (`RealIndexer::new_with_bm25_params(k1, b)`
+  plus the matching `Index::new(...).with_bm25_params(k1, b)`) for each
+  grid point, reusing `api::metrics::recall_at_10`/`ndcg_at_10`/
+  confusion-matrix logic.
 - Create: `crates/index/src/lexical_normalize.rs` — Lever B's narrow,
   tested-in-isolation punctuation-stripping function. New module, not a
   change to `bm25::tokenize` itself (see Task 4).
@@ -126,14 +235,19 @@ this plan does not build on it, only on the official B1 baseline.
   Lever C's diagnostic (corpus+dev candidate identification), alias
   application function, and ablation binary, all in one file (small
   enough not to warrant a split; see Task 6-8).
-- Create: `eval/results/B3-TUNE-v2/priority2-lever-a-grid.json`,
+- Create: `eval/results/B3-TUNE-v2/priority2-lever-a-grid.json`
+  (`A-score` grid over dev, since it's the cheaper variant for the
+  16-point sweep — correctness confirmed equivalent in direction to
+  `A-full` by Task 1b's own test, see Task 2),
   `priority2-lever-a-dev-ablation.json`,
-  `priority2-lever-a-calibration-ablation.json` — Lever A's grid
-  results and dev/calibration ablation reports.
+  `priority2-lever-a-calibration-ablation.json` — each containing BOTH
+  `A-score` and `A-full` numbers side by side for the one selected
+  grid point (Task 3).
 - Create: `eval/results/B3-TUNE-v2/priority2-lever-b-token-diagnostic.json`,
   `priority2-lever-b-dev-ablation.json`,
   `priority2-lever-b-calibration-ablation.json` — Lever B's diagnostic
-  and ablation reports.
+  and ablation reports, each ablation report containing BOTH `B-query`
+  and `B-symmetric` numbers side by side (Task 5).
 - Create: `eval/results/B3-TUNE-v2/priority2-lever-c-alias-candidates.json`,
   `priority2-lever-c-alias-table.json`,
   `priority2-lever-c-dev-ablation.json`,
@@ -144,7 +258,7 @@ this plan does not build on it, only on the official B1 baseline.
 
 ---
 
-### Task 1: Additive BM25 `k1`/`b` override path (`bm25.rs` + `search.rs`)
+### Task 1: `A-score` — additive BM25 `k1`/`b` override path for final scoring only (`bm25.rs` + `search.rs`)
 
 **Files:**
 - Modify: `crates/index/src/bm25.rs`
@@ -156,7 +270,8 @@ this plan does not build on it, only on the official B1 baseline.
 - Produces: `Bm25Index::new_with_params(k1: f64, b: f64) -> Self` (new,
   alongside unchanged `new()`), `Index::with_bm25_params(self, k1: f64,
   b: f64) -> Self` (new builder method on `Index<'a>`). Consumed by
-  Task 2's ablation binary.
+  Task 1b (`A-full`'s construction reuses `new_with_params`) and Task 2's
+  ablation binary (both `A-score` and `A-full` modes).
 
 - [ ] **Step 1: Write the failing test proving `new()`'s behavior is unchanged after the refactor**
 
@@ -275,14 +390,106 @@ git commit -m "feat(index): additive Bm25Index/Index constructor for custom k1/b
 
 ---
 
-### Task 2: Lever A ablation binary — BM25 `k1`/`b` grid
+### Task 1b: `A-full` — extend the override to `RealIndexer`'s own candidate-prefilter `Bm25Index`
+
+**Files:**
+- Modify: `crates/index/src/indexer_impl.rs`
+
+**Interfaces:**
+- Consumes: Task 1's `Bm25Index::new_with_params`.
+- Produces: `RealIndexer::new_with_bm25_params(k1: f64, b: f64) -> Self`
+  (new, alongside unchanged `new()`). Consumed by Task 2's ablation
+  binary's `A-full` mode.
+
+- [ ] **Step 1: Write the failing test proving the override reaches the candidate prefilter**
+
+```rust
+// In crates/index/tests/b1_search.rs, reusing that file's existing Fixture.
+#[test]
+fn new_with_bm25_params_changes_candidate_prefilter_scores() {
+    let f = Fixture::new();
+    f.commit_note("short-note", "rust");
+    f.commit_note("long-note", "rust ".repeat(50).trim());
+    let default_indexer = RealIndexer::new();
+    rebuild_index(&f.vault, &default_indexer).unwrap();
+    let default_ranked = default_indexer.bm25_ranked("rust", 10);
+
+    let b_zero_indexer = RealIndexer::new_with_bm25_params(1.2, 0.0);
+    rebuild_index(&f.vault, &b_zero_indexer).unwrap();
+    let b_zero_ranked = b_zero_indexer.bm25_ranked("rust", 10);
+
+    assert_ne!(default_ranked, b_zero_ranked, "b=0.0 must change the candidate prefilter's own BM25 scores vs the default b=0.75");
+}
+```
+
+(`bm25_ranked` is the existing `pub fn bm25_ranked` at
+`indexer_impl.rs:202-204` — already exposed, no new accessor needed for
+this test.)
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p index new_with_bm25_params_changes_candidate_prefilter_scores`
+Expected: FAIL (`RealIndexer::new_with_bm25_params` not yet defined).
+
+- [ ] **Step 3: Implement `RealIndexer::new_with_bm25_params` and fix the poison-recovery rebuild**
+
+Add `bm25_k1: f64, bm25_b: f64` fields to `RealIndexer` (alongside
+`data`/`poisoned`/`hook`). `new()`'s body becomes
+`Self::new_with_bm25_params(1.2, 0.75)` (single source of truth, same
+pattern Task 1 used for `Bm25Index`). `new_with_bm25_params(k1, b)`
+constructs `IndexData` manually (not via `IndexData::default()`, which
+can't carry custom params):
+
+```rust
+pub fn new_with_bm25_params(k1: f64, b: f64) -> Self {
+    Self {
+        data: Mutex::new(IndexData {
+            trigram: TrigramIndex::new(),
+            bm25: Bm25Index::new_with_params(k1, b),
+            notes: HashMap::new(),
+        }),
+        bm25_k1: k1,
+        bm25_b: b,
+        #[cfg(test)]
+        poisoned: Mutex::new(HashSet::new()),
+        #[cfg(test)]
+        hook: Mutex::new(None),
+    }
+}
+```
+
+In `data()`'s poisoned-mutex recovery branch (`indexer_impl.rs:169-170`),
+change `data.bm25 = Bm25Index::new();` to `data.bm25 =
+Bm25Index::new_with_params(self.bm25_k1, self.bm25_b);` — this is the
+correctness fix the Review Focus risk above names: without it, a
+poisoned-mutex recovery would silently reset `A-full`'s custom params
+back to the hardcoded defaults mid-run.
+
+- [ ] **Step 4: Run the test to verify it passes, then run the full `index` suite for regressions**
+
+Run: `cargo test -p index new_with_bm25_params_changes_candidate_prefilter_scores`
+Expected: PASS.
+Run: `cargo test -p index` — Expected: PASS, same count as before this
+task plus the one new test.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/index/src/indexer_impl.rs crates/index/tests/b1_search.rs
+git commit -m "feat(index): additive RealIndexer constructor for custom k1/b, defaults unchanged"
+```
+
+---
+
+### Task 2: Lever A ablation binary — BM25 `k1`/`b` grid (`A-score`, dev-only selection)
 
 **Files:**
 - Create: `crates/api/examples/b3_tune_v2_lever_a_bm25_params.rs`
 - Create: `eval/results/B3-TUNE-v2/priority2-lever-a-grid.json`
 
 **Interfaces:**
-- Consumes: Task 1's `Index::with_bm25_params`, `api::metrics::{recall_at_10,
+- Consumes: Task 1's `Index::with_bm25_params`, Task 1b's
+  `RealIndexer::new_with_bm25_params`, `api::metrics::{recall_at_10,
   ndcg_at_10, confusion_matrix_metrics, ConfusionMatrix}` (existing,
   unchanged), the same `TestFixture`/`LabelRow`/`parse_label_rows`/
   `exclude_canary`/`run_one_query` pattern `b3_metric_runner.rs` and
@@ -290,57 +497,73 @@ git commit -m "feat(index): additive Bm25Index/Index constructor for custom k1/b
   fixture code into this new file, per the established pattern — this
   plan does not refactor either existing example file to share code).
 - Produces: `eval/results/B3-TUNE-v2/priority2-lever-a-grid.json` (dev
-  results for every grid point) and, after the grid is reviewed,
-  `priority2-lever-a-dev-ablation.json` /
-  `priority2-lever-a-calibration-ablation.json` (Task 3's deliverable,
-  using the grid's chosen candidate).
+  results for every grid point, `A-score` mode only — see Step 5's note
+  on why) and, after the grid is reviewed, `priority2-lever-a-dev-ablation.json`
+  / `priority2-lever-a-calibration-ablation.json` (Task 3's deliverable,
+  using the grid's chosen candidate, run in BOTH `A-score` and `A-full`
+  modes).
 
-- [ ] **Step 1: Write the failing test for one grid point's end-to-end run**
+- [ ] **Step 1: Write the failing test for one grid point's end-to-end run in both modes**
 
 ```rust
 #[test]
-fn grid_point_runs_against_the_real_corpus_and_returns_metrics() {
+fn grid_point_runs_against_the_real_corpus_and_returns_metrics_for_both_modes() {
     let fixture = TestFixture::new();
     fixture.commit_corpus();
-    let idx = fixture.build_index_with_bm25_params(1.2, 0.75); // same as B1 default, sanity check
-    let report = run_split_with_bm25_params("dev", 1.2, 0.75);
-    assert_eq!(report.k1, 1.2);
-    assert_eq!(report.b, 0.75);
-    assert!(report.aggregate.recall_at_10 > 0.0);
+    let score_report = run_split_with_bm25_params("dev", 1.2, 0.75, BmVariant::AScore);
+    let full_report = run_split_with_bm25_params("dev", 1.2, 0.75, BmVariant::AFull);
+    assert_eq!(score_report.k1, 1.2);
+    assert_eq!(score_report.b, 0.75);
+    assert!(score_report.aggregate.recall_at_10 > 0.0);
+    assert!(full_report.aggregate.recall_at_10 > 0.0);
+    // At the current defaults, A-score and A-full must agree exactly --
+    // both are just B1 itself when k1/b match the hardcoded defaults.
+    assert_eq!(score_report.aggregate.recall_at_10, full_report.aggregate.recall_at_10);
 }
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p api --example b3_tune_v2_lever_a_bm25_params`
-Expected: FAIL (`build_index_with_bm25_params`/`run_split_with_bm25_params` not yet defined).
+Expected: FAIL (`BmVariant`/`run_split_with_bm25_params` not yet defined).
 
-- [ ] **Step 3: Implement the grid-point runner**
+- [ ] **Step 3: Implement the grid-point runner for both variants**
 
-`fn build_index_with_bm25_params(&self, k1: f64, b: f64) -> index::Index<'_>`
-on the duplicated `TestFixture` (same as the existing `build_index`, but
-calling `.with_bm25_params(k1, b)` before returning). `struct
-GridPointReport { k1: f64, b: f64, aggregate: MetricBreakdown, ... }`
-(reuse `b3_metric_runner.rs`'s `MetricBreakdown`/`AbstentionReport`
-shapes by duplicating their definitions, same pattern Task 1's sibling
-files already use) and `fn run_split_with_bm25_params(split: &str, k1:
-f64, b: f64) -> GridPointReport` — loads the split's labels, builds the
-index with the given params, runs every non-canary query through
-`api::search`, scores with `api::metrics::recall_at_10`/`ndcg_at_10`,
-computes the abstention confusion matrix the same way
-`b3_metric_runner.rs`'s `run_split` does.
+`enum BmVariant { AScore, AFull }`. `fn build_index_with_bm25_params(fixture:
+&TestFixture, k1: f64, b: f64, variant: BmVariant) -> (index::Index<'_>, )`
+— for `AScore`, builds the index with a plain `RealIndexer::new()` (so
+the candidate prefilter stays at defaults) and
+`.with_bm25_params(k1, b)` only on the returned `Index`; for `AFull`,
+builds with `RealIndexer::new_with_bm25_params(k1, b)` AND
+`.with_bm25_params(k1, b)` on the `Index` (both must carry the same
+params, since `A-full`'s whole point is custom params everywhere).
+`struct GridPointReport { k1: f64, b: f64, variant: String, aggregate:
+MetricBreakdown, ... }` (reuse `b3_metric_runner.rs`'s `MetricBreakdown`/
+`AbstentionReport` shapes by duplicating their definitions, same pattern
+Task 1's sibling files already use) and `fn run_split_with_bm25_params(split:
+&str, k1: f64, b: f64, variant: BmVariant) -> GridPointReport` — loads
+the split's labels, builds the index per `variant`, runs every
+non-canary query through `api::search`, scores with
+`api::metrics::recall_at_10`/`ndcg_at_10`, computes the abstention
+confusion matrix the same way `b3_metric_runner.rs`'s `run_split` does.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run the same command as Step 2. Expected: PASS.
 
-- [ ] **Step 5: Implement `main` to run the grid over dev and write the report**
+- [ ] **Step 5: Implement `main` to run the grid over dev (A-score only) and write the report**
 
 Candidate grid (fixed by this plan, per the design doc's "small, fixed
 candidate set" choice): `k1 ∈ {0.9, 1.2, 1.5, 1.8}`, `b ∈ {0.4, 0.6,
-0.75, 0.9}` — 16 combinations. `main()` runs `run_split_with_bm25_params("dev",
-k1, b)` for all 16, writes the full list of `GridPointReport`s to
-`eval/results/B3-TUNE-v2/priority2-lever-a-grid.json`, and prints a
+0.75, 0.9}` — 16 combinations. `main()` runs
+`run_split_with_bm25_params("dev", k1, b, BmVariant::AScore)` for all 16
+(the grid uses `A-score` because it's the correctness-focused diagnostic
+variant and the two variants only diverge when candidate-set membership
+itself changes, which the Frozen decision rules' grid-selection
+criterion doesn't need to see — Task 3 runs the ONE selected point in
+both modes, which is where `A-full`'s real effect is actually measured
+and KEEP/REJECT is decided), writes the full list of `GridPointReport`s
+to `eval/results/B3-TUNE-v2/priority2-lever-a-grid.json`, and prints a
 short table (k1, b, Recall@10, nDCG@10) to stdout for immediate
 inspection.
 
@@ -353,12 +576,12 @@ Expected: exits 0, writes the report, prints the 16-row table.
 
 ```bash
 git add crates/api/examples/b3_tune_v2_lever_a_bm25_params.rs eval/results/B3-TUNE-v2/priority2-lever-a-grid.json
-git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever A BM25 k1/b grid over dev"
+git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever A BM25 k1/b grid over dev (A-score)"
 ```
 
 ---
 
-### Task 3: Lever A dev/calibration ablation and KEEP/REJECT
+### Task 3: Lever A dev/calibration ablation (`A-score` + `A-full` side by side) and KEEP/REJECT
 
 **Files:**
 - Create: `eval/results/B3-TUNE-v2/priority2-lever-a-dev-ablation.json`,
@@ -367,40 +590,56 @@ git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever A BM25 k1/b grid over dev
 **Interfaces:**
 - Consumes: Task 2's grid report, the official B1 baseline
   (`eval/results/B3/frozen-config.json`,
-  `docs/research/B3-CLOSURE-SUMMARY.md`).
-- Produces: the dev/calibration ablation reports plus a KEEP/REJECT
-  decision, folded into Task 9's combined summary (this task does not
-  write its own separate summary doc — Task 9 covers all three levers
-  in one place, per "Proportion" self-review discipline).
+  `docs/research/B3-CLOSURE-SUMMARY.md`), the Frozen decision rules
+  (grid-point selection and Stage 1 KEEP/REJECT criterion) above.
+- Produces: the dev/calibration ablation reports (each containing both
+  `A-score` and `A-full` numbers) plus a KEEP/REJECT decision — the
+  decision is about `A-full` specifically (per the Frozen decision
+  rules; `A-score` stays informational in the same report) — folded
+  into Task 9's combined summary (this task does not write its own
+  separate summary doc — Task 9 covers all three levers in one place,
+  per "Proportion" self-review discipline).
 
-- [ ] **Step 1: Read Task 2's grid and pick ONE candidate for calibration**
+- [ ] **Step 1: Apply the frozen grid-point-selection rule to Task 2's grid**
 
-This is an analysis step: read `priority2-lever-a-grid.json`'s 16 rows,
-identify the single `(k1, b)` pair with the best dev Recall@10+nDCG@10
-combination (ties broken toward values closest to the current defaults
-`1.2`/`0.75`, to avoid picking an extreme grid edge on noisy dev data) —
-record the chosen pair and a one-paragraph rationale as a new field in
-a hand-edited copy of the grid JSON, or a short inline note in Task 9's
-summary (either is fine; this is data/rationale, not executable logic).
-**If the best dev candidate is identical to the current defaults**
-(`1.2`/`0.75` ties or wins), that is itself a valid, reportable outcome —
-do not force a different pick to have something to show.
+This is an analysis step, mechanical, not a judgment call: read
+`priority2-lever-a-grid.json`'s 16 rows and apply the Frozen decision
+rules' grid-point-selection rule verbatim (maximize dev Recall@10, tie-break
+nDCG@10, tie-break distance to `(1.2, 0.75)`) to pick exactly one
+`(k1, b)` pair. Record the chosen pair and which tie-break rule (if any)
+was needed, as a new field in a hand-edited copy of the grid JSON, or a
+short inline note in Task 9's summary (either is fine; this is data/
+rationale, not executable logic). **If the selected point IS the
+current defaults** (`1.2`/`0.75`), that is itself a valid, reportable
+outcome — do not force a different pick to have something to show.
 
-- [ ] **Step 2: Run the chosen candidate against dev and calibration, writing full ablation reports**
+- [ ] **Step 2: Run the chosen candidate against dev and calibration in BOTH modes, writing full ablation reports**
 
 Run `run_split_with_bm25_params` (Task 2's function) for both `dev` and
-`calibration` with the chosen `(k1, b)`, writing
-`priority2-lever-a-dev-ablation.json` /
-`priority2-lever-a-calibration-ablation.json` in the full schema (per
-Global Constraints: config, commit, hashes, Recall@10+CI, nDCG@10+CI,
-confusion matrix, delta vs. official B1 baseline, "not measured" for
-latency).
+`calibration`, with the chosen `(k1, b)`, in both `BmVariant::AScore` and
+`BmVariant::AFull` — writing `priority2-lever-a-dev-ablation.json` /
+`priority2-lever-a-calibration-ablation.json` with both variants' full
+results side by side (per Global Constraints: config, commit, hashes,
+Recall@10+CI, nDCG@10+CI, confusion matrix, delta vs. official B1
+baseline, "not measured" for latency — each field present for both
+`A-score` and `A-full`). **If `A-full`'s candidate set differs from
+`A-score`'s at this `(k1, b)` (Review Focus risk above), report the
+actual candidate-count delta explicitly** — this is expected signal,
+not an error to suppress.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Apply the frozen Stage 1 KEEP/REJECT criterion to `A-full`'s calibration numbers**
+
+Mechanical application of the Frozen decision rules' KEEP/REJECT
+criterion to `A-full`'s calibration ablation report from Step 2 (never
+`A-score`'s — `A-score` is informational only in this report, per the
+Interfaces block above). Name the specific passing/failing criterion
+in the recorded decision.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add eval/results/B3-TUNE-v2/priority2-lever-a-dev-ablation.json eval/results/B3-TUNE-v2/priority2-lever-a-calibration-ablation.json
-git commit -m "docs(eval): B3-TUNE-v2 Priority 2 Lever A dev/calibration ablation"
+git commit -m "docs(eval): B3-TUNE-v2 Priority 2 Lever A dev/calibration ablation (A-score + A-full)"
 ```
 
 ---
@@ -523,7 +762,7 @@ git commit -m "feat(index): conservative trailing-punctuation stripping, tested 
 
 ---
 
-### Task 5: Lever B ablation — normalization in the real search path
+### Task 5: Lever B ablation — `B-query` (query-only, diagnostic) and `B-symmetric` (index+query, decision)
 
 **Files:**
 - Modify: `crates/api/examples/b3_tune_v2_lever_b_normalization.rs`
@@ -533,10 +772,14 @@ git commit -m "feat(index): conservative trailing-punctuation stripping, tested 
 
 **Interfaces:**
 - Consumes: Task 4's `strip_trailing_sentence_punctuation`, the same
-  duplicated `TestFixture`/metrics pattern Task 2 uses.
-- Produces: the dev/calibration ablation reports, same schema as Task 3's.
+  duplicated `TestFixture`/metrics pattern Task 2 uses, the Frozen
+  decision rules' KEEP/REJECT criterion.
+- Produces: the dev/calibration ablation reports (each containing both
+  `B-query` and `B-symmetric` numbers side by side), same schema as
+  Task 3's. `B-symmetric` is what Lever B's KEEP/REJECT decision is
+  about; `B-query` stays informational in the same report.
 
-- [ ] **Step 1: Write the failing test for a normalized-tokenizer search**
+- [ ] **Step 1: Write the failing test for query-only normalized search (`B-query`)**
 
 ```rust
 #[test]
@@ -555,39 +798,104 @@ fn a_query_with_trailing_punctuation_matches_the_same_as_without() {
 Run: `cargo test -p api --example b3_tune_v2_lever_b_normalization normalized`
 Expected: FAIL (`run_one_query_normalized` not yet defined).
 
-- [ ] **Step 3: Implement `run_one_query_normalized`**
+- [ ] **Step 3: Implement `run_one_query_normalized` (`B-query`)**
 
 `fn run_one_query_normalized(idx: &index::Index<'_>, question: &str, k: usize) -> QueryOutcome` —
 applies `strip_trailing_sentence_punctuation` to `question` **split on
 whitespace, stripped per-token, rejoined with single spaces** before
-calling `api::search` with the rejoined string (this ablation tests the
-effect of normalizing the QUERY text; the design doc's lever is about
-query-time matching quality, and the indexed corpus text is already
-fixed/frozen — normalizing only the query side is the correct, minimal
-test of this lever without touching indexed content). Otherwise
-identical to the existing `run_one_query` pattern (same `QueryOutcome`
-enum, same `SearchOutcome` match).
+calling `api::search` with the rejoined string, against a plain,
+unmodified `TestFixture::build_index()` (indexed text stays exactly as
+B1 indexes it today). Otherwise identical to the existing
+`run_one_query` pattern (same `QueryOutcome` enum, same `SearchOutcome`
+match).
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run the same command as Step 2. Expected: PASS.
 
-- [ ] **Step 5: Implement the ablation `main` mode and run it against dev + calibration**
+- [ ] **Step 5: Write the failing test for symmetric (index + query) normalized search (`B-symmetric`)**
+
+```rust
+#[test]
+fn build_index_with_normalization_indexes_stripped_tokens() {
+    let fixture = TestFixture::new();
+    fixture.commit_corpus();
+    let idx = fixture.build_index_with_normalization();
+    // A query carrying trailing punctuation the corpus's own indexed
+    // text also had (and now has stripped) must still match -- this
+    // proves the SAME normalization ran on the indexed side, not just
+    // the query side (B-query would already pass this if the corpus
+    // happened to have no trailing punctuation at all; this test's
+    // point is confirming indexed text actually changed).
+    let result = run_one_query_normalized(&idx, "resolve_configured_timezone", 10);
+    assert!(matches!(result, QueryOutcome::Matches { .. }));
+}
+```
+
+- [ ] **Step 6: Run the test to verify it fails**
+
+Run: `cargo test -p api --example b3_tune_v2_lever_b_normalization build_index_with_normalization`
+Expected: FAIL (`build_index_with_normalization` not yet defined).
+
+- [ ] **Step 7: Implement `build_index_with_normalization` (`B-symmetric`'s indexing side)**
+
+`fn build_index_with_normalization(&self) -> index::Index<'_>` on the
+duplicated `TestFixture` — **does not call `rebuild_index`/`RealIndexer`
+at all** (that path always calls the frozen, unmodified `Bm25Index::insert`
+via `bm25::tokenize`, which this plan never changes). Instead: for each
+corpus note, read its raw bytes, call `Document::from_record_bytes` to
+get `text_searchable`, apply `strip_trailing_sentence_punctuation` to
+every whitespace-split token of `text_searchable` and rejoin with single
+spaces, and insert the result directly into a standalone `Bm25Index`
+(via `Bm25Index::new()` — default params, since Lever B and Lever A are
+independent, isolated ablations per the Global Constraints, never
+combined) and a standalone `TrigramIndex::new()`, bypassing `RealIndexer`
+entirely. Wrap both in a minimal struct that implements enough of
+`index::Index`'s own search entry point to be queried by
+`run_one_query_normalized` — if `index::Index` itself can't be
+constructed around a standalone pair of indexes without a `Vault`/
+`RealIndexer` (check this before writing further code; `Index::new`'s
+signature takes `&Vault`/`&RealIndexer`, which this standalone pair
+isn't), fall back to calling `Bm25Index::query_ranked` plus
+`TrigramIndex::query_exact` directly inside
+`run_one_query_normalized`'s own `B-symmetric` branch (unioning hits the
+same way `candidate_ids` does, scoring with the standalone `Bm25Index`)
+rather than trying to force this into `index::Index`'s shape — this
+plan's own earlier diagnostic binaries (`b3_tune_v2_signal_analysis.rs`)
+already call `api::search` through a real `Index`, but `B-symmetric`'s
+whole point is indexed text that real pipeline has never seen
+normalized, so a standalone scoring path here is correct, not a
+shortcut.
+
+- [ ] **Step 8: Run the test to verify it passes**
+
+Run the same command as Step 6. Expected: PASS.
+
+- [ ] **Step 9: Implement the ablation `main` mode and run both variants against dev + calibration**
 
 Extend `main()` with a `--ablate <split>` mode (alongside Task 4's
 `--diagnostic`) that runs every non-canary row of the given split
-through `run_one_query_normalized`, scores with
-`api::metrics::recall_at_10`/`ndcg_at_10`, and writes the full ablation
-report (same schema as Task 3). Run:
+through BOTH `run_one_query_normalized` against a plain `build_index()`
+(`B-query`) AND against `build_index_with_normalization()` (`B-symmetric`),
+scores both with `api::metrics::recall_at_10`/`ndcg_at_10`, and writes
+one ablation report per split containing both variants' full results
+(same schema as Task 3). Run:
 `cargo run --release -p api --example b3_tune_v2_lever_b_normalization -- --ablate dev`
 then `-- --ablate calibration`.
 Expected: both exit 0, write their reports.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 10: Apply the frozen Stage 1 KEEP/REJECT criterion to `B-symmetric`'s calibration numbers**
+
+Mechanical application of the Frozen decision rules' KEEP/REJECT
+criterion to `B-symmetric`'s calibration ablation report (never
+`B-query`'s). Name the specific passing/failing criterion in the
+recorded decision.
+
+- [ ] **Step 11: Commit**
 
 ```bash
 git add crates/api/examples/b3_tune_v2_lever_b_normalization.rs eval/results/B3-TUNE-v2/priority2-lever-b-dev-ablation.json eval/results/B3-TUNE-v2/priority2-lever-b-calibration-ablation.json
-git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever B normalization dev/calibration ablation"
+git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever B normalization dev/calibration ablation (B-query + B-symmetric)"
 ```
 
 ---
@@ -825,7 +1133,16 @@ report. Run:
 then `-- --ablate calibration`.
 Expected: both exit 0, write their reports.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Apply the frozen Stage 1 KEEP/REJECT criterion to the calibration ablation**
+
+Mechanical application of the Frozen decision rules' KEEP/REJECT
+criterion (above) to this ablation's calibration report. Name the
+specific passing/failing criterion in the recorded decision. (Lever C
+has only one configuration — no `-score`/`-full` or `-query`/`-symmetric`
+split — so this decision is simply Lever C's own KEEP/REJECT, with no
+separate informational variant.)
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/api/examples/b3_tune_v2_lever_c_alias_table.rs eval/results/B3-TUNE-v2/priority2-lever-c-dev-ablation.json eval/results/B3-TUNE-v2/priority2-lever-c-calibration-ablation.json
@@ -847,20 +1164,19 @@ git commit -m "feat(eval): B3-TUNE-v2 Priority 2 Lever C frozen alias table dev/
 
 - [ ] **Step 1: Write the per-lever KEEP/REJECT sections**
 
-For each of Lever A, B, C: report the full config (exact `k1`/`b` or
-the normalization rule or the frozen alias table), commit, corpus/
-labels hashes (already in each ablation report), Recall@10 (+CI),
-nDCG@10 (+CI), the abstention confusion matrix and whether it changed
-from B1's baseline pattern (constant non-abstaining — flag explicitly
-if any lever caused even one `NotPresent` where B1 didn't, or vice
-versa), latency ("not measured"), delta vs. the **official** B1
-baseline (never vs. another lever), and an explicit KEEP/REJECT
-decision with rationale, checked against: does calibration Recall@10/
-nDCG@10 move in the right direction without a false-abstention-rate-style
-hidden cost (there is no abstention tuning here, but a lever that
-degrades Recall@10 while not improving anything else is a REJECT
-regardless of dev's own numbers, same "calibration decides" discipline
-Priority 1 used).
+For each of Lever A (`A-full`'s decision, `A-score` informational),
+Lever B (`B-symmetric`'s decision, `B-query` informational), and Lever C
+(its one configuration): report the full config (exact `k1`/`b` or the
+normalization rule or the frozen alias table), commit, corpus/labels
+hashes (already in each ablation report), Recall@10 (+CI), nDCG@10
+(+CI), the abstention confusion matrix and whether it changed from B1's
+baseline pattern (constant non-abstaining — flag explicitly if any
+lever caused even one `NotPresent` where B1 didn't, or vice versa),
+latency ("not measured"), delta vs. the **official** B1 baseline (never
+vs. another lever), and the KEEP/REJECT decision each of Task 3/5/8
+already computed by applying the Frozen decision rules' criterion
+verbatim — this step assembles and reports those three decisions, it
+does not recompute or re-judge them against any new criterion.
 
 - [ ] **Step 2: Note whether any lever moved Priority 1's signal separation (secondary, non-gating)**
 
@@ -912,39 +1228,53 @@ include:
 ## Self-Review Notes
 
 - **Spec coverage**: the design doc's three levers (A/B/C) each map to
-  a dedicated pair of tasks (build + ablate: Tasks 1-2-3 for A, 4-5 for
-  B, 6-7-8 for C), its two-stage correction maps to this plan's own
+  a dedicated group of tasks (build + ablate: Tasks 1-1b-2-3 for A, 4-5
+  for B, 6-7-8 for C), its two-stage correction maps to this plan's own
   scope boundary (Stage 1 tasks only, Stage 2 explicitly excluded in
   "What this plan stops short of"), its calibration-never-selects-aliases
   correction maps to Task 6's "corpus + dev only" consumption and Task
   7's freeze-then-evaluate ordering, and its conservative-normalization
   correction maps to Task 4's narrow character set + diagnostic-gated
   finalization. The secondary signal-separation diagnostic (design
-  doc's Goal 2) maps to Task 9 Step 2, explicitly non-gating.
+  doc's Goal 2) maps to Task 9 Step 2, explicitly non-gating. This
+  revision's 3 corrections map to: Task 1b (`A-full`, the candidate-
+  prefilter-inclusive variant Lever A's decision is actually about),
+  Task 5 Steps 5-10 (`B-symmetric`, the index+query-symmetric variant
+  Lever B's decision is actually about), and the "Frozen decision
+  rules" section (both the grid-point-selection rule and the Stage 1
+  KEEP/REJECT criterion, fixed before Task 2 or any calibration run,
+  applied mechanically by Tasks 3/5/8 rather than judged after the
+  fact).
 - **Step scan**: Task 3 Step 1, Task 6 Step 6, and Task 2's grid-pick
   rule each flag a real judgment call (which grid point to carry
-  forward, whether any alias candidate is dev-justified, tie-breaking
-  toward current defaults) and give the implementer an explicit
-  tie-break rule or a legitimate "do nothing" outcome (C3) rather than
-  forcing a decision where the evidence doesn't support one.
+  forward, whether any alias candidate is dev-justified) and give the
+  implementer an explicit, frozen tie-break rule or a legitimate "do
+  nothing" outcome (C3) rather than forcing a decision where the
+  evidence doesn't support one, or leaving the rule itself to be
+  invented after seeing results.
 - **Type consistency**: `QueryOutcome` (Task 5, Task 8) matches the
   existing enum shape from `b3_metric_runner.rs`/`b3_tune_v2_signal_analysis.rs`
-  exactly (`NotPresent` / `Matches { retrieved_note_ids }`); `GridPointReport`
-  (Task 2) is defined once and referenced by Task 3 only for reading its
-  JSON output, never re-declared; `AliasCandidate` (Task 6) and the
-  frozen table's `{short_form: expansion}` shape (Task 7) are used
-  consistently from Task 6 through Task 8.
-- **Review Focus**: each of the 4 named risks has an owning task —
-  the candidate-prefilter-vs-final-scoring distinction (Task 1 Step 6's
-  `b=0.0` contrast test, chosen specifically because it's a large,
-  visible effect isolated to final scoring), the token-collision risk
-  (Task 4's diagnostic-before-finalize gate), the substring-vs-whole-token
-  alias risk (Task 7 Step 1's dedicated test), and the silent-abstention-drift
-  risk (every ablation's confusion-matrix field, explicit in Task 9
-  Step 1's reporting requirement).
-- **Proportion**: 9 tasks, each small (one pure function or one
-  additive constructor plus one diagnostic/ablation binary), for a
-  design doc whose own scope is three parallel, independent levers —
-  proportionate given the plan's real complexity is in correctly
+  exactly (`NotPresent` / `Matches { retrieved_note_ids }`); `BmVariant`
+  and `GridPointReport` (Task 2) are defined once and referenced by
+  Task 3 only for reading JSON output, never re-declared; `AliasCandidate`
+  (Task 6) and the frozen table's `{short_form: expansion}` shape
+  (Task 7) are used consistently from Task 6 through Task 8.
+- **Review Focus**: each of the 5 named risks has an owning task — the
+  `A-score`-vs-`A-full` attribution distinction (Task 1's final-scoring-
+  only test, Task 1b's candidate-prefilter test including the poisoned-
+  mutex recovery fix, Task 3's side-by-side report), the token-collision
+  risk (Task 4's diagnostic-before-finalize gate), `B-symmetric`'s
+  indexed-side/query-side normalization using the identical function
+  (Task 5 Step 7's explicit reuse of Task 4's `strip_trailing_sentence_punctuation`,
+  never a second implementation), the substring-vs-whole-token alias
+  risk (Task 7 Step 1's dedicated test), and the decision-rules-frozen-
+  before-results risk (the "Frozen decision rules" section itself,
+  applied mechanically rather than invented post-hoc by Tasks 3/5/8).
+- **Proportion**: 10 tasks (1, 1b, 2, 3, 4, 5, 6, 7, 8, 9), each small
+  (one pure function or one additive constructor plus one diagnostic/
+  ablation binary), for a design doc whose own scope is three parallel,
+  independent levers, each now measured in two variants (one
+  informational, one decision-bearing) — proportionate given the plan's
+  real complexity is in correctly
   isolating each lever's measurement from the others and from
   calibration, not in code volume.
