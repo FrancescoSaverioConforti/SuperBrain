@@ -1,0 +1,62 @@
+{
+  "split": "dev",
+  "run_commit": "ec96891823a21cd7d3baea5b7288d4a1f07ed3fe",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "aggregate": {
+    "recall_at_10": 0.8367346938775511,
+    "ndcg_at_10": 0.7139021585460019,
+    "recall_ci": [
+      0.7346938775510204,
+      0.9387755102040817
+    ],
+    "ndcg_ci": [
+      0.6058832617246017,
+      0.8148598173679488
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "abstention": {
+    "confusion_matrix": {
+      "tp": 0,
+      "tn": 49,
+      "fp": 0,
+      "fn": 11
+    },
+    "precision": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "recall": {
+      "value": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "valid_resamples": 2000,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "f1": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "accuracy": {
+      "value": 0.8166666666666667,
+      "ci": [
+        0.7166666666666667,
+        0.9
+      ],
+      "valid_resamples": 2000,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "n": 60
+  }
+}
