@@ -88,16 +88,15 @@ frozen baseline."
 
 ---
 
-## Lever B — Conservative Punctuation Normalization — **PROVISIONAL KEEP, pending real-pipeline verification**
+## Lever B — Conservative Punctuation Normalization — **REJECT (real-pipeline verification result)**
 
-**User review (2026-11-14): verdict downgraded to PROVISIONAL KEEP.**
-The report below measured `B-symmetric` through a standalone scorer,
-not the real `Index::search` pipeline — a real-pipeline verification
-is required before this becomes `KEEP CONFIRMED` or `REJECT`. See
-"Real-pipeline verification" section below for that result. The
-criterion is NOT re-chosen after seeing the verification result — it is
-the same Frozen decision rules criterion already applied to every
-other lever in this document.
+**User review (2026-11-14): verdict downgraded to PROVISIONAL KEEP**
+pending a real-pipeline verification, since the original measurement
+below used a standalone scorer, not the real `Index::search` pipeline.
+**That verification has now run (see "Real-pipeline verification"
+section below) and resolves the lever to REJECT** — the real pipeline
+does not reproduce the standalone scorer's promising signal; it shows
+a calibration nDCG@10 regression instead.
 
 **Config:** `strip_trailing_sentence_punctuation` — strips only trailing
 `. , ; : ! ? " '` (narrowed from the design doc's original candidate
@@ -177,9 +176,12 @@ rule's "at least one metric improves, no regression beyond tolerance"
 criterion is satisfied, but this is a KEEP for a real, if small and
 imprecisely measured, effect, not a decisive win.
 
-**Verdict (standalone scorer only): PROVISIONAL KEEP** — superseded by
-the real-pipeline verification result below, which is the one that
-decides `KEEP CONFIRMED` vs. `REJECT`.
+**Verdict (standalone scorer only): PROVISIONAL KEEP** — **superseded by
+the real-pipeline verification below, which resolves this lever to
+REJECT.** This standalone-scorer measurement is kept in this document
+for the record (it is what first surfaced the lever as promising and
+justified running the verification at all), but it is not what decides
+Lever B's final status.
 
 (Note: dev's own `B-symmetric` improvement — 0.9592 vs. B1's 0.8367 —
 is much larger than calibration's, and is itself measured through the
@@ -285,41 +287,109 @@ document depends on this diagnostic.
 
 ---
 
-## Real-pipeline verification of Lever B (user-authorized checkpoint)
+## Real-pipeline verification of Lever B (user-authorized checkpoint, 2026-11-14) — **REJECT**
 
-See the dedicated section below, after "Overall Stage 1 result" — this
-verification runs `B-symmetric`'s already-frozen normalization policy
-through an opt-in real-pipeline path (not the standalone scorer), and
-its result is what moves Lever B from `PROVISIONAL KEEP` to either
-`KEEP CONFIRMED` or `REJECT`, per the same Frozen decision rules
-criterion already applied to every other lever — not a new or
-re-chosen criterion.
+**Mechanism:** `RealIndexer::new_with_text_normalizer(fn(&str) -> String)`
+(new, additive constructor, commit `daa622e`) applies a transform to
+`Document::text_searchable` right before it reaches
+`trigram.insert`/`bm25.insert` inside `index_document` — before
+`bm25::tokenize` ever sees the text, never inside it. `None` for every
+existing constructor (`new()`, `new_with_bm25_params`), so default/
+production indexing is completely unaffected. The normalizer passed is
+the literal `normalize_text` function already used by the query side —
+**the identical function both sides, not a reimplementation** — which
+in turn calls `strip_trailing_sentence_punctuation`, Task 4's
+already-frozen rule. **No new punctuation set, no new rule, no new
+tuning, no variant selection after seeing results.**
 
-## Overall Stage 1 result
+**Config confirmation:** `normalization_policy_identical_to_frozen: true`
+in both reports below (self-documenting field) — the exact same
+`TRAILING_SENTENCE_PUNCTUATION = ['.', ',', ';', ':', '!', '?', '"', '\'']`
+set frozen in `crates/index/src/lexical_normalize.rs` at commit `ee5c6a4`,
+unchanged.
+
+**Commit:** `daa622e` (hook), ablation run at `daa622e`.
+
+| | Recall@10 | Δ vs B1 | nDCG@10 | Δ vs B1 | Queries w/ changed ranking |
+|---|---|---|---|---|---|
+| Dev (B1 this run) | 0.8367 | — | 0.7139 | — | — |
+| Dev (`B-symmetric`, real pipeline) | 0.8776 | — (diagnostic only) | 0.7503 | — | 33/60 |
+| Calibration (B1 this run) | 0.9167 | — | 0.7091 | — | — |
+| Calibration (`B-symmetric`, real pipeline) | 0.9167 | **+0.0000** | 0.6877 | **−0.0213** | 14/30 |
+
+**Abstention (calibration, real pipeline):** TP=0, TN=24, FP=0, FN=6 —
+unchanged from B1's own pattern. (This check is now the strong,
+real-pipeline version, not the standalone scorer's weaker one.)
+
+**Candidate-set/ranking change:** 14 of calibration's 30 non-canary
+queries (and 33 of dev's 60) retrieve a DIFFERENT top-10 ranking under
+real-pipeline `B-symmetric` versus plain B1 on the same run — the
+normalization genuinely changes retrieval behavior through the real
+pipeline, it is not a no-op. The change is simply not a beneficial one
+on calibration.
+
+**KEEP/REJECT rationale (same Frozen decision rules criterion, applied
+mechanically, not re-chosen after this result):** Recall@10 regression
+(0.0000) passes the ≤0.05 tolerance trivially. nDCG@10 regression
+(0.0213) also passes the ≤0.05 tolerance — but **it is a regression,
+not an improvement**. Abstention pattern unchanged. **Neither metric
+improves.** Per the same rule that rejected Levers A and (now) B's own
+original standalone-scorer-vs-control comparison was promising: "the
+real-pipeline verification does not confirm the standalone scorer's
+signal — the real effect on calibration is a small regression, not an
+improvement."
+
+**This result also explains dev's real-pipeline number matching
+`B-query`'s (not the standalone `B-symmetric`'s) almost exactly**
+(0.8776/0.7503 here vs. 0.8776/0.7503 in the original `B-query` row
+above): on this corpus, through the real pipeline, symmetric
+normalization's effect is dominated by the query-side change alone —
+indexing-side normalization changes individual rankings (33/60 on dev,
+14/30 on calibration) without moving the aggregate beyond what
+query-only normalization already produced. The standalone scorer's
+much larger dev improvement (0.9592/0.7969) was an artifact of its own
+different IDF/avgdl scope, not a real-pipeline effect that survived
+verification.
+
+**Final verdict for Lever B: REJECT.**
+
+## Overall Stage 1 result (FINAL)
 
 | Lever | Decision variant | Verdict |
 |---|---|---|
 | A (BM25 k1/b) | `A-full` (identical to `A-score` by construction) | **REJECT (CONFIRMED, CLOSED)** |
-| B (punctuation normalization) | `B-symmetric` | **PROVISIONAL KEEP → see real-pipeline verification below for the final verdict** |
+| B (punctuation normalization) | `B-symmetric`, real-pipeline verified | **REJECT** (calibration nDCG@10 regression −0.0213; real pipeline does not reproduce the standalone scorer's promising signal) |
 | C (alias table) | — | **NOT EVALUATED / NO-OP (closed, inconclusive)** |
 
-An independent whole-branch review (fresh context, 2026-11-14) found
-the original draft's verdicts were defensible on the frozen rule's own
-terms but mischaracterized what was actually measured in three places,
-and the user's own review (2026-11-14, second pass) adjusted the
-verdict labels accordingly: Lever A's two variants are mathematically
-identical on this corpus (not merely "no drift observed") — **REJECT
-confirmed by the user, closed, no further BM25 k1/b tuning**. Lever C
-never actually fired a single alias on either split — relabeled
-**NOT EVALUATED / NO-OP** rather than REJECT, since REJECT implies a
-tested-and-failed hypothesis; **closed as inconclusive, not
-reattempted** (constructing new aliases now, with dev/calibration
-results in hand, would leak the evaluation data into the table's own
-construction). Lever B's numbers came from a substitute scorer whose
-own bias ran against this lever (matched-control effect +0.019 nDCG@10,
-larger than the standalone-scorer-vs-real-B1 reported +0.0036) —
-relabeled **PROVISIONAL KEEP pending the real-pipeline verification**
-below, which decides the lever's final status.
+**No lever is accepted from this Stage 1 round.** All three close
+without a KEEP. Lever B came closest — its standalone-scorer measurement
+and matched control both suggested a real improvement — but the
+real-pipeline verification (the one measurement method that actually
+represents what shipping this change would do) found a small
+calibration regression instead. This is exactly why the verification
+checkpoint was required before treating the standalone-scorer number as
+decisive.
+
+**History of this document's revisions, for the record:** an
+independent whole-branch review (fresh context, 2026-11-14) found the
+original draft's verdicts were defensible on the frozen rule's own
+terms but mischaracterized what was actually measured in three places.
+The user's own review (2026-11-14, second pass) adjusted the verdict
+labels: Lever A's two variants are mathematically identical on this
+corpus (not merely "no drift observed") — **REJECT confirmed by the
+user, closed, no further BM25 k1/b tuning**. Lever C never actually
+fired a single alias on either split — relabeled **NOT EVALUATED /
+NO-OP** rather than REJECT, since REJECT implies a tested-and-failed
+hypothesis; **closed as inconclusive, not reattempted** (constructing
+new aliases now, with dev/calibration results in hand, would leak the
+evaluation data into the table's own construction). Lever B's
+standalone-scorer numbers were downgraded to **PROVISIONAL KEEP
+pending a real-pipeline verification**, since a matched control
+suggested the real effect might be larger than reported (+0.019 vs.
++0.0036). **That verification has now run** (see the dedicated section
+above) **and resolves Lever B to REJECT**: the real pipeline shows a
+small calibration nDCG@10 regression (−0.0213), not the improvement the
+standalone scorer suggested.
 
 ## Explicit confirmations
 

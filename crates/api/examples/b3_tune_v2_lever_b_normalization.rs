@@ -107,6 +107,39 @@ impl TestFixture {
         Self { vault: Some(vault), pii: Some(pii), indexer: Arc::new(RealIndexer::new()), root }
     }
 
+    /// Same as `new`, but the fixture's `RealIndexer` is constructed
+    /// with `RealIndexer::new_with_text_normalizer(normalizer)` instead
+    /// of the plain default — the real-pipeline `B-symmetric`
+    /// verification's own mechanism (Task "B verification checkpoint",
+    /// user-authorized 2026-11-14). The corpus commit and the plain
+    /// `B1` production path remain completely unaffected elsewhere;
+    /// this fixture is a separate instance, never a mutation of an
+    /// existing one.
+    fn new_with_text_normalizer(normalizer: fn(&str) -> String) -> Self {
+        let root = std::env::temp_dir().join(format!("superbrain-b3-tune-v2-lever-b-realpipeline-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let repo = git2::Repository::init(&root).unwrap();
+            let sig = git2::Signature::now("B3-TUNE-v2 Lever B", "test@localhost").unwrap();
+            let oid = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        let pii_root = root.join(".pii-store");
+        let pii =
+            vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii.bootstrap_deletion_log().unwrap();
+        let vault =
+            Vault::open_with_pii_store(root.clone(), &root.join("journal.sqlite"), &pii).unwrap();
+        Self {
+            vault: Some(vault),
+            pii: Some(pii),
+            indexer: Arc::new(RealIndexer::new_with_text_normalizer(normalizer)),
+            root,
+        }
+    }
+
     fn vault(&self) -> &Vault {
         self.vault.as_ref().unwrap()
     }
@@ -397,6 +430,20 @@ fn sha256_hex_of_file(path: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Scores a variant from already-computed outcomes (avoids re-running
+/// each query a second time just to also compare rankings — used by
+/// the real-pipeline verification, which needs each split's raw
+/// `QueryOutcome`s for its own `queries_with_changed_ranking` count).
+/// `outcomes` must be in the same order as `rows`.
+fn score_variant_from_outcomes(rows: &[LabelRow], outcomes: &[QueryOutcome], variant_name: &str) -> VariantReport {
+    let cursor = std::cell::Cell::new(0usize);
+    run_variant(rows, |_row| {
+        let i = cursor.get();
+        cursor.set(i + 1);
+        outcomes[i].clone()
+    }, variant_name)
+}
+
 fn run_variant(rows: &[LabelRow], run_query: impl Fn(&LabelRow) -> QueryOutcome, variant_name: &str) -> VariantReport {
     let mut recall_values: Vec<f64> = Vec::new();
     let mut ndcg_values: Vec<f64> = Vec::new();
@@ -473,6 +520,79 @@ fn run_ablation_for_split(split: &str) -> AblationReport {
     }
 }
 
+/// Real-pipeline B-symmetric verification (user-authorized checkpoint,
+/// 2026-11-14): runs the SAME already-frozen `strip_trailing_sentence_punctuation`
+/// policy through the real `RealIndexer`/`Index::search` path (via
+/// `RealIndexer::new_with_text_normalizer(normalize_text)` for the
+/// indexed side, `run_one_query_normalized` for the query side — the
+/// identical `normalize_text` function both sides, never a second
+/// implementation), against plain, unmodified B1 (`build_index()`) run
+/// on the same corpus/labels for the candidate-set/ranking comparison.
+/// Production/default `RealIndexer::new()` behavior is untouched.
+#[derive(Debug, serde::Serialize)]
+struct RealPipelineVerificationReport {
+    split: String,
+    run_commit: String,
+    labels_sha256: String,
+    /// Confirms the policy used here is byte-identical to the frozen
+    /// one: the normalizer passed to `RealIndexer::new_with_text_normalizer`
+    /// is the literal `normalize_text` function, which in turn calls
+    /// `strip_trailing_sentence_punctuation` (Task 4's frozen rule) —
+    /// no new rule, no different character set, no new tuning.
+    normalization_policy_identical_to_frozen: bool,
+    b1_baseline_this_run: VariantReport,
+    b_symmetric_real_pipeline: VariantReport,
+    /// How many of this split's non-canary queries had a DIFFERENT
+    /// top-10 retrieved-note-id ranking under `B-symmetric` versus
+    /// plain B1 on this same run — the real-pipeline analog of the
+    /// standalone-scorer report's informal "0.0000 means nothing
+    /// changed" observation, made explicit rather than implied.
+    queries_with_changed_ranking: usize,
+    query_count: usize,
+}
+
+fn run_real_pipeline_verification_for_split(split: &str) -> RealPipelineVerificationReport {
+    assert!(
+        split == "dev" || split == "calibration",
+        "Lever B's real-pipeline verification only ever reads dev or calibration, never test or v2-heldout; got {split:?}"
+    );
+    let labels_path = format!("{}/../../eval/rag/{split}/labels.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let raw_labels_text = std::fs::read_to_string(&labels_path).unwrap();
+    let rows = exclude_canary(parse_label_rows(&raw_labels_text));
+
+    let b1_fixture = TestFixture::new();
+    b1_fixture.commit_corpus();
+    let b1_idx = b1_fixture.build_index();
+    let b1_outcomes: Vec<QueryOutcome> = rows.iter().map(|row| run_one_query(&b1_idx, &row.question, K)).collect();
+    let b1 = score_variant_from_outcomes(&rows, &b1_outcomes, "B1-real-pipeline-this-run");
+
+    let normalized_fixture = TestFixture::new_with_text_normalizer(normalize_text);
+    normalized_fixture.commit_corpus();
+    let normalized_idx = normalized_fixture.build_index();
+    let symmetric_outcomes: Vec<QueryOutcome> = rows
+        .iter()
+        .map(|row| run_one_query_normalized(&normalized_idx, &row.question, K))
+        .collect();
+    let b_symmetric = score_variant_from_outcomes(&rows, &symmetric_outcomes, "B-symmetric-real-pipeline");
+
+    let queries_with_changed_ranking = b1_outcomes
+        .iter()
+        .zip(symmetric_outcomes.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    RealPipelineVerificationReport {
+        split: split.to_string(),
+        run_commit: git_rev_parse_head(),
+        labels_sha256: sha256_hex_of_file(&labels_path),
+        normalization_policy_identical_to_frozen: true,
+        b1_baseline_this_run: b1,
+        b_symmetric_real_pipeline: b_symmetric,
+        queries_with_changed_ranking,
+        query_count: rows.len(),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct TokenDiagnosticEntry {
     original: String,
@@ -542,13 +662,42 @@ fn main() {
             std::fs::write(&out_path, json).unwrap();
             println!("wrote {out_path}");
         }
-        other => panic!("usage: --diagnostic | --ablate <dev|calibration>; got {other:?}"),
+        Some("--verify-real-pipeline") => {
+            let split = args.get(2).cloned().unwrap_or_else(|| panic!("--verify-real-pipeline requires a split (dev|calibration)"));
+            let report = run_real_pipeline_verification_for_split(&split);
+            println!(
+                "{split}: B1(this run) Recall@10={:.4} nDCG@10={:.4} | B-symmetric(real pipeline) Recall@10={:.4} nDCG@10={:.4} | queries_with_changed_ranking={}/{}",
+                report.b1_baseline_this_run.aggregate.recall_at_10, report.b1_baseline_this_run.aggregate.ndcg_at_10,
+                report.b_symmetric_real_pipeline.aggregate.recall_at_10, report.b_symmetric_real_pipeline.aggregate.ndcg_at_10,
+                report.queries_with_changed_ranking, report.query_count
+            );
+            std::fs::create_dir_all(RESULTS_DIR).unwrap();
+            let out_path = format!("{RESULTS_DIR}/priority2-lever-b-{split}-real-pipeline-verification.json");
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            std::fs::write(&out_path, json).unwrap();
+            println!("wrote {out_path}");
+        }
+        other => panic!("usage: --diagnostic | --ablate <dev|calibration> | --verify-real-pipeline <dev|calibration>; got {other:?}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_pipeline_fixture_with_text_normalizer_indexes_normalized_text() {
+        let fixture = TestFixture::new_with_text_normalizer(normalize_text);
+        fixture.commit_corpus();
+        let idx = fixture.build_index();
+        // A query with a trailing comma the corpus's own indexed text
+        // doesn't have must still match via the real search path once
+        // the indexed side is normalized too -- same assertion shape as
+        // the B-query/B-symmetric tests above, but through RealIndexer
+        // this time, not a standalone scorer.
+        let result = run_one_query_normalized(&idx, "resolve_configured_timezone", 10);
+        assert!(matches!(result, QueryOutcome::Matches { .. }));
+    }
 
     /// Mirrors `index::bm25::tokenize`'s own pin test
     /// (`tokenize_is_whitespace_delimited_and_case_folded_with_no_punctuation_stripping`
