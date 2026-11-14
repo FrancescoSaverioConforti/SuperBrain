@@ -1,0 +1,44 @@
+{
+  "entries": {
+    "SEC-001": {
+      "expansion": "symlink TOCTOU check-then-act race",
+      "rationale": "Note bug-2026-10-27-sec001-toctou's body describes a check-then-act symlink race in record_path_checked/ensure_resolves_inside_root: 'a TOCTOU race'. Dev-referenced."
+    },
+    "SEC-002": {
+      "expansion": "symlink aliasing content version misattribution",
+      "rationale": "Note bug-2026-10-27-sec002-symlink-aliasing's body: a symlink makes read_note(note-a) return note-b's content/version, so 'content and version get misattributed to the wrong note id'. Dev-referenced."
+    },
+    "SEC-003": {
+      "expansion": "hard link aliasing outside vault file",
+      "rationale": "Note bug-2026-10-27-sec003-hardlink-aliasing's body: a hard link pointing outside the vault lets read_note return 'the external file's content'; canonicalization cannot detect it since a hard link resolves inside the vault root. Dev-referenced."
+    },
+    "Fase-B": {
+      "expansion": "deterministic retrieval baseline trigrams BM25",
+      "rationale": "Note decision-2026-10-26-faseb-deterministic-baseline's body: 'Fase B must pass using only the deterministic retrieval baseline, trigrams plus BM25'. Dev-referenced."
+    },
+    "C6": {
+      "expansion": "gate five independent properties schema link evidence verification retrieval",
+      "rationale": "Note pattern-2026-10-26-c6-independent-gate-properties's body: 'the gate tracks five independent properties of a note: schema validity, link validity, evidence presence, verification status, and retrieval eligibility'. Dev-referenced."
+    },
+    "C5": {
+      "expansion": "deletion log three step pending trusted reference completed",
+      "rationale": "Note pattern-2026-10-26-deletion-log-three-step's body: 'a three-step protocol applies: write and sync the new log generation marked pending; update and sync the trusted reference; only then mark the generation completed'. Dev-referenced."
+    },
+    "C1": {
+      "expansion": "write visibility journal committed linearization point",
+      "rationale": "Note pattern-2026-10-26-write-visibility-linearization's body: 'A write only becomes visible through the API once it reaches journal_committed, the logical linearization point'. Dev-referenced."
+    }
+  },
+  "excluded_candidates": [
+    {
+      "short_form": "SEC-002",
+      "note_id": "bug-2026-10-27-sec002-fix-incomplete",
+      "reason": "Not dev-referenced (no dev query targets this note). Per Task 6 Step 6: only dev-referenced candidates get a frozen expansion -- no entry is added without real dev evidence it would help a query. Note SEC-002's OTHER note (bug-2026-10-27-sec002-symlink-aliasing) IS dev-referenced and has its own entry above; the two notes share the same short_form prefix but are different notes, so only the dev-referenced one is included."
+    },
+    {
+      "short_form": "C2",
+      "note_id": "decision-2026-10-26-c2-approval-channel",
+      "reason": "Not dev-referenced (no dev query targets this note)."
+    }
+  ]
+}
