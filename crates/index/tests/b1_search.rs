@@ -1000,3 +1000,117 @@ fn identifier_boost_does_not_change_the_candidate_set() {
     let boosted_ids = ids(boosted.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
     assert_eq!(plain_ids, boosted_ids, "identifier_boost must only reorder, never change membership");
 }
+
+// --- B3-TUNE-v2 Priority 3 Stage 1, P2: status tie-break. ---
+
+#[test]
+fn status_tiebreak_fires_only_on_exactly_equal_bm25_scores() {
+    let f = Fixture::new();
+    // Both notes share identical text so their BM25 scores are
+    // bitwise-identical f64 values under the real pipeline.
+    f.write(&Note { status: "draft", ..Note::new("note-draft", "shared_term appears here") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-verified", "shared_term appears here") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let response = idx.search("shared_term", Default::default(), 10).unwrap();
+
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    assert_eq!(first.note_id.as_str(), "note-verified", "Verified must outrank Draft at an exact score tie");
+}
+
+#[test]
+fn status_tiebreak_never_fires_on_a_nonzero_score_difference() {
+    let f = Fixture::new();
+    // note-a has extra matching term frequency -> a strictly higher,
+    // non-tied BM25 score than note-b, despite note-b's higher status tier.
+    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term shared_term shared_term extra filler text to differ length") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let plain_outcome = plain.search("shared_term", Default::default(), 10).unwrap().outcome;
+    let tiebreak_outcome = tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome;
+
+    // Ordering must be identical whether or not the tiebreak flag is set,
+    // because the scores are NOT exactly equal.
+    assert_eq!(format!("{plain_outcome:?}"), format!("{tiebreak_outcome:?}"));
+}
+
+#[test]
+fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering() {
+    // `status_tier` itself is private to `search.rs` and `#[cfg(test)]`
+    // does NOT cross the crate boundary into this integration-test binary
+    // (confirmed: Priority 2 Lever B had to duplicate logic locally for
+    // exactly this reason, and `indexer_impl.rs`'s own `#[cfg(test)]`
+    // helpers like `trigram_hits` are never called from this file today).
+    // So this test observes the tier ordering indirectly, through
+    // `with_status_tiebreak`'s real effect on search output, for every
+    // pair of tiers, rather than calling a private function directly.
+    let pairs = [
+        ("verified", "test-passed"),
+        ("reviewed", "test-passed"),
+        ("test-passed", "draft"),
+        ("draft", "superseded"),
+        ("draft", "contradicted"),
+    ];
+    for (higher_status, lower_status) in pairs {
+        let f = Fixture::new();
+        f.write(&Note { id: "note-higher", status: higher_status, ..Note::new("note-higher", "shared_tier_probe_term") }, 0);
+        f.write(&Note { id: "note-lower", status: lower_status, ..Note::new("note-lower", "shared_tier_probe_term") }, 0);
+        let indexer = RealIndexer::new();
+        index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+        let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+        let response = idx.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+        let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+            panic!("expected a match for {higher_status} vs {lower_status}");
+        };
+        assert_eq!(first.note_id.as_str(), "note-higher", "{higher_status} must outrank {lower_status} at an exact score tie");
+    }
+    // Same-tier pair: Verified and Reviewed must NOT have a defined
+    // relative order from this rule (falls through to note-id tie-break).
+    let f_same_tier = Fixture::new();
+    f_same_tier.write(&Note { id: "note-verified", status: "verified", ..Note::new("note-verified", "shared_tier_probe_term") }, 0);
+    f_same_tier.write(&Note { id: "note-reviewed", status: "reviewed", ..Note::new("note-reviewed", "shared_tier_probe_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f_same_tier.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f_same_tier.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+    let response = idx.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    // note-reviewed < note-verified lexicographically -> the existing
+    // note-id tie-break decides, unchanged by the same-tier status pair.
+    assert_eq!(first.note_id.as_str(), "note-reviewed");
+}
+
+#[test]
+fn status_tiebreak_does_not_change_the_candidate_set() {
+    let f = Fixture::new();
+    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
+        match outcome {
+            index::search::SearchOutcome::NotPresent => Default::default(),
+            index::search::SearchOutcome::Matches { first, rest } => {
+                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                s.insert(first.note_id.as_str().to_string());
+                s
+            }
+        }
+    };
+    assert_eq!(
+        ids(plain.search("shared_term", Default::default(), 10).unwrap().outcome),
+        ids(tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome),
+    );
+}

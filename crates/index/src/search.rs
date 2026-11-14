@@ -204,6 +204,27 @@ pub struct Index<'a> {
     /// `with_identifier_boost`'s own doc comment). Defaults to `false`
     /// in `new()`; every existing call site is unaffected.
     identifier_boost: bool,
+    /// B3-TUNE-v2 Priority 3 Stage 1 Lever P2 (ablation use only — see
+    /// `with_status_tiebreak`'s own doc comment). Defaults to `false`
+    /// in `new()`; every existing call site is unaffected.
+    status_tiebreak: bool,
+}
+
+/// B3-TUNE-v2 Priority 3 Stage 1, Lever P2's frozen status-tier mapping
+/// (`docs/superpowers/specs/2026-11-14-b3-tune-v2-priority3-stage1-design.md`),
+/// confirmed against the real 6-variant `domain::NoteStatus` (which has
+/// no derived `Ord`): lower number sorts first (higher relevance tier).
+/// Tier 1: Verified, Reviewed. Tier 2: TestPassed. Tier 3: Draft.
+/// Tier 4: Superseded, Contradicted. Same-tier members (e.g. Verified
+/// vs. Reviewed) are NOT ordered by this function — they fall through
+/// to the existing note-id tie-break.
+fn status_tier(status: NoteStatus) -> u8 {
+    match status {
+        NoteStatus::Verified | NoteStatus::Reviewed => 1,
+        NoteStatus::TestPassed => 2,
+        NoteStatus::Draft => 3,
+        NoteStatus::Superseded | NoteStatus::Contradicted => 4,
+    }
 }
 
 impl<'a> Index<'a> {
@@ -221,6 +242,7 @@ impl<'a> Index<'a> {
             bm25_k1: 1.2,
             bm25_b: 0.75,
             identifier_boost: false,
+            status_tiebreak: false,
         }
     }
 
@@ -245,6 +267,18 @@ impl<'a> Index<'a> {
     /// `false`; every existing call site of `new()` is unaffected.
     pub fn with_identifier_boost(mut self) -> Self {
         self.identifier_boost = true;
+        self
+    }
+
+    /// Additive builder for B3-TUNE-v2 Priority 3 Stage 1 Lever P2
+    /// (ablation use only): when enabled, two candidates whose final
+    /// BM25 scores are bitwise-equal `f64` values (never within an
+    /// epsilon — a real, however small, score difference always wins)
+    /// are additionally ordered by `status_tier`, before the existing
+    /// note-id tie-break. Never changes candidate membership. Default
+    /// `false`; every existing call site of `new()` is unaffected.
+    pub fn with_status_tiebreak(mut self) -> Self {
+        self.status_tiebreak = true;
         self
     }
 
@@ -329,6 +363,11 @@ impl<'a> Index<'a> {
 
         let mut fresh_scores = Bm25Index::new_with_params(self.bm25_k1, self.bm25_b);
         let mut fresh_results = Vec::new();
+        // Parallel to `fresh_results`, same push order: `document.status`
+        // (Copy) captured before `document` is consumed by the push below,
+        // for Lever P2's status tie-break (search_impl's sort reads this
+        // by index position, never by note id, so order must stay in sync).
+        let mut fresh_result_statuses: Vec<NoteStatus> = Vec::new();
         let candidates = {
             let _timer =
                 PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.candidate_generation));
@@ -405,6 +444,7 @@ impl<'a> Index<'a> {
                 Some(body) if !sensitive && query_match(&body, query).is_some() => body,
                 _ => document.text_searchable,
             };
+            fresh_result_statuses.push(document.status);
             fresh_results.push(SearchResult {
                 note_id: id,
                 version: record.version,
@@ -438,11 +478,25 @@ impl<'a> Index<'a> {
             };
             result.score = base_score + boost;
         }
-        fresh_results.sort_by(|a, b| {
+        // Paired with `fresh_result_statuses` (same push order, Section
+        // above) so Lever P2's status tie-break can compare each pair's
+        // status without widening `SearchResult`'s own public fields.
+        let mut paired: Vec<(SearchResult, NoteStatus)> =
+            fresh_results.into_iter().zip(fresh_result_statuses).collect();
+        let status_tiebreak = self.status_tiebreak;
+        paired.sort_by(|(a, a_status), (b, b_status)| {
             b.score
                 .total_cmp(&a.score)
+                .then_with(|| {
+                    if status_tiebreak && a.score == b.score {
+                        status_tier(*a_status).cmp(&status_tier(*b_status))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| a.note_id.as_str().cmp(b.note_id.as_str()))
         });
+        let mut fresh_results: Vec<SearchResult> = paired.into_iter().map(|(r, _)| r).collect();
         fresh_results.truncate(k);
         let mut results = fresh_results.into_iter();
         let outcome = match results.next() {
