@@ -1,0 +1,803 @@
+{
+  "split": "dev",
+  "run_date": "2026-11-14",
+  "run_timestamp_utc": "2026-11-14T12:24:02Z",
+  "runner_commit": "6b96ee4715f43d892bf627277e863c2c9db72da2",
+  "retrieval_config": "B1 deterministic trigram+BM25, no embeddings",
+  "corpus_manifest_sha256": "5fcc32eab09b9ea738b2cee89a68e051f03dae1a39d83e67b32f07383fcd2f51",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "bootstrap_seed": 0,
+  "bootstrap_resamples": 2000,
+  "corpus_manifest_note_count": 53,
+  "query_count": 60,
+  "query_count_excluding_canary": 60,
+  "aggregate": {
+    "recall_at_10": 0.8367346938775511,
+    "ndcg_at_10": 0.7139021585460019,
+    "recall_ci": [
+      0.7346938775510204,
+      0.9387755102040817
+    ],
+    "ndcg_ci": [
+      0.6058832617246017,
+      0.8148598173679488
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "by_category": {
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.837207348280631,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.655884105881504,
+        1.0
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "identifier-code": {
+      "recall_at_10": 0.6666666666666666,
+      "ndcg_at_10": 0.5213928961351453,
+      "recall_ci": [
+        0.3333333333333333,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.25816286875419614,
+        0.806873278571435
+      ],
+      "n": 9,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 0.7,
+      "ndcg_at_10": 0.6630929753571457,
+      "recall_ci": [
+        0.4,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4,
+        0.9261859507142916
+      ],
+      "n": 10,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 0.8571428571428571,
+      "ndcg_at_10": 0.7230866159492644,
+      "recall_ci": [
+        0.5714285714285714,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4373723302349787,
+        0.9472756790816368
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "temporal": {
+      "recall_at_10": 0.8571428571428571,
+      "ndcg_at_10": 0.6981218296049345,
+      "recall_ci": [
+        0.5714285714285714,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4124075438906488,
+        0.9285714285714286
+      ],
+      "n": 7,
+      "low_confidence": false
+    }
+  },
+  "by_difficulty": {
+    "easy": {
+      "recall_at_10": 0.7333333333333333,
+      "ndcg_at_10": 0.5789336314197381,
+      "recall_ci": [
+        0.5333333333333333,
+        0.9333333333333333
+      ],
+      "ndcg_ci": [
+        0.36320095751351983,
+        0.7946663053259563
+      ],
+      "n": 15,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 0.8333333333333334,
+      "ndcg_at_10": 0.7681510354172648,
+      "recall_ci": [
+        0.5833333333333334,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.54890688928631,
+        0.9655735559529767
+      ],
+      "n": 12,
+      "low_confidence": false
+    },
+    "medium": {
+      "recall_at_10": 0.9090909090909091,
+      "ndcg_at_10": 0.776335857838675,
+      "recall_ci": [
+        0.7727272727272727,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6316781017163084,
+        0.8982663412337689
+      ],
+      "n": 22,
+      "low_confidence": false
+    }
+  },
+  "abstention": {
+    "confusion_matrix": {
+      "tp": 0,
+      "tn": 49,
+      "fp": 0,
+      "fn": 11
+    },
+    "precision": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "recall": {
+      "value": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "valid_resamples": 2000,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "f1": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "accuracy": {
+      "value": 0.8166666666666667,
+      "ci": [
+        0.7166666666666667,
+        0.9
+      ],
+      "valid_resamples": 2000,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "n": 60
+  },
+  "per_query": [
+    {
+      "id": "q001",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q008",
+      "category": "bugs-fixes",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.3333333333333333
+    },
+    {
+      "id": "q009",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q010",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q011",
+      "category": "bugs-fixes",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.2890648263178878
+    },
+    {
+      "id": "q015",
+      "category": "bugs-fixes",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q023",
+      "category": "cross-file-concept",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.5
+    },
+    {
+      "id": "q024",
+      "category": "identifier-code",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.6309297535714574
+    },
+    {
+      "id": "q026",
+      "category": "cross-file-concept",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q027",
+      "category": "identifier-code",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q028",
+      "category": "identifier-code",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.6309297535714574
+    },
+    {
+      "id": "q029",
+      "category": "identifier-code",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.4306765580733931
+    },
+    {
+      "id": "q031",
+      "category": "identifier-code",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q032",
+      "category": "cross-file-concept",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q035",
+      "category": "identifier-code",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q038",
+      "category": "temporal",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q039",
+      "category": "identifier-code",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q045",
+      "category": "temporal",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q046",
+      "category": "notes-decisions",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q047",
+      "category": "notes-decisions",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q048",
+      "category": "notes-decisions",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q049",
+      "category": "notes-decisions",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.6309297535714574
+    },
+    {
+      "id": "q050",
+      "category": "notes-decisions",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q051",
+      "category": "notes-decisions",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q057",
+      "category": "patterns-knowledge",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q064",
+      "category": "patterns-knowledge",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q065",
+      "category": "patterns-knowledge",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q066",
+      "category": "patterns-knowledge",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.6309297535714574
+    },
+    {
+      "id": "q067",
+      "category": "patterns-knowledge",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q069",
+      "category": "patterns-knowledge",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q070",
+      "category": "notes-decisions",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q071",
+      "category": "notes-decisions",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q073",
+      "category": "notes-decisions",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q074",
+      "category": "temporal",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.38685280723454163
+    },
+    {
+      "id": "q075",
+      "category": "temporal",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q078",
+      "category": "temporal",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q079",
+      "category": "temporal",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q081",
+      "category": "bugs-fixes",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.58688267143572
+    },
+    {
+      "id": "q082",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q084",
+      "category": "patterns-knowledge",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.4306765580733931
+    },
+    {
+      "id": "q086",
+      "category": "identifier-code",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q088",
+      "category": "cross-file-concept",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q089",
+      "category": "bugs-fixes",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q090",
+      "category": "temporal",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 0.5
+    },
+    {
+      "id": "q091",
+      "category": "notes-decisions",
+      "difficulty": "hard",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q093",
+      "category": "identifier-code",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 0.0,
+      "hit_at_10": false,
+      "ndcg_at_10": 0.0
+    },
+    {
+      "id": "q095",
+      "category": "cross-file-concept",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q098",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "q100",
+      "category": "bugs-fixes",
+      "difficulty": "easy",
+      "abstain_expected": false,
+      "outcome": "Matches",
+      "recall_at_10": 1.0,
+      "hit_at_10": true,
+      "ndcg_at_10": 1.0
+    },
+    {
+      "id": "a001",
+      "category": "identifier-code",
+      "difficulty": "medium",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a002",
+      "category": "patterns-knowledge",
+      "difficulty": "medium",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a003",
+      "category": "identifier-code",
+      "difficulty": "hard",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a005",
+      "category": "notes-decisions",
+      "difficulty": "hard",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a008",
+      "category": "cross-file-concept",
+      "difficulty": "hard",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a011",
+      "category": "notes-decisions",
+      "difficulty": "medium",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a014",
+      "category": "identifier-code",
+      "difficulty": "hard",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a015",
+      "category": "bugs-fixes",
+      "difficulty": "easy",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a016",
+      "category": "cross-file-concept",
+      "difficulty": "medium",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a017",
+      "category": "identifier-code",
+      "difficulty": "easy",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    },
+    {
+      "id": "a018",
+      "category": "bugs-fixes",
+      "difficulty": "medium",
+      "abstain_expected": true,
+      "outcome": "Matches",
+      "recall_at_10": null,
+      "hit_at_10": null,
+      "ndcg_at_10": null
+    }
+  ]
+}
