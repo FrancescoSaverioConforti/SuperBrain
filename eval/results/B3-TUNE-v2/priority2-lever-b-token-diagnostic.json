@@ -1,0 +1,1322 @@
+[
+  {
+    "original": "\"config\"",
+    "stripped": "\"config"
+  },
+  {
+    "original": "\"roles.json\"",
+    "stripped": "\"roles.json"
+  },
+  {
+    "original": "\"sunset\":",
+    "stripped": "\"sunset"
+  },
+  {
+    "original": "\"utc\"",
+    "stripped": "\"utc"
+  },
+  {
+    "original": "\"utc\");",
+    "stripped": "\"utc\")"
+  },
+  {
+    "original": "&hashset<noteid>,",
+    "stripped": "&hashset<noteid>"
+  },
+  {
+    "original": "&hashset<string>,",
+    "stripped": "&hashset<string>"
+  },
+  {
+    "original": "&policy::gate,",
+    "stripped": "&policy::gate"
+  },
+  {
+    "original": "&str,",
+    "stripped": "&str"
+  },
+  {
+    "original": "&timeexpression,",
+    "stripped": "&timeexpression"
+  },
+  {
+    "original": "&vault,",
+    "stripped": "&vault"
+  },
+  {
+    "original": "'{role_name}'",
+    "stripped": "'{role_name}"
+  },
+  {
+    "original": "(read,",
+    "stripped": "(read"
+  },
+  {
+    "original": "1,",
+    "stripped": "1"
+  },
+  {
+    "original": "10.",
+    "stripped": "10"
+  },
+  {
+    "original": "2026-09-11,",
+    "stripped": "2026-09-11"
+  },
+  {
+    "original": "2026-10-27:",
+    "stripped": "2026-10-27"
+  },
+  {
+    "original": "45).",
+    "stripped": "45)"
+  },
+  {
+    "original": "<proposal_id>`,",
+    "stripped": "<proposal_id>`"
+  },
+  {
+    "original": "[]).",
+    "stripped": "[])"
+  },
+  {
+    "original": "_get_registry(),",
+    "stripped": "_get_registry()"
+  },
+  {
+    "original": "a1-complete.",
+    "stripped": "a1-complete"
+  },
+  {
+    "original": "a229007a81582138f).",
+    "stripped": "a229007a81582138f)"
+  },
+  {
+    "original": "a2;",
+    "stripped": "a2"
+  },
+  {
+    "original": "a6c0f3e287d82e87b).",
+    "stripped": "a6c0f3e287d82e87b)"
+  },
+  {
+    "original": "absent,",
+    "stripped": "absent"
+  },
+  {
+    "original": "action.",
+    "stripped": "action"
+  },
+  {
+    "original": "action:",
+    "stripped": "action"
+  },
+  {
+    "original": "actions.",
+    "stripped": "actions"
+  },
+  {
+    "original": "add_role(role_name,",
+    "stripped": "add_role(role_name"
+  },
+  {
+    "original": "add_role,",
+    "stripped": "add_role"
+  },
+  {
+    "original": "after?",
+    "stripped": "after"
+  },
+  {
+    "original": "agent,",
+    "stripped": "agent"
+  },
+  {
+    "original": "ago\"",
+    "stripped": "ago"
+  },
+  {
+    "original": "aliasing,",
+    "stripped": "aliasing"
+  },
+  {
+    "original": "alone.",
+    "stripped": "alone"
+  },
+  {
+    "original": "api?",
+    "stripped": "api"
+  },
+  {
+    "original": "app/routers/settings_models.",
+    "stripped": "app/routers/settings_models"
+  },
+  {
+    "original": "applies:",
+    "stripped": "applies"
+  },
+  {
+    "original": "approve?",
+    "stripped": "approve"
+  },
+  {
+    "original": "argument.",
+    "stripped": "argument"
+  },
+  {
+    "original": "atomically,",
+    "stripped": "atomically"
+  },
+  {
+    "original": "automationengine/scheduler,",
+    "stripped": "automationengine/scheduler"
+  },
+  {
+    "original": "aware,",
+    "stripped": "aware"
+  },
+  {
+    "original": "b2,",
+    "stripped": "b2"
+  },
+  {
+    "original": "b2-eval-009,",
+    "stripped": "b2-eval-009"
+  },
+  {
+    "original": "b2-eval-013,",
+    "stripped": "b2-eval-013"
+  },
+  {
+    "original": "b2-id-012,",
+    "stripped": "b2-id-012"
+  },
+  {
+    "original": "b2-id-013,",
+    "stripped": "b2-id-013"
+  },
+  {
+    "original": "b2.",
+    "stripped": "b2"
+  },
+  {
+    "original": "b2:",
+    "stripped": "b2"
+  },
+  {
+    "original": "b2?",
+    "stripped": "b2"
+  },
+  {
+    "original": "backend,",
+    "stripped": "backend"
+  },
+  {
+    "original": "backup,",
+    "stripped": "backup"
+  },
+  {
+    "original": "baseline,",
+    "stripped": "baseline"
+  },
+  {
+    "original": "begun?",
+    "stripped": "begun"
+  },
+  {
+    "original": "bm25.",
+    "stripped": "bm25"
+  },
+  {
+    "original": "body,",
+    "stripped": "body"
+  },
+  {
+    "original": "budget?",
+    "stripped": "budget"
+  },
+  {
+    "original": "bug:",
+    "stripped": "bug"
+  },
+  {
+    "original": "called?",
+    "stripped": "called"
+  },
+  {
+    "original": "caller.",
+    "stripped": "caller"
+  },
+  {
+    "original": "caller:",
+    "stripped": "caller"
+  },
+  {
+    "original": "caller?",
+    "stripped": "caller"
+  },
+  {
+    "original": "cap,",
+    "stripped": "cap"
+  },
+  {
+    "original": "caught),",
+    "stripped": "caught)"
+  },
+  {
+    "original": "cause:",
+    "stripped": "cause"
+  },
+  {
+    "original": "chat?",
+    "stripped": "chat"
+  },
+  {
+    "original": "check.",
+    "stripped": "check"
+  },
+  {
+    "original": "checkpoint;",
+    "stripped": "checkpoint"
+  },
+  {
+    "original": "classes?",
+    "stripped": "classes"
+  },
+  {
+    "original": "classification,",
+    "stripped": "classification"
+  },
+  {
+    "original": "classification:",
+    "stripped": "classification"
+  },
+  {
+    "original": "cleanly?",
+    "stripped": "cleanly"
+  },
+  {
+    "original": "cleanup,",
+    "stripped": "cleanup"
+  },
+  {
+    "original": "cli,",
+    "stripped": "cli"
+  },
+  {
+    "original": "cli?",
+    "stripped": "cli"
+  },
+  {
+    "original": "close,",
+    "stripped": "close"
+  },
+  {
+    "original": "close?",
+    "stripped": "close"
+  },
+  {
+    "original": "closed.",
+    "stripped": "closed"
+  },
+  {
+    "original": "closed:",
+    "stripped": "closed"
+  },
+  {
+    "original": "closeout?",
+    "stripped": "closeout"
+  },
+  {
+    "original": "closure,",
+    "stripped": "closure"
+  },
+  {
+    "original": "closure.",
+    "stripped": "closure"
+  },
+  {
+    "original": "code?",
+    "stripped": "code"
+  },
+  {
+    "original": "commit:",
+    "stripped": "commit"
+  },
+  {
+    "original": "committed?",
+    "stripped": "committed"
+  },
+  {
+    "original": "completed.",
+    "stripped": "completed"
+  },
+  {
+    "original": "concluded:",
+    "stripped": "concluded"
+  },
+  {
+    "original": "configured,",
+    "stripped": "configured"
+  },
+  {
+    "original": "configured.",
+    "stripped": "configured"
+  },
+  {
+    "original": "confirmation.",
+    "stripped": "confirmation"
+  },
+  {
+    "original": "confirming.",
+    "stripped": "confirming"
+  },
+  {
+    "original": "consolidation.",
+    "stripped": "consolidation"
+  },
+  {
+    "original": "content,",
+    "stripped": "content"
+  },
+  {
+    "original": "copy?",
+    "stripped": "copy"
+  },
+  {
+    "original": "core;",
+    "stripped": "core"
+  },
+  {
+    "original": "corruption,",
+    "stripped": "corruption"
+  },
+  {
+    "original": "count?",
+    "stripped": "count"
+  },
+  {
+    "original": "d60d0c2,",
+    "stripped": "d60d0c2"
+  },
+  {
+    "original": "d?",
+    "stripped": "d"
+  },
+  {
+    "original": "date;",
+    "stripped": "date"
+  },
+  {
+    "original": "datetime,",
+    "stripped": "datetime"
+  },
+  {
+    "original": "datetime<tz>),",
+    "stripped": "datetime<tz>)"
+  },
+  {
+    "original": "datetime},",
+    "stripped": "datetime}"
+  },
+  {
+    "original": "days.",
+    "stripped": "days"
+  },
+  {
+    "original": "default?",
+    "stripped": "default"
+  },
+  {
+    "original": "description,",
+    "stripped": "description"
+  },
+  {
+    "original": "detection?",
+    "stripped": "detection"
+  },
+  {
+    "original": "device,",
+    "stripped": "device"
+  },
+  {
+    "original": "dict;",
+    "stripped": "dict"
+  },
+  {
+    "original": "docs/research/b2-closure-summary.md.",
+    "stripped": "docs/research/b2-closure-summary.md"
+  },
+  {
+    "original": "domain,",
+    "stripped": "domain"
+  },
+  {
+    "original": "domain;",
+    "stripped": "domain"
+  },
+  {
+    "original": "down,",
+    "stripped": "down"
+  },
+  {
+    "original": "effect,",
+    "stripped": "effect"
+  },
+  {
+    "original": "eligibility.",
+    "stripped": "eligibility"
+  },
+  {
+    "original": "else?",
+    "stripped": "else"
+  },
+  {
+    "original": "europe/rome.",
+    "stripped": "europe/rome"
+  },
+  {
+    "original": "evaluation,",
+    "stripped": "evaluation"
+  },
+  {
+    "original": "evidence,",
+    "stripped": "evidence"
+  },
+  {
+    "original": "evidence.",
+    "stripped": "evidence"
+  },
+  {
+    "original": "exactly?",
+    "stripped": "exactly"
+  },
+  {
+    "original": "exception,",
+    "stripped": "exception"
+  },
+  {
+    "original": "exist,",
+    "stripped": "exist"
+  },
+  {
+    "original": "exist.",
+    "stripped": "exist"
+  },
+  {
+    "original": "expected_version:",
+    "stripped": "expected_version"
+  },
+  {
+    "original": "extract_trigger_condition_device_ids,",
+    "stripped": "extract_trigger_condition_device_ids"
+  },
+  {
+    "original": "extraction?",
+    "stripped": "extraction"
+  },
+  {
+    "original": "f50c634.",
+    "stripped": "f50c634"
+  },
+  {
+    "original": "f50c634?",
+    "stripped": "f50c634"
+  },
+  {
+    "original": "failure.",
+    "stripped": "failure"
+  },
+  {
+    "original": "far.",
+    "stripped": "far"
+  },
+  {
+    "original": "fields,",
+    "stripped": "fields"
+  },
+  {
+    "original": "file,",
+    "stripped": "file"
+  },
+  {
+    "original": "finding.",
+    "stripped": "finding"
+  },
+  {
+    "original": "finding:",
+    "stripped": "finding"
+  },
+  {
+    "original": "finished?",
+    "stripped": "finished"
+  },
+  {
+    "original": "first,",
+    "stripped": "first"
+  },
+  {
+    "original": "fix,",
+    "stripped": "fix"
+  },
+  {
+    "original": "fix?",
+    "stripped": "fix"
+  },
+  {
+    "original": "fixed,",
+    "stripped": "fixed"
+  },
+  {
+    "original": "forever,",
+    "stripped": "forever"
+  },
+  {
+    "original": "forward?",
+    "stripped": "forward"
+  },
+  {
+    "original": "found\"",
+    "stripped": "found"
+  },
+  {
+    "original": "found,",
+    "stripped": "found"
+  },
+  {
+    "original": "from?",
+    "stripped": "from"
+  },
+  {
+    "original": "frontmatter,",
+    "stripped": "frontmatter"
+  },
+  {
+    "original": "frozen,",
+    "stripped": "frozen"
+  },
+  {
+    "original": "gap,",
+    "stripped": "gap"
+  },
+  {
+    "original": "gap?",
+    "stripped": "gap"
+  },
+  {
+    "original": "gate.",
+    "stripped": "gate"
+  },
+  {
+    "original": "gate:",
+    "stripped": "gate"
+  },
+  {
+    "original": "get_role();",
+    "stripped": "get_role()"
+  },
+  {
+    "original": "get_role(role_name:",
+    "stripped": "get_role(role_name"
+  },
+  {
+    "original": "get_sun_times_today(latitude:",
+    "stripped": "get_sun_times_today(latitude"
+  },
+  {
+    "original": "get_sun_times_today;",
+    "stripped": "get_sun_times_today"
+  },
+  {
+    "original": "graph,",
+    "stripped": "graph"
+  },
+  {
+    "original": "graph.",
+    "stripped": "graph"
+  },
+  {
+    "original": "group,",
+    "stripped": "group"
+  },
+  {
+    "original": "guardrail,",
+    "stripped": "guardrail"
+  },
+  {
+    "original": "handle,",
+    "stripped": "handle"
+  },
+  {
+    "original": "happening?",
+    "stripped": "happening"
+  },
+  {
+    "original": "id,",
+    "stripped": "id"
+  },
+  {
+    "original": "in?",
+    "stripped": "in"
+  },
+  {
+    "original": "incomplete:",
+    "stripped": "incomplete"
+  },
+  {
+    "original": "indexer).",
+    "stripped": "indexer)"
+  },
+  {
+    "original": "indexer,",
+    "stripped": "indexer"
+  },
+  {
+    "original": "indexer.",
+    "stripped": "indexer"
+  },
+  {
+    "original": "inheritance,",
+    "stripped": "inheritance"
+  },
+  {
+    "original": "inode,",
+    "stripped": "inode"
+  },
+  {
+    "original": "installed,",
+    "stripped": "installed"
+  },
+  {
+    "original": "installed?",
+    "stripped": "installed"
+  },
+  {
+    "original": "intact.",
+    "stripped": "intact"
+  },
+  {
+    "original": "interface.",
+    "stripped": "interface"
+  },
+  {
+    "original": "invalid,",
+    "stripped": "invalid"
+  },
+  {
+    "original": "isolation?",
+    "stripped": "isolation"
+  },
+  {
+    "original": "it,",
+    "stripped": "it"
+  },
+  {
+    "original": "it.",
+    "stripped": "it"
+  },
+  {
+    "original": "journal_committed,",
+    "stripped": "journal_committed"
+  },
+  {
+    "original": "justified.",
+    "stripped": "justified"
+  },
+  {
+    "original": "known_ids:",
+    "stripped": "known_ids"
+  },
+  {
+    "original": "landed,",
+    "stripped": "landed"
+  },
+  {
+    "original": "level,",
+    "stripped": "level"
+  },
+  {
+    "original": "limitation?",
+    "stripped": "limitation"
+  },
+  {
+    "original": "limits.",
+    "stripped": "limits"
+  },
+  {
+    "original": "limits?",
+    "stripped": "limits"
+  },
+  {
+    "original": "links.",
+    "stripped": "links"
+  },
+  {
+    "original": "list(_get_registry().keys()).",
+    "stripped": "list(_get_registry().keys())"
+  },
+  {
+    "original": "list_roles,",
+    "stripped": "list_roles"
+  },
+  {
+    "original": "list_roles.",
+    "stripped": "list_roles"
+  },
+  {
+    "original": "load_roles(path:",
+    "stripped": "load_roles(path"
+  },
+  {
+    "original": "load_roles,",
+    "stripped": "load_roles"
+  },
+  {
+    "original": "logic?",
+    "stripped": "logic"
+  },
+  {
+    "original": "longitude:",
+    "stripped": "longitude"
+  },
+  {
+    "original": "made:",
+    "stripped": "made"
+  },
+  {
+    "original": "main,",
+    "stripped": "main"
+  },
+  {
+    "original": "mechanism:",
+    "stripped": "mechanism"
+  },
+  {
+    "original": "messages?",
+    "stripped": "messages"
+  },
+  {
+    "original": "milder?",
+    "stripped": "milder"
+  },
+  {
+    "original": "modeled,",
+    "stripped": "modeled"
+  },
+  {
+    "original": "module.",
+    "stripped": "module"
+  },
+  {
+    "original": "month,",
+    "stripped": "month"
+  },
+  {
+    "original": "mvp,",
+    "stripped": "mvp"
+  },
+  {
+    "original": "new,",
+    "stripped": "new"
+  },
+  {
+    "original": "nodes?",
+    "stripped": "nodes"
+  },
+  {
+    "original": "note:",
+    "stripped": "note"
+  },
+  {
+    "original": "note_text:",
+    "stripped": "note_text"
+  },
+  {
+    "original": "notes,",
+    "stripped": "notes"
+  },
+  {
+    "original": "notes?",
+    "stripped": "notes"
+  },
+  {
+    "original": "october,",
+    "stripped": "october"
+  },
+  {
+    "original": "of?",
+    "stripped": "of"
+  },
+  {
+    "original": "one?",
+    "stripped": "one"
+  },
+  {
+    "original": "opened,",
+    "stripped": "opened"
+  },
+  {
+    "original": "opened.",
+    "stripped": "opened"
+  },
+  {
+    "original": "operation_id:",
+    "stripped": "operation_id"
+  },
+  {
+    "original": "optional[float],",
+    "stripped": "optional[float]"
+  },
+  {
+    "original": "order,",
+    "stripped": "order"
+  },
+  {
+    "original": "overhead,",
+    "stripped": "overhead"
+  },
+  {
+    "original": "override,",
+    "stripped": "override"
+  },
+  {
+    "original": "own,",
+    "stripped": "own"
+  },
+  {
+    "original": "parse,",
+    "stripped": "parse"
+  },
+  {
+    "original": "parse_note_id(field:",
+    "stripped": "parse_note_id(field"
+  },
+  {
+    "original": "pass:",
+    "stripped": "pass"
+  },
+  {
+    "original": "path,",
+    "stripped": "path"
+  },
+  {
+    "original": "path:",
+    "stripped": "path"
+  },
+  {
+    "original": "path?",
+    "stripped": "path"
+  },
+  {
+    "original": "pattern:",
+    "stripped": "pattern"
+  },
+  {
+    "original": "pending;",
+    "stripped": "pending"
+  },
+  {
+    "original": "pending_ids:",
+    "stripped": "pending_ids"
+  },
+  {
+    "original": "permissions?",
+    "stripped": "permissions"
+  },
+  {
+    "original": "phase?",
+    "stripped": "phase"
+  },
+  {
+    "original": "pii_store:",
+    "stripped": "pii_store"
+  },
+  {
+    "original": "point.",
+    "stripped": "point"
+  },
+  {
+    "original": "presence,",
+    "stripped": "presence"
+  },
+  {
+    "original": "process.",
+    "stripped": "process"
+  },
+  {
+    "original": "propose_and_commit(note-a,",
+    "stripped": "propose_and_commit(note-a"
+  },
+  {
+    "original": "propose_and_commit(vault:",
+    "stripped": "propose_and_commit(vault"
+  },
+  {
+    "original": "queries?",
+    "stripped": "queries"
+  },
+  {
+    "original": "race.",
+    "stripped": "race"
+  },
+  {
+    "original": "raw:",
+    "stripped": "raw"
+  },
+  {
+    "original": "reference;",
+    "stripped": "reference"
+  },
+  {
+    "original": "reference_date:",
+    "stripped": "reference_date"
+  },
+  {
+    "original": "registry.",
+    "stripped": "registry"
+  },
+  {
+    "original": "registry[role_name]`.",
+    "stripped": "registry[role_name]`"
+  },
+  {
+    "original": "rejected?",
+    "stripped": "rejected"
+  },
+  {
+    "original": "relations,",
+    "stripped": "relations"
+  },
+  {
+    "original": "remove_role(role_name:",
+    "stripped": "remove_role(role_name"
+  },
+  {
+    "original": "rename),",
+    "stripped": "rename)"
+  },
+  {
+    "original": "report.",
+    "stripped": "report"
+  },
+  {
+    "original": "repository:",
+    "stripped": "repository"
+  },
+  {
+    "original": "reproduced?",
+    "stripped": "reproduced"
+  },
+  {
+    "original": "resolve_time_expression(expr:",
+    "stripped": "resolve_time_expression(expr"
+  },
+  {
+    "original": "resource_type:",
+    "stripped": "resource_type"
+  },
+  {
+    "original": "result<(datetime<tz>,",
+    "stripped": "result<(datetime<tz>"
+  },
+  {
+    "original": "result<commitresult,",
+    "stripped": "result<commitresult"
+  },
+  {
+    "original": "result<noteid,",
+    "stripped": "result<noteid"
+  },
+  {
+    "original": "resume,",
+    "stripped": "resume"
+  },
+  {
+    "original": "revisions.",
+    "stripped": "revisions"
+  },
+  {
+    "original": "role.permissions.get(resource_type,",
+    "stripped": "role.permissions.get(resource_type"
+  },
+  {
+    "original": "role_has_permission(role_name:",
+    "stripped": "role_has_permission(role_name"
+  },
+  {
+    "original": "roleregistry.model_validate.",
+    "stripped": "roleregistry.model_validate"
+  },
+  {
+    "original": "root),",
+    "stripped": "root)"
+  },
+  {
+    "original": "root.",
+    "stripped": "root"
+  },
+  {
+    "original": "rule;",
+    "stripped": "rule"
+  },
+  {
+    "original": "running?",
+    "stripped": "running"
+  },
+  {
+    "original": "scheduler,",
+    "stripped": "scheduler"
+  },
+  {
+    "original": "scheduler/systemcontext\"",
+    "stripped": "scheduler/systemcontext"
+  },
+  {
+    "original": "schema_version,",
+    "stripped": "schema_version"
+  },
+  {
+    "original": "scope.",
+    "stripped": "scope"
+  },
+  {
+    "original": "sec-001,",
+    "stripped": "sec-001"
+  },
+  {
+    "original": "sec-001/2/3?",
+    "stripped": "sec-001/2/3"
+  },
+  {
+    "original": "sec-003,",
+    "stripped": "sec-003"
+  },
+  {
+    "original": "session.",
+    "stripped": "session"
+  },
+  {
+    "original": "set,",
+    "stripped": "set"
+  },
+  {
+    "original": "shipped?",
+    "stripped": "shipped"
+  },
+  {
+    "original": "slow?",
+    "stripped": "slow"
+  },
+  {
+    "original": "source,",
+    "stripped": "source"
+  },
+  {
+    "original": "space,",
+    "stripped": "space"
+  },
+  {
+    "original": "status,",
+    "stripped": "status"
+  },
+  {
+    "original": "str,",
+    "stripped": "str"
+  },
+  {
+    "original": "string;",
+    "stripped": "string"
+  },
+  {
+    "original": "structured_fields_as_text.",
+    "stripped": "structured_fields_as_text"
+  },
+  {
+    "original": "succeeds.",
+    "stripped": "succeeds"
+  },
+  {
+    "original": "sweep?",
+    "stripped": "sweep"
+  },
+  {
+    "original": "symbol:",
+    "stripped": "symbol"
+  },
+  {
+    "original": "symlink?",
+    "stripped": "symlink"
+  },
+  {
+    "original": "synchronous,",
+    "stripped": "synchronous"
+  },
+  {
+    "original": "syntax,",
+    "stripped": "syntax"
+  },
+  {
+    "original": "target.",
+    "stripped": "target"
+  },
+  {
+    "original": "task,",
+    "stripped": "task"
+  },
+  {
+    "original": "tests/unit/test_sun_times_consolidation.py.",
+    "stripped": "tests/unit/test_sun_times_consolidation.py"
+  },
+  {
+    "original": "there,",
+    "stripped": "there"
+  },
+  {
+    "original": "three.",
+    "stripped": "three"
+  },
+  {
+    "original": "time,",
+    "stripped": "time"
+  },
+  {
+    "original": "time.",
+    "stripped": "time"
+  },
+  {
+    "original": "timeout,",
+    "stripped": "timeout"
+  },
+  {
+    "original": "timing.",
+    "stripped": "timing"
+  },
+  {
+    "original": "to?",
+    "stripped": "to"
+  },
+  {
+    "original": "toctou,",
+    "stripped": "toctou"
+  },
+  {
+    "original": "today:",
+    "stripped": "today"
+  },
+  {
+    "original": "transactions,",
+    "stripped": "transactions"
+  },
+  {
+    "original": "trust,",
+    "stripped": "trust"
+  },
+  {
+    "original": "try/except,",
+    "stripped": "try/except"
+  },
+  {
+    "original": "type,",
+    "stripped": "type"
+  },
+  {
+    "original": "tz,",
+    "stripped": "tz"
+  },
+  {
+    "original": "tz:",
+    "stripped": "tz"
+  },
+  {
+    "original": "tzinfo,",
+    "stripped": "tzinfo"
+  },
+  {
+    "original": "unavailable.",
+    "stripped": "unavailable"
+  },
+  {
+    "original": "under,",
+    "stripped": "under"
+  },
+  {
+    "original": "update?",
+    "stripped": "update"
+  },
+  {
+    "original": "use.",
+    "stripped": "use"
+  },
+  {
+    "original": "used.",
+    "stripped": "used"
+  },
+  {
+    "original": "user,",
+    "stripped": "user"
+  },
+  {
+    "original": "uuid,",
+    "stripped": "uuid"
+  },
+  {
+    "original": "validity,",
+    "stripped": "validity"
+  },
+  {
+    "original": "verdict:",
+    "stripped": "verdict"
+  },
+  {
+    "original": "verified,",
+    "stripped": "verified"
+  },
+  {
+    "original": "verified;",
+    "stripped": "verified"
+  },
+  {
+    "original": "version,",
+    "stripped": "version"
+  },
+  {
+    "original": "version;",
+    "stripped": "version"
+  },
+  {
+    "original": "violated.",
+    "stripped": "violated"
+  },
+  {
+    "original": "vulnerable,",
+    "stripped": "vulnerable"
+  },
+  {
+    "original": "windows,",
+    "stripped": "windows"
+  },
+  {
+    "original": "write,",
+    "stripped": "write"
+  },
+  {
+    "original": "write.",
+    "stripped": "write"
+  },
+  {
+    "original": "yet.",
+    "stripped": "yet"
+  },
+  {
+    "original": "yet?",
+    "stripped": "yet"
+  },
+  {
+    "original": "zero.",
+    "stripped": "zero"
+  },
+  {
+    "original": "{\"sunrise\":",
+    "stripped": "{\"sunrise"
+  }
+]

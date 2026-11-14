@@ -58,6 +58,7 @@ pub mod bm25;
 pub mod document;
 pub mod diagnostics;
 pub mod indexer_impl;
+pub mod lexical_normalize;
 pub mod search;
 pub mod time_range;
 pub mod trigram;
