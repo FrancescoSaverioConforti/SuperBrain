@@ -65,6 +65,7 @@ mod calls;
 mod contains;
 mod extends_implements;
 mod instantiates;
+mod js_prototype_ownership;
 mod resolution;
 mod tests_for;
 
@@ -72,6 +73,7 @@ pub use calls::{resolve_calls, resolve_calls_with_extraction_rejections, resolve
 pub use contains::resolve_contains;
 pub use extends_implements::{resolve_extends_implements, resolve_extends_implements_with_csharp_contexts};
 pub use instantiates::resolve_instantiates;
+pub use js_prototype_ownership::resolve_js_prototype_ownership;
 pub use resolution::{Edge, EdgeResolutionError};
 pub use tests_for::resolve_tests_for;
 
@@ -132,6 +134,7 @@ pub fn resolve_all_typed_edges_with_csharp_contexts_and_negative_knowledge(
     edges.extend(resolve_tests_for(snapshots)?);
     edges.extend(resolve_contains(snapshots)?);
     edges.extend(resolve_instantiates(snapshots)?);
+    edges.extend(resolve_js_prototype_ownership(snapshots)?);
     Ok((edges, call_attempts))
 }
 

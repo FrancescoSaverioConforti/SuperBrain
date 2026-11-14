@@ -197,7 +197,10 @@ fn walk_for_imports(node: tree_sitter::Node, source: &[u8], language: Language, 
     match language {
         Language::Python => collect_python_import(node, source, out),
         Language::Rust => collect_rust_use(node, source, out),
-        Language::JavaScript | Language::TypeScript | Language::Tsx => collect_js_import(node, source, out),
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            collect_js_import(node, source, out);
+            collect_js_require(node, source, out);
+        }
         Language::CSharp => collect_csharp_using(node, source, out),
         Language::Cpp | Language::Html | Language::Css => {}
     }
@@ -429,6 +432,100 @@ fn collect_js_import_specifiers(node: tree_sitter::Node, source: &[u8], module_p
             collect_js_import_specifiers(child, source, module_path, out);
         }
     }
+}
+
+/// CommonJS Extraction Checkpoint (B2-ID-013): `require(...)` call sites
+/// never produced an `ImportFact` — `collect_js_import` only matches
+/// ESM `import_statement`. This collector recognizes the real shapes
+/// confirmed by direct parse inspection (`const x = require('./x')`,
+/// `const { a, b } = require('./x')`, `var y = require('./mod')`), all
+/// of which share the same AST skeleton: a `call_expression` whose
+/// callee is the bare `identifier` `"require"` and whose sole argument
+/// is a `string`, as the right-hand side of a `variable_declarator`.
+///
+/// This resolver is intentionally narrow: it recognizes `require(...)`
+/// ONLY when it is the direct right-hand side of a `variable_declarator`
+/// (binding the module to a name or a destructuring pattern) — a bare
+/// `require('./x');` with no assignment, or `require(...)` nested
+/// inside some other expression (e.g. `foo(require('./x'))`), produces
+/// no fact here, per this checkpoint's own explicit scope (no general
+/// call-expression analysis, no data-flow). This mirrors every other
+/// import collector in this module: syntax recognition only, no
+/// resolution (resolution happens later, in [`resolve_raw_import_statements`]).
+fn collect_js_require(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawImportStatement>) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    let Some(lhs) = children.first() else { return };
+    let Some(call) = children.iter().find(|c| c.kind() == "call_expression") else {
+        return;
+    };
+    let Some(module_path) = require_call_module_path(*call, source) else {
+        return;
+    };
+    let span = ByteSpan::from_node(&node);
+
+    match lhs.kind() {
+        // `const x = require('./x')` / `var y = require('./mod')` ->
+        // one fact, the bound name recorded as the alias (mirroring
+        // `collect_js_import_specifiers`'s own default-import
+        // convention: a bare bound name with no further named
+        // destructuring is recorded as `alias`, not `imported_symbol`,
+        // since nothing is named OUT of the module here distinct from
+        // the module itself).
+        "identifier" => {
+            out.push(RawImportStatement {
+                module_path,
+                imported_symbol: None,
+                alias: Some(text_of(*lhs, source)),
+                span,
+            });
+        }
+        // `const { a, b } = require('./x')` -> one fact per destructured
+        // name, mirroring Python's own `from X import a, b` convention
+        // (one fact per name, never one fact for the whole pattern).
+        "object_pattern" => {
+            let mut pattern_cursor = lhs.walk();
+            for child in lhs.children(&mut pattern_cursor) {
+                if child.kind() == "shorthand_property_identifier_pattern" {
+                    out.push(RawImportStatement {
+                        module_path: module_path.clone(),
+                        imported_symbol: Some(text_of(child, source)),
+                        alias: None,
+                        span,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `true`/`Some(module_path)` only when `call` is syntactically exactly
+/// `require(<string>)` — callee is the bare `identifier` `"require"`
+/// (never a member expression like `foo.require(...)`, which is a
+/// different, unrelated call), and the arguments list contains exactly
+/// one `string` argument. Confirmed against a real parse: the callee
+/// and the `arguments` node are both direct children of `call_expression`.
+fn require_call_module_path(call: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let mut cursor = call.walk();
+    let children: Vec<_> = call.children(&mut cursor).collect();
+    let callee = children.iter().find(|c| c.kind() == "identifier")?;
+    if text_of(*callee, source) != "require" {
+        return None;
+    }
+    let arguments = children.iter().find(|c| c.kind() == "arguments")?;
+    let mut args_cursor = arguments.walk();
+    let string_args: Vec<_> = arguments.children(&mut args_cursor).filter(|c| c.kind() == "string").collect();
+    if string_args.len() != 1 {
+        return None;
+    }
+    Some(text_of(string_args[0], source))
 }
 
 fn collect_csharp_using(node: tree_sitter::Node, source: &[u8], out: &mut Vec<RawImportStatement>) {
@@ -669,6 +766,78 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].imported_symbol, Some("helper".to_string()));
         assert_eq!(facts[0].alias, Some("h".to_string()));
+    }
+
+    // --- CommonJS Extraction Checkpoint: require() -> ImportFact (B2-ID-013) ---
+
+    #[test]
+    fn javascript_require_simple_binding_is_extracted() {
+        let tree = parse_js("const x = require('./x');\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].module_path, "'./x'");
+        assert_eq!(facts[0].imported_symbol, None);
+        assert_eq!(facts[0].alias, Some("x".to_string()));
+    }
+
+    #[test]
+    fn javascript_require_aliased_binding_is_extracted() {
+        let tree = parse_js("var y = require('./mod');\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].module_path, "'./mod'");
+        assert_eq!(facts[0].alias, Some("y".to_string()));
+    }
+
+    #[test]
+    fn javascript_require_destructured_binding_produces_one_fact_per_name() {
+        let tree = parse_js("const { a, b } = require('./x');\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].module_path, "'./x'");
+        assert_eq!(facts[0].imported_symbol, Some("a".to_string()));
+        assert_eq!(facts[0].alias, None);
+        assert_eq!(facts[1].imported_symbol, Some("b".to_string()));
+    }
+
+    #[test]
+    fn javascript_require_with_no_assignment_produces_no_fact() {
+        // Deliberately out of scope: a bare `require('./x');` with no
+        // binding at all is never recognized — there is no name this
+        // checkpoint's own narrow collector can honestly attach the
+        // fact to via a `variable_declarator`.
+        let tree = parse_js("require('./x');\n");
+        let facts = extract_import_statements(&tree);
+        assert!(facts.is_empty(), "a bare require() call with no variable_declarator must produce no ImportFact in this checkpoint's scope");
+    }
+
+    #[test]
+    fn javascript_require_nested_inside_another_call_produces_no_fact() {
+        // Deliberately out of scope: `require(...)` as an argument to
+        // some other call is not a `variable_declarator`'s direct RHS.
+        let tree = parse_js("const x = wrap(require('./x'));\n");
+        let facts = extract_import_statements(&tree);
+        assert!(facts.is_empty(), "require() nested inside another call is out of this checkpoint's narrow scope");
+    }
+
+    #[test]
+    fn javascript_require_of_a_package_not_a_relative_path_is_still_extracted() {
+        let tree = parse_js("const extend = require('extend');\n");
+        let facts = extract_import_statements(&tree);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].module_path, "'extend'");
+    }
+
+    #[test]
+    fn javascript_member_expression_call_named_require_is_not_confused_with_the_real_builtin() {
+        // `foo.require('./x')` is a DIFFERENT call (a method named
+        // "require" on some object) — its callee is a
+        // `member_expression`, not a bare `identifier`, so
+        // `require_call_module_path` must reject it, never
+        // mistaking it for the real CommonJS builtin.
+        let tree = parse_js("const x = foo.require('./x');\n");
+        let facts = extract_import_statements(&tree);
+        assert!(facts.is_empty(), "a method call merely NAMED require on some receiver must never be treated as the CommonJS builtin");
     }
 
     #[test]

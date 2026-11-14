@@ -48,6 +48,8 @@ pub struct UnrecognizedKindHint {
 /// | `rule_set` | CSS | `CssRule` |
 /// | `keyframes_statement` | CSS | `CssKeyframes` |
 /// | `self_attribute_assignment` | Python | `Field` (Task 9.5; a synthetic `kind_hint`, like `element_with_id` — no single raw tree-sitter node kind names "an instance attribute assignment" on its own, since Python's grammar uses the same `assignment` node for every assignment statement; the Python extractor itself recognizes the specific `attribute`-on-the-left, `self`-receiver shape and labels it this way before it ever reaches this mapping) |
+/// | `js_exports_property_function` | JavaScript, TypeScript, Tsx | `Function` (CommonJS Extraction Checkpoint, B2-ID-014; a synthetic `kind_hint` — `exports.X = function(){...}`/`module.exports.X = function(){...}` share tree-sitter's generic `assignment_expression` node with every other assignment, so the JS/TS extractor itself recognizes the specific property-assignment-to-function shape and labels it this way, exactly like `self_attribute_assignment` above) |
+/// | `js_prototype_method_assignment` | JavaScript, TypeScript, Tsx | `Method` (CommonJS Extraction Checkpoint, B2-ID-015; a synthetic `kind_hint` for `Foo.prototype.X = function(){...}` — mapped to `Method`, not `Function`, since (unlike the export idiom above) this construct IS conceptually owned by `Foo`; see `edges::js_prototype_ownership` for how that ownership is resolved, fail-closed, from this candidate's own re-parsed `signature_text`) |
 ///
 /// Note on `trait_item -> Interface`: a Rust `trait` and a C# `interface`
 /// are not semantically identical (a trait can carry default method
@@ -78,6 +80,8 @@ pub fn map_kind_hint(kind_hint: &str) -> Result<SymbolKind, UnrecognizedKindHint
         "rule_set" => Ok(SymbolKind::CssRule),
         "keyframes_statement" => Ok(SymbolKind::CssKeyframes),
         "self_attribute_assignment" => Ok(SymbolKind::Field),
+        "js_exports_property_function" => Ok(SymbolKind::Function),
+        "js_prototype_method_assignment" => Ok(SymbolKind::Method),
         _ => Err(UnrecognizedKindHint {
             kind_hint: kind_hint.to_string(),
         }),
@@ -125,6 +129,9 @@ mod tests {
             "keyframes_statement",
             // Python Field (Task 9.5)
             "self_attribute_assignment",
+            // CommonJS Extraction Checkpoint (B2-ID-014/B2-ID-015)
+            "js_exports_property_function",
+            "js_prototype_method_assignment",
         ];
         for kind_hint in all_real_kind_hints {
             assert!(map_kind_hint(kind_hint).is_ok(), "expected a mapping for real kind_hint {kind_hint:?}, got none");
@@ -183,6 +190,12 @@ mod tests {
     #[test]
     fn python_field_kind_hint_maps_correctly() {
         assert_eq!(map_kind_hint("self_attribute_assignment"), Ok(SymbolKind::Field));
+    }
+
+    #[test]
+    fn commonjs_kind_hints_map_correctly() {
+        assert_eq!(map_kind_hint("js_exports_property_function"), Ok(SymbolKind::Function));
+        assert_eq!(map_kind_hint("js_prototype_method_assignment"), Ok(SymbolKind::Method));
     }
 
     #[test]
