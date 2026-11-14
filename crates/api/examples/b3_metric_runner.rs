@@ -401,8 +401,19 @@ fn score_answerable_row(row: &LabelRow, outcome: &QueryOutcome) -> ScoredRow {
     }
 }
 
-fn run_split(split: &str, seed: u64, resamples: u32) -> Report {
-    assert_ne!(split, "test", "B3.3/B3.4 never read the held-out test split's content");
+/// `allow_test_split` is the single, explicit gate for reading
+/// `eval/rag/test/labels.jsonl`'s content. `main()` only ever passes
+/// `true` after verifying `FINAL_TEST_AUTHORIZATION_FLAG` was given on
+/// the command line; every unit test in this file calls this function
+/// with `false` and a non-"test" split, so the held-out split is never
+/// read as a side effect of running `cargo test`.
+fn run_split(split: &str, seed: u64, resamples: u32, allow_test_split: bool) -> Report {
+    if split == "test" {
+        assert!(
+            allow_test_split,
+            "refusing to score the held-out test split without explicit authorization"
+        );
+    }
 
     let labels_path = format!(
         "{}/../../eval/rag/{}/labels.jsonl",
@@ -546,23 +557,35 @@ fn run_split(split: &str, seed: u64, resamples: u32) -> Report {
 const BOOTSTRAP_SEED: u64 = 0;
 const BOOTSTRAP_RESAMPLES: u32 = 2000;
 
+/// B3.5 (final-test) requires this exact second argument on the command
+/// line, not just the split name "test" — so a bare invocation (a typo,
+/// a copy-pasted command, a future script) can never accidentally read
+/// the held-out split. This constant is the authorization GATE only; it
+/// changes no scoring, retrieval, bootstrap, threshold, corpus, label, or
+/// ranking logic anywhere in this file.
+const FINAL_TEST_AUTHORIZATION_FLAG: &str = "--authorize-final-test-b3.5";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let split = args.get(1).map(String::as_str).unwrap_or_else(|| {
-        panic!("usage: b3_metric_runner <dev|calibration>");
+        panic!("usage: b3_metric_runner <dev|calibration|test> [--authorize-final-test-b3.5]");
     });
+    let mut authorized_for_test = false;
     if split == "test" {
-        panic!(
-            "refusing to run against the held-out test split: B3.3/B3.4 never read \
-             eval/rag/test/labels.jsonl content (Global Constraints). Final-test runs \
-             require separate authorization (B3.5)."
-        );
-    }
-    if split != "dev" && split != "calibration" {
-        panic!("usage: b3_metric_runner <dev|calibration>, got {split:?}");
+        authorized_for_test = args.get(2).map(String::as_str) == Some(FINAL_TEST_AUTHORIZATION_FLAG);
+        if !authorized_for_test {
+            panic!(
+                "refusing to run against the held-out test split without explicit \
+                 authorization: pass {FINAL_TEST_AUTHORIZATION_FLAG:?} as the second \
+                 argument. B3.3/B3.4 never read eval/rag/test/labels.jsonl content; \
+                 B3.5 final-test runs require separate, explicit authorization every time."
+            );
+        }
+    } else if split != "dev" && split != "calibration" {
+        panic!("usage: b3_metric_runner <dev|calibration|test> [--authorize-final-test-b3.5], got {split:?}");
     }
 
-    let report = run_split(split, BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES);
+    let report = run_split(split, BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES, authorized_for_test);
 
     let out_dir = format!("{}/../../eval/results/B3", env!("CARGO_MANIFEST_DIR"));
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -742,7 +765,7 @@ mod tests {
 
     #[test]
     fn a_full_dev_split_run_produces_a_report_with_every_required_field() {
-        let report = run_split("dev", 0, 200);
+        let report = run_split("dev", 0, 200, false);
         assert_eq!(report.split, "dev");
         assert!(report.query_count_excluding_canary > 0);
         assert!(report.by_category.contains_key("bugs-fixes"));
@@ -756,5 +779,33 @@ mod tests {
         assert!(!report.labels_sha256.is_empty());
         assert_eq!(report.retrieval_config, "B1 deterministic trigram+BM25, no embeddings");
         assert_eq!(report.bootstrap_seed, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to score the held-out test split without explicit authorization")]
+    fn run_split_rejects_the_test_split_without_authorization() {
+        run_split("test", 0, 200, false);
+    }
+
+    #[test]
+    #[ignore = "reads the real held-out eval/rag/test/labels.jsonl; run explicitly \
+                with `cargo test -- --ignored` only when verifying the B3.5 \
+                authorization path, never as part of the ordinary suite"]
+    fn run_split_accepts_the_test_split_with_explicit_authorization() {
+        let report = run_split("test", 0, 200, true);
+        assert_eq!(report.split, "test");
+        assert!(report.query_count_excluding_canary > 0);
+    }
+
+    #[test]
+    fn run_split_never_requires_authorization_for_dev_or_calibration() {
+        // dev and calibration must work identically whether or not
+        // allow_test_split is passed, since the gate only applies to "test".
+        let dev_unauthorized = run_split("dev", 0, 200, false);
+        let dev_authorized = run_split("dev", 0, 200, true);
+        assert_eq!(dev_unauthorized.query_count_excluding_canary, dev_authorized.query_count_excluding_canary);
+
+        let calibration = run_split("calibration", 0, 200, false);
+        assert_eq!(calibration.split, "calibration");
     }
 }
