@@ -13,7 +13,7 @@ event_period: 2026-10-26
 relations: {}
 ---
 repository: superbrain
-commit: see corpus-manifest.json build_commit
+commit: e92dc781bcd32fcca5445295221f36aea2fe791e
 path: crates/storage/src/propose.rs
 symbol: propose_and_commit
 

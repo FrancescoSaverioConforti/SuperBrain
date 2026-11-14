@@ -13,7 +13,7 @@ event_period: 2026-10-30
 relations: {}
 ---
 repository: superbrain
-commit: see corpus-manifest.json build_commit
+commit: e92dc781bcd32fcca5445295221f36aea2fe791e
 path: crates/index/src/search.rs
 symbol: Provenance
 

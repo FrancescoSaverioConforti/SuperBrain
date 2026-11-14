@@ -70,7 +70,7 @@
   },
   "code-api-lib-b1-callable-core": {
     "category": "identifier-code",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/api/src/lib.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -94,7 +94,7 @@
   },
   "code-document-sensitive-vs-internal-fields": {
     "category": "identifier-code",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/index/src/document.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -102,7 +102,7 @@
   },
   "code-document-text-searchable-classification": {
     "category": "cross-file-concept",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/index/src/document.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -110,7 +110,7 @@
   },
   "code-parse-note-id-shared-validator": {
     "category": "cross-file-concept",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/storage/src/propose.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -118,7 +118,7 @@
   },
   "code-propose-propose-and-commit": {
     "category": "identifier-code",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/storage/src/propose.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -190,7 +190,7 @@
   },
   "code-search-provenance-withheld-for-sensitive": {
     "category": "identifier-code",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/index/src/search.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -214,7 +214,7 @@
   },
   "code-time-range-resolve-time-expression": {
     "category": "identifier-code",
-    "commit": null,
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
     "path": "crates/index/src/time_range.rs",
     "repository": "superbrain",
     "stratum": "code",
@@ -308,27 +308,18 @@
   },
   "pattern-2026-09-11-automation-engine-boundary": {
     "category": "patterns-knowledge",
-    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
-    "path": "app/core/timezone_resolver.py",
-    "repository": "controllore",
-    "stratum": "code",
-    "symbol": null
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/timezone_resolver.py",
+    "stratum": "project-history"
   },
   "pattern-2026-09-11-timezone-fallback-reuse": {
     "category": "patterns-knowledge",
-    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
-    "path": "app/core/timezone_resolver.py",
-    "repository": "controllore",
-    "stratum": "code",
-    "symbol": null
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/timezone_resolver.py",
+    "stratum": "project-history"
   },
   "pattern-2026-09-sun-times-never-raises": {
     "category": "patterns-knowledge",
-    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
-    "path": "app/core/sun_times.py",
-    "repository": "controllore",
-    "stratum": "code",
-    "symbol": null
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/sun_times.py",
+    "stratum": "project-history"
   },
   "pattern-2026-10-26-c6-independent-gate-properties": {
     "category": "patterns-knowledge",

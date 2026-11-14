@@ -83,17 +83,32 @@ project-history notes (decision/bug/pattern/session), a `docs/` path
 and/or a continuity decision id with its exact text copied in (frozen at
 build time, not a live lookup); for code notes, the real `repository`,
 `commit`, `path` and `symbol`. Code notes cite two frozen source repos:
-SuperBrain itself (commit recorded in `corpus-manifest.json`'s
-`build_commit`) and `controllore` pinned at
+SuperBrain itself, pinned at the commit recorded in each note's own
+`corpus-provenance.json` entry (the last commit to touch the quoted
+source file at authoring time — not `corpus-manifest.json`'s
+`build_commit`, which only describes when the manifest itself was last
+regenerated), and `controllore` pinned at
 `ec274f4680c19f5b335a01a7a563c8f64546e7e2`. Neither source repo is ever
 modified by this corpus.
 
 ## Checks
 
+Run from the repository root:
+
 ```text
 python -B -m unittest discover -s eval/rag -p "test_*.py" -v
 cargo test -p api held_out_labels -- --exact
-python -c "from eval.rag.validate_corpus import validate_corpus; from pathlib import Path; print(validate_corpus(Path('eval/rag/corpus'), Path('eval/rag')))"
+```
+
+`validate_corpus.py` and `build_manifest.py` both import `runner` with a
+bare `from runner import load_labels`, which only resolves when
+`eval/rag/` itself is on `sys.path` — `eval/rag/` is not a package (no
+`__init__.py`), so a dotted `eval.rag.validate_corpus` import fails with
+`ModuleNotFoundError: No module named 'runner'`. Run either script from
+inside `eval/rag/`, or add that directory to `sys.path` first:
+
+```text
+python -c "import sys; sys.path.insert(0, 'eval/rag'); from validate_corpus import validate_corpus; from pathlib import Path; print(validate_corpus(Path('eval/rag/corpus'), Path('eval/rag')))"
 ```
 
 ## What's still ahead (B3.3+)

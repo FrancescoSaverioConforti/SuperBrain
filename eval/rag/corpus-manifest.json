@@ -1,9 +1,9 @@
 {
   "build_date": "2026-11-14",
-  "build_commit": "d8ea6e4a0636812149f3f0143a5a1b8fb0e85d4b",
+  "build_commit": "df3c1ec368720cdfbe48720854e2d4b764cf947b",
   "sources": {
     "superbrain": {
-      "commit": "d8ea6e4a0636812149f3f0143a5a1b8fb0e85d4b"
+      "commit": "df3c1ec368720cdfbe48720854e2d4b764cf947b"
     },
     "controllore": {
       "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",

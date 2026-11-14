@@ -13,7 +13,7 @@ event_period: 2026-10-26
 relations: {}
 ---
 repository: superbrain
-commit: see corpus-manifest.json build_commit
+commit: e92dc781bcd32fcca5445295221f36aea2fe791e
 path: crates/index/src/time_range.rs
 symbol: resolve_time_expression
 

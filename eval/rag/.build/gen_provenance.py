@@ -97,9 +97,20 @@ CONTINUITY_TEXT = {
 }
 
 CODE_SOURCE_RE_CONTROLLORE = "controllore@" + CONTROLLORE_COMMIT + ":"
+# Pinned, not re-queried: the last commit that touched any of the SuperBrain
+# source files these code notes quote from (crates/index/src/time_range.rs,
+# document.rs, search.rs; crates/storage/src/propose.rs; crates/api/src/lib.rs),
+# verified via `git log --oneline -1 -- <those files>` before this pin was set.
+SUPERBRAIN_CODE_COMMIT = "e92dc781bcd32fcca5445295221f36aea2fe791e"
 
-def parse_source(note_id, source_line):
-    if source_line.startswith(CODE_SOURCE_RE_CONTROLLORE):
+def parse_source(note_id, note_type, source_line):
+    # stratum: "code" is reserved for notes whose TYPE is code (per Task 2's
+    # body-provenance-lines convention); a pattern/decision/bug note that
+    # happens to cite controllore/crates code as its source is still
+    # project-history — its body carries prose, not repository/commit/path
+    # lines, so build_manifest's cross-check would otherwise flag a
+    # spurious drift against fields the note never claimed to carry.
+    if note_type == "code" and source_line.startswith(CODE_SOURCE_RE_CONTROLLORE):
         rest = source_line[len(CODE_SOURCE_RE_CONTROLLORE):]
         path, _, symbol = rest.partition(":")
         return {
@@ -109,12 +120,12 @@ def parse_source(note_id, source_line):
             "path": path,
             "symbol": symbol or None,
         }
-    if source_line.startswith("crates/"):
+    if note_type == "code" and source_line.startswith("crates/"):
         path, _, symbol = source_line.partition(":")
         return {
             "stratum": "code",
             "repository": "superbrain",
-            "commit": None,  # filled from build_commit at manifest-build time
+            "commit": SUPERBRAIN_CODE_COMMIT,
             "path": path,
             "symbol": symbol or None,
         }
@@ -143,17 +154,21 @@ def main():
         note_id = md.stem
         text = md.read_text(encoding="utf-8")
         source_line = None
+        note_type = None
         for line in text.splitlines():
             if line.startswith("source:"):
                 source_line = line.split(":", 1)[1].strip()
-                break
+            if line.startswith("type:"):
+                note_type = line.split(":", 1)[1].strip()
         if source_line is None:
             raise SystemExit(f"note {note_id} has no source: field")
+        if note_type is None:
+            raise SystemExit(f"note {note_id} has no type: field")
         category = CATEGORY.get(note_id)
         if category is None:
             raise SystemExit(f"no category assigned for note {note_id}")
         entry = {"category": category}
-        entry.update(parse_source(note_id, source_line))
+        entry.update(parse_source(note_id, note_type, source_line))
         provenance[note_id] = entry
 
     OUT.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")

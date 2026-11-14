@@ -82,6 +82,34 @@ class ValidateCorpusTests(unittest.TestCase):
 
         self.assertEqual(problems, [])
 
+    def test_flags_citation_span_not_a_substring_of_its_note(self):
+        _write_note(self.notes_dir, "real-note", "This note explains the retry policy in detail.")
+        row = _answerable_row(
+            "q1", "real-note", "What governs repeated attempts after failure?",
+            answer="retry policy", span="this text does not appear in the note",
+        )
+        for split in ("dev", "calibration", "test"):
+            _write_labels(self.eval_root, split, [row] if split == "dev" else [])
+
+        problems = validate_corpus(self.corpus_dir, self.eval_root)
+
+        self.assertTrue(any("not a substring of" in p for p in problems))
+
+    def test_flags_citation_span_note_id_not_in_relevant_note_ids(self):
+        _write_note(self.notes_dir, "real-note", "This note explains the retry policy in detail.")
+        _write_note(self.notes_dir, "other-note", "This note explains something else entirely.")
+        row = _answerable_row(
+            "q1", "real-note", "What governs repeated attempts after failure?",
+            answer="retry policy", span="retry policy",
+        )
+        row["citation_spans"] = [{"note_id": "other-note", "excerpt_substring": "something else"}]
+        for split in ("dev", "calibration", "test"):
+            _write_labels(self.eval_root, split, [row] if split == "dev" else [])
+
+        problems = validate_corpus(self.corpus_dir, self.eval_root)
+
+        self.assertTrue(any("not in relevant_note_ids" in p for p in problems))
+
     def test_abstain_rows_are_never_flagged_for_substring_overlap(self):
         _write_note(self.notes_dir, "real-note", "the quick brown fox jumps over the lazy dog")
         abstain_row = {

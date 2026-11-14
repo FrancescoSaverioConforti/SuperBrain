@@ -71,6 +71,22 @@ def validate_corpus(corpus_dir, eval_root):
                         "not present in corpus"
                     )
 
+            relevant_note_ids = set(row.get("relevant_note_ids", []))
+            for span in row.get("citation_spans", []):
+                span_note_id = span.get("note_id")
+                excerpt = span.get("excerpt_substring", "")
+                if span_note_id not in relevant_note_ids:
+                    problems.append(
+                        f"{split}/{row['id']}: citation_spans note id "
+                        f"{span_note_id!r} is not in relevant_note_ids"
+                    )
+                body = note_bodies.get(span_note_id)
+                if body is not None and excerpt not in body:
+                    problems.append(
+                        f"{split}/{row['id']}: citation_spans excerpt "
+                        f"{excerpt!r} is not a substring of note {span_note_id!r}'s body"
+                    )
+
             if row.get("abstain_expected"):
                 continue
 
