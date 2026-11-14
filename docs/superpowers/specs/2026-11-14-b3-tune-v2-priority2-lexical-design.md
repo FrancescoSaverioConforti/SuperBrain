@@ -1,9 +1,9 @@
 # B3-TUNE-v2 Priority 2 — Lexical Tuning: Design
 
-**Status:** design-only. No code, no tuning, no new runs are
-authorized by this document. Implementation requires a separate,
-approved plan (per `superpowers:writing-plans`), the same two-gate
-process Priority 1 used.
+**Status:** approved with 3 corrections (this revision). Design-only.
+No code, no tuning, no new runs are authorized by this document.
+Implementation requires a separate, approved plan (per
+`superpowers:writing-plans`), the same two-gate process Priority 1 used.
 
 ## Why this exists
 
@@ -170,13 +170,42 @@ of things already present:
 
 ### Lever B — Normalization
 
-- **Option B1 (light, auditable normalization additions)**: add
-  punctuation stripping (currently absent, confirmed by audit) to
-  `bm25::tokenize` specifically — e.g. strip a token's leading/trailing
-  non-alphanumeric characters before lowercasing, so `"BM25,"` tokenizes
-  identically to `"BM25"`. **Recommended**: small, deterministic, targets
-  a real documented gap (not a re-implementation), directly testable in
-  isolation from Lever A/C.
+- **Option B1 (conservative, code-aware punctuation normalization —
+  correction, this revision)**: add a *narrow* punctuation-stripping
+  rule to `bm25::tokenize`, not a generic "strip all leading/trailing
+  non-alphanumeric characters" transformation. The corpus is code-heavy,
+  and a generic strip rule would corrupt technical tokens this corpus
+  actually contains: `C++`, `C#`, `SEC-001`, `foo::bar`, `foo.bar`,
+  `snake_case`, CLI flags (`--split`), paths (`crates/api/src/metrics.rs`),
+  URLs, and other identifier-like tokens where the "punctuation" is
+  semantically load-bearing, not editorial. **Recommended policy**:
+  strip only a token's trailing **sentence-boundary** punctuation — the
+  specific characters `.` `,` `;` `:` `!` `?` `)` `]` `}` `"` `'` — and
+  only when stripping would leave a nonempty remainder, and only at the
+  token's *end* (trailing), never its start or interior. This targets
+  exactly the documented gap (`"BM25,"` → `"BM25"`, a trailing comma
+  from sentence punctuation) without touching `C++`/`C#` (trailing `+`/`#`
+  are not in the stripped set), `foo::bar`/`foo.bar`/`snake_case`
+  (interior punctuation is never touched), `SEC-001` (interior/trailing
+  digit, no punctuation at all), or CLI flags/paths (leading punctuation
+  is never touched, and `/`, `-`, `_`, `::` are not in the stripped set).
+  If a token is trailing-only punctuation with nothing left after
+  stripping (e.g. a bare `"..."` token), stripping is skipped entirely
+  for that token (the "nonempty remainder" guard) — this keeps the rule
+  narrow rather than aggressive, per the instruction to prefer a
+  stricter transformation over a more aggressive one when a simple rule
+  without collision risk isn't available.
+
+  The implementation plan's own early step is a **diagnostic pass**
+  identifying every distinct token in the corpus + dev that the proposed
+  stripped-character set would affect, specifically checking for false
+  positives among known technical-token shapes (`C++`, `C#`, `foo::bar`,
+  paths, CLI flags) before the rule is finalized — if that diagnostic
+  finds the narrow rule above still collides with a real corpus token,
+  the plan narrows the stripped-character set further (e.g. dropping
+  `!`/`?` if they turn out to appear as trailing punctuation inside a
+  real identifier somewhere) rather than proceeding with a known
+  collision.
 - **Option B2 (stemming, e.g. Porter or Snowball)**: considered and
   rejected for this phase — stemming is a bigger behavior change
   (affects every token, not just punctuation-adjacent ones), harder to
@@ -199,18 +228,41 @@ of things already present:
 
 ### Lever C — Deterministic synonym/alias table
 
-- **Option C1 (small, hand-curated, auditable table)**: a short, explicit
-  list of domain-specific alias pairs this corpus actually repeats (the
+- **Option C1 (small, hand-curated, auditable table, built from corpus +
+  dev only — correction, this revision)**: a short, explicit list of
+  domain-specific alias pairs this corpus actually repeats (the
   original design doc's own examples: `"SEC-001"` ↔ `"symlink TOCTOU
   bug"`, `"B2-ID-018"` ↔ `"TypeScript interface extraction gap"`), each
-  entry justified by a real query/note pair from the existing corpus
-  where the alias would help, applied as query-time expansion (not
-  index-time — expanding at index time would bloat every document's
-  token set; expanding at query time only touches the query actually
-  being searched for). **Recommended**: small, reversible, every entry
-  individually auditable and justified, matches the original design
-  doc's own framing of this lever ("cheap, auditable, and reversible,
-  unlike a learned embedding").
+  entry justified by a real query/note pair, applied as query-time
+  expansion (not index-time — expanding at index time would bloat every
+  document's token set; expanding at query time only touches the query
+  actually being searched for). **Recommended**: small, reversible,
+  every entry individually auditable and justified, matches the
+  original design doc's own framing of this lever ("cheap, auditable,
+  and reversible, unlike a learned embedding").
+
+  **Correction (this revision): calibration must never be used to
+  identify, choose, or justify alias candidates.** Alias-table
+  construction may use only the corpus itself, the dev split's queries,
+  and structural knowledge already explicit in the corpus (e.g. an
+  identifier that literally appears in a note's frontmatter alongside
+  its plain-English description) — never calibration. The required
+  workflow is:
+
+  `corpus + dev → candidate aliases → freeze alias table → calibration evaluation`
+
+  **never**:
+
+  `dev + calibration → choose aliases`.
+
+  Calibration's only role for Lever C is evaluating an already-frozen
+  table — exactly the same role it plays for Lever A's candidate grid
+  and Lever B's normalization rule (dev informs/diagnoses, calibration
+  decides on an already-fixed candidate, never co-selects it). This
+  prevents the decision split from leaking into the thing being
+  decided: an alias table built by looking at which calibration queries
+  it would help is calibration-fit by construction, not independently
+  evaluated by calibration afterward.
 - **Option C2 (auto-mined synonym table, e.g. from co-occurrence
   statistics)**: rejected — this corpus (53 notes) is far too small for
   co-occurrence-based synonym mining to produce anything but noise, and
@@ -225,24 +277,54 @@ of things already present:
 
 ## Chosen approach (this design)
 
-**A1 + B1 + C1**, each as its own fully separate ablation against the
-official B1 baseline, in that order (A then B then C), with each
-accepted change becoming the new reference baseline for the next lever's
-ablation — same "sequential accepted-baseline chaining" rule the parent
-B3-TUNE-v2 design already established for priorities generally, now
-applied within Priority 2's own three levers.
+**A1 + B1 + C1**, each measured as a genuinely isolated ablation
+against the official B1 baseline — **not chained**. This corrects an
+internal contradiction in this design's earlier draft, which claimed
+both "each lever is an independent ablation" and "each accepted lever
+becomes the baseline for the next" — those cannot both be true at once;
+chaining would mean Lever B's ablation is no longer measuring B1+B, but
+B1+A+B, which is composition, not isolation. Priority 2 therefore has
+**two distinct stages** (correction #2, this revision):
 
-Rationale: each of A1/B1/C1 is the version of its lever that is
-small, deterministic, auditable, and testable in isolation, which is
-what lets each stay a genuinely separate ablation rather than a bundled,
-hard-to-attribute change. The rejected alternatives in each lever either
-reach for more complexity than this corpus's size (53 notes, 30-60
-queries per split) can support without overfitting, or solve a problem
-not yet shown to exist.
+### Stage 1 — isolated ablations
+
+`B1 + A`, `B1 + B`, `B1 + C` are each measured **independently against
+the official B1 baseline**. No lever inherits another lever's changes
+during this stage — each ablation's configuration is exactly B1 plus
+that one lever's change, nothing else. Stage 1 ends with a KEEP/REJECT
+decision per lever, reported together, and this design's own plan STOPS
+there for user review (see "What this design does NOT authorize"
+below) — composition is Stage 2's job, not something Stage 1
+automatically proceeds into.
+
+### Stage 2 — composition (separately authorized, not started by this design)
+
+Only after Stage 1's three KEEP/REJECT decisions are reported and the
+user separately authorizes it, the levers that were KEPT (and only
+those) may be combined into a composite configuration (e.g. `B1 + A +
+B`, or `B1 + A + B + C` if all three were kept) and measured as its own
+ablation, with its own full report and its own KEEP/REJECT decision. A
+composite configuration's result is never used to retroactively credit
+an improvement to a lever whose own isolated ablation (Stage 1) didn't
+already demonstrate it — if Stage 1 rejected Lever C alone, a later
+composite's improvement cannot be attributed to C just because C is
+present in the mix; only levers that passed their own isolated ablation
+make it into any composite at all, which already prevents this, but the
+report must still state deltas against both the official B1 baseline
+*and* against the best single accepted lever, so a composite's
+incremental contribution stays visible rather than implied.
+
+Rationale: each of A1/B1/C1 is the version of its lever that is small,
+deterministic, auditable, and testable in isolation, which is what lets
+Stage 1 measure true per-lever attribution. The rejected alternatives in
+each lever either reach for more complexity than this corpus's size (53
+notes, 30-60 queries per split) can support without overfitting, or
+solve a problem not yet shown to exist.
 
 ## What's measured for each ablation
 
-For every one of the three levers' ablations (dev, then calibration):
+For every one of the three levers' **Stage 1 isolated** ablations (dev,
+then calibration):
 
 - Recall@10 (+ CI), nDCG@10 (+ CI) — same frozen formulas B3 established,
   unchanged.
@@ -264,11 +346,21 @@ For every one of the three levers' ablations (dev, then calibration):
   search even if the gap improves; it only informs whether a *future*,
   separately-authorized abstention round would have better raw material
   to work with.
-- Delta vs. the official B1 baseline (`eval/results/B3/frozen-config.json`,
-  not the previous lever's ablation, so drift across A→B→C stays visible
-  — same rule B3-TUNE-v2's parent design already states).
-- KEEP/REJECT per ablation, with rationale, before moving to the next
-  lever.
+- Delta vs. the official B1 baseline (`eval/results/B3/frozen-config.json`)
+  — the only comparison point in Stage 1, since each lever's ablation is
+  `B1 + <lever>` alone, never a previous lever's ablation (correction
+  #2 — Stage 1 never chains).
+- KEEP/REJECT per lever, with rationale.
+- **Lever B additionally requires token-level test coverage** (correction
+  #3) proving the normalization rule's conservative boundary, covering
+  at minimum: sentence-ending punctuation (`"BM25,"` → `"bm25"`,
+  `"index."` → `"index"`), technical identifiers that must survive
+  unchanged (`"C++"`, `"C#"`, `"SEC-001"`, `"foo::bar"`, `"foo.bar"`,
+  `"snake_case"`, a CLI flag like `"--split"`, a path fragment like
+  `"crates/api/src/metrics.rs"`), interior punctuation (never stripped,
+  regardless of position in the token), and the edge case of a token
+  that is nothing but stripped-set punctuation (must pass through
+  unstripped, per the nonempty-remainder guard above).
 
 ## What this design does NOT decide
 
@@ -293,8 +385,16 @@ For every one of the three levers' ablations (dev, then calibration):
   approved implementation plan (per `superpowers:writing-plans`/
   `superpowers:executing-plans`, the same process Priority 1's plan
   used).
+- **Stage 2 (composition)** — the implementation plan built from this
+  design covers Stage 1 only (the three isolated ablations) and stops
+  at their KEEP/REJECT report. Composing any accepted levers together
+  requires the user's separate, explicit authorization after reviewing
+  Stage 1's results — this design does not pre-authorize it.
 - Priority 3 (reranking) and Priority 4 (hybrid retrieval) — remain
   design-only, untouched by this document.
 - No modification to the B3 frozen config, runner, corpus, or labels.
 - No read of the v2 held-out set.
+- Calibration is never used to select, identify, or justify an alias
+  table entry (correction #1) — it evaluates an already-frozen table
+  only.
 - No MCP, no merge/tag/push.
