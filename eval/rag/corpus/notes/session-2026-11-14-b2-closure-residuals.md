@@ -6,7 +6,7 @@ status: reviewed
 trust: internal
 classification: internal
 project: eval-b3
-source: continuity:B2-CLOSURE
+source: docs/research/B2-CLOSURE-SUMMARY.md
 created: 2026-11-14
 updated: 2026-11-14
 event_period: 2026-11-14

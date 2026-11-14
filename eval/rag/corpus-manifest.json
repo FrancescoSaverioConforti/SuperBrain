@@ -1,0 +1,115 @@
+{
+  "build_date": "2026-11-14",
+  "build_commit": "933c5aa38541a03a25b1090359cadf13a377619d",
+  "sources": {
+    "superbrain": {
+      "commit": "933c5aa38541a03a25b1090359cadf13a377619d"
+    },
+    "controllore": {
+      "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+      "path": "C:\\Users\\fsave\\Desktop\\Python_code\\controllore"
+    }
+  },
+  "note_count_by_category": {
+    "bugs-fixes": 11,
+    "cross-file-concept": 7,
+    "identifier-code": 13,
+    "notes-decisions": 15,
+    "patterns-knowledge": 7
+  },
+  "note_count_total": 53,
+  "query_count_by_split_category_difficulty": {
+    "dev": {
+      "bugs-fixes": {
+        "easy": 5,
+        "hard": 2,
+        "medium": 6
+      },
+      "cross-file-concept": {
+        "hard": 3,
+        "medium": 4
+      },
+      "identifier-code": {
+        "easy": 5,
+        "hard": 3,
+        "medium": 5
+      },
+      "notes-decisions": {
+        "easy": 3,
+        "hard": 4,
+        "medium": 5
+      },
+      "patterns-knowledge": {
+        "easy": 2,
+        "hard": 2,
+        "medium": 4
+      },
+      "temporal": {
+        "easy": 2,
+        "hard": 2,
+        "medium": 3
+      }
+    },
+    "calibration": {
+      "bugs-fixes": {
+        "easy": 2,
+        "hard": 1,
+        "medium": 4
+      },
+      "cross-file-concept": {
+        "hard": 1,
+        "medium": 2
+      },
+      "identifier-code": {
+        "easy": 3,
+        "hard": 1,
+        "medium": 2
+      },
+      "notes-decisions": {
+        "easy": 2,
+        "hard": 2,
+        "medium": 2
+      },
+      "patterns-knowledge": {
+        "easy": 1,
+        "hard": 2,
+        "medium": 2
+      },
+      "temporal": {
+        "easy": 1,
+        "medium": 2
+      }
+    },
+    "test": {
+      "bugs-fixes": {
+        "easy": 2,
+        "hard": 1,
+        "medium": 3
+      },
+      "cross-file-concept": {
+        "easy": 1,
+        "hard": 1,
+        "medium": 2
+      },
+      "identifier-code": {
+        "easy": 3,
+        "hard": 1,
+        "medium": 2
+      },
+      "notes-decisions": {
+        "easy": 2,
+        "hard": 2,
+        "medium": 2
+      },
+      "patterns-knowledge": {
+        "easy": 1,
+        "hard": 2,
+        "medium": 1
+      },
+      "temporal": {
+        "easy": 2,
+        "medium": 2
+      }
+    }
+  }
+}
