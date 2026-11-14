@@ -1,11 +1,14 @@
 # B3-TUNE-v2 — Initial Design
 
-Status: **approved with changes** (see continuity, this revision). This
-document is still design-only for Priorities 2-4; a full implementation
-plan exists separately for Priority 1 only
-(`docs/superpowers/plans/2026-11-14-b3-tune-v2-priority1-abstention.md`).
-No code, no tuning, no new runs are authorized by this document itself —
-only by that separate Priority 1 plan, once it is in turn approved.
+Status: **Priority 1 CLOSED — REJECT** (see
+`docs/research/B3-TUNE-v2-PRIORITY1-CLOSURE.md`; signal `ratio` confirmed
+best-of-three, but no single global cutoff of it satisfies the required
+abstention-recall/false-abstention-rate/Recall@10/nDCG@10 guardrails on
+calibration — single-signal thresholding is insufficient on this corpus).
+Priority 2 (lexical tuning) is now being separately designed/planned,
+starting from the official B1 baseline. Priorities 3-4 remain
+design-only. No code, no tuning, no new runs are authorized by this
+document itself — only by each priority's own separately-approved plan.
 
 ## Why this exists
 
@@ -141,6 +144,23 @@ rule using whichever signal measurement shows discriminates best.
 Per-category thresholds are a possible future refinement, requiring
 their own evidence (a larger corpus/query set per category) before they
 could be proposed — not something this phase pre-commits to.
+
+**RESULT (2026-11-14): REJECT.** `ratio` (top1/top2) confirmed as the
+best-discriminating signal of the three on both dev and calibration
+(see `docs/research/B3-TUNE-v2-PRIORITY1-CLOSURE.md`), but the
+deterministic cutoff sweep over calibration's 30 distinct ratio values
+shows no single global cutoff simultaneously achieves nonzero
+abstention recall, a false-abstention rate ≤10%, and Recall@10/nDCG@10
+degradation ≤0.05 each versus the official B1 baseline. The first
+cutoff with any abstention recall at all already violates all three of
+the other guardrails. User's conclusion: the limiting factor is
+single-signal separability, not cutoff choice — per-category
+thresholds, ad hoc signal combinations, and further calibration tuning
+are explicitly declined for now, given calibration's n=6
+abstention-positive queries makes further search over threshold space
+an overfitting risk rather than a genuine discovery. Priority 1 is
+closed; Priority 2 (lexical tuning) proceeds from the official B1
+baseline, not from any Priority 1 threshold.
 
 ### Priority 2 — Lexical tuning
 
