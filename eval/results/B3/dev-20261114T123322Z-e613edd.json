@@ -1,8 +1,8 @@
 {
   "split": "dev",
   "run_date": "2026-11-14",
-  "run_timestamp_utc": "2026-11-14T12:24:02Z",
-  "runner_commit": "6b96ee4715f43d892bf627277e863c2c9db72da2",
+  "run_timestamp_utc": "2026-11-14T12:33:22Z",
+  "runner_commit": "e613edd07508985d157b32d81cc5b9704dd7a72f",
   "retrieval_config": "B1 deterministic trigram+BM25, no embeddings",
   "corpus_manifest_sha256": "5fcc32eab09b9ea738b2cee89a68e051f03dae1a39d83e67b32f07383fcd2f51",
   "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
