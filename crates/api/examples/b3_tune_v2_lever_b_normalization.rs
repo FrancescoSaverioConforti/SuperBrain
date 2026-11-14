@@ -68,10 +68,22 @@ fn exclude_canary(rows: Vec<LabelRow>) -> Vec<LabelRow> {
 }
 
 struct TestFixture {
-    vault: Vault,
-    pii: vault_security::PiiStore,
+    vault: Option<Vault>,
+    pii: Option<vault_security::PiiStore>,
     indexer: Arc<RealIndexer>,
     root: std::path::PathBuf,
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        // See the identical comment in b3_tune_v2_lever_a_bm25_params.rs's
+        // TestFixture::drop: dropping vault/pii explicitly, in this
+        // order, before touching the filesystem avoids a Windows
+        // file-lock race that would otherwise leak this temp directory.
+        drop(self.vault.take());
+        drop(self.pii.take());
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 impl TestFixture {
@@ -92,7 +104,15 @@ impl TestFixture {
         pii.bootstrap_deletion_log().unwrap();
         let vault =
             Vault::open_with_pii_store(root.clone(), &root.join("journal.sqlite"), &pii).unwrap();
-        Self { vault, pii, indexer: Arc::new(RealIndexer::new()), root }
+        Self { vault: Some(vault), pii: Some(pii), indexer: Arc::new(RealIndexer::new()), root }
+    }
+
+    fn vault(&self) -> &Vault {
+        self.vault.as_ref().unwrap()
+    }
+
+    fn pii(&self) -> &vault_security::PiiStore {
+        self.pii.as_ref().unwrap()
     }
 
     fn commit_corpus(&self) -> usize {
@@ -112,14 +132,14 @@ impl TestFixture {
         for path in &note_paths {
             let note_text = std::fs::read_to_string(path).unwrap();
             let outcome = storage::propose_and_commit(
-                &self.vault,
+                self.vault(),
                 &note_text,
                 Version(0),
                 Uuid::new_v4(),
                 &known_ids,
                 &HashSet::new(),
                 &policy::Gate::new(policy::SecretPolicy::new(1)),
-                Some(&self.pii),
+                Some(self.pii()),
             )
             .unwrap();
             assert!(
@@ -132,9 +152,9 @@ impl TestFixture {
     }
 
     fn build_index(&self) -> index::Index<'_> {
-        rebuild_index(&self.vault, &self.indexer).unwrap();
+        rebuild_index(self.vault(), &self.indexer).unwrap();
         index::Index::new(
-            &self.vault,
+            self.vault(),
             &self.indexer,
             "eval-b3",
             chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
@@ -529,6 +549,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors `index::bm25::tokenize`'s own pin test
+    /// (`tokenize_is_whitespace_delimited_and_case_folded_with_no_punctuation_stripping`
+    /// in `crates/index/src/bm25.rs`) with the same example assertions,
+    /// since `tokenize_like_bm25` duplicates that function's logic and
+    /// the two can't be mechanically kept in sync across the crate
+    /// boundary (`bm25::tokenize` is `pub(crate)`). If either test ever
+    /// needs a different assertion to pass, the other one must be
+    /// checked for drift too.
+    #[test]
+    fn tokenize_like_bm25_matches_the_real_tokenizers_documented_behavior() {
+        assert_eq!(tokenize_like_bm25("Rust Systems"), vec!["rust", "systems"]);
+        assert_eq!(tokenize_like_bm25("BM25, index."), vec!["bm25,", "index."]);
+        assert_eq!(tokenize_like_bm25("C++ C# foo::bar"), vec!["c++", "c#", "foo::bar"]);
+        assert_eq!(tokenize_like_bm25(""), Vec::<String>::new());
+        assert_eq!(tokenize_like_bm25("  leading  and  trailing  "), vec!["leading", "and", "trailing"]);
+    }
+
+    #[test]
+    fn dropping_a_fixture_removes_its_temp_directory() {
+        let fixture = TestFixture::new();
+        let root = fixture.root.clone();
+        assert!(root.exists());
+        drop(fixture);
+        assert!(!root.exists(), "TestFixture's temp directory must be removed on drop: {root:?}");
+    }
 
     #[test]
     fn a_query_with_trailing_punctuation_matches_the_same_as_without() {

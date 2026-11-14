@@ -226,6 +226,21 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Pins `tokenize`'s exact observable behavior. `crates/api/examples/
+    /// b3_tune_v2_lever_b_normalization.rs` and `b3_tune_v2_lever_a_bm25_params.rs`
+    /// duplicate this logic locally (this function is `pub(crate)`, not
+    /// visible across the crate boundary) — if this test ever fails, the
+    /// duplicates in those files must be checked and updated to match,
+    /// since there is no way to enforce that mechanically across crates.
+    #[test]
+    fn tokenize_is_whitespace_delimited_and_case_folded_with_no_punctuation_stripping() {
+        assert_eq!(tokenize("Rust Systems"), vec!["rust", "systems"]);
+        assert_eq!(tokenize("BM25, index."), vec!["bm25,", "index."]);
+        assert_eq!(tokenize("C++ C# foo::bar"), vec!["c++", "c#", "foo::bar"]);
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize("  leading  and  trailing  "), vec!["leading", "and", "trailing"]);
+    }
+
     #[test]
     fn independently_calculated_scores_pin_idf_tf_and_length_normalization() {
         // N=3 (including the empty document), avgdl=(3+6+0)/3=3.

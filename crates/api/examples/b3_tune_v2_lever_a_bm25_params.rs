@@ -50,9 +50,25 @@ fn exclude_canary(rows: Vec<LabelRow>) -> Vec<LabelRow> {
 }
 
 struct TestFixture {
-    vault: Vault,
-    pii: vault_security::PiiStore,
+    vault: Option<Vault>,
+    pii: Option<vault_security::PiiStore>,
     root: std::path::PathBuf,
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        // Custom Drop::drop runs BEFORE the struct's own fields are
+        // dropped, so an un-dropped `self.vault`/`self.pii` would still
+        // hold their file locks (the vault's SQLite connection, the PII
+        // store's key file) when this body runs, making `remove_dir_all`
+        // silently fail on Windows. Taking both out of their `Option`
+        // and dropping them explicitly, in this order, before touching
+        // the filesystem avoids that race entirely rather than retrying
+        // against a lock that cannot yet be released.
+        drop(self.vault.take());
+        drop(self.pii.take());
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 impl TestFixture {
@@ -73,7 +89,15 @@ impl TestFixture {
         pii.bootstrap_deletion_log().unwrap();
         let vault =
             Vault::open_with_pii_store(root.clone(), &root.join("journal.sqlite"), &pii).unwrap();
-        Self { vault, pii, root }
+        Self { vault: Some(vault), pii: Some(pii), root }
+    }
+
+    fn vault(&self) -> &Vault {
+        self.vault.as_ref().unwrap()
+    }
+
+    fn pii(&self) -> &vault_security::PiiStore {
+        self.pii.as_ref().unwrap()
     }
 
     fn commit_corpus(&self) -> usize {
@@ -93,14 +117,14 @@ impl TestFixture {
         for path in &note_paths {
             let note_text = std::fs::read_to_string(path).unwrap();
             let outcome = storage::propose_and_commit(
-                &self.vault,
+                self.vault(),
                 &note_text,
                 Version(0),
                 Uuid::new_v4(),
                 &known_ids,
                 &HashSet::new(),
                 &policy::Gate::new(policy::SecretPolicy::new(1)),
-                Some(&self.pii),
+                Some(self.pii()),
             )
             .unwrap();
             assert!(
@@ -289,9 +313,9 @@ fn build_index_with_bm25_params<'a>(
     k1: f64,
     b: f64,
 ) -> index::Index<'a> {
-    rebuild_index(&fixture.vault, indexer).unwrap();
+    rebuild_index(fixture.vault(), indexer).unwrap();
     index::Index::new(
-        &fixture.vault,
+        fixture.vault(),
         indexer,
         "eval-b3",
         chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
@@ -372,6 +396,15 @@ fn run_split_with_bm25_params(split: &str, k1: f64, b: f64, variant: BmVariant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_fixture_removes_its_temp_directory() {
+        let fixture = TestFixture::new();
+        let root = fixture.root.clone();
+        assert!(root.exists());
+        drop(fixture);
+        assert!(!root.exists(), "TestFixture's temp directory must be removed on drop: {root:?}");
+    }
 
     #[test]
     fn grid_point_runs_against_the_real_corpus_and_returns_metrics_for_both_modes() {
