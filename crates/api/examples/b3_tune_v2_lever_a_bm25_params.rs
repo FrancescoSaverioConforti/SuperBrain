@@ -390,7 +390,65 @@ mod tests {
 const K1_GRID: &[f64] = &[0.9, 1.2, 1.5, 1.8];
 const B_GRID: &[f64] = &[0.4, 0.6, 0.75, 0.9];
 
+/// The selected grid point (Task 3 Step 1 — frozen rule applied to the
+/// grid: max dev Recall@10, tie-break max dev nDCG@10, tie-break min
+/// distance to defaults; `(1.8, 0.75)` won uniquely on nDCG@10, no
+/// further tie-break needed). See `priority2-lever-a-selection.md`.
+const SELECTED_K1: f64 = 1.8;
+const SELECTED_B: f64 = 0.75;
+
+#[derive(Debug, serde::Serialize)]
+struct AblationReport {
+    split: String,
+    selected_k1: f64,
+    selected_b: f64,
+    a_score: GridPointReport,
+    a_full: GridPointReport,
+    /// Candidate-set-drift signal: if `A-full`'s own retrieved-note
+    /// count pattern differs from `A-score`'s because the candidate
+    /// prefilter itself changed membership, that is expected signal,
+    /// not an error — reported explicitly here as the delta in mean
+    /// retrieved-candidate behavior via each variant's own aggregate
+    /// Recall@10 (a difference in aggregate Recall@10 between A-score
+    /// and A-full at the SAME k1/b can only come from candidate-set
+    /// membership changing, since final re-ranking alone cannot change
+    /// which notes are present when a note's own score stays the same).
+    a_full_vs_a_score_recall_at_10_delta: f64,
+}
+
+fn run_ablation_for_split(split: &str, k1: f64, b: f64) -> AblationReport {
+    let a_score = run_split_with_bm25_params(split, k1, b, BmVariant::AScore);
+    let a_full = run_split_with_bm25_params(split, k1, b, BmVariant::AFull);
+    let delta = a_full.aggregate.recall_at_10 - a_score.aggregate.recall_at_10;
+    AblationReport {
+        split: split.to_string(),
+        selected_k1: k1,
+        selected_b: b,
+        a_score,
+        a_full,
+        a_full_vs_a_score_recall_at_10_delta: delta,
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--ablate") {
+        let split = args.get(2).cloned().unwrap_or_else(|| panic!("--ablate requires a split (dev|calibration)"));
+        let report = run_ablation_for_split(&split, SELECTED_K1, SELECTED_B);
+        println!(
+            "{split}: A-score Recall@10={:.4} nDCG@10={:.4} | A-full Recall@10={:.4} nDCG@10={:.4} | candidate-set-drift(Recall@10 delta)={:+.4}",
+            report.a_score.aggregate.recall_at_10, report.a_score.aggregate.ndcg_at_10,
+            report.a_full.aggregate.recall_at_10, report.a_full.aggregate.ndcg_at_10,
+            report.a_full_vs_a_score_recall_at_10_delta
+        );
+        std::fs::create_dir_all(RESULTS_DIR).unwrap();
+        let out_path = format!("{RESULTS_DIR}/priority2-lever-a-{split}-ablation.json");
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        std::fs::write(&out_path, json).unwrap();
+        println!("wrote {out_path}");
+        return;
+    }
+
     let mut reports = Vec::with_capacity(K1_GRID.len() * B_GRID.len());
     for &k1 in K1_GRID {
         for &b in B_GRID {
