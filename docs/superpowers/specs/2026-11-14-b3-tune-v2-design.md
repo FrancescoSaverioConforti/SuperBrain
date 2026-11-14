@@ -56,6 +56,39 @@ held-out in any meaningful sense, even if its content was never
 literally read before — the act of shaping its queries around known
 tuning outcomes contaminates it.
 
+### Held-out authoring must happen in a separate context from tuning (correction)
+
+Building the held-out set and running the tuning work cannot happen in
+the same conversation/agent context, because the agent that authors the
+held-out queries necessarily retains their content in its own context —
+making that same agent "blind" during tuning is not possible after the
+fact. The workflow is:
+
+1. A dedicated, separate session/subagent authors the held-out
+   queries+labels. This agent sees the existing corpus (read-only, same
+   as any B3 authoring work) and writes `eval/rag/v2-heldout/labels.jsonl`.
+2. Mechanical validation (`validate_corpus.py`, the same schema checks
+   B3 used) runs inside that same dedicated session.
+3. That session commits the file.
+4. That session computes and freezes the SHA-256 (and query count/
+   category/difficulty distribution) into `eval/rag/v2-heldout/manifest.json`.
+5. **That session then closes.** Its context — including the query
+   text, answers, and relevant_note_ids it just authored — does not
+   carry forward.
+6. Tuning work (Priority 1 onward) starts in a **fresh context** that
+   receives only: the manifest's hash, query count, category
+   distribution, difficulty distribution, and any other non-semantic
+   metadata. The tuning context is never given, and must not read:
+   the held-out set's query text, answers, `relevant_note_ids`, or
+   citation spans.
+
+This is what makes the new set genuinely blind during tuning, not just
+procedurally "unread until later" — the distinction matters because a
+single long-running session that both authors the held-out set and
+later tunes against dev/calibration retains the held-out content in its
+own conversation history the whole time, which is not blind in any
+meaningful sense even if that content is never explicitly re-read.
+
 ## Priority order (per user instruction, not open to reordering without new authorization)
 
 ### Priority 1 — Abstention thresholding
@@ -184,12 +217,24 @@ after seeing that result.
 **Explicitly conditional**, per both the user's instruction here and the
 B3 design's own constraint (`docs/Spec_mvp.md`): CPU embeddings / hybrid
 retrieval are introduced **only if** Priorities 1-3 are measured and
-found insufficient against the new held-out final-test, and only if the
-improvement is large enough to justify the added resource cost (the
-spec's own language: "senza peggiorare latenza e RAM oltre i limiti").
-This priority is not scoped further here — if reached, it gets its own
-design pass once there is real evidence that lexical tuning and
-reranking alone don't close the gap.
+found insufficient, and only if the improvement is large enough to
+justify the added resource cost (the spec's own language: "senza
+peggiorare latenza e RAM oltre i limiti").
+
+**Correction: the new v2 held-out final-test never decides whether to
+proceed to Priority 4.** The decision to stop after P1/P2/P3, or to
+proceed to P4, is made **exclusively** from dev, calibration, each
+priority's own ablation results, and latency/RAM/resource evidence —
+never from the new held-out set, which stays unread through this entire
+decision. Concretely: `P1 → P2 → P3 → (decide: stop, or P4)` is decided
+on dev/calibration/ablation evidence alone; only **after** that decision
+converges on one final v2 configuration (whether that's "P1+P2+P3" or
+"P1+P2+P3+P4") does anyone freeze that configuration and then read the
+new held-out set exactly once. The held-out set validates the chosen
+configuration; it is never consulted to help choose among
+configurations. This priority is not scoped further here — if reached,
+it gets its own design pass once there is real dev/calibration evidence
+that lexical tuning and reranking alone don't close the gap.
 
 ## v2 evaluation plan sketch (not a committed plan — subject to revision once v2 work is actually authorized)
 
@@ -209,13 +254,19 @@ reranking alone don't close the gap.
 4. Each ablation is measured against dev first (same discipline as B3:
    dev never gates, it diagnoses), then calibration for threshold/
    tolerance proposals.
-5. Before any v2 configuration is declared better than the B1 baseline,
-   run the new held-out final-test (built in step 1) exactly once,
-   under the same freeze/report discipline B3 used (`frozen-config.json`
-   analog, single run, no post-hoc tuning).
-6. A v2 configuration only replaces the B1 baseline as "official" if it
+5. **Whether to stop after P1/P2/P3, or proceed to P4, is decided
+   exclusively from dev/calibration/ablation/resource evidence — never
+   from the new held-out set** (correction, see Priority 4 above). The
+   held-out set stays unread through every one of these stop/proceed
+   decisions.
+6. Only once that decision converges on one final, frozen v2
+   configuration does anyone run the new held-out final-test (built in
+   step 1), exactly once, under the same freeze/report discipline B3
+   used (`frozen-config.json` analog, single run, no post-hoc tuning).
+7. A v2 configuration only replaces the B1 baseline as "official" if it
    passes the multi-objective acceptance criterion above on that new
-   held-out set — not a single-metric "beats B1 everywhere" bar.
+   held-out set — not a single-metric "beats B1 everywhere" bar, and
+   not a criterion the held-out result was used to help select.
 
 ### Experimental logging rule (correction)
 
