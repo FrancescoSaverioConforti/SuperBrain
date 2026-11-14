@@ -1,0 +1,113 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 1.02s
+     Running `target\release\examples\b2_eval_009_cpp_fmt.exe 'C:/Users/fsave/AppData/Local/Temp/claude/9a7d8ffadeaf98c4/d0963c5f-908d-4243-bcbc-0add1602b5af/scratchpad/cpp-eval/fmt-repo' 208219daff58f2a7438f6931cc2ddc358acf33ef`
+=== B2-EVAL-009: C++ domain standalone evaluation (fmtlib/fmt) ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\d0963c5f-908d-4243-bcbc-0add1602b5af\scratchpad\cpp-eval\fmt-repo
+commit: 208219daff58f2a7438f6931cc2ddc358acf33ef
+
+--- A. Corpus metrics ---
+total_files_in_commit: 19
+files_supported (parser available): 19
+files_parsed: 19
+files_with_error_nodes: 18
+parse_failures: 0
+total_loc (newline count, parsed files): 17252
+raw_candidates_total: 1441
+rejections_total: 16
+snapshots_promoted: 1441
+  Class: 62
+  Function: 1215
+  Struct: 164
+
+--- B. Raw-parse proxies: namespace/template call shapes (real AST, not extraction-dependent) ---
+raw_total_call_expressions (every call_expression node, library files only): 4215
+dropped call-site callee kinds (callee_name()-equivalent returns None, same match arms as edges/calls.rs's real callee_name): [("qualified_identifier", 678), ("primitive_type", 32), ("parenthesized_expression", 7), ("subscript_expression", 1), ("concatenated_string", 1), ("assignment_expression", 1), ("lambda_expression", 1), ("call_expression", 1)]
+raw_namespace_decls: 29
+raw_qualified_identifier_calls (ns::foo(...), any — includes qualified_template below): 678
+raw_qualified_template_calls (ns::foo<T>(...) specifically): 253
+raw_bare_template_calls (foo<T>(...), no namespace qualifier): 767
+raw_receiver_template_calls (obj.foo<T>(...)/obj->foo<T>(...)): 14
+qualified_call_examples (first 10): ["include/fmt/args.h:192: fmt::arg(arg_name, arg.value)", "include/fmt/args.h:190: fmt::arg(arg_name, dynamic_args_.push<stored_t<T>>(arg.value))", "include/fmt/args.h:119: detail::unwrap(arg.value)", "include/fmt/args.h:62: std::move(new_node)", "include/fmt/args.h:61: std::move(head_)", "include/fmt/base.h:2934: fmt::println(stdout, fmt, static_cast<T&&>(args)...)", "include/fmt/base.h:2927: detail::vprint_mojibake(f, fmt.str, va, true)", "include/fmt/base.h:2916: detail::vprint_mojibake(f, fmt.str, va, false)", "include/fmt/base.h:2899: detail::vprint_mojibake(stdout, fmt.str, va, false)", "include/fmt/base.h:2878: detail::vformat_to(buf, fmt.str, vargs<T...>{{args...}}, {})"]
+qualified_template_call_examples (first 10): ["include/fmt/args.h:59: std::unique_ptr<typed_node<T>>(new typed_node<T>(arg))", "include/fmt/base.h:2917: detail::is_locking<T...>()", "include/fmt/base.h:2900: detail::is_locking<T...>()", "include/fmt/base.h:2877: detail::counting_buffer<>()", "include/fmt/base.h:2830: detail::iterator_buffer<OutputIt, char, traits>(out, n)", "include/fmt/base.h:2797: detail::get_buffer<char>(out)", "include/fmt/base.h:2761: detail::make_descriptor<Context, T...>()", "include/fmt/base.h:2760: detail::count_named_args<T...>()", "include/fmt/base.h:2715: detail::enforce_compile_checks<sizeof(s) != 0>()", "include/fmt/base.h:2714: detail::parse_format_string<char>(str, checker(str, arg_pack()))"]
+
+real_import_facts_extracted (#include-based; walk_for_imports has NO Language::Cpp arm per imports.rs, so this is structurally 0 for C++, confirmed not assumed): 0
+
+--- C. Structural edges ---
+  Calls: 845
+  Contains: 216
+  Extends: 4
+resolution_method breakdown (all edge kinds combined):
+  NameHeuristic: 180
+  StaticAnalysis: 885
+
+--- D. Calls resolution taxonomy (EvidenceTier) ---
+resolved Calls edges by tier:
+  Heuristic: 180
+  Resolved: 665
+total_call_attempts (negative knowledge): 1282
+  Ambiguous: 782
+  Unresolved: 500
+
+--- D2. UnresolvedReason distribution ---
+  AmbiguousCandidates: 782
+  ExtractionRejected: 7
+  Unknown: 493
+
+--- E. Overload-named candidate pools (format_to, overload-heavy real name) ---
+real snapshots named exactly 'format_to': 9
+  include/fmt/base.h::format_to span=ByteSpan { start: 97624, end: 97798 }
+  include/fmt/base.h::format_to span=ByteSpan { start: 99678, end: 99896 }
+  include/fmt/color.h::format_to span=ByteSpan { start: 23302, end: 23491 }
+  include/fmt/compile.h::format_to span=ByteSpan { start: 16731, end: 16910 }
+  include/fmt/compile.h::format_to span=ByteSpan { start: 18101, end: 18579 }
+  include/fmt/format.h::format_to span=ByteSpan { start: 160875, end: 161079 }
+  include/fmt/xchar.h::format_to span=ByteSpan { start: 6435, end: 6592 }
+  include/fmt/xchar.h::format_to span=ByteSpan { start: 8768, end: 8977 }
+  include/fmt/xchar.h::format_to span=ByteSpan { start: 9797, end: 10070 }
+CallAttempts with callee_name == 'format_to': 0 (by tier below)
+resolved Calls edges targeting a 'format_to' snapshot: 0
+
+--- F. Negative-knowledge sample: 10 Ambiguous CallAttempts (deterministic order) ---
+  caller=Some("include/fmt/base.h::get_container") callee_name="accessor" candidate_count=2 candidates=["include/fmt/base.h::accessor", "include/fmt/base.h::accessor"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/base.h::on_format_specs") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::format") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::parse") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/base.h::format_custom") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::parse") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::parse") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/base.h::format_custom") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::do_format") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+  caller=Some("include/fmt/ranges.h::format") callee_name="advance_to" candidate_count=4 candidates=["include/fmt/base.h::advance_to", "include/fmt/base.h::advance_to", "include/fmt/format.h::advance_to", "include/fmt/printf.h::advance_to"] rationale=None limitations=["name-based matching cannot distinguish overloads by parameter list or generic arity; 2+ same-named candidates remained even after scope/arity narrowing"]
+
+--- G. Full index timing ---
+full_index_elapsed: 410.0303ms
+real_instantiates_edges: 0
+real_contains_edges: 216
+real_extends_edges: 4
+
+--- G2. Ground-truth spot checks (ticked against real source, for the eval report's 30-row sample) ---
+  name="parse_format_string" real_decl_count=1 resolved_edges=4 call_attempts=0 attempt_tiers=[]
+  name="push" real_decl_count=1 resolved_edges=3 call_attempts=0 attempt_tiers=[]
+  name="get_container" real_decl_count=1 resolved_edges=7 call_attempts=0 attempt_tiers=[]
+  name="accessor" real_decl_count=2 resolved_edges=0 call_attempts=1 attempt_tiers=[Ambiguous]
+  name="vformat_to" real_decl_count=9 resolved_edges=1 call_attempts=7 attempt_tiers=[Ambiguous, Ambiguous, Ambiguous, Ambiguous, Ambiguous, Ambiguous, Ambiguous]
+  name="is_locking" real_decl_count=2 resolved_edges=1 call_attempts=0 attempt_tiers=[]
+  name="get_buffer" real_decl_count=2 resolved_edges=0 call_attempts=1 attempt_tiers=[Ambiguous]
+  name="counting_buffer" real_decl_count=2 resolved_edges=0 call_attempts=1 attempt_tiers=[Ambiguous]
+  name="enforce_compile_checks" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="make_descriptor" real_decl_count=1 resolved_edges=0 call_attempts=0 attempt_tiers=[]
+  name="println" real_decl_count=8 resolved_edges=1 call_attempts=0 attempt_tiers=[]
+
+--- H. Agent usefulness + reliability simulation (real data, real agent_policy::evaluate) ---
+Q1: 'who calls advance_to (a templated, cross-namespace-ambiguous function)?' -> real answer: an Ambiguous CallAttempt (4 real candidates), never collapsed to one.
+  real tier=Ambiguous candidate_count=4
+  policy(InformationalDisplay)=Forbidden { reason: "an Ambiguous outcome has 2+ real candidates and the resolver deliberately declined to choose -- never pick one arbitrarily; surface every real candidate to the human, or seek independent confirmation (direct source reading, compiler/language-server query) before treating any one of them as the target" }
+  policy(AssertAsFactOrSoleJustification)=Forbidden { reason: "an Ambiguous outcome has 2+ real candidates and the resolver deliberately declined to choose -- never pick one arbitrarily; surface every real candidate to the human, or seek independent confirmation (direct source reading, compiler/language-server query) before treating any one of them as the target" }
+  policy(HighImpactModification)=Forbidden { reason: "an Ambiguous outcome has 2+ real candidates and the resolver deliberately declined to choose -- never pick one arbitrarily; surface every real candidate to the human, or seek independent confirmation (direct source reading, compiler/language-server query) before treating any one of them as the target" }
+  Ambiguous correctly Forbidden for assert/high-impact: true
+
+Q2: 'what does Policy::handle<T>() resolve to, for a namespace-qualified template call?' -> real answer per the known residual gap: the call site is NEVER EXTRACTED AT ALL (no CallAttempt, no edge) for ns::foo<T>() shapes -- confirmed by direct source reading of callee_name's match arms (no 'qualified_identifier' arm exists). An agent asking this question about a REAL ns::foo<T>() call site in this corpus gets NO ANSWER (silent absence), not a hedged Ambiguous/Unresolved answer -- this is the one case where 'Forbidden-by-default' honesty does NOT apply, because the call site never reaches negative-knowledge tracking either.
+
+Q3: 'what overloads exist for a given name (e.g. advance_to/format_to)?' -> real answer: snapshot lookup by name works correctly regardless of Calls-resolution quality (advance_to: 4 real same-named declarations found across base.h/format.h/printf.h; format_to: 9 real same-named declarations found across base.h/color.h/compile.h/format.h/xchar.h) -- this question is answerable and reliable independent of the Calls-edge gap above, since it does not depend on call-site resolution at all.
+
+=== END ===

@@ -1,0 +1,4 @@
+changed_files (git diff A..B): 6 -> ["package.json", "src/libs/ddd/entity.base.ts", "src/modules/user/database/user.repository.ts", "src/modules/user/domain/user.entity.ts", "src/modules/user/user.mapper.ts", "src/modules/wallet/wallet.mapper.ts"]
+full_outcome: snapshots=236 edges=229 import_facts=441 impl_facts=0 call_attempts=245
+incremental_outcome: snapshots=270 edges=229 import_facts=441 impl_facts=0 call_attempts=245
+full/incremental PARITY CONFIRMED, zero divergences.

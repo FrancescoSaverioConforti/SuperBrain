@@ -1,0 +1,142 @@
+   Compiling codegraph-index v0.1.0 (C:\Users\fsave\Desktop\Python_code\SuperBrain\.worktrees\b2-code-graph\crates\codegraph-index)
+    Finished `release` profile [optimized] target(s) in 1.22s
+     Running `target\release\examples\b2_smoke_test_cli_tooling.exe 'C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-007\repo' 2299c0124283a6f8a8c6b38f326a236ea4221014 c923d239fef3ccb1c00c49aae87f8855f85f62c1`
+=== B2-EVAL-007: CLI/tooling domain smoke test ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\0e7e6c2c-3e1f-4ffa-8eb7-a309f2439e85\scratchpad\b2-eval-007\repo
+commit_b: c923d239fef3ccb1c00c49aae87f8855f85f62c1
+
+--- B. Pipeline results (full index at commit B) ---
+total_files_in_tree: 251
+files_supported_by_parser: 140
+files_parsed: 140
+parse_failures: 0
+files_with_tree_has_error: 0
+raw_candidates_extracted: 2540
+extraction_rejections (oversized name/signature): 18
+  rejection_kind SignatureTooLong: 18
+  signature_too_long files (first 10): ["scripts/release.py", "src/pipx/backends/pip.py", "src/pipx/backends/uv.py", "src/pipx/commands/inject.py", "src/pipx/commands/install.py", "src/pipx/commands/install.py", "src/pipx/commands/manifest.py", "src/pipx/commands/reinstall.py", "src/pipx/commands/run.py", "src/pipx/commands/run.py"]
+  signature_too_long frequency vs total candidates: 18/2558 (0.70%)
+snapshots_promoted: 2540
+promotion_failures: 0
+python_files_with_at_least_one_import_statement: 130
+
+--- C. Symbol coverage (SymbolKind counts) ---
+  Class: 129
+  Field: 100
+  Function: 2311
+
+--- C1. Module/File -> top-level-symbol gap (CLI/tooling domain stress case) ---
+files_with_at_least_one_extracted_symbol: 131
+total_top_level_symbols_across_all_files (MEASURED, span-nesting definition): 2251
+files_with_more_than_one_top_level_symbol (MEASURED): 117
+percentage_of_files_with_multiple_top_level_symbols (MEASURED): 89.3%
+mean_top_level_symbols_per_file (MEASURED): 17.18
+median_top_level_symbols_per_file (MEASURED): 11
+top 15 files by top-level-symbol count (file: count):
+  tests/test_install.py: 142
+  src/pipx/main.py: 112
+  tests/test_run.py: 105
+  src/pipx/commands/common.py: 60
+  tests/test_main.py: 57
+  tests/test_upgrade.py: 56
+  src/pipx/package_specifier.py: 53
+  tests/test_reinstall.py: 49
+  tests/conftest.py: 46
+  tests/test_standalone_interpreter.py: 45
+  tests/test_common.py: 43
+  tests/test_interpreter.py: 43
+  tests/test_backends.py: 41
+  src/pipx/venv.py: 40
+  tests/test_package_specifier.py: 38
+
+--- C2. Call-graph vs. command-registration-graph distinction (CLI/tooling domain stress case) ---
+set_defaults_func_assignments (MEASURED, raw parse: `func=IDENTIFIER` keyword argument -- a function NAME passed as a VALUE, never a call): 36
+dynamic_func_dispatch_call_sites (MEASURED, raw parse: `X.func(...)` call where `func` is a runtime-bound attribute, not a literal callee name): 1
+local_function_scoped_imports (MEASURED, raw parse: `import`/`from...import` statements nested inside a function body, not at module level): 65
+note: this pipeline's resolve_calls matches a call site's own callee NAME directly against the snapshot pool by string equality. `args.func(args, ctx)` has callee name "func" -- no snapshot in this corpus is named literally "func", so this call site produces either zero candidates (no edge, correctly) or, if any OTHER unrelated symbol in the corpus happens to be named "func", a risk of a false match. The REAL relationship (`_cmd_install` is registered as this dispatch's actual target via `parser.set_defaults(func=_cmd_install)`) is a command-REGISTRATION relationship, never represented as an Edge by this pipeline today -- confirmed structurally, measured directly in Section H below, not assumed.
+
+--- D. Edge quality ---
+lineage_edges (B alone, no prev): 0
+calls_edges: 3427
+extends_implements_edges: 20
+tests_for_edges: 18
+  by_kind Calls: 3427
+  by_kind Contains: 94
+  by_kind Extends: 20
+  by_kind Instantiates: 21
+  by_kind TestsFor: 18
+  by_resolution_method NameHeuristic: 71
+  by_resolution_method StaticAnalysis: 3509
+full_index_elapsed: 1.0698404s
+
+--- Manual call-quality sample (first 30 by evidence note, deterministic) ---
+Some("src/pipx/commands/install.py::_install_on_supported_python") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/run_pip.py::_sync_main_package_metadata_after_runpip_install") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/main.py::_run_pipx_command") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_common.py::test_package_name_from_spec_reads_static_name_without_building") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_common.py::test_package_name_from_spec_reads_wheel_metadata_without_installing") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_main.py::test_validate_backend_silent_on_env_uv_missing") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_main.py::test_validate_backend_raises_on_cli_uv_missing") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_venv.py::test_backend_override_warning_dedups_per_venv") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_venv.py::test_venv_without_record_resolves_like_a_fresh_one") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::BackendOptions") [StaticAnalysis] :: call to "BackendOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/cache.py::print_cache_dir") [Calls/StaticAnalysis] -> Some("src/pipx/commands/cache.py::CacheData") [StaticAnalysis] :: call to "CacheData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/cache.py::purge_cache") [Calls/StaticAnalysis] -> Some("src/pipx/commands/cache.py::CacheData") [StaticAnalysis] :: call to "CacheData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/upgrade.py::_upgrade_venv") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::CooldownOptions") [StaticAnalysis] :: call to "CooldownOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/main.py::_run_pipx_command") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::CooldownOptions") [StaticAnalysis] :: call to "CooldownOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_run.py::capture") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::CooldownOptions") [StaticAnalysis] :: call to "CooldownOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_run_uv.py::test_run_via_uv_tool_run_basic") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::CooldownOptions") [StaticAnalysis] :: call to "CooldownOptions" resolves to exactly one candidate in the given snapshot pool
+Some("tests/test_run_uv.py::test_run_script_via_uv_run_uses_uv_run_script") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::CooldownOptions") [StaticAnalysis] :: call to "CooldownOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/expose.py::_failure") [Calls/StaticAnalysis] -> Some("src/pipx/commands/expose.py::ExposureData") [StaticAnalysis] :: call to "ExposureData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/expose.py::_success") [Calls/StaticAnalysis] -> Some("src/pipx/commands/expose.py::ExposureData") [StaticAnalysis] :: call to "ExposureData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/expose.py::_collision_outcome") [Calls/StaticAnalysis] -> Some("src/pipx/commands/expose.py::ExposureData") [StaticAnalysis] :: call to "ExposureData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/run.py::_prepare_venv") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::ExposureOptions") [StaticAnalysis] :: call to "ExposureOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/upgrade.py::_upgrade_venv") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::ExposureOptions") [StaticAnalysis] :: call to "ExposureOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/main.py::_cmd_install") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::ExposureOptions") [StaticAnalysis] :: call to "ExposureOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/main.py::_compute_fetch_python") [Calls/StaticAnalysis] -> Some("src/pipx/constants.py::FetchPythonOptions") [StaticAnalysis] :: call to "FetchPythonOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/health.py::health") [Calls/StaticAnalysis] -> Some("src/pipx/commands/health.py::HealthData") [StaticAnalysis] :: call to "HealthData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/venv.py::install_package") [Calls/StaticAnalysis] -> Some("src/pipx/requires_python.py::IncompatiblePythonError") [StaticAnalysis] :: call to "IncompatiblePythonError" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/venv.py::install_package_no_deps") [Calls/StaticAnalysis] -> Some("src/pipx/requires_python.py::IncompatiblePythonError") [StaticAnalysis] :: call to "IncompatiblePythonError" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/main.py::_cmd_inject") [Calls/StaticAnalysis] -> Some("src/pipx/options.py::InjectOptions") [StaticAnalysis] :: call to "InjectOptions" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/inject.py::inject") [Calls/StaticAnalysis] -> Some("src/pipx/commands/inject.py::InjectionData") [StaticAnalysis] :: call to "InjectionData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/uninject.py::uninject") [Calls/StaticAnalysis] -> Some("src/pipx/commands/inject.py::InjectionData") [StaticAnalysis] :: call to "InjectionData" resolves to exactly one candidate in the given snapshot pool
+Some("src/pipx/commands/uninject.py::_uninject_failure") [Calls/StaticAnalysis] -> Some("src/pipx/commands/inject.py::InjectionData") [StaticAnalysis] :: call to "InjectionData" resolves to exactly one candidate in the given snapshot pool
+
+--- G. Performance observation (approx, Windows tasklist) ---
+"b2_smoke_test_cli_tooling.exe","11608","Console","22","12.820 K"
+
+--- F. Incremental A -> B (CodeGraphIndexer) ---
+commit_a: 2299c0124283a6f8a8c6b38f326a236ea4221014
+observe_commit(A) generation: 1
+observe_commit(A) snapshot_count: 2540
+observe_commit(A) edge_count: 3578
+observe_commit(A) elapsed (full reindex): 1.1099652s
+changed_files (git diff A..B): ["changelog.d/+self-inject-runpip-mixed-versions.bugfix.rst", "src/pipx/commands/inject.py", "src/pipx/commands/run_pip.py", "tests/test_transaction.py"]
+observe_commit(B) generation: 2
+observe_commit(B) metrics: IndexMetrics { files_considered: 4, files_reparsed: 4, snapshots_removed: 35, snapshots_added: 35, edges_rebuilt: 3615, raw_import_statements_extracted: 92, raw_import_statements_reused: 2593, import_facts_resolved: 2685, raw_impl_statements_extracted: 0, raw_impl_statements_reused: 0, impl_facts_resolved: 0 }
+observe_commit(B) elapsed (incremental): 674.9548ms
+observe_commit(B) final snapshot_count: 2575
+observe_commit(B) final edge_count: 3580
+observe_commit(B) final lineage_edge_count: 35
+
+--- Imports measurement (via the real CodeGraphIndexer, extraction coverage vs. resolution accuracy kept separate) ---
+total_import_statements_in_python_files_at_commit_b (line-based count, MEASURED): 1998
+python_import_facts_extracted (MEASURED, ImportFact, file-level): 2685
+extraction_coverage: 2685/1998 (134.4%)
+total_import_facts_all_languages (MEASURED): 2685
+  resolution_internal (MEASURED): 796
+  resolution_external (MEASURED): 1829
+  resolution_ambiguous (MEASURED): 60
+  aliases_captured (MEASURED): 20
+  raw_import_statements_extracted_this_call (MEASURED, IndexMetrics): 92
+  raw_import_statements_reused_this_call (MEASURED, IndexMetrics): 2593
+
+--- H. CLI/tooling usefulness Q&A (pipx, commit B) ---
+Q1 [needs: Calls] 'What is the CLI entry point, and what does it call?' -> cli() calls: ["src/pipx/fanout.py::stopping_children_on_signals", "src/pipx/animate.py::hide_cursor", "src/pipx/animate.py::show_cursor", "src/pipx/main.py::_dispatch"]
+Q2 [needs: command-registration-graph, NOT Calls] 'Which handler executes the install subcommand?' -> callers of _cmd_install found via Calls: [] (ground truth: _cmd_install is registered via `parser.set_defaults(func=_cmd_install)`, a NAME-AS-VALUE assignment, never a call expression naming it -- confirmed this pipeline has no edge kind representing 'this parser dispatches to this handler function')
+Q3 [needs: Calls, cross-file, function-local import] 'Does _cmd_install call install (cross-file, locally-imported)?' -> calls: ["src/pipx/options.py::InstallOptions", "src/pipx/options.py::ExposureOptions"] (found target: false; ground truth is YES per direct source reading, but `install` itself is a SignatureTooLong rejection -- confirmed by a dedicated real-extractor probe, install_fn_exists_in_pool=true -- so this is Not answerable for a root-caused extraction-gap reason, not a Calls-resolution defect)
+Q4 [needs: Calls, cross-file] 'Does inject_dep call runs_from_venv (introduced by this exact commit)?' -> NOT ANSWERABLE: `inject_dep` itself is not a symbol in this graph at all -- confirmed by a dedicated real-extractor probe to be a SignatureTooLong rejection, a SECOND independent instance of the same gap Q3 demonstrates, on a function this exact commit pair's own diff directly modified (ground truth: inject_dep DOES call runs_from_venv, per direct source reading of commit c923d23's own diff -- the relationship is real, the extraction gap is what blocks it)
+Q5 [needs: Module/File structure] 'What does src/pipx/main.py contain?' -> 122 symbols found ONLY via file-path string matching: ["_compute_fetch_python", "_cmd_list", "_package_is_url", "_add_repair", "_cmd_unpin", "_cmd_ensurepath", "_cmd_uninstall", "_add_health", "_add_upgrade_shared", "_venv_container", "_split_runpip_args", "_RunHelpFormatter", "_add_uninject", "_setup_logging", "_validate_max_logs"]
+Q6 [needs: TestsFor] 'Which tests cover the install command?' -> total TestsFor edges in corpus: 18
+Q7 [needs: Calls, impact analysis] 'If I modify preserve_venv, what is impacted?' -> callers: ["tests/test_transaction.py::test_remove_venv_moves_the_venv_once_the_rename_succeeds_on_retry", "tests/test_transaction.py::test_remove_venv_restores_a_venv_moved_just_before_an_interrupt", "tests/test_transaction.py::test_preserve_venv_restores_after_another_command_swept_the_trash", "tests/test_transaction.py::test_preserve_venv_finishes_the_restore_through_an_interrupt", "tests/test_transaction.py::test_preserve_venv_keeps_the_backup_out_of_the_venv_namespace", "src/pipx/commands/install.py::_upgrade_existing_venv", "tests/test_transaction.py::test_remove_venv_keeps_the_venv_when_the_rename_keeps_failing", "tests/test_transaction.py::test_preserve_venv_restores_the_backup_on_failure", "tests/test_transaction.py::test_preserve_venv_without_upfront_copy_discards_the_removed_venv_on_success", "tests/test_transaction.py::test_preserve_venv_without_upfront_copy_restores_a_removed_venv_on_failure", "src/pipx/commands/run_pip.py::run_pip", "src/pipx/commands/upgrade.py::_upgrade_venv_packages"]
+
+=== done ===
