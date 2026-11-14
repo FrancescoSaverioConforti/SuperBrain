@@ -874,3 +874,35 @@ fn new_with_bm25_params_changes_candidate_prefilter_scores() {
         "b=0.0 must change the candidate prefilter's own BM25 scores vs the default b=0.75"
     );
 }
+
+#[test]
+fn new_with_text_normalizer_applies_the_hook_before_indexing_text() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "resolve_configured_timezone,"), 0);
+
+    let default_indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &default_indexer).unwrap();
+    // Default indexer: the trailing comma stays part of the indexed
+    // token, so a query WITHOUT the comma relies on prefix-free exact
+    // token matching alone and the comma-bearing token never equals it.
+    let default_hit_without_comma = default_indexer.bm25_ranked("resolve_configured_timezone", 10);
+
+    fn strip_trailing_comma(text: &str) -> String {
+        text.split_whitespace()
+            .map(|tok| tok.trim_end_matches(','))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let normalized_indexer = RealIndexer::new_with_text_normalizer(strip_trailing_comma);
+    index::indexer_impl::rebuild_index(&f.vault, &normalized_indexer).unwrap();
+    let normalized_hit_without_comma = normalized_indexer.bm25_ranked("resolve_configured_timezone", 10);
+
+    assert!(
+        default_hit_without_comma.is_empty(),
+        "sanity check: without the hook, the comma-bearing indexed token must not match the comma-free query"
+    );
+    assert!(
+        !normalized_hit_without_comma.is_empty(),
+        "the text normalizer hook must apply to indexed text before it reaches trigram/bm25 insertion"
+    );
+}

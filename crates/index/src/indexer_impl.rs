@@ -133,6 +133,18 @@ pub struct RealIndexer {
     /// rather than silently resetting to the hardcoded defaults.
     bm25_k1: f64,
     bm25_b: f64,
+    /// Optional transform applied to `Document::text_searchable` right
+    /// before it reaches `trigram.insert`/`bm25.insert` in
+    /// `index_document` — `None` for every existing caller (`new()`,
+    /// `new_with_bm25_params`), so default/production indexing is
+    /// completely unaffected. Added for B3-TUNE-v2 Priority 2 Lever B's
+    /// real-pipeline verification: it lets the already-frozen
+    /// `strip_trailing_sentence_punctuation` normalization reach the
+    /// INDEXED side through the real search path, rather than through
+    /// a standalone scorer. `bm25::tokenize` itself is never modified
+    /// by this — the transform runs on the raw text BEFORE tokenization,
+    /// not inside it.
+    text_normalizer: Option<fn(&str) -> String>,
     #[cfg(test)]
     poisoned: Mutex<HashSet<String>>,
     #[cfg(test)]
@@ -178,6 +190,30 @@ impl RealIndexer {
             }),
             bm25_k1: k1,
             bm25_b: b,
+            text_normalizer: None,
+            #[cfg(test)]
+            poisoned: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+
+    /// Additive constructor applying `normalizer` to
+    /// `Document::text_searchable` before it reaches
+    /// `trigram.insert`/`bm25.insert` (see the field's own doc
+    /// comment). `new()`'s and `new_with_bm25_params`'s own behavior
+    /// is unchanged — this is a separate opt-in constructor, not a
+    /// parameter added to either of them.
+    pub fn new_with_text_normalizer(normalizer: fn(&str) -> String) -> Self {
+        Self {
+            data: Mutex::new(IndexData {
+                trigram: TrigramIndex::new(),
+                bm25: Bm25Index::new(),
+                notes: HashMap::new(),
+            }),
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
+            text_normalizer: Some(normalizer),
             #[cfg(test)]
             poisoned: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -259,14 +295,18 @@ impl RealIndexer {
             return;
         }
         let previous = note.published.clone();
+        let text_searchable = match self.text_normalizer {
+            Some(normalizer) => normalizer(&document.text_searchable),
+            None => document.text_searchable.clone(),
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             data.trigram
-                .insert(note_id.clone(), &document.text_searchable);
+                .insert(note_id.clone(), &text_searchable);
             #[cfg(test)]
             if let Some(hook) = &hook {
                 hook(TestPoint::AfterTrigram, note_id.as_str(), version);
             }
-            data.bm25.insert(note_id.clone(), &document.text_searchable);
+            data.bm25.insert(note_id.clone(), &text_searchable);
         }));
         if outcome.is_err() {
             // Guard lives outside the unwind boundary: readers remain excluded
