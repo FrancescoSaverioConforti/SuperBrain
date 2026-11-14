@@ -1,0 +1,28 @@
+=== CALL-RES-A4 performance measurement ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\commonjs-checkpoint\request
+commit_a (full-index target): be7882b0bb6cdb0971f76c2a5b11d5a8767a22e1
+commit_b (incremental target): df346d8531ac4b8c360df301f228d5767d0e374e
+timed_runs: 10 (plus 1 discarded warm-up run)
+changed_files (git diff A..B): 3 files
+
+--- warm-up run (discarded) ---
+warm-up full: 242.4909ms, incremental: 66.0904ms, edges_a: 193, edges_b: 197
+
+--- 10 timed runs ---
+run 0: full=211.0067ms incremental=62.8655ms edges_a=193 edges_b=197
+run 1: full=211.2304ms incremental=59.6471ms edges_a=193 edges_b=197
+run 2: full=198.0667ms incremental=61.0367ms edges_a=193 edges_b=197
+run 3: full=199.7961ms incremental=65.2723ms edges_a=193 edges_b=197
+run 4: full=213.5172ms incremental=60.5173ms edges_a=193 edges_b=197
+run 5: full=206.0039ms incremental=61.6538ms edges_a=193 edges_b=197
+run 6: full=204.5152ms incremental=61.175ms edges_a=193 edges_b=197
+run 7: full=199.9188ms incremental=59.6993ms edges_a=193 edges_b=197
+run 8: full=206.0043ms incremental=61.1045ms edges_a=193 edges_b=197
+run 9: full=201.622ms incremental=67.5566ms edges_a=193 edges_b=197
+
+--- Summary ---
+full_index: median=205.25955ms min=198.0667ms max=213.5172ms (range=15.4505ms)
+incremental_index: median=61.13975ms min=59.6471ms max=67.5566ms (range=7.9095ms)
+edge_count_a (full, all runs): [193, 193, 193, 193, 193, 193, 193, 193, 193, 193]
+edge_count_b (incremental, all runs): [197, 197, 197, 197, 197, 197, 197, 197, 197, 197]
+edge_count_stability: full=true, incremental=true (true means every run produced identical output, confirming timing variance is not masking a correctness difference)

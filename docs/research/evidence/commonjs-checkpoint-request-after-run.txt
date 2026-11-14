@@ -1,0 +1,59 @@
+=== CommonJS Extraction Checkpoint: AFTER remeasurement (request/request) ===
+repo: \\?\C:\Users\fsave\AppData\Local\Temp\claude\9a7d8ffadeaf98c4\8e42511f-6db2-4252-92ca-20203d91734b\scratchpad\commonjs-checkpoint\request
+commit: 3c0cddc7c8eb60b470e9519da85896ed7ee0081e
+
+--- A. Corpus metrics (AFTER) ---
+total_files_in_commit (scoped): 13
+files_parsed: 13
+total_loc: 2991
+raw_candidates_total: 96
+snapshots_promoted: 96
+  Function: 44
+  Method: 52
+
+real_import_facts_extracted (AFTER, require()+import_statement both handled): 48
+  External: 48
+
+--- C. Structural edges (AFTER, real production resolver set) ---
+  Calls: 88
+  Contains: 52
+resolution_method breakdown (all edge kinds combined):
+  NameHeuristic: 1
+  StaticAnalysis: 139
+
+--- D. Calls resolution taxonomy (EvidenceTier), AFTER ---
+resolved Calls edges by tier:
+  Heuristic: 1
+  Resolved: 87
+total_call_attempts (negative knowledge): 215
+  Ambiguous: 11
+  Unresolved: 204
+
+--- D2. UnresolvedReason distribution (AFTER) ---
+  AmbiguousCandidates: 11
+  ExtractionRejected: 3
+  ImportTargetExternal: 11
+  NoMatchingImportAlias: 190
+
+--- F. Ground-truth ID of the real cross-file call sites (AFTER: should now resolve, per B2-ID-014 fix) ---
+Note: 'jar' now has TWO real distinct declarations (lib/cookies.js's exports.jar, B2-ID-014; AND request.js's own Request.prototype.jar, B2-ID-015) -- a genuine real-corpus name collision this checkpoint's own fixes newly exposed, not a measurement artifact. decl_count below is therefore intentionally corpus-wide (2), while a per-caller resolved_edges/call_attempts lookup is also shown to confirm the real per-call-site outcome.
+Note: index.js's own request.jar/request.cookie (caller_name below) are NOT found by this lookup -- new finding B2-ID-016: `Foo.X = function(){}` where Foo is a plain local identifier (not exports/module.exports/.prototype) is a real, distinct CommonJS idiom outside this checkpoint's own authorized 4-point scope. request.js:39's own module-level call site is separately invisible for an unrelated, pre-existing reason (no Module/File caller-eligible snapshot exists in this pipeline at all).
+  real call site: request.js:39 `cookies.jar()` (module-level, outside any function) -> real_decl_count_for_"jar"(corpus-wide)=2 caller_found=false resolved_edges_from_this_caller=0 call_attempts_from_this_caller=0
+  real call site: request.js:301 `self.jar(...)` inside Request.prototype.init -> real_decl_count_for_"jar"(corpus-wide)=2 caller_found=false resolved_edges_from_this_caller=0 call_attempts_from_this_caller=0
+  real call site: index.js:76 `cookies.jar(store)` inside request.jar (B2-ID-016, out of scope) -> real_decl_count_for_"jar"(corpus-wide)=2 caller_found=false resolved_edges_from_this_caller=0 call_attempts_from_this_caller=0
+  real call site: index.js:80 `cookies.parse(str)` inside request.cookie (B2-ID-016, out of scope) -> real_decl_count_for_"parse"(corpus-wide)=2 caller_found=false resolved_edges_from_this_caller=0 call_attempts_from_this_caller=0
+  real call site: request.js:1422 `hawk.header(...)` inside Request.prototype.hawk -> real_decl_count_for_"header"(corpus-wide)=1 caller_found=true resolved_edges_from_this_caller=1 call_attempts_from_this_caller=0
+
+--- G. Full index timing (AFTER) ---
+full_index_elapsed: 61.5473ms
+real_contains_edges: 52
+real_extends_edges: 0
+real_instantiates_edges: 0
+
+--- H2. Visibility of Request.prototype.X = function(){} (AFTER: should now be visible AND owned, per B2-ID-015 fix) ---
+visible (real extracted Method snapshot in request.js specifically) out of 27: 24
+invisible names: ["init", "start", "onRequestResponse"]
+owned by Request (real Contains edge) out of 24 visible: 24
+SignatureTooLong rejections this run: ["init", "start", "onRequestResponse"]
+
+=== END ===
