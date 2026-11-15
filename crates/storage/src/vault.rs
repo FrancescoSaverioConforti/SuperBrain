@@ -2195,23 +2195,47 @@ fn before_image_path_checked(
     Ok(candidate)
 }
 
-/// Writes `current_record_bytes` as the before-image for `operation_id` via
-/// the crate-private `atomic_write`, and returns the content hash of the
-/// bytes written.
+/// Relative (to `root`) path of the before-image for `operation_id`, for use
+/// with `open_verified`'s root-relative candidate parameter.
+fn before_image_relative(note_id: &NoteId, operation_id: Uuid) -> PathBuf {
+    Path::new(BEFORE_IMAGE_DIR).join(format!("{}-{}.record", note_id.as_str(), operation_id))
+}
+
+/// Writes `current_record_bytes` as the before-image for `operation_id`,
+/// verified on the open handle (B5.SEC), and returns the content hash of
+/// the bytes written.
 pub(crate) fn persist_before_image(
     root: &Path,
     note_id: &NoteId,
     operation_id: Uuid,
     current_record_bytes: &[u8],
 ) -> Result<String, StorageError> {
+    use std::io::Write;
     std::fs::create_dir_all(root.join(BEFORE_IMAGE_DIR)).map_err(StorageError::Io)?;
-    let path = before_image_path_checked(root, note_id, operation_id)?;
-    atomic_write(&path, current_record_bytes).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+    let mut handle = crate::handle_safety::open_verified(
+        root,
+        &before_image_relative(note_id, operation_id),
+        crate::handle_safety::OpenMode::CreateOrOpenForWrite,
+        note_id.as_str(),
+    )?;
+    handle.file.write_all(current_record_bytes).map_err(StorageError::Io)?;
+    handle.file.sync_all().map_err(StorageError::Io)?;
     Ok(content_hash(current_record_bytes))
 }
 
 /// Removes the before-image for `operation_id`. Idempotent: a missing file
 /// is not an error.
+///
+/// B5.SEC residual-risk note: this still resolves through
+/// `before_image_path_checked` (a path-string containment check), not
+/// `open_verified`, because `std::fs::remove_file`'s target is a name to
+/// unlink, not a handle to read/write through — removing a symlink or an
+/// aliased hard link at this path only unlinks that directory entry (never
+/// follows the link to delete its target, and never exposes its content),
+/// so this call site has no data-leak or data-corruption exposure even
+/// though it is not handle-verified. Documented here, not silently left
+/// unexamined, per B5.SEC's "cover read/create-write/replace-rename/parent
+/// separately" requirement.
 pub(crate) fn delete_before_image(
     root: &Path,
     note_id: &NoteId,
@@ -2225,22 +2249,24 @@ pub(crate) fn delete_before_image(
     }
 }
 
-/// Reads back the before-image for `operation_id`.
+/// Reads back the before-image for `operation_id`, verified on the open
+/// handle (B5.SEC) rather than a path string checked separately from the
+/// read that follows it.
 pub(crate) fn read_before_image(
     root: &Path,
     note_id: &NoteId,
     operation_id: Uuid,
 ) -> Result<Vec<u8>, StorageError> {
-    let path = before_image_path_checked(root, note_id, operation_id)?;
-    std::fs::read(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            StorageError::NotFound {
-                note_id: note_id.as_str().to_string(),
-            }
-        } else {
-            StorageError::Io(e)
-        }
-    })
+    use std::io::Read;
+    let mut handle = crate::handle_safety::open_verified(
+        root,
+        &before_image_relative(note_id, operation_id),
+        crate::handle_safety::OpenMode::ReadExisting,
+        note_id.as_str(),
+    )?;
+    let mut bytes = Vec::new();
+    handle.file.read_to_end(&mut bytes).map_err(StorageError::Io)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2768,6 +2794,27 @@ mod tests {
         let op2_before = read_before_image(vault.root_for_test(), &id, op2).unwrap();
         assert!(String::from_utf8(op2_before).unwrap().contains("v1"), "op2's before-image must hold what op2 overwrote");
         assert!(read_before_image(vault.root_for_test(), &id, op1).is_err(), "op1 never had a prior version to preserve a before-image for");
+    }
+
+    #[test]
+    fn before_image_read_rejects_a_hard_linked_before_images_directory_entry() {
+        // B5.SEC (Task 5): .before-images is a sibling of .record files, so
+        // the same hard-link-aliasing gap SEC-003 closed for records must
+        // also be closed here — before_image_path_checked's containment
+        // check (same as record_path_checked's) never inspected link
+        // count, so a before-image file hard-linked to an outside victim
+        // file was readable as if it were the real before-image.
+        let root = unique_test_dir();
+        let outside = unique_test_dir();
+        let outside_file = outside.join("victim.record");
+        std::fs::write(&outside_file, b"OUTSIDE CONTENT").unwrap();
+        std::fs::create_dir_all(root.join(".before-images")).unwrap();
+        let id = NoteId::parse("note-a").unwrap();
+        let op = Uuid::new_v4();
+        let before_image_file = before_image_path(&root, &id, op);
+        std::fs::hard_link(&outside_file, &before_image_file).unwrap();
+        let result = read_before_image(&root, &id, op);
+        assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
     }
 
     #[test]
