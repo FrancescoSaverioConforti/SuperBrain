@@ -1,0 +1,163 @@
+{
+  "model": "all-MiniLM-L6-v2",
+  "split": "v2-heldout",
+  "run_commit": "73625c361ceb25cb3a2d5070b2ffd8557b6d0b15",
+  "labels_sha256_raw_working_tree": "d7dd80e8a37964ccc4c98e4e97140df908b4e1672488b016c7c2f431ab31df90",
+  "labels_sha256_lf_normalized": "be4fa30a3cef7a342f77552b799dd8d27855d1236f371e2e376d0e15c6bdd232",
+  "labels_sha256_manifest_recorded": "be4fa30a3cef7a342f77552b799dd8d27855d1236f371e2e376d0e15c6bdd232",
+  "dense_top_n": 50,
+  "query_count": 60,
+  "answerable_query_count": 45,
+  "candidate_recall_hits": 45,
+  "candidate_recall_rate": 1.0,
+  "truncation_events": 0,
+  "total_embed_calls": 98,
+  "dense_recall_at_10": 1.0,
+  "dense_recall_at_10_ci": [
+    1.0,
+    1.0
+  ],
+  "dense_ndcg_at_10": 0.8908943294981368,
+  "dense_ndcg_at_10_ci": [
+    0.8307172111474743,
+    0.9470681487611319
+  ],
+  "delta_recall_vs_b1_frozen_calibration": 0.08333333333333337,
+  "delta_ndcg_vs_b1_frozen_calibration": 0.18184078469954845,
+  "by_category": {
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.6341110509979023,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4195134467005765,
+        0.8436010519408085
+      ],
+      "n": 6,
+      "low_confidence": false
+    },
+    "identifier-code": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9375,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8125,
+        1.0
+      ],
+      "n": 8,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9538662191964322,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8615986575892965,
+        1.0
+      ],
+      "n": 8,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9472756790816368,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8418270372449103,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9538662191964322,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8615986575892965,
+        1.0
+      ],
+      "n": 8,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8615986575892965,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7231973151785931,
+        1.0
+      ],
+      "n": 8,
+      "low_confidence": false
+    }
+  },
+  "by_difficulty": {
+    "medium": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8698466194584951,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7707462525514598,
+        0.9532277409907618
+      ],
+      "n": 21,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9153886065673442,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8189976133995082,
+        1.0
+      ],
+      "n": 17,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8945513581632737,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.789102716326547,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    }
+  },
+  "abstention_confusion_matrix": {
+    "tp": 0,
+    "fp": 0,
+    "tn": 0,
+    "fn_": 15
+  }
+}
