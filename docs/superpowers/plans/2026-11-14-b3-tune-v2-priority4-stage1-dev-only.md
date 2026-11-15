@@ -90,9 +90,27 @@ workflow) and `docs/research/B3-TUNE-v2-PRIORITY4-MODEL-SHORTLIST-AUDIT.md`
       `k` (starting value: `60`, the literature default), deduplication
       semantics for a note appearing in both candidate lists, tie-break
       fallback (B1's existing note-id lexicographic order).
-- [ ] Commit this freeze as a short written spec (new file under
-      `docs/superpowers/specs/`) before Task 1 begins. Nothing in this
-      spec may change after Task 1 benchmarking starts.
+- [ ] Freeze the **model-selection tie-break** (distinct from the
+      retrieval-result tie-break above — this one decides between
+      candidate *models*, not between search results): if the primary
+      DEV quality-and-cost selection rule (frozen in this same task,
+      below) ends in an exact tie between two or more of the 4
+      shortlisted models, resolve it, in order: (1) lower DEV
+      warm-query P95 latency; (2) if still tied, lower model-weight
+      on-disk footprint; (3) if still tied, the fixed precedence
+      `all-MiniLM-L6-v2` > `bge-small-en-v1.5` > `all-mpnet-base-v2` >
+      `nomic-embed-text-v1.5` (ascending deployment cost/complexity,
+      per `B3-TUNE-v2-PRIORITY4-MODEL-SHORTLIST-AUDIT.md`'s frozen
+      tie-break section — lowest-risk/no-custom-code candidates first,
+      the `trust_remote_code`-requiring candidate last). **This
+      tie-break never uses calibration and is frozen now, before any
+      DEV benchmark runs — it must not be reordered after seeing
+      results.**
+- [ ] Commit this freeze — including the primary selection rule, the
+      hyperparameters above, and the model-selection tie-break — as a
+      short written spec (new file under `docs/superpowers/specs/`)
+      before Task 1 begins. Nothing in this spec may change after Task
+      1 benchmarking starts.
 
 ## Task 1 — Select and validate an offline-only local embedding runtime
 
@@ -103,6 +121,18 @@ workflow) and `docs/research/B3-TUNE-v2-PRIORITY4-MODEL-SHORTLIST-AUDIT.md`
 - [ ] Verify the selected runtime's own license is compatible with
       this project's Apache-2.0 licensing and local-first distribution
       model — do not assume compatibility from popularity.
+- [ ] **Re-confirm the `trust_remote_code`/custom-code status of each
+      of the 4 shortlisted models directly against the exact pinned
+      revision**, before benchmarking any of them — the shortlist
+      audit's entries are this document's expected/intended state, not
+      a verified local load, and must be re-checked here. For
+      `nomic-embed-text-v1.5` specifically: confirm whether the
+      selected runtime requires executing the model's custom remote
+      modeling code, and if so, pin and cache that code file's exact
+      revision/hash locally (not just the weights) before any offline
+      benchmark run — consistent with the project's own
+      allowlist/version/hash-pinning principle for its acquisition
+      network (`docs/Spec_mvp.md:27`).
 - [ ] Document the exact runtime + version chosen and why, alongside
       the Task 0 freeze spec.
 
@@ -149,8 +179,16 @@ workflow) and `docs/research/B3-TUNE-v2-PRIORITY4-MODEL-SHORTLIST-AUDIT.md`
       apply the deterministic selection rule frozen in Task 0's spec
       (not invented after seeing these results) to pick exactly one
       model.
-- [ ] Record the selection decision and the rule's mechanical
-      application (not a fresh judgment call) in a short writeup.
+- [ ] **If the primary rule produces an exact tie**, apply Task 0's
+      frozen model-selection tie-break mechanically, in order: DEV
+      warm-query P95 latency, then model-weight footprint, then the
+      fixed precedence `all-MiniLM-L6-v2` > `bge-small-en-v1.5` >
+      `all-mpnet-base-v2` > `nomic-embed-text-v1.5`. Do not resolve a
+      tie by any means other than this frozen sequence, and do not
+      consult calibration at any point in this step.
+- [ ] Record the selection decision and the rule's (and, if invoked,
+      the tie-break's) mechanical application — not a fresh judgment
+      call — in a short writeup.
 - [ ] From this point forward, no other model may be substituted
       without restarting this plan's Task 0-4 sequence.
 
