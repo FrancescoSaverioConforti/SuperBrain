@@ -12,7 +12,7 @@ description = "SuperBrain local read-only core API."
 # dependency exposure, identical to every pre-B4 build. Enabling it
 # links ort/tokenizers/ndarray as real production dependencies, for
 # RetrievalMode::DenseV2 (index::search::RetrievalMode, B4.0).
-dense-retrieval = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+dense-retrieval = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:sha2"]
 
 [dependencies]
 domain = { path = "../domain" }
@@ -31,6 +31,11 @@ uuid = "1"
 ort = { version = "2.0.0-rc.15", features = ["download-binaries", "ndarray"], optional = true }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
+# B4.2: verifies the fetched ONNX/tokenizer artifacts' SHA-256 against
+# frozen-config-v2.json's own recorded hashes before loading either
+# one -- a real gap the evaluation harness never closed (see
+# crates/api/src/dense.rs's own module doc comment).
+sha2 = { version = "0.10", optional = true }
 
 [[example]]
 name = "b3_tune_v2_priority4_cost"
