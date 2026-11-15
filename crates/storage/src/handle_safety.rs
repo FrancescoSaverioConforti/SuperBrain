@@ -48,6 +48,30 @@ fn escapes(note_id_label: &str) -> StorageError {
     StorageError::PathEscapesVaultRoot { note_id: note_id_label.to_string() }
 }
 
+fn not_found(note_id_label: &str) -> StorageError {
+    StorageError::NotFound { note_id: note_id_label.to_string() }
+}
+
+/// Maps the initial `open()`'s own `io::Error` to `NotFound` when nothing
+/// exists at the candidate path at all (the ordinary "no note here yet"
+/// case every read must still be able to report), and to `escapes` for
+/// every other failure — including `O_NOFOLLOW`/`FILE_FLAG_OPEN_REPARSE_POINT`
+/// rejecting a symlink/reparse point at the final component, which is a
+/// real entry existing there, just not a trustworthy one. Only this first
+/// open call can produce `NotFound`; every check after a successful open
+/// (link count, reparse-point attribute, root confinement) failing means
+/// something untrustworthy DOES exist, so it is always `escapes`, never
+/// `NotFound`.
+fn open_or_not_found(opts: &std::fs::OpenOptions, candidate: &Path, note_id_label: &str) -> Result<File, StorageError> {
+    opts.open(candidate).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            not_found(note_id_label)
+        } else {
+            escapes(note_id_label)
+        }
+    })
+}
+
 /// Opens `root.join(candidate_relative)` without following a reparse
 /// point/symlink at the final component, then verifies the open handle:
 /// regular file, single hard link, resolves inside `root`. Any failure at
@@ -97,7 +121,7 @@ fn open_verified_unix(
     }
     opts.custom_flags(libc::O_NOFOLLOW);
 
-    let file = opts.open(candidate).map_err(|_| escapes(note_id_label))?;
+    let file = open_or_not_found(&opts, candidate, note_id_label)?;
 
     let metadata = file.metadata().map_err(|_| escapes(note_id_label))?;
     if !metadata.is_file() {
@@ -141,7 +165,7 @@ fn open_verified_windows(
     }
     opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
 
-    let file = opts.open(candidate).map_err(|_| escapes(note_id_label))?;
+    let file = open_or_not_found(&opts, candidate, note_id_label)?;
 
     let raw_handle = HANDLE(file.as_raw_handle());
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
@@ -243,9 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn read_existing_rejects_a_nonexistent_file() {
+    fn read_existing_a_nonexistent_file_returns_not_found_not_an_escape() {
+        // A missing file is the ordinary "no note here yet" case, not an
+        // attack signal — must be distinguishable from a real identity
+        // verification failure (StorageError::PathEscapesVaultRoot).
         let dir = unique_test_dir();
         let result = open_verified(&dir, Path::new("missing.record"), OpenMode::ReadExisting, "note-a");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(StorageError::NotFound { .. })), "got {result:?}");
     }
 }

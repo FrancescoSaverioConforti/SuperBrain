@@ -880,25 +880,29 @@ impl Vault {
     /// current committed record (for its own version check) without trying
     /// to re-acquire a lock it already holds.
     fn read_note_locked(&self, note_id: &NoteId) -> Result<VaultRecord, StorageError> {
-        // The containment check runs before the journal lookup (A1's own
-        // check order, unchanged): a symlink escape is a structural problem
-        // with the path itself and must be caught regardless of whether a
-        // committed journal row happens to exist yet for this note id.
-        let path = self.record_path_checked(note_id)?;
+        // The containment/identity check runs before the journal lookup
+        // (A1's own check order, unchanged): a symlink escape or aliasing
+        // handle is a structural problem with the path itself and must be
+        // caught regardless of whether a committed journal row happens to
+        // exist yet for this note id. B5.SEC: verified on the OPEN HANDLE
+        // (open_verified), not re-derived from a path string after the
+        // fact — closes the TOCTOU window record_path_checked alone left
+        // open between its check and this function's own read.
+        use std::io::Read;
+        let relative = PathBuf::from(format!("{}.record", note_id.as_str()));
+        let mut handle = crate::handle_safety::open_verified(
+            &self.root,
+            &relative,
+            crate::handle_safety::OpenMode::ReadExisting,
+            note_id.as_str(),
+        )?;
         let Some(row) = self.journal.lock().unwrap().last_committed_for_note(note_id.as_str()).map_err(journal_err)? else {
             return Err(StorageError::NotFound {
                 note_id: note_id.as_str().to_string(),
             });
         };
-        let bytes = std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound {
-                    note_id: note_id.as_str().to_string(),
-                }
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
+        let mut bytes = Vec::new();
+        handle.file.read_to_end(&mut bytes).map_err(StorageError::Io)?;
         let expected_hash = row.content_hash.as_deref();
         if expected_hash != Some(content_hash(&bytes).as_str()) {
             return Err(StorageError::Inconsistent {
@@ -2990,19 +2994,15 @@ mod tests {
     }
 
     #[test]
-    fn record_symlink_resolving_inside_the_vault_root_is_not_an_escape() {
-        // The check is about leaving the root, not about symlinks as such: a
-        // link whose target is inside the root is read normally.
-        //
-        // A2 note: `read_note` now resolves through the journal, so the
-        // record must actually be written via `write_record_unchecked`
-        // first (establishing a committed row) rather than placed directly
-        // on disk as A1's version of this test did — a raw `fs::write` with
-        // no journal row is now correctly invisible to readers regardless
-        // of containment. The symlink is then swapped in afterward, still
-        // pointing at a copy of the exact bytes the committed row expects,
-        // so this test still isolates the containment check from the
-        // journal-resolution check.
+    fn record_symlink_resolving_inside_the_vault_root_is_rejected_as_an_alias_not_followed() {
+        // SEC-002 closure (B5.SEC, Task 4): a symlink at the record's final
+        // component must now be REJECTED, never read through, even when its
+        // target happens to resolve inside the vault root — aliasing one
+        // note's bytes through another in-root path is exactly the gap
+        // open_verified's O_NOFOLLOW/FILE_FLAG_OPEN_REPARSE_POINT handling
+        // closes. (Renamed and inverted from
+        // `record_symlink_resolving_inside_the_vault_root_is_not_an_escape`,
+        // which asserted the old, vulnerable pass-through behavior.)
         let root = unique_test_dir();
         crate::git::test_support::init_git_repo_at(&root);
         let vault = Vault::open_with_default_indexer(root.clone(), &unique_test_dir().join("journal.sqlite")).unwrap();
@@ -3012,9 +3012,8 @@ mod tests {
         let target = root.join("store").join("real.record");
         std::fs::rename(root.join("note-a.record"), &target).unwrap();
         symlink_file(&target, &root.join("note-a.record"));
-        let record = vault.read_note(&id).unwrap();
-        assert_eq!(record.content, "inside");
-        assert_eq!(record.version, Version(1));
+        let read = vault.read_note(&id);
+        assert!(matches!(read, Err(StorageError::PathEscapesVaultRoot { .. })), "got {read:?}");
     }
 
     #[test]
@@ -4399,10 +4398,20 @@ mod tests {
         // reproducible narrowing the brief's own prediction did not
         // anticipate: a pure "alias a never-written note id to another
         // note's file" read is now rejected, not aliased.
+        // B5.SEC (Task 4) update: `read_note_locked` now verifies the record
+        // handle's identity (`open_verified`) BEFORE the journal lookup —
+        // same check-before-journal order as before B5.SEC, but now the
+        // check itself rejects an in-root symlink outright (closing
+        // SEC-002), rather than approving it and leaving journal-keying as
+        // an incidental, narrower defense. So this scenario is now rejected
+        // for the INTENDED reason (PathEscapesVaultRoot, the identity check
+        // itself), not for the previously-incidental reason (NotFound, the
+        // journal lookup) — strictly more correct than the prior narrowing,
+        // not a regression.
         let never_written_alias_result = vault.read_note(&id_a);
         assert!(
-            matches!(&never_written_alias_result, Err(StorageError::NotFound { note_id }) if note_id == "note-a"),
-            "SEC-002 finding (narrower than predicted): aliasing a note id that was NEVER itself written is now rejected as NotFound by the journal lookup, not silently aliased — got {never_written_alias_result:?}. If this assertion fails, the journal's per-note-id resolution changed and this specific variant may no longer be rejected."
+            matches!(&never_written_alias_result, Err(StorageError::PathEscapesVaultRoot { note_id }) if note_id == "note-a"),
+            "SEC-002 Task 4 update: an in-root symlink at a never-written note id's path is now rejected by open_verified's identity check itself — got {never_written_alias_result:?}."
         );
 
         // A second, more realistic variant of the same exploit family: have
@@ -4442,10 +4451,15 @@ mod tests {
         // all against an attacker who can also write to the journal
         // directly (the resolved row's `content_hash` is just a column a
         // sufficiently-privileged attacker could set to match anything).
+        // B5.SEC (Task 4) update: same reasoning as Scenario A above — the
+        // identity check now runs before the hash check even gets a
+        // chance, so this swap is rejected as PathEscapesVaultRoot (the
+        // intended reason) rather than Inconsistent (the prior, incidental
+        // reason via the unconditional hash check). Strictly more correct.
         let result = vault.read_note(&id_a_v2);
         assert!(
-            matches!(&result, Err(StorageError::Inconsistent { note_id }) if note_id == "note-a-v2"),
-            "SEC-002 finding (this read-path sub-case is CLOSED): once a note has its own committed journal row, read_note's unconditional hash check rejects a later swap to DIFFERENT content as Inconsistent, rather than aliasing it — got {result:?}. If this assertion fails, that hash check stopped catching this swap and the verdict must be re-evaluated toward OPEN."
+            matches!(&result, Err(StorageError::PathEscapesVaultRoot { note_id }) if note_id == "note-a-v2"),
+            "SEC-002 Task 4 update: swapping a committed note's file for an in-root symlink is now rejected by open_verified's identity check itself — got {result:?}."
         );
 
         // Independent-review finding I-2: everything above is scoped to the
@@ -4528,10 +4542,16 @@ mod tests {
         // the hard link (unchanged from A1) — but the journal lookup now
         // gates every read before canonicalization's blind spot is ever
         // reached for a note id with no committed history.
+        // B5.SEC (Task 4) update: `open_verified` rejects a multi-linked
+        // file by its link-count check, before the journal lookup even
+        // runs — closing SEC-003's canonicalization blind spot directly
+        // (link count is checked on the open handle, not inferred from
+        // path resolution), rather than relying on the incidental
+        // journal-keying narrowing that caught this case before.
         let result = vault.read_note(&NoteId::parse("note-a").unwrap());
         assert!(
-            matches!(&result, Err(StorageError::NotFound { note_id }) if note_id == "note-a"),
-            "SEC-003 finding (narrower than predicted): a hard link planted under a note id that was NEVER itself written is now rejected as NotFound by the journal lookup before canonicalization's blind spot matters — got {result:?}. If this assertion fails, the journal's per-note-id gating changed and this variant may again return the hard-linked OUTSIDE content."
+            matches!(&result, Err(StorageError::PathEscapesVaultRoot { note_id }) if note_id == "note-a"),
+            "SEC-003 Task 4 update: a hard-linked record is now rejected by open_verified's link-count check itself — got {result:?}."
         );
 
         // Second variant, symmetric with SEC-002's second variant and closer
@@ -4552,10 +4572,14 @@ mod tests {
         // bytes, not the OUTSIDE file's "OUTSIDE" content), rather than
         // returning the hard-linked victim content under note-a-v2's name.
         // This sub-case is CLOSED by the same mechanism as SEC-002's.
+        // B5.SEC (Task 4) update: same link-count check catches this swap
+        // before the hash check gets a chance, rejecting it as
+        // PathEscapesVaultRoot (the intended reason) rather than
+        // Inconsistent (the prior, incidental reason).
         let result2 = vault.read_note(&id_a_v2);
         assert!(
-            matches!(&result2, Err(StorageError::Inconsistent { note_id }) if note_id == "note-a-v2"),
-            "SEC-003 finding (this sub-case is CLOSED): once a note has its own committed journal row, read_note's unconditional hash check rejects a later hard-link swap to different content as Inconsistent — got {result2:?}. If this assertion fails, that hash check stopped catching this swap and the verdict must be re-evaluated toward OPEN."
+            matches!(&result2, Err(StorageError::PathEscapesVaultRoot { note_id }) if note_id == "note-a-v2"),
+            "SEC-003 Task 4 update: swapping a committed note's file for a hard link is now rejected by open_verified's link-count check itself — got {result2:?}."
         );
     }
 
