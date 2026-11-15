@@ -404,10 +404,14 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-rebuild-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        // fixture.root, not a bare std::env::temp_dir() path -- see
+        // dense_storage::rename_with_retry's own doc comment and this
+        // file's "model-identity-mismatch" test for why a fresh path
+        // directly under the system temp root reproducibly hit a
+        // persistent Windows sharing violation on rename, while a
+        // path under an already-created, isolated directory (every
+        // VaultFixture already creates one) did not.
+        let index_path = fixture.root.join("index.bin");
         let scorer = ProductionDenseScorer::new(model, index_path.clone());
 
         scorer.rebuild(fixture.vault()).unwrap();
@@ -449,10 +453,7 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-incr-unchanged-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         let scorer = ProductionDenseScorer::new(model, index_path.clone());
         scorer.rebuild(fixture.vault()).unwrap();
 
@@ -505,10 +506,7 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-delete-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         let scorer = ProductionDenseScorer::new(model, index_path.clone());
         scorer.rebuild(fixture.vault()).unwrap();
 
@@ -586,10 +584,7 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-privacy-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         let scorer = ProductionDenseScorer::new(model, index_path.clone());
         scorer.rebuild(fixture.vault()).unwrap();
 
@@ -669,10 +664,7 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-reclassify-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         let scorer = ProductionDenseScorer::new(model, index_path.clone());
         scorer.rebuild(fixture.vault()).unwrap();
 
@@ -757,10 +749,7 @@ mod tests {
         let fixture = VaultFixture::new("restart");
         fixture.write_note("note-a", "content that survives a simulated restart");
 
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-restart-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         {
             let env = dense::shared_environment();
             let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
@@ -800,10 +789,21 @@ mod tests {
             eprintln!("skipping: cached model artifacts not found on this machine");
             return;
         };
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-model-mismatch-{}.bin",
+        // A dedicated, pre-created subdirectory, NOT a bare path
+        // directly under std::env::temp_dir() -- found empirically
+        // (B4.8's own performance smoke test) that writing an index
+        // file directly under %TEMP% on Windows can hit a persistent
+        // ERROR_SHARING_VIOLATION (os error 32) on rename, most
+        // plausibly real-time antivirus scanning of a freshly-written
+        // file in that commonly-watched location. A dedicated
+        // subdirectory (mirroring every other test's own
+        // VaultFixture-rooted directory) avoids this.
+        let test_dir = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-model-mismatch-dir-{}",
             uuid::Uuid::new_v4()
         ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let index_path = test_dir.join("index.bin");
         let wrong_identity_index = DenseIndex {
             model_identity_hash: [0xAAu8; 32], // deliberately NOT model_identity_hash()
             embedding_dimension: dense::EMBEDDING_DIMENSION as u32,
@@ -855,10 +855,7 @@ mod tests {
 
         let env = dense::shared_environment();
         let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
-        let index_path = std::env::temp_dir().join(format!(
-            "superbrain-dense-lifecycle-concurrency-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let index_path = fixture.root.join("index.bin"); // see the Windows sharing-violation note above
         let scorer = std::sync::Arc::new(ProductionDenseScorer::new(model, index_path.clone()));
         scorer.rebuild(fixture.vault()).unwrap();
 

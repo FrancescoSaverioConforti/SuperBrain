@@ -259,8 +259,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut tmp_file = std::fs::File::create(&tmp_path)?;
         tmp_file.write_all(bytes)?;
         tmp_file.sync_all()?;
+        // `tmp_file` drops here, closing the handle before rename --
+        // required on Windows, where `rename` can fail while the
+        // source file still has an open handle in THIS process.
     }
-    std::fs::rename(&tmp_path, path)?;
+    rename_with_retry(&tmp_path, path)?;
     #[cfg(unix)]
     {
         if let Ok(dir_file) = std::fs::File::open(dir) {
@@ -268,6 +271,50 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Retries `std::fs::rename` a bounded number of times on a transient
+/// sharing violation (Windows `ERROR_SHARING_VIOLATION`, surfaced as
+/// `io::Error` raw OS error 32) -- found empirically by this crate's
+/// own performance smoke test (`b4_production_performance_smoke`),
+/// which writes a larger index file (53 notes) than any unit test's
+/// 1-2-entry fixtures and reproducibly hit this error on the very
+/// first write to a brand-new path. The sharing violation is
+/// consistent with a third-party process (most plausibly a real-time
+/// antivirus scanner) transiently opening the just-closed temp file
+/// before this function's own rename reaches it -- a known, documented
+/// class of Windows filesystem behavior for freshly-written files, not
+/// a bug in this function's own locking discipline (the temp file's
+/// handle is already closed, by this process, before rename is
+/// attempted, per the comment above). Unix is unaffected (rename
+/// cannot fail this way there) but the retry loop runs unconditionally
+/// since it is a correct no-op when the first attempt succeeds.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_sharing_violation(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                last_err = Some(e);
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed with no captured error")))
+}
+
+#[cfg(windows)]
+fn is_transient_sharing_violation(e: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION = 32 on Windows.
+    e.raw_os_error() == Some(32)
+}
+
+#[cfg(not(windows))]
+fn is_transient_sharing_violation(_e: &std::io::Error) -> bool {
+    false
 }
 
 /// Reads and deserializes the index at `path`. Returns `Ok(None)` if the
@@ -302,6 +349,45 @@ mod tests {
                 },
             ],
         }
+    }
+
+    // --- Mutation-testing finding (cargo-mutants, B4's own closure
+    // requirement): `impl Display for LoadError`'s match arms all
+    // survived mutation to `Ok(Default::default())` (an empty string)
+    // because nothing asserted the ACTUAL formatted text, only that
+    // the enum variant matched in a `match`. Fixed by pinning the
+    // real Display output for each variant. ---
+
+    #[test]
+    fn load_error_display_messages_are_specific_per_variant() {
+        assert_eq!(
+            LoadError::Io(std::io::Error::other("disk full")).to_string(),
+            "io error: disk full"
+        );
+        assert_eq!(
+            LoadError::Corrupted("bad magic bytes".to_string()).to_string(),
+            "corrupted index: bad magic bytes"
+        );
+        assert_eq!(
+            LoadError::FormatVersionMismatch {
+                found: 99,
+                expected: 1
+            }
+            .to_string(),
+            "format version mismatch: found 99, expected 1"
+        );
+        assert_eq!(
+            LoadError::ModelIdentityMismatch.to_string(),
+            "model identity hash mismatch"
+        );
+        assert_eq!(
+            LoadError::EmbeddingDimensionMismatch {
+                found: 128,
+                expected: 384
+            }
+            .to_string(),
+            "embedding dimension mismatch: found 128, expected 384"
+        );
     }
 
     #[test]

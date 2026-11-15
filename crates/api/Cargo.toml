@@ -71,6 +71,10 @@ required-features = ["dense-retrieval"]
 name = "b3_tune_v2_priority4_hybrid_dev"
 required-features = ["dense-retrieval"]
 
+[[example]]
+name = "b4_production_performance_smoke"
+required-features = ["dense-retrieval"]
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
