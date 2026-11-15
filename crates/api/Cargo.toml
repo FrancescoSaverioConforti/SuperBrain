@@ -30,3 +30,7 @@ sha2 = "0.10"
 ort = { version = "2.0.0-rc.15", features = ["download-binaries", "ndarray"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ndarray = "0.17"
+# Fetches each shortlisted model's onnx/model.onnx + tokenizer.json from
+# its pinned HF revision (Task 2) -- the only network fetches this
+# harness performs beyond ort's own one-time runtime-binary download.
+ureq = "3"
