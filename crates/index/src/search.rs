@@ -785,3 +785,54 @@ fn matches_time(document: &Document, filter: &AppliedTimeFilter) -> bool {
         TimeField::Any => created() || updated() || event(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutation-testing finding (cargo-mutants, B4's own closure
+    // requirement -- found while reviewing search.rs as a whole, not
+    // specific to any B4 change): `extract_structural_identifier` is
+    // module-private, so it was previously unreachable from
+    // `crates/index/tests/b1_search.rs` (the external integration test
+    // file) at all, and no test exercised the empty-fragment case
+    // ("docs/file.md#" with nothing after the hash) through ANY path.
+    // An attempt to cover this via the external search_impl-level test
+    // was itself dead on arrival: `identifier_boost_applies`'s own
+    // `query_tokens.contains(&identifier.to_lowercase())` check can
+    // never observe an empty-string identifier mattering, because
+    // `query.split_whitespace()` never yields an empty token for the
+    // query side either -- so the mutation, while surviving at the
+    // unit level, is genuinely unreachable through the real
+    // search_impl call chain. This internal unit test is the correct,
+    // minimal fix: it tests `extract_structural_identifier` directly,
+    // which the mutation actually changes.
+    #[test]
+    fn extract_structural_identifier_returns_none_for_an_empty_trailing_fragment() {
+        assert_eq!(
+            extract_structural_identifier("docs/technical-debt.md#"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_structural_identifier_returns_the_fragment_for_a_real_identifier() {
+        assert_eq!(
+            extract_structural_identifier("docs/technical-debt.md#SEC-001"),
+            Some("SEC-001".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_structural_identifier_returns_none_with_no_hash_fragment_at_all() {
+        assert_eq!(extract_structural_identifier("agent:fixture"), None);
+    }
+
+    #[test]
+    fn extract_structural_identifier_stops_at_the_first_non_identifier_character() {
+        assert_eq!(
+            extract_structural_identifier("docs/file.md#SEC-001 and some trailing text"),
+            Some("SEC-001".to_string())
+        );
+    }
+}
