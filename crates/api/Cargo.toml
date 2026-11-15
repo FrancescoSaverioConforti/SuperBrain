@@ -34,3 +34,5 @@ ndarray = "0.17"
 # its pinned HF revision (Task 2) -- the only network fetches this
 # harness performs beyond ort's own one-time runtime-binary download.
 ureq = "3"
+# Peak-RAM measurement for the Task 3 cost harness (process-level RSS).
+sysinfo = "0.40"

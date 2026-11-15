@@ -1,0 +1,18 @@
+{
+  "target": "all-MiniLM-L6-v2",
+  "run_commit": "9822b32708ae0d38f308984b00d2e7700162a52b",
+  "startup_or_model_load_ms": 155.5675,
+  "build_index_time_ms": 549.6492,
+  "warm_query_p50_ms": 8.6897,
+  "warm_query_p95_ms": 9.276799999999998,
+  "warm_query_sample_size": 49,
+  "embedding_inference_p50_ms": 8.5145,
+  "embedding_inference_p95_ms": 9.099599999999999,
+  "vector_search_p50_ms": 0.1736,
+  "vector_search_p95_ms": 0.1887,
+  "peak_rss_after_load_bytes": 135475200,
+  "peak_rss_after_build_bytes": 150315008,
+  "peak_rss_after_queries_bytes": 150417408,
+  "model_weight_bytes_on_disk": 90405214,
+  "vector_index_bytes_on_disk": 81408
+}

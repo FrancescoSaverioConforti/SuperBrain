@@ -1,0 +1,18 @@
+{
+  "target": "B1-cost-control",
+  "run_commit": "9822b32708ae0d38f308984b00d2e7700162a52b",
+  "startup_or_model_load_ms": 4519.436,
+  "build_index_time_ms": 144.9637,
+  "warm_query_p50_ms": 116.4944,
+  "warm_query_p95_ms": 124.5378,
+  "warm_query_sample_size": 49,
+  "embedding_inference_p50_ms": null,
+  "embedding_inference_p95_ms": null,
+  "vector_search_p50_ms": null,
+  "vector_search_p95_ms": null,
+  "peak_rss_after_load_bytes": 30539776,
+  "peak_rss_after_build_bytes": 34402304,
+  "peak_rss_after_queries_bytes": 35020800,
+  "model_weight_bytes_on_disk": null,
+  "vector_index_bytes_on_disk": null
+}
