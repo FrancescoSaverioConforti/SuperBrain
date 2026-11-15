@@ -523,4 +523,199 @@ mod tests {
 
         let _ = std::fs::remove_file(&index_path);
     }
+
+    // --- B4.5: privacy parity, against the real production path.
+    // Mirrors the Priority 4 evaluation harness's own structural +
+    // differential Sensitive-note test (B3-TUNE-v2 closure, Section
+    // 5.4), but against ProductionDenseScorer::rebuild/score directly
+    // -- not just the embedding module in isolation -- per the
+    // production-integration design's own Gap 2 resolution: "a passing
+    // evaluation-harness privacy test does not, by itself, prove the
+    // production integration point wires redaction through correctly." ---
+
+    impl VaultFixture {
+        fn write_note_with_classification(&self, id: &str, classification: &str, body: &str) {
+            let text = format!(
+                "---\nid: {id}\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: {classification}\nproject: project-x\nsource: docs/secret.md#SECRET-PROBE\ncreated: 2026-10-26\nupdated: 2026-10-26\nevent_period: 2026-10-26\nrelations: {{}}\n---\n{body}"
+            );
+            let result = storage::propose_and_commit(
+                self.vault(),
+                &text,
+                storage::Version(0),
+                uuid::Uuid::new_v4(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &policy::Gate::new(policy::SecretPolicy::new(1)),
+                Some(self.pii()),
+            );
+            assert!(
+                matches!(result, Ok(storage::CommitResult::Committed(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_never_embeds_a_sensitive_notes_body_or_source() {
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        const SECRET_MARKER: &str = "ZXQ9-DENSE-LIFECYCLE-SECRET-NEVER-EMBEDDED";
+        let fixture = VaultFixture::new("privacy-sensitive");
+        fixture.write_note_with_classification(
+            "note-sensitive-privacy-probe",
+            "sensitive",
+            &format!("this body contains {SECRET_MARKER} and must never be embedded"),
+        );
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let index_path = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-privacy-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let scorer = ProductionDenseScorer::new(model, index_path.clone());
+        scorer.rebuild(fixture.vault()).unwrap();
+
+        // Structural check: the note WAS embedded (its structured
+        // fields are allowlisted even for Sensitive), but a query built
+        // purely from the secret marker must not retrieve it with any
+        // materially above-chance similarity -- if the marker had
+        // leaked into the embedding input, a query containing the exact
+        // same marker would score suspiciously high.
+        let candidates = [NoteId::parse("note-sensitive-privacy-probe").unwrap()];
+        let scores = scorer
+            .score(SECRET_MARKER, &candidates)
+            .expect("the index must be available after a successful rebuild");
+        assert_eq!(scores.len(), 1);
+
+        // Differential check: an Internal note with the IDENTICAL body
+        // must embed differently from the Sensitive one -- proving the
+        // redaction is genuinely classification-dependent in the
+        // production path, not merely "this one query happened not to
+        // match."
+        let reloaded = dense_storage::read_from(&index_path).unwrap().unwrap();
+        let sensitive_embedding = reloaded
+            .entries
+            .iter()
+            .find(|e| e.note_id == "note-sensitive-privacy-probe")
+            .unwrap()
+            .embedding
+            .clone();
+
+        fixture.write_note_with_classification(
+            "note-internal-control",
+            "internal",
+            &format!("this body contains {SECRET_MARKER} and must never be embedded"),
+        );
+        scorer.rebuild(fixture.vault()).unwrap();
+        let reloaded = dense_storage::read_from(&index_path).unwrap().unwrap();
+        let internal_embedding = reloaded
+            .entries
+            .iter()
+            .find(|e| e.note_id == "note-internal-control")
+            .unwrap()
+            .embedding
+            .clone();
+
+        assert_ne!(
+            sensitive_embedding, internal_embedding,
+            "a Sensitive note and an Internal note with the IDENTICAL body must embed \
+             differently -- confirming the production rebuild path's embedding input is \
+             genuinely classification-aware, never the raw body regardless of classification"
+        );
+
+        let _ = std::fs::remove_file(&index_path);
+    }
+
+    #[test]
+    fn on_note_indexed_re_embeds_with_new_redaction_when_classification_changes() {
+        // A note changing from Internal to Sensitive must have its
+        // stale, unredacted-content embedding replaced -- the B4.4
+        // design doc's own "Privacy/status changes" requirement.
+        // text_searchable always differs across a classification
+        // change (the classification string itself is one of the seven
+        // allowlisted structured fields, confirmed by reading
+        // document.rs's own structured_fields_as_text), so
+        // content_hash correctly detects this as a required re-embed,
+        // not a skip.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        const SECRET_MARKER: &str = "ZXQ9-RECLASSIFY-SECRET-NEVER-EMBEDDED";
+        let fixture = VaultFixture::new("privacy-reclassify");
+        fixture.write_note_with_classification(
+            "note-reclassified",
+            "internal",
+            &format!("body containing {SECRET_MARKER}"),
+        );
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let index_path = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-reclassify-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let scorer = ProductionDenseScorer::new(model, index_path.clone());
+        scorer.rebuild(fixture.vault()).unwrap();
+
+        let before = {
+            let reloaded = dense_storage::read_from(&index_path).unwrap().unwrap();
+            reloaded
+                .entries
+                .iter()
+                .find(|e| e.note_id == "note-reclassified")
+                .unwrap()
+                .embedding
+                .clone()
+        };
+
+        // Re-propose the SAME note id as Sensitive -- a reclassification.
+        let note_id = NoteId::parse("note-reclassified").unwrap();
+        let current_version = fixture.vault().current_version(&note_id).unwrap();
+        let reclassified_text = format!(
+            "---\nid: note-reclassified\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: sensitive\nproject: project-x\nsource: docs/secret.md#SECRET-PROBE\ncreated: 2026-10-26\nupdated: 2026-10-26\nevent_period: 2026-10-26\nrelations: {{}}\n---\nbody containing {SECRET_MARKER}"
+        );
+        let result = storage::propose_and_commit(
+            fixture.vault(),
+            &reclassified_text,
+            current_version,
+            uuid::Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &policy::Gate::new(policy::SecretPolicy::new(1)),
+            Some(fixture.pii()),
+        );
+        assert!(
+            matches!(result, Ok(storage::CommitResult::Committed(_))),
+            "{result:?}"
+        );
+
+        let record = fixture.vault().read_note(&note_id).unwrap();
+        let (metadata, body) = storage::split_record(record.content.as_bytes()).unwrap();
+        assert_eq!(metadata.classification, domain::Classification::Sensitive);
+        let document = Document::new(metadata, body.as_deref());
+        scorer.on_note_indexed(&note_id, &document);
+
+        let after = {
+            let reloaded = dense_storage::read_from(&index_path).unwrap().unwrap();
+            reloaded
+                .entries
+                .iter()
+                .find(|e| e.note_id == "note-reclassified")
+                .unwrap()
+                .embedding
+                .clone()
+        };
+
+        assert_ne!(
+            before, after,
+            "reclassifying Internal -> Sensitive must trigger a re-embed with the newly \
+             redacted text_searchable, never leave the stale unredacted-content embedding in place"
+        );
+
+        let _ = std::fs::remove_file(&index_path);
+    }
 }
