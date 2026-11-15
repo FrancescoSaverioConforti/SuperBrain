@@ -189,6 +189,27 @@ impl std::error::Error for SearchError {}
 /// top of the ranking rather than merely nudging it.
 const IDENTIFIER_BOOST: f64 = 100.0;
 
+/// Frozen contract (B4.0,
+/// `docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md`).
+/// Selects which retrieval pipeline `Index::search` uses to generate and
+/// score candidates. Filtering, privacy/redaction, and the final top-k
+/// truncation are IDENTICAL across every variant — only candidate
+/// generation and scoring differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetrievalMode {
+    /// Default. Byte-identical to every `Index::search` call site's
+    /// behavior before this enum existed — B1 trigram+BM25 only. Zero
+    /// behavior change for any caller that does not explicitly opt in.
+    #[default]
+    Lexical,
+    /// Opt-in. `v2 MiniLM dense-only`, per
+    /// `eval/results/B3-TUNE-v2/frozen-config-v2.json`. Falls back to
+    /// `Lexical` behavior, with an explicit logged warning, if the dense
+    /// model/index is structurally confirmed unavailable — never a hard
+    /// `SearchError` for that reason alone.
+    DenseV2,
+}
+
 pub struct Index<'a> {
     vault: &'a Vault,
     indexer: &'a RealIndexer,
@@ -208,6 +229,10 @@ pub struct Index<'a> {
     /// `with_status_tiebreak`'s own doc comment). Defaults to `false`
     /// in `new()`; every existing call site is unaffected.
     status_tiebreak: bool,
+    /// B4.0 frozen contract (see `RetrievalMode`'s own doc comment).
+    /// Defaults to `RetrievalMode::Lexical` in `new()`; every existing
+    /// call site is unaffected.
+    retrieval_mode: RetrievalMode,
 }
 
 /// B3-TUNE-v2 Priority 3 Stage 1, Lever P2's frozen status-tier mapping
@@ -243,6 +268,7 @@ impl<'a> Index<'a> {
             bm25_b: 0.75,
             identifier_boost: false,
             status_tiebreak: false,
+            retrieval_mode: RetrievalMode::default(),
         }
     }
 
@@ -279,6 +305,16 @@ impl<'a> Index<'a> {
     /// `false`; every existing call site of `new()` is unaffected.
     pub fn with_status_tiebreak(mut self) -> Self {
         self.status_tiebreak = true;
+        self
+    }
+
+    /// Additive builder (B4.0 frozen contract,
+    /// `docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md`).
+    /// Selects `retrieval_mode` for this `Index` instance. Default (never
+    /// called): `RetrievalMode::Lexical`, identical to every pre-B4 call
+    /// site.
+    pub fn with_retrieval_mode(mut self, mode: RetrievalMode) -> Self {
+        self.retrieval_mode = mode;
         self
     }
 

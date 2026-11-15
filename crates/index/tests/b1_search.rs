@@ -1167,3 +1167,50 @@ fn status_tiebreak_does_not_change_the_candidate_set() {
         ids(tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome),
     );
 }
+
+// ---------------------------------------------------------------------------
+// B4.0: frozen `RetrievalMode` contract
+// (docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md).
+// These tests pin the contract before any dense-retrieval implementation
+// exists: `Lexical` is the enum's `Default`, `Index::new(...)` behaves
+// exactly as before B4 without ever mentioning `RetrievalMode`, and the new
+// `with_retrieval_mode` builder is additive -- never changing behavior for a
+// caller who never calls it, mirroring `with_identifier_boost`/
+// `with_status_tiebreak`'s own precedent exactly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retrieval_mode_default_is_lexical() {
+    assert_eq!(index::search::RetrievalMode::default(), index::search::RetrievalMode::Lexical);
+}
+
+#[test]
+fn index_new_defaults_to_lexical_retrieval_mode_without_mentioning_it() {
+    // This is the backward-compatibility contract itself: an `Index`
+    // constructed exactly as every pre-B4 call site already does, with zero
+    // knowledge that `RetrievalMode` exists, must behave under `Lexical`.
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "distinctive_lexical_default_probe"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let idx = f.index();
+    let response = idx.search("distinctive_lexical_default_probe", Default::default(), 10).unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match under the default (Lexical) retrieval mode");
+    };
+    assert_eq!(first.note_id.as_str(), "note-a");
+}
+
+#[test]
+fn with_retrieval_mode_lexical_is_byte_identical_to_never_calling_it() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "retrieval_mode_parity_probe_term"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let plain = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let explicit_lexical = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_retrieval_mode(index::search::RetrievalMode::Lexical);
+    assert_eq!(
+        plain.search("retrieval_mode_parity_probe_term", Default::default(), 10).unwrap(),
+        explicit_lexical.search("retrieval_mode_parity_probe_term", Default::default(), 10).unwrap(),
+        "explicitly setting Lexical must be byte-identical to never calling with_retrieval_mode at all"
+    );
+}
