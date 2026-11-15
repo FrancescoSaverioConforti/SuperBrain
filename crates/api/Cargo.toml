@@ -21,3 +21,12 @@ vault-security = { path = "../vault-security" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Priority 4 Stage 1 (B3-TUNE-v2) DEV-only dense/hybrid retrieval
+# benchmark harness -- example-only, never a production dependency of
+# the `index`/`search` crates. `ort` with `download-binaries` fetches
+# the ONNX Runtime shared library once; no further runtime network
+# calls after that initial fetch (see
+# docs/superpowers/specs/2026-11-14-b3-tune-v2-priority4-stage1-dev-freeze.md).
+ort = { version = "2.0.0-rc.15", features = ["download-binaries", "ndarray"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ndarray = "0.17"
