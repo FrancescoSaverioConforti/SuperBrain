@@ -110,6 +110,14 @@ pub struct Provenance {
 pub enum MatchKind {
     ExactSubstring,
     RankedTerms,
+    /// B4.6: this candidate was surfaced by `RetrievalMode::DenseV2`'s
+    /// own candidate set (the dense scorer's `candidate_ids()`), not by
+    /// a literal substring or BM25 token overlap with `query` -- the
+    /// whole point of dense retrieval is finding semantically related
+    /// notes that share no literal tokens with the query at all, so
+    /// `query_match`'s lexical-overlap check is correctly bypassed for
+    /// this match kind, never applied and failed silently.
+    SemanticMatch,
 }
 
 /// C6's gate result is not persisted in B1 records. Nonempty relations cannot
@@ -218,12 +226,36 @@ pub enum RetrievalMode {
 /// implementation of this trait via `Index::with_dense_scorer`; `index`
 /// never knows or cares what is behind it.
 pub trait DenseScorer: Send + Sync {
+    /// Returns every note id currently present in the dense index (B4.6
+    /// correction to this trait's original B4.2 shape — see this
+    /// method's own addition commit for why): the evaluation harness
+    /// that produced `frozen-config-v2.json`'s own Recall@10/nDCG@10
+    /// numbers scored EVERY note the dense index held, with no lexical
+    /// pre-filtering whatsoever (confirmed directly against
+    /// `crates/api/examples/b3_tune_v2_priority4_dense_calibration/main.rs`:
+    /// `note_vectors.iter()`, not a filtered subset). `DenseV2` mode
+    /// must reproduce that same candidate-generation behavior in
+    /// production — restricting it to `self.indexer.candidate_ids(query)`
+    /// (the LEXICAL candidate generator) would make dense retrieval
+    /// structurally unable to surface anything lexical search did not
+    /// already find, defeating dense retrieval's entire purpose and
+    /// silently diverging from every accepted evaluation number.
+    ///
+    /// Returns `None` under the same structurally-unavailable conditions
+    /// as `score` (B4.0's frozen fallback contract) — `search_impl`
+    /// must check this BEFORE calling `score`, since an empty or
+    /// unavailable candidate set makes `score` itself moot.
+    fn candidate_ids(&self) -> Option<Vec<storage::NoteId>>;
+
     /// Returns a ranked list of `(note_id, cosine_similarity)` pairs for
     /// `query`, restricted to `candidate_ids` — never a wider set. `index`
     /// still re-reads, re-validates and re-filters every returned id
     /// through the existing authoritative per-candidate loop exactly as
     /// it does for the lexical path; this method only proposes which ids
-    /// to consider and a score to rank them by.
+    /// to consider and a score to rank them by. Callers (B4.6's
+    /// `search_impl` wiring) pass this method's own `candidate_ids()`
+    /// result as the `candidate_ids` argument, not the lexical
+    /// candidate generator's output.
     ///
     /// Returns `None` if the dense path is structurally unavailable
     /// (model/index not loaded, hash-mismatched, runtime failed to init)
@@ -475,10 +507,30 @@ impl<'a> Index<'a> {
         // for Lever P2's status tie-break (search_impl's sort reads this
         // by index position, never by note id, so order must stay in sync).
         let mut fresh_result_statuses: Vec<NoteStatus> = Vec::new();
+        // B4.6 (docs/superpowers/specs/2026-11-15-b4-6-search-impl-wiring.md):
+        // DenseV2's candidate set comes from the dense scorer's OWN
+        // `candidate_ids()` (every note its index currently holds),
+        // never the lexical `self.indexer.candidate_ids(query)` --
+        // confirmed against the real evaluation harness
+        // (`b3_tune_v2_priority4_dense_calibration/main.rs`:
+        // `note_vectors.iter()`, unfiltered by lexical overlap) that
+        // every accepted Priority 4 quality number was measured this
+        // way. Falls back to the Lexical candidate set (B4.0's frozen
+        // fallback contract) when `retrieval_mode` is `Lexical`, no
+        // scorer is attached, or the scorer reports itself
+        // structurally unavailable (`candidate_ids()` returns `None`).
+        let dense_candidate_ids: Option<Vec<NoteId>> = match self.retrieval_mode {
+            RetrievalMode::DenseV2 => self.dense_scorer.and_then(|scorer| scorer.candidate_ids()),
+            RetrievalMode::Lexical => None,
+        };
+        let using_dense = dense_candidate_ids.is_some();
         let candidates = {
             let _timer =
                 PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.candidate_generation));
-            self.indexer.candidate_ids(query)
+            match dense_candidate_ids {
+                Some(ids) => ids,
+                None => self.indexer.candidate_ids(query),
+            }
         };
         if let Some(p) = profile.as_deref_mut() {
             p.candidates = candidates.len();
@@ -529,8 +581,19 @@ impl<'a> Index<'a> {
                 Some(metadata.source.clone())
             };
             let document = Document::new(metadata, body.as_deref());
-            let Some(match_kind) = query_match(&document.text_searchable, query) else {
-                continue;
+            // B4.6: under DenseV2, this candidate's membership is
+            // already justified by the dense scorer's own
+            // candidate_ids() (checked above) -- query_match's literal-
+            // substring/BM25-token-overlap gate is bypassed, never
+            // applied and failed, since a semantically-related note is
+            // expected to share zero literal tokens with the query.
+            let match_kind = if using_dense {
+                MatchKind::SemanticMatch
+            } else {
+                let Some(match_kind) = query_match(&document.text_searchable, query) else {
+                    continue;
+                };
+                match_kind
             };
             if document.project != project
                 || filters.type_filter.is_some_and(|v| v != document.r#type)
@@ -570,26 +633,57 @@ impl<'a> Index<'a> {
             });
         }
         let _response_timer = PhaseTimer::new(profile.map(|p| &mut p.response_building));
-        let scores: HashMap<_, _> = fresh_scores
-            .query_ranked(query, usize::MAX)
-            .into_iter()
-            .collect();
-        let query_tokens: HashSet<String> =
-            query.split_whitespace().map(|t| t.to_lowercase()).collect();
-        for result in &mut fresh_results {
-            let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
-            let boost = if self.identifier_boost && identifier_boost_applies(&result.provenance.source, &query_tokens) {
-                IDENTIFIER_BOOST
-            } else {
-                0.0
-            };
-            result.score = base_score + boost;
+        // B4.6: under DenseV2 (confirmed `using_dense`), final scores
+        // come from the dense scorer's own `score()` call, restricted
+        // to exactly the eligible, post-filter candidate ids -- never
+        // BM25's `fresh_scores`. The identifier-boost lever
+        // (Priority 3 P1) is a BM25-specific signal keyed to
+        // `source:`-extracted identifiers appearing as literal query
+        // tokens; it is not meaningful for a dense cosine score and is
+        // correctly skipped under DenseV2, never silently added to a
+        // dense score.
+        if using_dense {
+            let eligible_ids: Vec<NoteId> =
+                fresh_results.iter().map(|r| r.note_id.clone()).collect();
+            // `using_dense` is only true when `dense_candidate_ids`
+            // (and therefore `self.dense_scorer`) was `Some` above, so
+            // this call site is always reached with a real scorer
+            // attached -- `unwrap_or` only guards the type, it can
+            // never actually fall through at this point.
+            let dense_scores: HashMap<NoteId, f64> = self
+                .dense_scorer
+                .and_then(|scorer| scorer.score(query, &eligible_ids))
+                .map(|scored| scored.into_iter().collect())
+                .unwrap_or_default();
+            for result in &mut fresh_results {
+                result.score = dense_scores.get(&result.note_id).copied().unwrap_or(0.0);
+            }
+        } else {
+            let scores: HashMap<_, _> = fresh_scores
+                .query_ranked(query, usize::MAX)
+                .into_iter()
+                .collect();
+            let query_tokens: HashSet<String> =
+                query.split_whitespace().map(|t| t.to_lowercase()).collect();
+            for result in &mut fresh_results {
+                let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+                let boost = if self.identifier_boost
+                    && identifier_boost_applies(&result.provenance.source, &query_tokens)
+                {
+                    IDENTIFIER_BOOST
+                } else {
+                    0.0
+                };
+                result.score = base_score + boost;
+            }
         }
         // Paired with `fresh_result_statuses` (same push order, Section
         // above) so Lever P2's status tie-break can compare each pair's
         // status without widening `SearchResult`'s own public fields.
-        let mut paired: Vec<(SearchResult, NoteStatus)> =
-            fresh_results.into_iter().zip(fresh_result_statuses).collect();
+        let mut paired: Vec<(SearchResult, NoteStatus)> = fresh_results
+            .into_iter()
+            .zip(fresh_result_statuses)
+            .collect();
         let status_tiebreak = self.status_tiebreak;
         paired.sort_by(|(a, a_status), (b, b_status)| {
             b.score

@@ -103,6 +103,21 @@ impl ProductionDenseScorer {
 }
 
 impl DenseScorer for ProductionDenseScorer {
+    fn candidate_ids(&self) -> Option<Vec<NoteId>> {
+        let mut state = self.index.lock().unwrap();
+        self.ensure_checked(&mut state);
+        let LoadState::Loaded(index) = &*state else {
+            return None;
+        };
+        Some(
+            index
+                .entries
+                .iter()
+                .filter_map(|e| NoteId::parse(&e.note_id).ok())
+                .collect(),
+        )
+    }
+
     fn score(&self, query: &str, candidate_ids: &[NoteId]) -> Option<Vec<(NoteId, f64)>> {
         let mut state = self.index.lock().unwrap();
         self.ensure_checked(&mut state);
