@@ -1711,12 +1711,14 @@ version = "0.1.0"
 dependencies = [
  "domain",
  "git2",
+ "libc",
  "policy",
  "rusqlite",
  "sha2",
  "thiserror 1.0.69",
  "uuid",
  "vault-security",
+ "windows",
 ]
 
 [[package]]

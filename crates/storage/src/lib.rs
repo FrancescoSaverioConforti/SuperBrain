@@ -91,6 +91,7 @@
 mod atomic;
 mod fault;
 mod git;
+mod handle_safety;
 mod journal;
 mod note_id;
 mod propose;
