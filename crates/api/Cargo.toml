@@ -6,12 +6,74 @@ license = "Apache-2.0"
 publish = false
 description = "SuperBrain local read-only core API."
 
+[features]
+# B4.1 (docs/superpowers/specs/2026-11-15-b4-1-dependency-promotion-decisions.md):
+# default OFF. A build without this feature has zero ONNX/embedding
+# dependency exposure, identical to every pre-B4 build. Enabling it
+# links ort/tokenizers/ndarray as real production dependencies, for
+# RetrievalMode::DenseV2 (index::search::RetrievalMode, B4.0).
+dense-retrieval = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:sha2", "dep:ureq"]
+
 [dependencies]
 domain = { path = "../domain" }
 storage = { path = "../storage" }
 index = { path = "../index" }
 policy = { path = "../policy" }
 uuid = "1"
+# Optional, feature-gated by `dense-retrieval` (B4.1 decision record,
+# Section 2-3): the same pinned versions the Priority 4 evaluation
+# harness already used as dev-dependencies (frozen-config-v2.json),
+# now promotable to a real production dependency without re-pinning.
+# `ort` with `download-binaries` fetches the ONNX Runtime shared
+# library once; no further runtime network calls after that initial
+# fetch (B4.1 decision record, Section 4 -- vendoring deferred, not
+# chosen now).
+ort = { version = "2.0.0-rc.15", features = ["download-binaries", "ndarray"], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+ndarray = { version = "0.17", optional = true }
+# B4.2: verifies the fetched ONNX/tokenizer artifacts' SHA-256 against
+# frozen-config-v2.json's own recorded hashes before loading either
+# one -- a real gap the evaluation harness never closed (see
+# crates/api/src/dense.rs's own module doc comment).
+sha2 = { version = "0.10", optional = true }
+# B4.8: the one-time, explicit setup step that fetches the pinned
+# model/tokenizer artifacts (same pinned HF revision the evaluation
+# harness already used) -- not a runtime/query-time dependency; see
+# crate::dense::setup's own doc comment for the offline-after-fetch
+# contract this enforces.
+ureq = { version = "3", optional = true }
+
+[[example]]
+name = "b3_tune_v2_priority4_cost"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_cost_calibration"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_dense_calibration"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_dense_dev"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_dense_v2_heldout"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_hybrid_calibration"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b3_tune_v2_priority4_hybrid_dev"
+required-features = ["dense-retrieval"]
+
+[[example]]
+name = "b4_production_performance_smoke"
+required-features = ["dense-retrieval"]
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
@@ -21,15 +83,6 @@ vault-security = { path = "../vault-security" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# Priority 4 Stage 1 (B3-TUNE-v2) DEV-only dense/hybrid retrieval
-# benchmark harness -- example-only, never a production dependency of
-# the `index`/`search` crates. `ort` with `download-binaries` fetches
-# the ONNX Runtime shared library once; no further runtime network
-# calls after that initial fetch (see
-# docs/superpowers/specs/2026-11-14-b3-tune-v2-priority4-stage1-dev-freeze.md).
-ort = { version = "2.0.0-rc.15", features = ["download-binaries", "ndarray"] }
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-ndarray = "0.17"
 # Fetches each shortlisted model's onnx/model.onnx + tokenizer.json from
 # its pinned HF revision (Task 2) -- the only network fetches this
 # harness performs beyond ort's own one-time runtime-binary download.

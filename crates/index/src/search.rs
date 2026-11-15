@@ -110,6 +110,14 @@ pub struct Provenance {
 pub enum MatchKind {
     ExactSubstring,
     RankedTerms,
+    /// B4.6: this candidate was surfaced by `RetrievalMode::DenseV2`'s
+    /// own candidate set (the dense scorer's `candidate_ids()`), not by
+    /// a literal substring or BM25 token overlap with `query` -- the
+    /// whole point of dense retrieval is finding semantically related
+    /// notes that share no literal tokens with the query at all, so
+    /// `query_match`'s lexical-overlap check is correctly bypassed for
+    /// this match kind, never applied and failed silently.
+    SemanticMatch,
 }
 
 /// C6's gate result is not persisted in B1 records. Nonempty relations cannot
@@ -189,6 +197,105 @@ impl std::error::Error for SearchError {}
 /// top of the ranking rather than merely nudging it.
 const IDENTIFIER_BOOST: f64 = 100.0;
 
+/// Frozen contract (B4.0,
+/// `docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md`).
+/// Selects which retrieval pipeline `Index::search` uses to generate and
+/// score candidates. Filtering, privacy/redaction, and the final top-k
+/// truncation are IDENTICAL across every variant — only candidate
+/// generation and scoring differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetrievalMode {
+    /// Default. Byte-identical to every `Index::search` call site's
+    /// behavior before this enum existed — B1 trigram+BM25 only. Zero
+    /// behavior change for any caller that does not explicitly opt in.
+    #[default]
+    Lexical,
+    /// Opt-in. `v2 MiniLM dense-only`, per
+    /// `eval/results/B3-TUNE-v2/frozen-config-v2.json`. Falls back to
+    /// `Lexical` behavior, with an explicit logged warning, if the dense
+    /// model/index is structurally confirmed unavailable — never a hard
+    /// `SearchError` for that reason alone.
+    DenseV2,
+}
+
+/// B4.2 frozen contract
+/// (`docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md`).
+/// Injected capability, mirroring `storage::Indexer`'s own cross-crate
+/// trait-boundary pattern: `index` depends on no embedding runtime. A
+/// caller that wants `RetrievalMode::DenseV2` to do anything supplies an
+/// implementation of this trait via `Index::with_dense_scorer`; `index`
+/// never knows or cares what is behind it.
+pub trait DenseScorer: Send + Sync {
+    /// Returns every note id currently present in the dense index (B4.6
+    /// correction to this trait's original B4.2 shape — see this
+    /// method's own addition commit for why): the evaluation harness
+    /// that produced `frozen-config-v2.json`'s own Recall@10/nDCG@10
+    /// numbers scored EVERY note the dense index held, with no lexical
+    /// pre-filtering whatsoever (confirmed directly against
+    /// `crates/api/examples/b3_tune_v2_priority4_dense_calibration/main.rs`:
+    /// `note_vectors.iter()`, not a filtered subset). `DenseV2` mode
+    /// must reproduce that same candidate-generation behavior in
+    /// production — restricting it to `self.indexer.candidate_ids(query)`
+    /// (the LEXICAL candidate generator) would make dense retrieval
+    /// structurally unable to surface anything lexical search did not
+    /// already find, defeating dense retrieval's entire purpose and
+    /// silently diverging from every accepted evaluation number.
+    ///
+    /// Returns `None` under the same structurally-unavailable conditions
+    /// as `score` (B4.0's frozen fallback contract) — `search_impl`
+    /// must check this BEFORE calling `score`, since an empty or
+    /// unavailable candidate set makes `score` itself moot.
+    fn candidate_ids(&self) -> Option<Vec<storage::NoteId>>;
+
+    /// Returns a ranked list of `(note_id, cosine_similarity)` pairs for
+    /// `query`, restricted to `candidate_ids` — never a wider set. `index`
+    /// still re-reads, re-validates and re-filters every returned id
+    /// through the existing authoritative per-candidate loop exactly as
+    /// it does for the lexical path; this method only proposes which ids
+    /// to consider and a score to rank them by. Callers (B4.6's
+    /// `search_impl` wiring) pass this method's own `candidate_ids()`
+    /// result as the `candidate_ids` argument, not the lexical
+    /// candidate generator's output.
+    ///
+    /// Returns `None` if the dense path is structurally unavailable
+    /// (model/index not loaded, hash-mismatched, runtime failed to init)
+    /// — `search_impl` falls back to the `Lexical` candidate set for that
+    /// request. A transient error is the implementation's own
+    /// responsibility to resolve into one of these two outcomes before
+    /// returning.
+    fn score(
+        &self,
+        query: &str,
+        candidate_ids: &[storage::NoteId],
+    ) -> Option<Vec<(storage::NoteId, f64)>>;
+
+    /// Builds (or confirms up to date) the dense index for every live
+    /// note `vault` holds, mirroring
+    /// `index::indexer_impl::rebuild_index`'s own cold-start contract
+    /// exactly (same caller discipline: outside any writer's lock,
+    /// called once at startup or on-demand).
+    fn rebuild(&self, vault: &Vault) -> Result<(), DenseScorerError>;
+
+    /// Called once per note write, to keep the dense index incrementally
+    /// current without a full rebuild. `document` is the SAME
+    /// `crate::document::Document` the lexical path already built for
+    /// this note — this method embeds `document.text_searchable`, never
+    /// a raw body, enforcing privacy parity at the type level.
+    fn on_note_indexed(&self, note_id: &storage::NoteId, document: &crate::document::Document);
+
+    /// Called when a note is deleted — the incremental path's removal
+    /// call, for a delete that happens between rebuilds.
+    fn on_note_deleted(&self, note_id: &storage::NoteId);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseScorerError {
+    /// The vault could not be read during rebuild.
+    VaultUnavailable,
+    /// The dense index could not be written.
+    IndexWriteFailed,
+}
+
 pub struct Index<'a> {
     vault: &'a Vault,
     indexer: &'a RealIndexer,
@@ -208,6 +315,15 @@ pub struct Index<'a> {
     /// `with_status_tiebreak`'s own doc comment). Defaults to `false`
     /// in `new()`; every existing call site is unaffected.
     status_tiebreak: bool,
+    /// B4.0 frozen contract (see `RetrievalMode`'s own doc comment).
+    /// Defaults to `RetrievalMode::Lexical` in `new()`; every existing
+    /// call site is unaffected.
+    retrieval_mode: RetrievalMode,
+    /// B4.2 frozen contract (see `DenseScorer`'s own doc comment).
+    /// Defaults to `None` in `new()`; every existing call site is
+    /// unaffected, and the trait's mere presence changes nothing unless
+    /// `retrieval_mode` is also `DenseV2` (B4.6 wires that branch).
+    dense_scorer: Option<&'a dyn DenseScorer>,
 }
 
 /// B3-TUNE-v2 Priority 3 Stage 1, Lever P2's frozen status-tier mapping
@@ -243,6 +359,8 @@ impl<'a> Index<'a> {
             bm25_b: 0.75,
             identifier_boost: false,
             status_tiebreak: false,
+            retrieval_mode: RetrievalMode::default(),
+            dense_scorer: None,
         }
     }
 
@@ -279,6 +397,27 @@ impl<'a> Index<'a> {
     /// `false`; every existing call site of `new()` is unaffected.
     pub fn with_status_tiebreak(mut self) -> Self {
         self.status_tiebreak = true;
+        self
+    }
+
+    /// Additive builder (B4.0 frozen contract,
+    /// `docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md`).
+    /// Selects `retrieval_mode` for this `Index` instance. Default (never
+    /// called): `RetrievalMode::Lexical`, identical to every pre-B4 call
+    /// site.
+    pub fn with_retrieval_mode(mut self, mode: RetrievalMode) -> Self {
+        self.retrieval_mode = mode;
+        self
+    }
+
+    /// Additive builder (B4.2 frozen contract,
+    /// `docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md`).
+    /// Attaches a `DenseScorer` implementation. Default (never called):
+    /// `None`. The trait's mere presence changes nothing unless
+    /// `retrieval_mode` is ALSO `RetrievalMode::DenseV2` (B4.6 wires that
+    /// branch) — attaching a scorer under `Lexical` is a no-op.
+    pub fn with_dense_scorer(mut self, scorer: &'a dyn DenseScorer) -> Self {
+        self.dense_scorer = Some(scorer);
         self
     }
 
@@ -368,10 +507,30 @@ impl<'a> Index<'a> {
         // for Lever P2's status tie-break (search_impl's sort reads this
         // by index position, never by note id, so order must stay in sync).
         let mut fresh_result_statuses: Vec<NoteStatus> = Vec::new();
+        // B4.6 (docs/superpowers/specs/2026-11-15-b4-6-search-impl-wiring.md):
+        // DenseV2's candidate set comes from the dense scorer's OWN
+        // `candidate_ids()` (every note its index currently holds),
+        // never the lexical `self.indexer.candidate_ids(query)` --
+        // confirmed against the real evaluation harness
+        // (`b3_tune_v2_priority4_dense_calibration/main.rs`:
+        // `note_vectors.iter()`, unfiltered by lexical overlap) that
+        // every accepted Priority 4 quality number was measured this
+        // way. Falls back to the Lexical candidate set (B4.0's frozen
+        // fallback contract) when `retrieval_mode` is `Lexical`, no
+        // scorer is attached, or the scorer reports itself
+        // structurally unavailable (`candidate_ids()` returns `None`).
+        let dense_candidate_ids: Option<Vec<NoteId>> = match self.retrieval_mode {
+            RetrievalMode::DenseV2 => self.dense_scorer.and_then(|scorer| scorer.candidate_ids()),
+            RetrievalMode::Lexical => None,
+        };
+        let using_dense = dense_candidate_ids.is_some();
         let candidates = {
             let _timer =
                 PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.candidate_generation));
-            self.indexer.candidate_ids(query)
+            match dense_candidate_ids {
+                Some(ids) => ids,
+                None => self.indexer.candidate_ids(query),
+            }
         };
         if let Some(p) = profile.as_deref_mut() {
             p.candidates = candidates.len();
@@ -422,8 +581,19 @@ impl<'a> Index<'a> {
                 Some(metadata.source.clone())
             };
             let document = Document::new(metadata, body.as_deref());
-            let Some(match_kind) = query_match(&document.text_searchable, query) else {
-                continue;
+            // B4.6: under DenseV2, this candidate's membership is
+            // already justified by the dense scorer's own
+            // candidate_ids() (checked above) -- query_match's literal-
+            // substring/BM25-token-overlap gate is bypassed, never
+            // applied and failed, since a semantically-related note is
+            // expected to share zero literal tokens with the query.
+            let match_kind = if using_dense {
+                MatchKind::SemanticMatch
+            } else {
+                let Some(match_kind) = query_match(&document.text_searchable, query) else {
+                    continue;
+                };
+                match_kind
             };
             if document.project != project
                 || filters.type_filter.is_some_and(|v| v != document.r#type)
@@ -463,26 +633,57 @@ impl<'a> Index<'a> {
             });
         }
         let _response_timer = PhaseTimer::new(profile.map(|p| &mut p.response_building));
-        let scores: HashMap<_, _> = fresh_scores
-            .query_ranked(query, usize::MAX)
-            .into_iter()
-            .collect();
-        let query_tokens: HashSet<String> =
-            query.split_whitespace().map(|t| t.to_lowercase()).collect();
-        for result in &mut fresh_results {
-            let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
-            let boost = if self.identifier_boost && identifier_boost_applies(&result.provenance.source, &query_tokens) {
-                IDENTIFIER_BOOST
-            } else {
-                0.0
-            };
-            result.score = base_score + boost;
+        // B4.6: under DenseV2 (confirmed `using_dense`), final scores
+        // come from the dense scorer's own `score()` call, restricted
+        // to exactly the eligible, post-filter candidate ids -- never
+        // BM25's `fresh_scores`. The identifier-boost lever
+        // (Priority 3 P1) is a BM25-specific signal keyed to
+        // `source:`-extracted identifiers appearing as literal query
+        // tokens; it is not meaningful for a dense cosine score and is
+        // correctly skipped under DenseV2, never silently added to a
+        // dense score.
+        if using_dense {
+            let eligible_ids: Vec<NoteId> =
+                fresh_results.iter().map(|r| r.note_id.clone()).collect();
+            // `using_dense` is only true when `dense_candidate_ids`
+            // (and therefore `self.dense_scorer`) was `Some` above, so
+            // this call site is always reached with a real scorer
+            // attached -- `unwrap_or` only guards the type, it can
+            // never actually fall through at this point.
+            let dense_scores: HashMap<NoteId, f64> = self
+                .dense_scorer
+                .and_then(|scorer| scorer.score(query, &eligible_ids))
+                .map(|scored| scored.into_iter().collect())
+                .unwrap_or_default();
+            for result in &mut fresh_results {
+                result.score = dense_scores.get(&result.note_id).copied().unwrap_or(0.0);
+            }
+        } else {
+            let scores: HashMap<_, _> = fresh_scores
+                .query_ranked(query, usize::MAX)
+                .into_iter()
+                .collect();
+            let query_tokens: HashSet<String> =
+                query.split_whitespace().map(|t| t.to_lowercase()).collect();
+            for result in &mut fresh_results {
+                let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+                let boost = if self.identifier_boost
+                    && identifier_boost_applies(&result.provenance.source, &query_tokens)
+                {
+                    IDENTIFIER_BOOST
+                } else {
+                    0.0
+                };
+                result.score = base_score + boost;
+            }
         }
         // Paired with `fresh_result_statuses` (same push order, Section
         // above) so Lever P2's status tie-break can compare each pair's
         // status without widening `SearchResult`'s own public fields.
-        let mut paired: Vec<(SearchResult, NoteStatus)> =
-            fresh_results.into_iter().zip(fresh_result_statuses).collect();
+        let mut paired: Vec<(SearchResult, NoteStatus)> = fresh_results
+            .into_iter()
+            .zip(fresh_result_statuses)
+            .collect();
         let status_tiebreak = self.status_tiebreak;
         paired.sort_by(|(a, a_status), (b, b_status)| {
             b.score
@@ -582,5 +783,56 @@ fn matches_time(document: &Document, filter: &AppliedTimeFilter) -> bool {
         TimeField::UpdatedAt => updated(),
         TimeField::EventPeriod => event(),
         TimeField::Any => created() || updated() || event(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutation-testing finding (cargo-mutants, B4's own closure
+    // requirement -- found while reviewing search.rs as a whole, not
+    // specific to any B4 change): `extract_structural_identifier` is
+    // module-private, so it was previously unreachable from
+    // `crates/index/tests/b1_search.rs` (the external integration test
+    // file) at all, and no test exercised the empty-fragment case
+    // ("docs/file.md#" with nothing after the hash) through ANY path.
+    // An attempt to cover this via the external search_impl-level test
+    // was itself dead on arrival: `identifier_boost_applies`'s own
+    // `query_tokens.contains(&identifier.to_lowercase())` check can
+    // never observe an empty-string identifier mattering, because
+    // `query.split_whitespace()` never yields an empty token for the
+    // query side either -- so the mutation, while surviving at the
+    // unit level, is genuinely unreachable through the real
+    // search_impl call chain. This internal unit test is the correct,
+    // minimal fix: it tests `extract_structural_identifier` directly,
+    // which the mutation actually changes.
+    #[test]
+    fn extract_structural_identifier_returns_none_for_an_empty_trailing_fragment() {
+        assert_eq!(
+            extract_structural_identifier("docs/technical-debt.md#"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_structural_identifier_returns_the_fragment_for_a_real_identifier() {
+        assert_eq!(
+            extract_structural_identifier("docs/technical-debt.md#SEC-001"),
+            Some("SEC-001".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_structural_identifier_returns_none_with_no_hash_fragment_at_all() {
+        assert_eq!(extract_structural_identifier("agent:fixture"), None);
+    }
+
+    #[test]
+    fn extract_structural_identifier_stops_at_the_first_non_identifier_character() {
+        assert_eq!(
+            extract_structural_identifier("docs/file.md#SEC-001 and some trailing text"),
+            Some("SEC-001".to_string())
+        );
     }
 }

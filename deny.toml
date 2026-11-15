@@ -3,9 +3,21 @@
 # of serde_yaml 0.9, which is pinned by the plan. No fixed upstream release is
 # available as of 2026-10-26. Granted 2026-10-26; must be re-reviewed by
 # 2027-04-26 for an available fix. See eval/results/A1/dependency-exceptions.md.
+#
+# Exception RUSTSEC-2024-0436 (paste unmaintained): transitive dependency of
+# tokenizers 0.23.2, promoted to a production dependency of `api` behind the
+# `dense-retrieval` feature (default off) in B4.1 -- see
+# docs/superpowers/specs/2026-11-15-b4-1-dependency-promotion-decisions.md,
+# Section 1. No safe upgrade is available upstream as of 2026-11-15. Granted
+# 2026-11-15; must be re-reviewed by 2027-05-15 for an available fix.
 ignore = [
   { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is a transitive dependency of serde_yaml 0.9 (pinned by plan); no upstream fix. Granted 2026-10-26, re-review by 2027-04-26." },
+  { id = "RUSTSEC-2024-0436", reason = "paste is a transitive dependency of tokenizers 0.23.2 (api's dense-retrieval feature, default off); no safe upgrade available. Granted 2026-11-15, re-review by 2027-05-15." },
 ]
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0"]
+# CDLA-Permissive-2.0 added in B4.1 (same spec doc, Section 10): a build
+# dependency of `ort` (ort-sys) transitively pulls in ureq's webpki-root-certs
+# / webpki-roots, both under this license for Mozilla's bundled root
+# certificate data, not code logic.
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CDLA-Permissive-2.0"]

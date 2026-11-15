@@ -18,6 +18,12 @@
 //! Only note ids are supported; chunk ids are explicitly rejected until B2.
 //! Repository/commit provenance and persisted Pending/Resolved states remain
 //! unavailable as documented in B1 Task 6. No backing data is fabricated.
+#[cfg(feature = "dense-retrieval")]
+pub mod dense;
+#[cfg(feature = "dense-retrieval")]
+pub mod dense_lifecycle;
+#[cfg(feature = "dense-retrieval")]
+pub mod dense_storage;
 pub mod metrics;
 pub mod retrieve;
 pub mod search;

@@ -895,7 +895,8 @@ fn new_with_text_normalizer_applies_the_hook_before_indexing_text() {
     }
     let normalized_indexer = RealIndexer::new_with_text_normalizer(strip_trailing_comma);
     index::indexer_impl::rebuild_index(&f.vault, &normalized_indexer).unwrap();
-    let normalized_hit_without_comma = normalized_indexer.bm25_ranked("resolve_configured_timezone", 10);
+    let normalized_hit_without_comma =
+        normalized_indexer.bm25_ranked("resolve_configured_timezone", 10);
 
     assert!(
         default_hit_without_comma.is_empty(),
@@ -919,11 +920,18 @@ fn identifier_boost_fires_on_exact_whole_token_match_against_source_fragment() {
     // so only the boost (not candidate membership) decides which ranks
     // first once the query also contains the literal token "sec-001".
     f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "shared_probe_term extra filler words so note-b scores higher on shared_probe_term alone") }, 0);
-    f.write(&Note::new("note-b", "shared_probe_term shared_probe_term shared_probe_term"), 0);
+    f.write(
+        &Note::new(
+            "note-b",
+            "shared_probe_term shared_probe_term shared_probe_term",
+        ),
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
     let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_identifier_boost();
 
     let plain_first = |outcome: index::search::SearchOutcome| match outcome {
         index::search::SearchOutcome::Matches { first, .. } => first.note_id.as_str().to_string(),
@@ -934,11 +942,25 @@ fn identifier_boost_fires_on_exact_whole_token_match_against_source_fragment() {
     // "sec-001" token has zero BM25/trigram overlap with either note's
     // indexed text on its own, since neither note's source token is an
     // exact whole-token match for "sec-001" by itself).
-    let plain_outcome = plain.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
-    assert_eq!(plain_first(plain_outcome), "note-b", "sanity check: without the boost, note-b's term frequency must win");
+    let plain_outcome = plain
+        .search("shared_probe_term sec-001", Default::default(), 10)
+        .unwrap()
+        .outcome;
+    assert_eq!(
+        plain_first(plain_outcome),
+        "note-b",
+        "sanity check: without the boost, note-b's term frequency must win"
+    );
 
-    let boosted_outcome = boosted.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
-    assert_eq!(plain_first(boosted_outcome), "note-a", "the exact identifier match's boost must outrank note-b's higher term frequency");
+    let boosted_outcome = boosted
+        .search("shared_probe_term sec-001", Default::default(), 10)
+        .unwrap()
+        .outcome;
+    assert_eq!(
+        plain_first(boosted_outcome),
+        "note-a",
+        "the exact identifier match's boost must outrank note-b's higher term frequency"
+    );
 }
 
 #[test]
@@ -959,23 +981,36 @@ fn identifier_boost_never_fires_on_a_substring_or_prefix_match() {
     // flip the ranking, while the correct exact-match rule (which
     // declines to boost either note, since "sec" != "sec-001") leaves
     // note-b's higher term frequency winning untouched.
-    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "shared_probe_term_b") }, 0);
+    f.write(
+        &Note {
+            source: "docs/technical-debt.md#SEC-001",
+            ..Note::new("note-a", "shared_probe_term_b")
+        },
+        0,
+    );
     f.write(&Note::new("note-b", "shared_probe_term_b shared_probe_term_b shared_probe_term_b extra filler words so note-b scores higher on term frequency alone"), 0);
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
-    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_identifier_boost();
 
     // "sec" is a substring/prefix of "SEC-001" but must never match it,
     // so note-b's higher term frequency on shared_probe_term_b must
     // still win even with the boost enabled -- a substring-matching bug
     // would incorrectly boost note-a's score by IDENTIFIER_BOOST (100.0,
     // far larger than any term-frequency difference) and flip this.
-    let response = idx.search("shared_probe_term_b sec", Default::default(), 10).unwrap();
+    let response = idx
+        .search("shared_probe_term_b sec", Default::default(), 10)
+        .unwrap();
 
     let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
         panic!("expected a match");
     };
-    assert_eq!(first.note_id.as_str(), "note-b", "\"sec\" must never match \"SEC-001\" as a substring/prefix");
+    assert_eq!(
+        first.note_id.as_str(),
+        "note-b",
+        "\"sec\" must never match \"SEC-001\" as a substring/prefix"
+    );
 }
 
 #[test]
@@ -986,22 +1021,43 @@ fn identifier_boost_never_applies_to_a_sensitive_candidates_withheld_source() {
     // with no shared term would never become a candidate at all, which
     // would make this test pass vacuously (confirmed by Review mutation
     // testing on the sibling test above).
-    f.write(&Note { source: "docs/technical-debt.md#SEC-001", classification: "sensitive", ..Note::new("note-a", "shared_probe_term_c") }, 0);
-    f.write(&Note::new("note-b", "shared_probe_term_c shared_probe_term_c shared_probe_term_c"), 0);
+    f.write(
+        &Note {
+            source: "docs/technical-debt.md#SEC-001",
+            classification: "sensitive",
+            ..Note::new("note-a", "shared_probe_term_c")
+        },
+        0,
+    );
+    f.write(
+        &Note::new(
+            "note-b",
+            "shared_probe_term_c shared_probe_term_c shared_probe_term_c",
+        ),
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
     let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_identifier_boost();
 
     // Sensitive: source is withheld by the existing pipeline before
     // identifier_boost's logic can see it at all -- so the boosted
     // ordering must be identical to the plain ordering even though the
     // query contains the literal identifier and note-a would otherwise
     // be eligible for the boost were its source not withheld.
-    let plain_outcome = plain.search("shared_probe_term_c sec-001", Default::default(), 10).unwrap().outcome;
-    let boosted_outcome = boosted.search("shared_probe_term_c sec-001", Default::default(), 10).unwrap().outcome;
+    let plain_outcome = plain
+        .search("shared_probe_term_c sec-001", Default::default(), 10)
+        .unwrap()
+        .outcome;
+    let boosted_outcome = boosted
+        .search("shared_probe_term_c sec-001", Default::default(), 10)
+        .unwrap()
+        .outcome;
     assert_eq!(
-        format!("{plain_outcome:?}"), format!("{boosted_outcome:?}"),
+        format!("{plain_outcome:?}"),
+        format!("{boosted_outcome:?}"),
         "a Sensitive candidate's withheld source must never let the boost apply"
     );
 }
@@ -1009,26 +1065,45 @@ fn identifier_boost_never_applies_to_a_sensitive_candidates_withheld_source() {
 #[test]
 fn identifier_boost_does_not_change_the_candidate_set() {
     let f = Fixture::new();
-    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "a note about sec-001 topic") }, 0);
+    f.write(
+        &Note {
+            source: "docs/technical-debt.md#SEC-001",
+            ..Note::new("note-a", "a note about sec-001 topic")
+        },
+        0,
+    );
     f.write(&Note::new("note-b", "a note about sec-001 topic too"), 0);
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
     let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_identifier_boost();
 
     let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
         match outcome {
             index::search::SearchOutcome::NotPresent => Default::default(),
             index::search::SearchOutcome::Matches { first, rest } => {
-                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                let mut s: std::collections::HashSet<String> = rest
+                    .iter()
+                    .map(|r| r.note_id.as_str().to_string())
+                    .collect();
                 s.insert(first.note_id.as_str().to_string());
                 s
             }
         }
     };
-    let plain_ids = ids(plain.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
-    let boosted_ids = ids(boosted.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
-    assert_eq!(plain_ids, boosted_ids, "identifier_boost must only reorder, never change membership");
+    let plain_ids = ids(plain
+        .search("sec-001 topic", Default::default(), 10)
+        .unwrap()
+        .outcome);
+    let boosted_ids = ids(boosted
+        .search("sec-001 topic", Default::default(), 10)
+        .unwrap()
+        .outcome);
+    assert_eq!(
+        plain_ids, boosted_ids,
+        "identifier_boost must only reorder, never change membership"
+    );
 }
 
 // --- B3-TUNE-v2 Priority 3 Stage 1, P2: status tie-break. ---
@@ -1038,18 +1113,35 @@ fn status_tiebreak_fires_only_on_exactly_equal_bm25_scores() {
     let f = Fixture::new();
     // Both notes share identical text so their BM25 scores are
     // bitwise-identical f64 values under the real pipeline.
-    f.write(&Note { status: "draft", ..Note::new("note-draft", "shared_term appears here") }, 0);
-    f.write(&Note { status: "verified", ..Note::new("note-verified", "shared_term appears here") }, 0);
+    f.write(
+        &Note {
+            status: "draft",
+            ..Note::new("note-draft", "shared_term appears here")
+        },
+        0,
+    );
+    f.write(
+        &Note {
+            status: "verified",
+            ..Note::new("note-verified", "shared_term appears here")
+        },
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
-    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_status_tiebreak();
 
     let response = idx.search("shared_term", Default::default(), 10).unwrap();
 
     let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
         panic!("expected a match");
     };
-    assert_eq!(first.note_id.as_str(), "note-verified", "Verified must outrank Draft at an exact score tie");
+    assert_eq!(
+        first.note_id.as_str(),
+        "note-verified",
+        "Verified must outrank Draft at an exact score tie"
+    );
 }
 
 #[test]
@@ -1057,19 +1149,44 @@ fn status_tiebreak_never_fires_on_a_nonzero_score_difference() {
     let f = Fixture::new();
     // note-a has extra matching term frequency -> a strictly higher,
     // non-tied BM25 score than note-b, despite note-b's higher status tier.
-    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term shared_term shared_term extra filler text to differ length") }, 0);
-    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    f.write(
+        &Note {
+            status: "draft",
+            ..Note::new(
+                "note-a",
+                "shared_term shared_term shared_term extra filler text to differ length",
+            )
+        },
+        0,
+    );
+    f.write(
+        &Note {
+            status: "verified",
+            ..Note::new("note-b", "shared_term")
+        },
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
     let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_status_tiebreak();
 
-    let plain_outcome = plain.search("shared_term", Default::default(), 10).unwrap().outcome;
-    let tiebreak_outcome = tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome;
+    let plain_outcome = plain
+        .search("shared_term", Default::default(), 10)
+        .unwrap()
+        .outcome;
+    let tiebreak_outcome = tiebreak
+        .search("shared_term", Default::default(), 10)
+        .unwrap()
+        .outcome;
 
     // Ordering must be identical whether or not the tiebreak flag is set,
     // because the scores are NOT exactly equal.
-    assert_eq!(format!("{plain_outcome:?}"), format!("{tiebreak_outcome:?}"));
+    assert_eq!(
+        format!("{plain_outcome:?}"),
+        format!("{tiebreak_outcome:?}")
+    );
 }
 
 #[test]
@@ -1100,15 +1217,35 @@ fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering
         // test even with status_tier always returning Ordering::Equal,
         // since the id tie-break alone already produced the expected
         // order for every pair.
-        f.write(&Note { id: "note-z-higher", status: higher_status, ..Note::new("note-z-higher", "shared_tier_probe_term") }, 0);
-        f.write(&Note { id: "note-a-lower", status: lower_status, ..Note::new("note-a-lower", "shared_tier_probe_term") }, 0);
+        f.write(
+            &Note {
+                id: "note-z-higher",
+                status: higher_status,
+                ..Note::new("note-z-higher", "shared_tier_probe_term")
+            },
+            0,
+        );
+        f.write(
+            &Note {
+                id: "note-a-lower",
+                status: lower_status,
+                ..Note::new("note-a-lower", "shared_tier_probe_term")
+            },
+            0,
+        );
         let indexer = RealIndexer::new();
         index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
         let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-        let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+        let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+            .with_status_tiebreak();
 
-        let plain_response = plain.search("shared_tier_probe_term", Default::default(), 10).unwrap();
-        let index::search::SearchOutcome::Matches { first: plain_first, .. } = plain_response.outcome else {
+        let plain_response = plain
+            .search("shared_tier_probe_term", Default::default(), 10)
+            .unwrap();
+        let index::search::SearchOutcome::Matches {
+            first: plain_first, ..
+        } = plain_response.outcome
+        else {
             panic!("expected a match for {higher_status} vs {lower_status}");
         };
         assert_eq!(
@@ -1116,8 +1253,14 @@ fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering
             "control: without the tiebreak, the note-id order alone must put note-a-lower first for {higher_status} vs {lower_status}"
         );
 
-        let tiebreak_response = tiebreak.search("shared_tier_probe_term", Default::default(), 10).unwrap();
-        let index::search::SearchOutcome::Matches { first: tiebreak_first, .. } = tiebreak_response.outcome else {
+        let tiebreak_response = tiebreak
+            .search("shared_tier_probe_term", Default::default(), 10)
+            .unwrap();
+        let index::search::SearchOutcome::Matches {
+            first: tiebreak_first,
+            ..
+        } = tiebreak_response.outcome
+        else {
             panic!("expected a match for {higher_status} vs {lower_status}");
         };
         assert_eq!(
@@ -1128,12 +1271,34 @@ fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering
     // Same-tier pair: Verified and Reviewed must NOT have a defined
     // relative order from this rule (falls through to note-id tie-break).
     let f_same_tier = Fixture::new();
-    f_same_tier.write(&Note { id: "note-verified", status: "verified", ..Note::new("note-verified", "shared_tier_probe_term") }, 0);
-    f_same_tier.write(&Note { id: "note-reviewed", status: "reviewed", ..Note::new("note-reviewed", "shared_tier_probe_term") }, 0);
+    f_same_tier.write(
+        &Note {
+            id: "note-verified",
+            status: "verified",
+            ..Note::new("note-verified", "shared_tier_probe_term")
+        },
+        0,
+    );
+    f_same_tier.write(
+        &Note {
+            id: "note-reviewed",
+            status: "reviewed",
+            ..Note::new("note-reviewed", "shared_tier_probe_term")
+        },
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f_same_tier.vault, &indexer).unwrap();
-    let idx = index::Index::new(&f_same_tier.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
-    let response = idx.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+    let idx = index::Index::new(
+        &f_same_tier.vault,
+        &indexer,
+        "project-x",
+        date("2026-10-26"),
+    )
+    .with_status_tiebreak();
+    let response = idx
+        .search("shared_tier_probe_term", Default::default(), 10)
+        .unwrap();
     let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
         panic!("expected a match");
     };
@@ -1145,25 +1310,443 @@ fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering
 #[test]
 fn status_tiebreak_does_not_change_the_candidate_set() {
     let f = Fixture::new();
-    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term") }, 0);
-    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    f.write(
+        &Note {
+            status: "draft",
+            ..Note::new("note-a", "shared_term")
+        },
+        0,
+    );
+    f.write(
+        &Note {
+            status: "verified",
+            ..Note::new("note-b", "shared_term")
+        },
+        0,
+    );
     let indexer = RealIndexer::new();
     index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
     let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
-    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"))
+        .with_status_tiebreak();
 
     let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
         match outcome {
             index::search::SearchOutcome::NotPresent => Default::default(),
             index::search::SearchOutcome::Matches { first, rest } => {
-                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                let mut s: std::collections::HashSet<String> = rest
+                    .iter()
+                    .map(|r| r.note_id.as_str().to_string())
+                    .collect();
                 s.insert(first.note_id.as_str().to_string());
                 s
             }
         }
     };
     assert_eq!(
-        ids(plain.search("shared_term", Default::default(), 10).unwrap().outcome),
-        ids(tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome),
+        ids(plain
+            .search("shared_term", Default::default(), 10)
+            .unwrap()
+            .outcome),
+        ids(tiebreak
+            .search("shared_term", Default::default(), 10)
+            .unwrap()
+            .outcome),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B4.0: frozen `RetrievalMode` contract
+// (docs/superpowers/specs/2026-11-15-b4-production-contract-freeze.md).
+// These tests pin the contract before any dense-retrieval implementation
+// exists: `Lexical` is the enum's `Default`, `Index::new(...)` behaves
+// exactly as before B4 without ever mentioning `RetrievalMode`, and the new
+// `with_retrieval_mode` builder is additive -- never changing behavior for a
+// caller who never calls it, mirroring `with_identifier_boost`/
+// `with_status_tiebreak`'s own precedent exactly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retrieval_mode_default_is_lexical() {
+    assert_eq!(
+        index::search::RetrievalMode::default(),
+        index::search::RetrievalMode::Lexical
+    );
+}
+
+#[test]
+fn index_new_defaults_to_lexical_retrieval_mode_without_mentioning_it() {
+    // This is the backward-compatibility contract itself: an `Index`
+    // constructed exactly as every pre-B4 call site already does, with zero
+    // knowledge that `RetrievalMode` exists, must behave under `Lexical`.
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "distinctive_lexical_default_probe"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let idx = f.index();
+    let response = idx
+        .search("distinctive_lexical_default_probe", Default::default(), 10)
+        .unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match under the default (Lexical) retrieval mode");
+    };
+    assert_eq!(first.note_id.as_str(), "note-a");
+}
+
+#[test]
+fn with_retrieval_mode_lexical_is_byte_identical_to_never_calling_it() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "retrieval_mode_parity_probe_term"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let plain = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let explicit_lexical = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_retrieval_mode(index::search::RetrievalMode::Lexical);
+    assert_eq!(
+        plain.search("retrieval_mode_parity_probe_term", Default::default(), 10).unwrap(),
+        explicit_lexical.search("retrieval_mode_parity_probe_term", Default::default(), 10).unwrap(),
+        "explicitly setting Lexical must be byte-identical to never calling with_retrieval_mode at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B4.2: `DenseScorer` trait boundary
+// (docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md).
+// `with_dense_scorer` is additive and default-off (`None`): a caller who
+// never calls it, and every pre-B4.2 call site, must behave identically
+// regardless of RetrievalMode -- the trait's mere existence changes nothing
+// until B4.6 wires search_impl's own DenseV2 branch to actually consult it.
+// ---------------------------------------------------------------------------
+
+struct StubDenseScorer {
+    response: std::sync::Mutex<Option<Vec<(storage::NoteId, f64)>>>,
+}
+impl index::search::DenseScorer for StubDenseScorer {
+    fn candidate_ids(&self) -> Option<Vec<storage::NoteId>> {
+        self.response
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|scored| scored.iter().map(|(id, _)| id.clone()).collect())
+    }
+    fn score(
+        &self,
+        _query: &str,
+        _candidate_ids: &[storage::NoteId],
+    ) -> Option<Vec<(storage::NoteId, f64)>> {
+        self.response.lock().unwrap().clone()
+    }
+    fn rebuild(&self, _vault: &storage::Vault) -> Result<(), index::search::DenseScorerError> {
+        Ok(())
+    }
+    fn on_note_indexed(&self, _note_id: &storage::NoteId, _document: &index::document::Document) {}
+    fn on_note_deleted(&self, _note_id: &storage::NoteId) {}
+}
+
+#[test]
+fn with_dense_scorer_under_lexical_mode_does_not_change_behavior() {
+    // Attaching a scorer without ever selecting DenseV2 must be a no-op --
+    // the trait's mere presence on `Index` changes nothing under Lexical.
+    let f = Fixture::new();
+    f.write(
+        &Note::new("note-a", "dense_scorer_noop_under_lexical_probe"),
+        0,
+    );
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let scorer = StubDenseScorer {
+        response: std::sync::Mutex::new(Some(vec![])),
+    };
+    let plain = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let with_scorer = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer);
+    assert_eq!(
+        plain
+            .search(
+                "dense_scorer_noop_under_lexical_probe",
+                Default::default(),
+                10
+            )
+            .unwrap(),
+        with_scorer
+            .search(
+                "dense_scorer_noop_under_lexical_probe",
+                Default::default(),
+                10
+            )
+            .unwrap(),
+        "attaching a DenseScorer must not change Lexical-mode behavior at all"
+    );
+}
+
+#[test]
+fn dense_scorer_error_variants_exist_and_are_distinct() {
+    // Pins the exact error shape B4.2's design froze -- a compile-time
+    // contract test, not a behavioral one.
+    assert_ne!(
+        index::search::DenseScorerError::VaultUnavailable,
+        index::search::DenseScorerError::IndexWriteFailed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B4.6: real search_impl wiring for RetrievalMode::DenseV2
+// (docs/superpowers/specs/2026-11-15-b4-6-search-impl-wiring.md).
+// Uses a controllable stub (not StubDenseScorer above, which only
+// returns a fixed score list regardless of query) to exercise both the
+// "dense scorer available" and "structurally unavailable -> falls back
+// to Lexical" paths precisely.
+// ---------------------------------------------------------------------------
+
+struct ConfigurableDenseScorer {
+    /// `None` here means "structurally unavailable" (B4.0's frozen
+    /// fallback contract) -- both `candidate_ids()` and `score()` must
+    /// return `None` together, never one `Some` and the other `None`,
+    /// mirroring how `ProductionDenseScorer` ties both to the same
+    /// `LoadState` check.
+    available: std::sync::Mutex<Option<Vec<(String, f64)>>>,
+}
+impl ConfigurableDenseScorer {
+    fn unavailable() -> Self {
+        Self {
+            available: std::sync::Mutex::new(None),
+        }
+    }
+    fn with_scores(scores: Vec<(&str, f64)>) -> Self {
+        Self {
+            available: std::sync::Mutex::new(Some(
+                scores
+                    .into_iter()
+                    .map(|(id, s)| (id.to_string(), s))
+                    .collect(),
+            )),
+        }
+    }
+}
+impl index::search::DenseScorer for ConfigurableDenseScorer {
+    fn candidate_ids(&self) -> Option<Vec<storage::NoteId>> {
+        self.available.lock().unwrap().as_ref().map(|scores| {
+            scores
+                .iter()
+                .filter_map(|(id, _)| NoteId::parse(id).ok())
+                .collect()
+        })
+    }
+    fn score(
+        &self,
+        _query: &str,
+        candidate_ids: &[storage::NoteId],
+    ) -> Option<Vec<(storage::NoteId, f64)>> {
+        let scores = self.available.lock().unwrap().clone()?;
+        Some(
+            candidate_ids
+                .iter()
+                .filter_map(|id| {
+                    scores
+                        .iter()
+                        .find(|(sid, _)| sid == id.as_str())
+                        .map(|(_, s)| (id.clone(), *s))
+                })
+                .collect(),
+        )
+    }
+    fn rebuild(&self, _vault: &storage::Vault) -> Result<(), index::search::DenseScorerError> {
+        Ok(())
+    }
+    fn on_note_indexed(&self, _note_id: &storage::NoteId, _document: &index::document::Document) {}
+    fn on_note_deleted(&self, _note_id: &storage::NoteId) {}
+}
+
+#[test]
+fn densev2_with_an_unavailable_scorer_falls_back_to_lexical_byte_identically() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "fallback_parity_probe_term"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let scorer = ConfigurableDenseScorer::unavailable();
+
+    let lexical = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let dense_unavailable = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer)
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    assert_eq!(
+        lexical.search("fallback_parity_probe_term", Default::default(), 10).unwrap(),
+        dense_unavailable.search("fallback_parity_probe_term", Default::default(), 10).unwrap(),
+        "DenseV2 with a structurally-unavailable scorer must fall back to byte-identical Lexical behavior"
+    );
+}
+
+#[test]
+fn densev2_with_no_scorer_attached_falls_back_to_lexical() {
+    // DenseV2 selected, but with_dense_scorer was never called at all
+    // (dense_scorer: None) -- must behave exactly like the unavailable
+    // case above, not panic or error.
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "no_scorer_attached_probe_term"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+
+    let lexical = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let dense_no_scorer = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    assert_eq!(
+        lexical
+            .search("no_scorer_attached_probe_term", Default::default(), 10)
+            .unwrap(),
+        dense_no_scorer
+            .search("no_scorer_attached_probe_term", Default::default(), 10)
+            .unwrap(),
+        "DenseV2 with no scorer attached at all must fall back to byte-identical Lexical behavior"
+    );
+}
+
+#[test]
+fn densev2_with_an_available_scorer_uses_dense_scores_not_bm25() {
+    let f = Fixture::new();
+    // Two notes that DO share a lexical term with the query (so BM25
+    // alone could find both), but whose dense scores are set up to
+    // invert the BM25 ranking -- proving the final order comes from
+    // the dense scorer, not from BM25's own score.
+    f.write(
+        &Note::new(
+            "note-low-bm25-high-dense",
+            "shared_term shared_term shared_term shared_term",
+        ),
+        0,
+    );
+    f.write(&Note::new("note-high-bm25-low-dense", "shared_term"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+
+    // note-high-bm25-low-dense would win on raw BM25 term frequency in
+    // the OTHER direction is not guaranteed by construction here --
+    // what IS guaranteed is that the dense scorer's own scores
+    // (0.1 vs 0.9) determine final order, since that's the only score
+    // search_impl reads under DenseV2.
+    let scorer = ConfigurableDenseScorer::with_scores(vec![
+        ("note-low-bm25-high-dense", 0.9),
+        ("note-high-bm25-low-dense", 0.1),
+    ]);
+    let dense = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer)
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    let response = dense.search("shared_term", Default::default(), 10).unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    assert_eq!(
+        first.note_id.as_str(),
+        "note-low-bm25-high-dense",
+        "the note with the HIGHER dense score must rank first, confirming DenseV2 reads the \
+         dense scorer's own score, not a BM25 score"
+    );
+}
+
+#[test]
+fn densev2_candidate_set_is_the_dense_indexs_own_not_the_lexical_generators() {
+    // The central B4.6 correction: a note with ZERO lexical term
+    // overlap with the query (so self.indexer.candidate_ids(query)
+    // would never surface it) must STILL be found under DenseV2, as
+    // long as the dense scorer's own candidate_ids() includes it --
+    // proving DenseV2 does not route through lexical candidate
+    // generation at all.
+    let f = Fixture::new();
+    f.write(
+        &Note::new(
+            "note-no-lexical-overlap",
+            "completely_unrelated_vocabulary_here",
+        ),
+        0,
+    );
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+
+    let scorer = ConfigurableDenseScorer::with_scores(vec![("note-no-lexical-overlap", 0.8)]);
+    let dense = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer)
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    // This query shares ZERO tokens with the note's own indexed text --
+    // the lexical candidate generator would return an empty set for it.
+    let response = dense
+        .search(
+            "semantically different query wording entirely",
+            Default::default(),
+            10,
+        )
+        .unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected DenseV2 to find the note via the dense scorer's own candidate set, got NotPresent");
+    };
+    assert_eq!(first.note_id.as_str(), "note-no-lexical-overlap");
+}
+
+#[test]
+fn densev2_still_applies_existing_structured_filters_and_privacy_redaction() {
+    // DenseV2 changes ONLY candidate generation/scoring -- the existing
+    // per-candidate authoritative-read, structured-filter and
+    // Sensitive-redaction loop must still run unchanged.
+    let f = Fixture::new();
+    f.write(
+        &Note {
+            status: "draft",
+            ..Note::new("note-wrong-status", "filter_test_probe")
+        },
+        0,
+    );
+    f.write(
+        &Note {
+            status: "verified",
+            ..Note::new("note-right-status", "filter_test_probe")
+        },
+        0,
+    );
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+
+    let scorer = ConfigurableDenseScorer::with_scores(vec![
+        ("note-wrong-status", 0.9), // highest dense score, but must be filtered OUT
+        ("note-right-status", 0.5),
+    ]);
+    let dense = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer)
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    let filters = SearchFilters {
+        status_filter: Some(domain::NoteStatus::Verified),
+        ..Default::default()
+    };
+    let response = dense.search("filter_test_probe", filters, 10).unwrap();
+    let index::search::SearchOutcome::Matches { first, rest } = response.outcome else {
+        panic!("expected a match");
+    };
+    let ids: Vec<&str> = std::iter::once(&first)
+        .chain(&rest)
+        .map(|r| r.note_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["note-right-status"], "the status filter must still apply under DenseV2, even though note-wrong-status had the higher dense score");
+}
+
+#[test]
+fn densev2_deterministic_tie_break_on_equal_dense_scores_matches_lexicals_own_convention() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-b-tie", "tie_break_probe"), 0);
+    f.write(&Note::new("note-a-tie", "tie_break_probe"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+
+    let scorer = ConfigurableDenseScorer::with_scores(vec![
+        ("note-b-tie", 0.5),
+        ("note-a-tie", 0.5), // bitwise-equal dense score -- same tie value
+    ]);
+    let dense = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer)
+        .with_retrieval_mode(index::search::RetrievalMode::DenseV2);
+
+    let response = dense
+        .search("tie_break_probe", Default::default(), 10)
+        .unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    assert_eq!(
+        first.note_id.as_str(),
+        "note-a-tie",
+        "on an exact dense-score tie, the SAME note-id lexicographic tie-break B1's own sort \
+         uses must decide -- note-a-tie < note-b-tie lexicographically"
     );
 }
