@@ -129,6 +129,26 @@ pub struct EmbedResult {
     pub truncated: bool,
 }
 
+/// Process-global `ort::environment::Environment`, initialized exactly
+/// once (B4.0's frozen "ONNX Runtime lifecycle" contract: one
+/// `Environment` per process, never re-initialized per search request).
+/// `ort` itself enforces this at runtime (a second
+/// `ort::init().build()` call in the same process errors with "only
+/// one environment is allowed per process," confirmed directly by this
+/// module's own test suite colliding under parallel test execution
+/// before this helper existed) -- `std::sync::OnceLock` makes the
+/// single-initialization requirement structural rather than a
+/// caller-discipline convention every call site has to remember.
+static SHARED_ENVIRONMENT: std::sync::OnceLock<ort::environment::Environment> =
+    std::sync::OnceLock::new();
+
+/// Returns the process-wide `Environment`, initializing it on first
+/// call. Every production and test call site should go through this,
+/// never call `ort::init().build()` directly.
+pub fn shared_environment() -> &'static ort::environment::Environment {
+    SHARED_ENVIRONMENT.get_or_init(|| ort::init().build().expect("ONNX Runtime environment init"))
+}
+
 /// The real, loaded `all-MiniLM-L6-v2` ONNX model + tokenizer, hash-
 /// verified at load time. Implements the SAME representation semantics
 /// (`QUERY_PREFIX`/`DOCUMENT_PREFIX` empty, `MAX_SEQUENCE_LENGTH` = 256,
@@ -443,8 +463,8 @@ mod tests {
         let tampered_onnx = dir.join("model.onnx");
         std::fs::write(&tampered_onnx, b"not actually an onnx model").unwrap();
 
-        let env = ort::init().build().expect("ONNX Runtime environment init");
-        let result = EmbeddingModel::load(&env, &tampered_onnx, &tokenizer_path);
+        let env = shared_environment();
+        let result = EmbeddingModel::load(env, &tampered_onnx, &tokenizer_path);
         let _ = std::fs::remove_dir_all(&dir);
 
         match result {
@@ -462,8 +482,8 @@ mod tests {
             eprintln!("skipping: cached model artifacts not found on this machine");
             return;
         };
-        let env = ort::init().build().expect("ONNX Runtime environment init");
-        let mut model = EmbeddingModel::load(&env, &onnx_path, &tokenizer_path)
+        let env = shared_environment();
+        let mut model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path)
             .expect("hash-verified real artifacts must load successfully");
 
         let result = model
@@ -493,8 +513,8 @@ mod tests {
             eprintln!("skipping: cached model artifacts not found on this machine");
             return;
         };
-        let env = ort::init().build().expect("ONNX Runtime environment init");
-        let mut model = EmbeddingModel::load(&env, &onnx_path, &tokenizer_path).unwrap();
+        let env = shared_environment();
+        let mut model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
 
         let a = model
             .embed_document("deterministic embedding probe text")
@@ -515,8 +535,8 @@ mod tests {
             eprintln!("skipping: cached model artifacts not found on this machine");
             return;
         };
-        let env = ort::init().build().expect("ONNX Runtime environment init");
-        let mut model = EmbeddingModel::load(&env, &onnx_path, &tokenizer_path).unwrap();
+        let env = shared_environment();
+        let mut model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
 
         let base = model
             .embed_document("the quick brown fox jumps over the lazy dog")
@@ -547,8 +567,8 @@ mod tests {
             eprintln!("skipping: cached model artifacts not found on this machine");
             return;
         };
-        let env = ort::init().build().expect("ONNX Runtime environment init");
-        let mut model = EmbeddingModel::load(&env, &onnx_path, &tokenizer_path).unwrap();
+        let env = shared_environment();
+        let mut model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
 
         // 500 distinct numbered words -- comfortably over 256 word-pieces
         // once tokenized, and avoids relying on how a repeated identical
