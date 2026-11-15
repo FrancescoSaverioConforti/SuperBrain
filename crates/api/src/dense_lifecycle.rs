@@ -269,6 +269,45 @@ mod tests {
         assert_eq!(model_identity_hash().len(), 32);
     }
 
+    // --- Mutation-testing findings (cargo-mutants, B4's own closure
+    // requirement): all three of the following were MISSED --
+    // model_identity_hash replaced with a fixed [0; 32]/[1; 32],
+    // candidate_ids replaced with None/Some(vec![]), and
+    // on_note_indexed's content_hash equality check inverted (==
+    // -> !=) -- because nothing asserted the ACTUAL real value these
+    // functions compute, only that they were internally consistent
+    // with themselves. Fixed below. ---
+
+    #[test]
+    fn model_identity_hash_is_not_a_trivial_constant_and_matches_its_own_real_formula() {
+        let hash = model_identity_hash();
+        assert_ne!(
+            hash, [0u8; 32],
+            "must not degenerate to an all-zero constant"
+        );
+        assert_ne!(
+            hash, [1u8; 32],
+            "must not degenerate to an all-one constant"
+        );
+        // Independently re-derives the exact same formula this
+        // function itself uses (combined = "HF_REPO|REVISION|ONNX_SHA|TOKENIZER_SHA",
+        // then SHA-256) -- not copy-pasted blindly, but confirming the
+        // real function's output against that formula computed fresh,
+        // right here, so a change to EITHER side would be caught.
+        use sha2::{Digest, Sha256};
+        let combined = format!(
+            "{}|{}|{}|{}",
+            dense::HF_REPO,
+            dense::PINNED_REVISION_SHA,
+            dense::ONNX_ARTIFACT_SHA256,
+            dense::TOKENIZER_ARTIFACT_SHA256
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(combined.as_bytes());
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(hash, expected);
+    }
+
     // --- Real end-to-end lifecycle tests: real storage::Vault, real
     // notes, real EmbeddingModel against the cached, hash-verified
     // all-MiniLM-L6-v2 artifacts (same reuse convention as
@@ -443,6 +482,49 @@ mod tests {
     }
 
     #[test]
+    fn candidate_ids_returns_exactly_the_real_notes_after_a_rebuild_and_none_before() {
+        // Mutation-testing fix: calls candidate_ids() DIRECTLY (not
+        // only indirectly through score(), which was not enough to
+        // kill the None/Some(vec![]) mutants) and asserts its actual
+        // returned set, both before and after a real rebuild.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        let fixture = VaultFixture::new("candidate-ids");
+        fixture.write_note("note-x", "first note content");
+        fixture.write_note("note-y", "second note content");
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let index_path = fixture.root.join("index.bin");
+        let scorer = ProductionDenseScorer::new(model, index_path.clone());
+
+        assert_eq!(
+            scorer.candidate_ids(),
+            None,
+            "before any rebuild, candidate_ids must be structurally unavailable, not an empty Some"
+        );
+
+        scorer.rebuild(fixture.vault()).unwrap();
+
+        let mut ids: Vec<String> = scorer
+            .candidate_ids()
+            .expect("a freshly rebuilt index must report its candidates")
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["note-x".to_string(), "note-y".to_string()],
+            "candidate_ids must return exactly the real notes the rebuild just embedded, neither empty nor a wider/narrower set"
+        );
+
+        let _ = std::fs::remove_file(&index_path);
+    }
+
+    #[test]
     fn on_note_indexed_skips_re_embedding_when_content_hash_is_unchanged() {
         let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
             eprintln!("skipping: cached model artifacts not found on this machine");
@@ -490,6 +572,81 @@ mod tests {
                 .clone()
         };
         assert_eq!(before, after, "re-indexing identical text_searchable must not change the stored embedding (no re-embed)");
+
+        let _ = std::fs::remove_file(&index_path);
+    }
+
+    #[test]
+    fn on_note_indexed_genuinely_skips_the_re_embed_call_when_content_hash_matches() {
+        // Mutation-testing fix: the test above alone could not
+        // distinguish "the comparison correctly skipped re-embedding"
+        // from "it re-embedded anyway and happened to get the exact
+        // same deterministic vector" -- both look identical from the
+        // OUTSIDE. This test breaks that ambiguity by deliberately
+        // planting an obviously-wrong embedding directly into the
+        // in-memory index after a real rebuild, then calling
+        // on_note_indexed with the SAME text_searchable. If the `==`
+        // comparison were inverted to `!=` (the exact mutant
+        // cargo-mutants found), this call would re-embed and silently
+        // REPLACE the planted wrong vector with a correct one -- the
+        // only way to prove the skip genuinely happened is to confirm
+        // the deliberately-wrong vector survives untouched.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        let fixture = VaultFixture::new("incremental-genuine-skip");
+        fixture.write_note(
+            "note-a",
+            "stable searchable content for the genuine-skip probe",
+        );
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let index_path = fixture.root.join("index.bin");
+        let scorer = ProductionDenseScorer::new(model, index_path.clone());
+        scorer.rebuild(fixture.vault()).unwrap();
+
+        const PLANTED_WRONG_EMBEDDING_MARKER: f32 = 999.999;
+        {
+            let mut state = scorer.index.lock().unwrap();
+            let LoadState::Loaded(index) = &mut *state else {
+                panic!("expected a loaded index")
+            };
+            let entry = index
+                .entries
+                .iter_mut()
+                .find(|e| e.note_id == "note-a")
+                .unwrap();
+            entry.embedding = vec![PLANTED_WRONG_EMBEDDING_MARKER; entry.embedding.len()];
+            // content_hash is left UNCHANGED -- this is the exact
+            // condition the `==` comparison is supposed to detect and
+            // skip on.
+        }
+
+        let note_id = NoteId::parse("note-a").unwrap();
+        let record = fixture.vault().read_note(&note_id).unwrap();
+        let (metadata, body) = storage::split_record(record.content.as_bytes()).unwrap();
+        let document = Document::new(metadata, body.as_deref());
+        scorer.on_note_indexed(&note_id, &document);
+
+        let state = scorer.index.lock().unwrap();
+        let LoadState::Loaded(index) = &*state else {
+            panic!("expected a loaded index")
+        };
+        let entry = index
+            .entries
+            .iter()
+            .find(|e| e.note_id == "note-a")
+            .unwrap();
+        assert_eq!(
+            entry.embedding,
+            vec![PLANTED_WRONG_EMBEDDING_MARKER; entry.embedding.len()],
+            "an unchanged content_hash must genuinely skip re-embedding -- the deliberately \
+             planted (wrong) embedding must survive untouched, proving the skip actually \
+             happened rather than coincidentally reproducing the same vector"
+        );
+        drop(state);
 
         let _ = std::fs::remove_file(&index_path);
     }
