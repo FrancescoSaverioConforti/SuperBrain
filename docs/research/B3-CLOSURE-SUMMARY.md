@@ -11,6 +11,10 @@ design draft at the end.
 **Verdict: B1 deterministic trigram+BM25 baseline PASSES both frozen
 thresholds. B3 is CLOSED. Baseline ACCEPTED.**
 
+**This document freezes the historical state at B3 closure.** Subsequent
+B3-TUNE-v2 experiments are documented separately and do not alter the B3
+baseline verdict.
+
 ---
 
 ## 1. Scope recap
@@ -156,9 +160,11 @@ statistically meaningful on its own.
 ## 9. Baseline verdict
 
 **PASS.** The B1 deterministic trigram+BM25 baseline passes both frozen
-thresholds on held-out data, with Recall@10 and nDCG@10 slightly higher on
-test than on calibration (no overfitting signal — the opposite direction
-would have been the concerning one). Abstention is a confirmed, consistent
+thresholds on held-out data. Recall@10 and nDCG@10 were higher on the
+held-out test than on calibration. Therefore, no calibration-to-test
+degradation suggestive of obvious overfitting was observed, while the
+limited split sizes and associated uncertainty remain acknowledged.
+Abstention is a confirmed, consistent
 structural limitation across all three splits (dev, calibration, test):
 the baseline never returns `NotPresent`, so it has no working "I don't
 know" signal. This is accepted as a known baseline property, not a defect
@@ -167,8 +173,10 @@ to fix within B3's own scope.
 ## 10. What is NOT part of this closure
 
 - No MCP server exists or was built.
-- No merge, tag, or push has occurred — all B3 work lives on local branch
-  `b3-retrieval-eval`.
+- `b3-retrieval-eval` was published to origin as a separate branch
+  checkpoint. No B3 merge into main and no B3 tag occurred as part of
+  this closure. Subsequent commits may exist locally beyond the last
+  pushed checkpoint and should be verified separately if needed.
 - `graph_query`/`get_code_context`/Task 10/A5: not started, not touched.
 - No threshold, config, or protocol change occurred after this final-test
   result was read.
