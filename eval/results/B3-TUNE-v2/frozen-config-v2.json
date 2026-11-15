@@ -1,0 +1,66 @@
+{
+  "_comment": "B3-TUNE-v2 Priority 4 -- frozen v2 configuration, written before any v2 held-out content was read. Hard rule (verbatim-equivalent to eval/results/B3/frozen-config.json): any change to model, representation, retrieval config, metrics, or promotion criteria made AFTER reading any v2 held-out result invalidates that held-out run as independent evidence for this configuration.",
+  "freeze_date": "2026-11-14",
+  "model_runtime": {
+    "model_name": "all-MiniLM-L6-v2",
+    "hf_repo": "sentence-transformers/all-MiniLM-L6-v2",
+    "pinned_revision_sha": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "onnx_artifact_path": ".priority4-model-cache/all-MiniLM-L6-v2/model.onnx",
+    "onnx_artifact_sha256": "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+    "onnx_runtime_crate": "ort",
+    "onnx_runtime_crate_version": "2.0.0-rc.15",
+    "tokenizer_artifact_path": ".priority4-model-cache/all-MiniLM-L6-v2/tokenizer.json",
+    "tokenizer_artifact_sha256": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    "tokenizer_crate_version": "0.23.2",
+    "embedding_dimension": 384
+  },
+  "representation_semantics": {
+    "document_searchable_surface": "index::document::Document::text_searchable (B1's existing redaction-aware field, unmodified)",
+    "query_representation": "raw query string, no prefix",
+    "prefix": null,
+    "max_sequence_length": 256,
+    "truncation_policy": "truncate to 256 tokens, tail discarded",
+    "chunking_policy": "none (Stage 1 decision; truncation events recorded per-note, not chunked)",
+    "pooling": "mean pooling over token embeddings, using attention mask to exclude padding",
+    "embedding_normalization": "L2",
+    "similarity_metric": "cosine",
+    "source_spec": "docs/superpowers/specs/2026-11-14-b3-tune-v2-priority4-stage1-dev-freeze.md, Section 2"
+  },
+  "retrieval": {
+    "dense_candidate_depth": 50,
+    "final_top_k": 10,
+    "candidate_ordering": "score descending, then note-id lexicographic ascending tie-break (B1's existing convention)",
+    "filtering_privacy_semantics": "unchanged from B1's existing search_impl (project/type/status/trust/time filters, Sensitive-note redaction before embedding)",
+    "sensitive_note_behavior": "embedding input is built from text_searchable only, never raw note body; verified by this session's privacy test in the Stage 1 dense-DEV harness"
+  },
+  "frozen_quality_gates": {
+    "recall_at_10_degradation_vs_b1_max_absolute": 0.05,
+    "ndcg_at_10_improvement_vs_b1_min_absolute": 0.03
+  },
+  "frozen_cost_gates": {
+    "warm_query_p95_max_multiple_of_b1": 3.0,
+    "peak_ram_max_mb": 300,
+    "model_weight_footprint_max_mb": 150,
+    "vector_index_footprint_approx_max_kb_per_note": 2,
+    "build_index_time_max_multiple_of_b1": 5.0
+  },
+  "evidence_provenance": {
+    "corpus_manifest_sha256": "5fcc32eab09b9ea738b2cee89a68e051f03dae1a39d83e67b32f07383fcd2f51",
+    "dev_labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+    "calibration_labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+    "b1_official_frozen_config_sha256": "25060eda466b7ac310f630d1489474c60207e68a9a7c58a3a040361418cf106a",
+    "dev_report_minilm_sha256": "f980713ece2cd9f500a79fa504621885e4700a8c3dc2ba80897368fe2ffcfbee",
+    "calibration_dense_report_sha256": "f4d023485d2181ff4e1591b69f58b65d6d901c35f1b36be3947de7b925870615",
+    "calibration_hybrid_report_sha256": "f0409f81fad43f211b463e22f325d834fb5b97ebf0b45fb39ddb77a2d1c473f3",
+    "calibration_cost_report_sha256": "5022783d1e5a39bcdd47ed5d69685e2ae21ee3668e213e00a0c57174f6954a7c",
+    "selected_implementation_commit": "97ace1a",
+    "freeze_commit": "TO_BE_FILLED_BY_THIS_COMMIT",
+    "bootstrap_seed": 0,
+    "bootstrap_resamples": 2000,
+    "metric_formula_module": "crates/api/src/metrics.rs (unchanged from B3/Priority1-3)"
+  },
+  "hard_rule": "Any change to retrieval_config, representation semantics, model, metric formulas, or promotion criteria made AFTER reading any v2 held-out (B3-TUNE-v2 Priority 4) result invalidates that held-out run as independent evidence for this configuration. This mirrors eval/results/B3/frozen-config.json's own hard rule verbatim in spirit.",
+  "promoted_candidate": "all-MiniLM-L6-v2 dense-only",
+  "rejected_candidate": "all-MiniLM-L6-v2 + B1 hybrid-RRF (failed the nDCG@10-vs-dense-standalone gate at calibration)",
+  "official_baseline_unchanged": "B1 (eval/results/B3/frozen-config.json, commit 52d42ea) remains the official baseline until/unless this v2 configuration passes v2 held-out validation"
+}
