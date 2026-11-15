@@ -12,7 +12,7 @@ description = "SuperBrain local read-only core API."
 # dependency exposure, identical to every pre-B4 build. Enabling it
 # links ort/tokenizers/ndarray as real production dependencies, for
 # RetrievalMode::DenseV2 (index::search::RetrievalMode, B4.0).
-dense-retrieval = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:sha2"]
+dense-retrieval = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:sha2", "dep:ureq"]
 
 [dependencies]
 domain = { path = "../domain" }
@@ -36,6 +36,12 @@ ndarray = { version = "0.17", optional = true }
 # one -- a real gap the evaluation harness never closed (see
 # crates/api/src/dense.rs's own module doc comment).
 sha2 = { version = "0.10", optional = true }
+# B4.8: the one-time, explicit setup step that fetches the pinned
+# model/tokenizer artifacts (same pinned HF revision the evaluation
+# harness already used) -- not a runtime/query-time dependency; see
+# crate::dense::setup's own doc comment for the offline-after-fetch
+# contract this enforces.
+ureq = { version = "3", optional = true }
 
 [[example]]
 name = "b3_tune_v2_priority4_cost"
