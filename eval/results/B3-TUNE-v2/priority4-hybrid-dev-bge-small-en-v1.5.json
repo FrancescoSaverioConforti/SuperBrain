@@ -1,0 +1,180 @@
+{
+  "model": "bge-small-en-v1.5",
+  "split": "dev",
+  "run_commit": "c0921d42c1e37fb44b1097c8390caff85602d611",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "query_count": 60,
+  "answerable_query_count": 49,
+  "b1_lexical_only": {
+    "recall_at_10": 0.8367346938775511,
+    "ndcg_at_10": 0.7139021585460019,
+    "recall_ci": [
+      0.7346938775510204,
+      0.9387755102040817
+    ],
+    "ndcg_ci": [
+      0.6058832617246017,
+      0.8148598173679488
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "dense_standalone": {
+    "recall_at_10": 1.0,
+    "ndcg_at_10": 0.8815116212402966,
+    "recall_ci": [
+      1.0,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.8195829275596708,
+      0.9349724606665246
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "hybrid_rrf": {
+    "recall_at_10": 0.8979591836734694,
+    "ndcg_at_10": 0.8030469712247614,
+    "recall_ci": [
+      0.8163265306122449,
+      0.9795918367346939
+    ],
+    "ndcg_ci": [
+      0.7059855640940534,
+      0.8909111993440262
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "hybrid_by_category": {
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8494849471938838,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6539034834183777,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 0.8,
+      "ndcg_at_10": 0.7386852807234542,
+      "recall_ci": [
+        0.5,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4773705614469083,
+        1.0
+      ],
+      "n": 10,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9235456186184012,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.816091401309749,
+        1.0
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "identifier-code": {
+      "recall_at_10": 0.7777777777777778,
+      "ndcg_at_10": 0.6216880933862499,
+      "recall_ci": [
+        0.4444444444444444,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.3584580660053006,
+        0.847881083730162
+      ],
+      "n": 9,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 0.8571428571428571,
+      "ndcg_at_10": 0.7516942153061307,
+      "recall_ci": [
+        0.5714285714285714,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4659799295918449,
+        0.9472756790816368
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    }
+  },
+  "hybrid_by_difficulty": {
+    "hard": {
+      "recall_at_10": 0.9166666666666666,
+      "ndcg_at_10": 0.8004497029299666,
+      "recall_ci": [
+        0.75,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6030271823942548,
+        0.9692441461309548
+      ],
+      "n": 12,
+      "low_confidence": false
+    },
+    "medium": {
+      "recall_at_10": 0.9090909090909091,
+      "ndcg_at_10": 0.8755390685064962,
+      "recall_ci": [
+        0.7727272727272727,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7391754321428597,
+        0.9832240797077936
+      ],
+      "n": 22,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 0.8666666666666667,
+      "ndcg_at_10": 0.6988030431807193,
+      "recall_ci": [
+        0.6666666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5122966151648444,
+        0.8678521707204
+      ],
+      "n": 15,
+      "low_confidence": false
+    }
+  }
+}
