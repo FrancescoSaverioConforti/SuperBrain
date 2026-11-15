@@ -54,7 +54,7 @@
     "calibration_hybrid_report_sha256": "f0409f81fad43f211b463e22f325d834fb5b97ebf0b45fb39ddb77a2d1c473f3",
     "calibration_cost_report_sha256": "5022783d1e5a39bcdd47ed5d69685e2ae21ee3668e213e00a0c57174f6954a7c",
     "selected_implementation_commit": "97ace1a",
-    "freeze_commit": "TO_BE_FILLED_BY_THIS_COMMIT",
+    "freeze_commit": "c27d043",
     "bootstrap_seed": 0,
     "bootstrap_resamples": 2000,
     "metric_formula_module": "crates/api/src/metrics.rs (unchanged from B3/Priority1-3)"
