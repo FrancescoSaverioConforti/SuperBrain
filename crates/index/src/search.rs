@@ -210,6 +210,60 @@ pub enum RetrievalMode {
     DenseV2,
 }
 
+/// B4.2 frozen contract
+/// (`docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md`).
+/// Injected capability, mirroring `storage::Indexer`'s own cross-crate
+/// trait-boundary pattern: `index` depends on no embedding runtime. A
+/// caller that wants `RetrievalMode::DenseV2` to do anything supplies an
+/// implementation of this trait via `Index::with_dense_scorer`; `index`
+/// never knows or cares what is behind it.
+pub trait DenseScorer: Send + Sync {
+    /// Returns a ranked list of `(note_id, cosine_similarity)` pairs for
+    /// `query`, restricted to `candidate_ids` — never a wider set. `index`
+    /// still re-reads, re-validates and re-filters every returned id
+    /// through the existing authoritative per-candidate loop exactly as
+    /// it does for the lexical path; this method only proposes which ids
+    /// to consider and a score to rank them by.
+    ///
+    /// Returns `None` if the dense path is structurally unavailable
+    /// (model/index not loaded, hash-mismatched, runtime failed to init)
+    /// — `search_impl` falls back to the `Lexical` candidate set for that
+    /// request. A transient error is the implementation's own
+    /// responsibility to resolve into one of these two outcomes before
+    /// returning.
+    fn score(
+        &self,
+        query: &str,
+        candidate_ids: &[storage::NoteId],
+    ) -> Option<Vec<(storage::NoteId, f64)>>;
+
+    /// Builds (or confirms up to date) the dense index for every live
+    /// note `vault` holds, mirroring
+    /// `index::indexer_impl::rebuild_index`'s own cold-start contract
+    /// exactly (same caller discipline: outside any writer's lock,
+    /// called once at startup or on-demand).
+    fn rebuild(&self, vault: &Vault) -> Result<(), DenseScorerError>;
+
+    /// Called once per note write, to keep the dense index incrementally
+    /// current without a full rebuild. `document` is the SAME
+    /// `crate::document::Document` the lexical path already built for
+    /// this note — this method embeds `document.text_searchable`, never
+    /// a raw body, enforcing privacy parity at the type level.
+    fn on_note_indexed(&self, note_id: &storage::NoteId, document: &crate::document::Document);
+
+    /// Called when a note is deleted — the incremental path's removal
+    /// call, for a delete that happens between rebuilds.
+    fn on_note_deleted(&self, note_id: &storage::NoteId);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseScorerError {
+    /// The vault could not be read during rebuild.
+    VaultUnavailable,
+    /// The dense index could not be written.
+    IndexWriteFailed,
+}
+
 pub struct Index<'a> {
     vault: &'a Vault,
     indexer: &'a RealIndexer,
@@ -233,6 +287,11 @@ pub struct Index<'a> {
     /// Defaults to `RetrievalMode::Lexical` in `new()`; every existing
     /// call site is unaffected.
     retrieval_mode: RetrievalMode,
+    /// B4.2 frozen contract (see `DenseScorer`'s own doc comment).
+    /// Defaults to `None` in `new()`; every existing call site is
+    /// unaffected, and the trait's mere presence changes nothing unless
+    /// `retrieval_mode` is also `DenseV2` (B4.6 wires that branch).
+    dense_scorer: Option<&'a dyn DenseScorer>,
 }
 
 /// B3-TUNE-v2 Priority 3 Stage 1, Lever P2's frozen status-tier mapping
@@ -269,6 +328,7 @@ impl<'a> Index<'a> {
             identifier_boost: false,
             status_tiebreak: false,
             retrieval_mode: RetrievalMode::default(),
+            dense_scorer: None,
         }
     }
 
@@ -315,6 +375,17 @@ impl<'a> Index<'a> {
     /// site.
     pub fn with_retrieval_mode(mut self, mode: RetrievalMode) -> Self {
         self.retrieval_mode = mode;
+        self
+    }
+
+    /// Additive builder (B4.2 frozen contract,
+    /// `docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md`).
+    /// Attaches a `DenseScorer` implementation. Default (never called):
+    /// `None`. The trait's mere presence changes nothing unless
+    /// `retrieval_mode` is ALSO `RetrievalMode::DenseV2` (B4.6 wires that
+    /// branch) — attaching a scorer under `Lexical` is a no-op.
+    pub fn with_dense_scorer(mut self, scorer: &'a dyn DenseScorer) -> Self {
+        self.dense_scorer = Some(scorer);
         self
     }
 

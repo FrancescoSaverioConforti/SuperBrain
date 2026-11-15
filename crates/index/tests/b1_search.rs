@@ -1214,3 +1214,54 @@ fn with_retrieval_mode_lexical_is_byte_identical_to_never_calling_it() {
         "explicitly setting Lexical must be byte-identical to never calling with_retrieval_mode at all"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B4.2: `DenseScorer` trait boundary
+// (docs/superpowers/specs/2026-11-15-b4-2-dense-scorer-trait-and-runtime.md).
+// `with_dense_scorer` is additive and default-off (`None`): a caller who
+// never calls it, and every pre-B4.2 call site, must behave identically
+// regardless of RetrievalMode -- the trait's mere existence changes nothing
+// until B4.6 wires search_impl's own DenseV2 branch to actually consult it.
+// ---------------------------------------------------------------------------
+
+struct StubDenseScorer {
+    response: std::sync::Mutex<Option<Vec<(storage::NoteId, f64)>>>,
+}
+impl index::search::DenseScorer for StubDenseScorer {
+    fn score(&self, _query: &str, _candidate_ids: &[storage::NoteId]) -> Option<Vec<(storage::NoteId, f64)>> {
+        self.response.lock().unwrap().clone()
+    }
+    fn rebuild(&self, _vault: &storage::Vault) -> Result<(), index::search::DenseScorerError> {
+        Ok(())
+    }
+    fn on_note_indexed(&self, _note_id: &storage::NoteId, _document: &index::document::Document) {}
+    fn on_note_deleted(&self, _note_id: &storage::NoteId) {}
+}
+
+#[test]
+fn with_dense_scorer_under_lexical_mode_does_not_change_behavior() {
+    // Attaching a scorer without ever selecting DenseV2 must be a no-op --
+    // the trait's mere presence on `Index` changes nothing under Lexical.
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "dense_scorer_noop_under_lexical_probe"), 0);
+    index::indexer_impl::rebuild_index(&f.vault, &f.indexer).unwrap();
+    let scorer = StubDenseScorer { response: std::sync::Mutex::new(Some(vec![])) };
+    let plain = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"));
+    let with_scorer = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_dense_scorer(&scorer);
+    assert_eq!(
+        plain.search("dense_scorer_noop_under_lexical_probe", Default::default(), 10).unwrap(),
+        with_scorer.search("dense_scorer_noop_under_lexical_probe", Default::default(), 10).unwrap(),
+        "attaching a DenseScorer must not change Lexical-mode behavior at all"
+    );
+}
+
+#[test]
+fn dense_scorer_error_variants_exist_and_are_distinct() {
+    // Pins the exact error shape B4.2's design froze -- a compile-time
+    // contract test, not a behavioral one.
+    assert_ne!(
+        index::search::DenseScorerError::VaultUnavailable,
+        index::search::DenseScorerError::IndexWriteFailed
+    );
+}
