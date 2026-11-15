@@ -733,4 +733,161 @@ mod tests {
 
         let _ = std::fs::remove_file(&index_path);
     }
+
+    // --- B4.7: broader integration/adversarial tests, per the B4
+    // acceptance criteria beyond what B4.4/B4.5/B4.6 already covered:
+    // restart (a fresh process reloading a persisted index), model-
+    // identity mismatch at the ProductionDenseScorer level (not just
+    // raw-artifact tampering, already covered in crate::dense's own
+    // tests), and concurrent access. ---
+
+    #[test]
+    fn restart_reloads_a_persisted_index_without_rebuilding() {
+        // Simulates a process restart: build and persist an index with
+        // one ProductionDenseScorer instance, then construct a SECOND,
+        // independent instance pointed at the same file (never calling
+        // rebuild on it) and confirm it can score using the persisted
+        // data alone -- the real "does disk persistence actually work
+        // across process boundaries" test, distinct from the in-memory
+        // round-trip B4.4's own tests already covered.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        let fixture = VaultFixture::new("restart");
+        fixture.write_note("note-a", "content that survives a simulated restart");
+
+        let index_path = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-restart-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let env = dense::shared_environment();
+            let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+            let first_process_scorer = ProductionDenseScorer::new(model, index_path.clone());
+            first_process_scorer.rebuild(fixture.vault()).unwrap();
+            // first_process_scorer drops here -- its in-memory state is
+            // gone, exactly as it would be across a real process exit.
+        }
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let second_process_scorer = ProductionDenseScorer::new(model, index_path.clone());
+        // Deliberately NOT calling rebuild() on this instance -- the
+        // whole point is proving the PERSISTED file alone is sufficient.
+        let candidates = [NoteId::parse("note-a").unwrap()];
+        let scores = second_process_scorer
+            .score("content from a restart", &candidates)
+            .expect("a fresh instance must load the persisted index from disk, not require a fresh rebuild");
+        assert_eq!(
+            scores.len(),
+            1,
+            "the persisted note must be scorable after a simulated restart"
+        );
+
+        let _ = std::fs::remove_file(&index_path);
+    }
+
+    #[test]
+    fn a_model_identity_mismatch_in_the_persisted_file_is_treated_as_unavailable() {
+        // Writes a DenseIndex with a WRONG model_identity_hash directly
+        // (simulating an index built by a different model version, or
+        // a stale index left over from before a model upgrade), then
+        // confirms ProductionDenseScorer treats it as structurally
+        // unavailable (B4.0's frozen fallback condition 2), never
+        // reading mismatched vectors as if they were valid.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        let index_path = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-model-mismatch-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let wrong_identity_index = DenseIndex {
+            model_identity_hash: [0xAAu8; 32], // deliberately NOT model_identity_hash()
+            embedding_dimension: dense::EMBEDDING_DIMENSION as u32,
+            entries: vec![IndexEntry {
+                note_id: "note-a".to_string(),
+                content_hash: 1,
+                embedding: vec![0.1; dense::EMBEDDING_DIMENSION],
+            }],
+        };
+        dense_storage::write_atomic(
+            &index_path,
+            &dense_storage::serialize(&wrong_identity_index),
+        )
+        .unwrap();
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let scorer = ProductionDenseScorer::new(model, index_path.clone());
+        let candidates = [NoteId::parse("note-a").unwrap()];
+        assert_eq!(
+            scorer.score("anything", &candidates),
+            None,
+            "a persisted index whose model_identity_hash does not match the currently-loaded \
+             model must be treated as structurally unavailable, never read as if valid"
+        );
+
+        let _ = std::fs::remove_file(&index_path);
+    }
+
+    #[test]
+    fn concurrent_reads_during_a_rebuild_never_panic_or_deadlock() {
+        // Spawns several threads calling score() concurrently while a
+        // rebuild is in progress on another thread, confirming the
+        // Mutex-guarded interior state (B4.4 design doc, Section 1)
+        // genuinely serializes access without panicking or deadlocking
+        // -- not merely assumed safe because it compiles under Send +
+        // Sync.
+        let Some((onnx_path, tokenizer_path)) = cached_artifact_paths() else {
+            eprintln!("skipping: cached model artifacts not found on this machine");
+            return;
+        };
+        let fixture = VaultFixture::new("concurrency");
+        for i in 0..5 {
+            fixture.write_note(
+                &format!("note-{i}"),
+                &format!("concurrent test content number {i}"),
+            );
+        }
+
+        let env = dense::shared_environment();
+        let model = EmbeddingModel::load(env, &onnx_path, &tokenizer_path).unwrap();
+        let index_path = std::env::temp_dir().join(format!(
+            "superbrain-dense-lifecycle-concurrency-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let scorer = std::sync::Arc::new(ProductionDenseScorer::new(model, index_path.clone()));
+        scorer.rebuild(fixture.vault()).unwrap();
+
+        let candidates: Vec<NoteId> = (0..5)
+            .map(|i| NoteId::parse(&format!("note-{i}")).unwrap())
+            .collect();
+
+        std::thread::scope(|s| {
+            let rebuild_scorer = scorer.clone();
+            let rebuild_vault = fixture.vault();
+            s.spawn(move || {
+                for _ in 0..3 {
+                    rebuild_scorer.rebuild(rebuild_vault).unwrap();
+                }
+            });
+            for _ in 0..4 {
+                let read_scorer = scorer.clone();
+                let read_candidates = candidates.clone();
+                s.spawn(move || {
+                    for _ in 0..5 {
+                        // Must not panic or deadlock, regardless of
+                        // whether it observes a pre- or post-rebuild
+                        // state -- both are valid interleavings.
+                        let _ = read_scorer.score("concurrent test content", &read_candidates);
+                    }
+                });
+            }
+        });
+
+        let _ = std::fs::remove_file(&index_path);
+    }
 }
