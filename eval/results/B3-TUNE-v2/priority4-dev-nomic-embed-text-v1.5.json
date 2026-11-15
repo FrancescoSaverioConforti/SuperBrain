@@ -1,0 +1,153 @@
+{
+  "model": "nomic-embed-text-v1.5",
+  "split": "dev",
+  "run_commit": "3caea77a57e7d090b982e986cf77f73fe897234e",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "dense_top_n": 50,
+  "query_count": 60,
+  "answerable_query_count": 49,
+  "candidate_recall_hits": 49,
+  "candidate_recall_rate": 1.0,
+  "truncation_events": 0,
+  "total_embed_calls": 102,
+  "dense_recall_at_10": 1.0,
+  "dense_recall_at_10_ci": [
+    1.0,
+    1.0
+  ],
+  "dense_ndcg_at_10": 0.9088921166125319,
+  "dense_ndcg_at_10_ci": [
+    0.8581164982396388,
+    0.9533111815352305
+  ],
+  "by_category": {
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.847239508296199,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6746723188990816,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8926780576829022,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7734534104956718,
+        1.0
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "identifier-code": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8769765845238192,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7539531690476383,
+        1.0
+      ],
+      "n": 9,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9472756790816368,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8418270372449104,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9261859507142916,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8154648767857287,
+        1.0
+      ],
+      "n": 10,
+      "low_confidence": false
+    }
+  },
+  "by_difficulty": {
+    "medium": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9604968069805208,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8982663412337689,
+        1.0
+      ],
+      "n": 22,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8234220788463978,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6961363321554191,
+        0.9432882195426604
+      ],
+      "n": 12,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9015812676190554,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8031625352381108,
+        0.9753953169047639
+      ],
+      "n": 15,
+      "low_confidence": false
+    }
+  }
+}

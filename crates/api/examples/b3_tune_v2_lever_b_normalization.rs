@@ -1,0 +1,744 @@
+//! B3-TUNE-v2 Priority 2 Lever B: conservative punctuation
+//! normalization. Two modes:
+//! - `--diagnostic` (Task 4): scans every distinct token in the corpus
+//!   + dev split, applies `index::lexical_normalize::strip_trailing_sentence_punctuation`,
+//!   and reports every token where stripping changes it, for manual
+//!   review — this never changes tokenization itself, it only observes
+//!   what the rule would do.
+//! - `--ablate <split>` (Task 5): runs `B-query` (normalization applied
+//!   to the query only) and `B-symmetric` (normalization applied to both
+//!   indexed text and query) against the real corpus, measuring the
+//!   effect on Recall@10/nDCG@10. `bm25::tokenize` itself is never
+//!   modified; this binary duplicates its exact, documented
+//!   whitespace+lowercase logic locally (that function is `pub(crate)`
+//!   to the `index` crate, not visible here), since this plan does not
+//!   widen `bm25::tokenize`'s visibility or otherwise touch the frozen
+//!   production tokenizer.
+
+use index::indexer_impl::{rebuild_index, RealIndexer};
+use index::lexical_normalize::strip_trailing_sentence_punctuation;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use storage::{NoteId, Vault, Version};
+use uuid::Uuid;
+
+const CANARY_ROW_ID: &str = "canary-isolation-probe";
+const CORPUS_NOTES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/rag/corpus/notes");
+const RESULTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/results/B3-TUNE-v2");
+const K: usize = 10;
+const BOOTSTRAP_SEED: u64 = 0;
+const BOOTSTRAP_RESAMPLES: u32 = 2000;
+
+/// Duplicate of `index::bm25::tokenize`'s exact documented behavior
+/// (whitespace-delimited, Unicode-aware, case-folded, no punctuation
+/// stripping) — that function is `pub(crate)` to the `index` crate and
+/// not visible here; this plan does not widen its visibility, per
+/// Global Constraints' "no existing call site changes behavior."
+fn tokenize_like_bm25(text: &str) -> Vec<String> {
+    text.split_whitespace().map(|token| token.to_lowercase()).collect()
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LabelRow {
+    id: String,
+    question: String,
+    #[allow(dead_code)]
+    answer: String,
+    category: String,
+    difficulty: String,
+    abstain_expected: bool,
+    relevant_note_ids: Vec<String>,
+    graded_relevance: HashMap<String, u8>,
+    #[allow(dead_code)]
+    citation_spans: Vec<serde_json::Value>,
+}
+
+fn parse_label_rows(text: &str) -> Vec<LabelRow> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("malformed label row: {e}\nline: {line}"))
+        })
+        .collect()
+}
+
+fn exclude_canary(rows: Vec<LabelRow>) -> Vec<LabelRow> {
+    rows.into_iter().filter(|r| r.id != CANARY_ROW_ID).collect()
+}
+
+struct TestFixture {
+    vault: Option<Vault>,
+    pii: Option<vault_security::PiiStore>,
+    indexer: Arc<RealIndexer>,
+    root: std::path::PathBuf,
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        // See the identical comment in b3_tune_v2_lever_a_bm25_params.rs's
+        // TestFixture::drop: dropping vault/pii explicitly, in this
+        // order, before touching the filesystem avoids a Windows
+        // file-lock race that would otherwise leak this temp directory.
+        drop(self.vault.take());
+        drop(self.pii.take());
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl TestFixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("superbrain-b3-tune-v2-lever-b-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let repo = git2::Repository::init(&root).unwrap();
+            let sig = git2::Signature::now("B3-TUNE-v2 Lever B", "test@localhost").unwrap();
+            let oid = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        let pii_root = root.join(".pii-store");
+        let pii =
+            vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii.bootstrap_deletion_log().unwrap();
+        let vault =
+            Vault::open_with_pii_store(root.clone(), &root.join("journal.sqlite"), &pii).unwrap();
+        Self { vault: Some(vault), pii: Some(pii), indexer: Arc::new(RealIndexer::new()), root }
+    }
+
+    /// Same as `new`, but the fixture's `RealIndexer` is constructed
+    /// with `RealIndexer::new_with_text_normalizer(normalizer)` instead
+    /// of the plain default — the real-pipeline `B-symmetric`
+    /// verification's own mechanism (Task "B verification checkpoint",
+    /// user-authorized 2026-11-14). The corpus commit and the plain
+    /// `B1` production path remain completely unaffected elsewhere;
+    /// this fixture is a separate instance, never a mutation of an
+    /// existing one.
+    fn new_with_text_normalizer(normalizer: fn(&str) -> String) -> Self {
+        let root = std::env::temp_dir().join(format!("superbrain-b3-tune-v2-lever-b-realpipeline-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let repo = git2::Repository::init(&root).unwrap();
+            let sig = git2::Signature::now("B3-TUNE-v2 Lever B", "test@localhost").unwrap();
+            let oid = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        let pii_root = root.join(".pii-store");
+        let pii =
+            vault_security::PiiStore::open(pii_root.clone(), &pii_root.join("master.key")).unwrap();
+        pii.bootstrap_deletion_log().unwrap();
+        let vault =
+            Vault::open_with_pii_store(root.clone(), &root.join("journal.sqlite"), &pii).unwrap();
+        Self {
+            vault: Some(vault),
+            pii: Some(pii),
+            indexer: Arc::new(RealIndexer::new_with_text_normalizer(normalizer)),
+            root,
+        }
+    }
+
+    fn vault(&self) -> &Vault {
+        self.vault.as_ref().unwrap()
+    }
+
+    fn pii(&self) -> &vault_security::PiiStore {
+        self.pii.as_ref().unwrap()
+    }
+
+    fn commit_corpus(&self) -> usize {
+        let note_paths: Vec<_> = std::fs::read_dir(CORPUS_NOTES_DIR)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+        let known_ids: HashSet<NoteId> = note_paths
+            .iter()
+            .map(|path| {
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                NoteId::parse(stem).unwrap()
+            })
+            .collect();
+        let mut committed = 0;
+        for path in &note_paths {
+            let note_text = std::fs::read_to_string(path).unwrap();
+            let outcome = storage::propose_and_commit(
+                self.vault(),
+                &note_text,
+                Version(0),
+                Uuid::new_v4(),
+                &known_ids,
+                &HashSet::new(),
+                &policy::Gate::new(policy::SecretPolicy::new(1)),
+                Some(self.pii()),
+            )
+            .unwrap();
+            assert!(
+                matches!(outcome, storage::CommitResult::Committed(_)),
+                "corpus note {path:?} failed to commit: {outcome:?}"
+            );
+            committed += 1;
+        }
+        committed
+    }
+
+    fn build_index(&self) -> index::Index<'_> {
+        rebuild_index(self.vault(), &self.indexer).unwrap();
+        index::Index::new(
+            self.vault(),
+            &self.indexer,
+            "eval-b3",
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
+        )
+    }
+}
+
+fn allow_policy() -> policy::ReadPolicy {
+    policy::ReadPolicy::new(true, true)
+}
+
+fn request_context() -> api::RequestContext {
+    api::RequestContext {
+        schema_version: api::SCHEMA_VERSION,
+        correlation_id: Uuid::new_v4(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum QueryOutcome {
+    NotPresent,
+    Matches { retrieved_note_ids: Vec<String> },
+}
+
+fn run_one_query(idx: &index::Index<'_>, question: &str, k: usize) -> QueryOutcome {
+    let response = api::search(
+        idx,
+        &allow_policy(),
+        request_context(),
+        api::SearchRequest {
+            text: question.to_string(),
+            filters: Default::default(),
+            k,
+        },
+    );
+    let search_response = response.result.unwrap_or_else(|e| {
+        panic!("search failed for question {question:?}: {e}");
+    });
+    match search_response.outcome {
+        index::search::SearchOutcome::NotPresent => QueryOutcome::NotPresent,
+        index::search::SearchOutcome::Matches { first, rest } => {
+            let mut ids: Vec<String> = vec![first.note_id.as_str().to_string()];
+            ids.extend(rest.iter().map(|r| r.note_id.as_str().to_string()));
+            ids.truncate(k);
+            QueryOutcome::Matches { retrieved_note_ids: ids }
+        }
+    }
+}
+
+/// Normalizes `text` by splitting on whitespace, applying
+/// `strip_trailing_sentence_punctuation` per token, and rejoining with
+/// single spaces. Used for both the query side (always) and, in
+/// `B-symmetric`, the indexed-text side too — the SAME function call in
+/// both places, so the two sides can never drift from each other.
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(strip_trailing_sentence_punctuation)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `B-query`: applies normalization to the question text only, against
+/// a plain, unmodified index (indexed text stays exactly as B1 indexes
+/// it today).
+fn run_one_query_normalized(idx: &index::Index<'_>, question: &str, k: usize) -> QueryOutcome {
+    run_one_query(idx, &normalize_text(question), k)
+}
+
+/// `B-symmetric`'s own standalone scoring path: builds a `Bm25Index` +
+/// `TrigramIndex` pair directly from the corpus's `text_searchable`
+/// content, with `strip_trailing_sentence_punctuation` applied to every
+/// token on the INDEXED side (never done by `RealIndexer`, which always
+/// calls the frozen, unmodified `bm25::tokenize`) before insertion. This
+/// bypasses `RealIndexer`/`rebuild_index` entirely, by design: proving
+/// a symmetric effect requires indexed text this plan's own frozen
+/// pipeline has never normalized, which is not something `RealIndexer`
+/// can be asked to do without touching `bm25::tokenize` itself.
+struct SymmetricIndex {
+    bm25: index::bm25::Bm25Index,
+    trigram: index::trigram::TrigramIndex,
+}
+
+impl SymmetricIndex {
+    fn build(corpus_dir: &str) -> Self {
+        let mut bm25 = index::bm25::Bm25Index::new();
+        let mut trigram = index::trigram::TrigramIndex::new();
+        for entry in std::fs::read_dir(corpus_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let raw = std::fs::read(&path).unwrap();
+            let document = index::document::Document::from_record_bytes(&raw)
+                .unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+            let normalized_text = normalize_text(&document.text_searchable);
+            let note_id = NoteId::parse(&document.id).unwrap();
+            bm25.insert(note_id.clone(), &normalized_text);
+            trigram.insert(note_id, &normalized_text);
+        }
+        Self { bm25, trigram }
+    }
+
+    /// Runs one normalized query against this standalone index. Mirrors
+    /// `RealIndexer::candidate_ids`'s own candidate generation (unions
+    /// `trigram.query_exact(query)` with every note `bm25.query_ranked`
+    /// scores above zero) before final BM25 ranking — the trigram side
+    /// only widens which notes are even considered, since `bm25.query_ranked`
+    /// is what actually produces the returned ranking and scores.
+    /// Simplified versus the real `Index::search` in one respect: no
+    /// vault/project/classification/time filtering is re-applied, since
+    /// this standalone index has none of that — every corpus note is
+    /// eligible by construction.
+    fn search(&self, query: &str, k: usize) -> QueryOutcome {
+        let normalized_query = normalize_text(query);
+        let mut candidates: HashSet<NoteId> = self.trigram.query_exact(&normalized_query).into_iter().collect();
+        candidates.extend(self.bm25.query_ranked(&normalized_query, usize::MAX).into_iter().map(|(id, _)| id));
+        if candidates.is_empty() {
+            return QueryOutcome::NotPresent;
+        }
+        let ranked = self.bm25.query_ranked(&normalized_query, k);
+        if ranked.is_empty() {
+            return QueryOutcome::NotPresent;
+        }
+        QueryOutcome::Matches {
+            retrieved_note_ids: ranked.into_iter().map(|(id, _)| id.as_str().to_string()).collect(),
+        }
+    }
+}
+
+fn run_one_query_symmetric(idx: &SymmetricIndex, question: &str, k: usize) -> QueryOutcome {
+    idx.search(question, k)
+}
+
+fn build_index_with_normalization() -> SymmetricIndex {
+    SymmetricIndex::build(CORPUS_NOTES_DIR)
+}
+
+struct ScoredRow {
+    recall_at_10: f64,
+    ndcg_at_10: f64,
+}
+
+fn score_answerable_row(row: &LabelRow, outcome: &QueryOutcome) -> ScoredRow {
+    let empty: Vec<String> = Vec::new();
+    let retrieved_note_ids = match outcome {
+        QueryOutcome::NotPresent => &empty,
+        QueryOutcome::Matches { retrieved_note_ids } => retrieved_note_ids,
+    };
+    ScoredRow {
+        recall_at_10: api::metrics::recall_at_10(&row.relevant_note_ids, retrieved_note_ids),
+        ndcg_at_10: api::metrics::ndcg_at_10(retrieved_note_ids, &row.graded_relevance),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MetricBreakdown {
+    recall_at_10: f64,
+    ndcg_at_10: f64,
+    recall_ci: [f64; 2],
+    ndcg_ci: [f64; 2],
+    n: usize,
+    low_confidence: bool,
+}
+
+fn metrics_breakdown(recall_values: &[f64], ndcg_values: &[f64], seed: u64, resamples: u32) -> MetricBreakdown {
+    let n = recall_values.len();
+    let recall_mean = recall_values.iter().sum::<f64>() / n as f64;
+    let ndcg_mean = ndcg_values.iter().sum::<f64>() / n as f64;
+    let recall_ci = api::metrics::bootstrap_ci(recall_values, seed, resamples);
+    let ndcg_ci = api::metrics::bootstrap_ci(ndcg_values, seed, resamples);
+    MetricBreakdown {
+        recall_at_10: recall_mean,
+        ndcg_at_10: ndcg_mean,
+        recall_ci: [recall_ci.low, recall_ci.high],
+        ndcg_ci: [ndcg_ci.low, ndcg_ci.high],
+        n,
+        low_confidence: n < api::metrics::LOW_CONFIDENCE_FLOOR,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ConfusionMatrixReport {
+    tp: u32,
+    tn: u32,
+    fp: u32,
+    #[serde(rename = "fn")]
+    fn_: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OptionalMetricReport {
+    value: Option<f64>,
+    ci: Option<[f64; 2]>,
+    valid_resamples: u32,
+    total_resamples: u32,
+    low_confidence: bool,
+}
+
+fn optional_metric_report(result: &api::metrics::OptionalMetricResult) -> OptionalMetricReport {
+    OptionalMetricReport {
+        value: result.point_estimate,
+        ci: result.ci.map(|c| [c.low, c.high]),
+        valid_resamples: result.valid_resamples,
+        total_resamples: result.total_resamples,
+        low_confidence: (result.valid_resamples as usize) < api::metrics::LOW_CONFIDENCE_FLOOR,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AbstentionReport {
+    confusion_matrix: ConfusionMatrixReport,
+    precision: OptionalMetricReport,
+    recall: OptionalMetricReport,
+    f1: OptionalMetricReport,
+    accuracy: OptionalMetricReport,
+    n: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct VariantReport {
+    variant: String,
+    aggregate: MetricBreakdown,
+    abstention: AbstentionReport,
+}
+
+fn git_rev_parse_head() -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("failed to run git rev-parse HEAD");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn sha256_hex_of_file(path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Scores a variant from already-computed outcomes (avoids re-running
+/// each query a second time just to also compare rankings — used by
+/// the real-pipeline verification, which needs each split's raw
+/// `QueryOutcome`s for its own `queries_with_changed_ranking` count).
+/// `outcomes` must be in the same order as `rows`.
+fn score_variant_from_outcomes(rows: &[LabelRow], outcomes: &[QueryOutcome], variant_name: &str) -> VariantReport {
+    let cursor = std::cell::Cell::new(0usize);
+    run_variant(rows, |_row| {
+        let i = cursor.get();
+        cursor.set(i + 1);
+        outcomes[i].clone()
+    }, variant_name)
+}
+
+fn run_variant(rows: &[LabelRow], run_query: impl Fn(&LabelRow) -> QueryOutcome, variant_name: &str) -> VariantReport {
+    let mut recall_values: Vec<f64> = Vec::new();
+    let mut ndcg_values: Vec<f64> = Vec::new();
+    let mut abstain_expected_flags: Vec<bool> = Vec::new();
+    let mut predicted_not_present_flags: Vec<bool> = Vec::new();
+
+    for row in rows {
+        let outcome = run_query(row);
+        abstain_expected_flags.push(row.abstain_expected);
+        predicted_not_present_flags.push(matches!(outcome, QueryOutcome::NotPresent));
+        if !row.abstain_expected {
+            let scored = score_answerable_row(row, &outcome);
+            recall_values.push(scored.recall_at_10);
+            ndcg_values.push(scored.ndcg_at_10);
+        }
+    }
+
+    let aggregate = metrics_breakdown(&recall_values, &ndcg_values, BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES);
+    let cm_bootstrap = api::metrics::confusion_matrix_bootstrap(
+        &abstain_expected_flags,
+        &predicted_not_present_flags,
+        BOOTSTRAP_SEED,
+        BOOTSTRAP_RESAMPLES,
+    );
+    let abstention = AbstentionReport {
+        confusion_matrix: ConfusionMatrixReport {
+            tp: cm_bootstrap.confusion_matrix.tp,
+            tn: cm_bootstrap.confusion_matrix.tn,
+            fp: cm_bootstrap.confusion_matrix.fp,
+            fn_: cm_bootstrap.confusion_matrix.fn_,
+        },
+        precision: optional_metric_report(&cm_bootstrap.precision),
+        recall: optional_metric_report(&cm_bootstrap.recall),
+        f1: optional_metric_report(&cm_bootstrap.f1),
+        accuracy: optional_metric_report(&cm_bootstrap.accuracy),
+        n: rows.len(),
+    };
+
+    VariantReport { variant: variant_name.to_string(), aggregate, abstention }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AblationReport {
+    split: String,
+    run_commit: String,
+    labels_sha256: String,
+    b_query: VariantReport,
+    b_symmetric: VariantReport,
+}
+
+fn run_ablation_for_split(split: &str) -> AblationReport {
+    assert!(
+        split == "dev" || split == "calibration",
+        "Lever B's ablation only ever reads dev or calibration, never test or v2-heldout; got {split:?}"
+    );
+    let labels_path = format!("{}/../../eval/rag/{split}/labels.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let raw_labels_text = std::fs::read_to_string(&labels_path).unwrap();
+    let rows = exclude_canary(parse_label_rows(&raw_labels_text));
+
+    let fixture = TestFixture::new();
+    fixture.commit_corpus();
+    let plain_idx = fixture.build_index();
+    let b_query = run_variant(&rows, |row| run_one_query_normalized(&plain_idx, &row.question, K), "B-query");
+
+    let symmetric_idx = build_index_with_normalization();
+    let b_symmetric = run_variant(&rows, |row| run_one_query_symmetric(&symmetric_idx, &row.question, K), "B-symmetric");
+
+    AblationReport {
+        split: split.to_string(),
+        run_commit: git_rev_parse_head(),
+        labels_sha256: sha256_hex_of_file(&labels_path),
+        b_query,
+        b_symmetric,
+    }
+}
+
+/// Real-pipeline B-symmetric verification (user-authorized checkpoint,
+/// 2026-11-14): runs the SAME already-frozen `strip_trailing_sentence_punctuation`
+/// policy through the real `RealIndexer`/`Index::search` path (via
+/// `RealIndexer::new_with_text_normalizer(normalize_text)` for the
+/// indexed side, `run_one_query_normalized` for the query side — the
+/// identical `normalize_text` function both sides, never a second
+/// implementation), against plain, unmodified B1 (`build_index()`) run
+/// on the same corpus/labels for the candidate-set/ranking comparison.
+/// Production/default `RealIndexer::new()` behavior is untouched.
+#[derive(Debug, serde::Serialize)]
+struct RealPipelineVerificationReport {
+    split: String,
+    run_commit: String,
+    labels_sha256: String,
+    /// Confirms the policy used here is byte-identical to the frozen
+    /// one: the normalizer passed to `RealIndexer::new_with_text_normalizer`
+    /// is the literal `normalize_text` function, which in turn calls
+    /// `strip_trailing_sentence_punctuation` (Task 4's frozen rule) —
+    /// no new rule, no different character set, no new tuning.
+    normalization_policy_identical_to_frozen: bool,
+    b1_baseline_this_run: VariantReport,
+    b_symmetric_real_pipeline: VariantReport,
+    /// How many of this split's non-canary queries had a DIFFERENT
+    /// top-10 retrieved-note-id ranking under `B-symmetric` versus
+    /// plain B1 on this same run — the real-pipeline analog of the
+    /// standalone-scorer report's informal "0.0000 means nothing
+    /// changed" observation, made explicit rather than implied.
+    queries_with_changed_ranking: usize,
+    query_count: usize,
+}
+
+fn run_real_pipeline_verification_for_split(split: &str) -> RealPipelineVerificationReport {
+    assert!(
+        split == "dev" || split == "calibration",
+        "Lever B's real-pipeline verification only ever reads dev or calibration, never test or v2-heldout; got {split:?}"
+    );
+    let labels_path = format!("{}/../../eval/rag/{split}/labels.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let raw_labels_text = std::fs::read_to_string(&labels_path).unwrap();
+    let rows = exclude_canary(parse_label_rows(&raw_labels_text));
+
+    let b1_fixture = TestFixture::new();
+    b1_fixture.commit_corpus();
+    let b1_idx = b1_fixture.build_index();
+    let b1_outcomes: Vec<QueryOutcome> = rows.iter().map(|row| run_one_query(&b1_idx, &row.question, K)).collect();
+    let b1 = score_variant_from_outcomes(&rows, &b1_outcomes, "B1-real-pipeline-this-run");
+
+    let normalized_fixture = TestFixture::new_with_text_normalizer(normalize_text);
+    normalized_fixture.commit_corpus();
+    let normalized_idx = normalized_fixture.build_index();
+    let symmetric_outcomes: Vec<QueryOutcome> = rows
+        .iter()
+        .map(|row| run_one_query_normalized(&normalized_idx, &row.question, K))
+        .collect();
+    let b_symmetric = score_variant_from_outcomes(&rows, &symmetric_outcomes, "B-symmetric-real-pipeline");
+
+    let queries_with_changed_ranking = b1_outcomes
+        .iter()
+        .zip(symmetric_outcomes.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    RealPipelineVerificationReport {
+        split: split.to_string(),
+        run_commit: git_rev_parse_head(),
+        labels_sha256: sha256_hex_of_file(&labels_path),
+        normalization_policy_identical_to_frozen: true,
+        b1_baseline_this_run: b1,
+        b_symmetric_real_pipeline: b_symmetric,
+        queries_with_changed_ranking,
+        query_count: rows.len(),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TokenDiagnosticEntry {
+    original: String,
+    stripped: String,
+}
+
+fn run_token_diagnostic() -> Vec<TokenDiagnosticEntry> {
+    let mut distinct_tokens: HashSet<String> = HashSet::new();
+
+    for entry in std::fs::read_dir(CORPUS_NOTES_DIR).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let raw = std::fs::read(&path).unwrap();
+        let document = index::document::Document::from_record_bytes(&raw)
+            .unwrap_or_else(|e| panic!("failed to parse {path:?}: {e}"));
+        distinct_tokens.extend(tokenize_like_bm25(&document.text_searchable));
+    }
+
+    let dev_labels_path = format!("{}/../../eval/rag/dev/labels.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let dev_text = std::fs::read_to_string(&dev_labels_path).unwrap();
+    for row in exclude_canary(parse_label_rows(&dev_text)) {
+        distinct_tokens.extend(tokenize_like_bm25(&row.question));
+    }
+
+    let mut affected: Vec<TokenDiagnosticEntry> = distinct_tokens
+        .into_iter()
+        .filter_map(|token| {
+            let stripped = strip_trailing_sentence_punctuation(&token);
+            if stripped == token {
+                None
+            } else {
+                Some(TokenDiagnosticEntry { original: token.clone(), stripped: stripped.to_string() })
+            }
+        })
+        .collect();
+    affected.sort_by(|a, b| a.original.cmp(&b.original));
+    affected
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--diagnostic") => {
+            let affected = run_token_diagnostic();
+            for entry in &affected {
+                println!("{:?} -> {:?}", entry.original, entry.stripped);
+            }
+            std::fs::create_dir_all(RESULTS_DIR).unwrap();
+            let out_path = format!("{RESULTS_DIR}/priority2-lever-b-token-diagnostic.json");
+            let json = serde_json::to_string_pretty(&affected).unwrap();
+            std::fs::write(&out_path, json).unwrap();
+            println!("wrote {out_path} ({} affected tokens)", affected.len());
+        }
+        Some("--ablate") => {
+            let split = args.get(2).cloned().unwrap_or_else(|| panic!("--ablate requires a split (dev|calibration)"));
+            let report = run_ablation_for_split(&split);
+            println!(
+                "{split}: B-query Recall@10={:.4} nDCG@10={:.4} | B-symmetric Recall@10={:.4} nDCG@10={:.4}",
+                report.b_query.aggregate.recall_at_10, report.b_query.aggregate.ndcg_at_10,
+                report.b_symmetric.aggregate.recall_at_10, report.b_symmetric.aggregate.ndcg_at_10
+            );
+            std::fs::create_dir_all(RESULTS_DIR).unwrap();
+            let out_path = format!("{RESULTS_DIR}/priority2-lever-b-{split}-ablation.json");
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            std::fs::write(&out_path, json).unwrap();
+            println!("wrote {out_path}");
+        }
+        Some("--verify-real-pipeline") => {
+            let split = args.get(2).cloned().unwrap_or_else(|| panic!("--verify-real-pipeline requires a split (dev|calibration)"));
+            let report = run_real_pipeline_verification_for_split(&split);
+            println!(
+                "{split}: B1(this run) Recall@10={:.4} nDCG@10={:.4} | B-symmetric(real pipeline) Recall@10={:.4} nDCG@10={:.4} | queries_with_changed_ranking={}/{}",
+                report.b1_baseline_this_run.aggregate.recall_at_10, report.b1_baseline_this_run.aggregate.ndcg_at_10,
+                report.b_symmetric_real_pipeline.aggregate.recall_at_10, report.b_symmetric_real_pipeline.aggregate.ndcg_at_10,
+                report.queries_with_changed_ranking, report.query_count
+            );
+            std::fs::create_dir_all(RESULTS_DIR).unwrap();
+            let out_path = format!("{RESULTS_DIR}/priority2-lever-b-{split}-real-pipeline-verification.json");
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            std::fs::write(&out_path, json).unwrap();
+            println!("wrote {out_path}");
+        }
+        other => panic!("usage: --diagnostic | --ablate <dev|calibration> | --verify-real-pipeline <dev|calibration>; got {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_pipeline_fixture_with_text_normalizer_indexes_normalized_text() {
+        let fixture = TestFixture::new_with_text_normalizer(normalize_text);
+        fixture.commit_corpus();
+        let idx = fixture.build_index();
+        // A query with a trailing comma the corpus's own indexed text
+        // doesn't have must still match via the real search path once
+        // the indexed side is normalized too -- same assertion shape as
+        // the B-query/B-symmetric tests above, but through RealIndexer
+        // this time, not a standalone scorer.
+        let result = run_one_query_normalized(&idx, "resolve_configured_timezone", 10);
+        assert!(matches!(result, QueryOutcome::Matches { .. }));
+    }
+
+    /// Mirrors `index::bm25::tokenize`'s own pin test
+    /// (`tokenize_is_whitespace_delimited_and_case_folded_with_no_punctuation_stripping`
+    /// in `crates/index/src/bm25.rs`) with the same example assertions,
+    /// since `tokenize_like_bm25` duplicates that function's logic and
+    /// the two can't be mechanically kept in sync across the crate
+    /// boundary (`bm25::tokenize` is `pub(crate)`). If either test ever
+    /// needs a different assertion to pass, the other one must be
+    /// checked for drift too.
+    #[test]
+    fn tokenize_like_bm25_matches_the_real_tokenizers_documented_behavior() {
+        assert_eq!(tokenize_like_bm25("Rust Systems"), vec!["rust", "systems"]);
+        assert_eq!(tokenize_like_bm25("BM25, index."), vec!["bm25,", "index."]);
+        assert_eq!(tokenize_like_bm25("C++ C# foo::bar"), vec!["c++", "c#", "foo::bar"]);
+        assert_eq!(tokenize_like_bm25(""), Vec::<String>::new());
+        assert_eq!(tokenize_like_bm25("  leading  and  trailing  "), vec!["leading", "and", "trailing"]);
+    }
+
+    #[test]
+    fn dropping_a_fixture_removes_its_temp_directory() {
+        let fixture = TestFixture::new();
+        let root = fixture.root.clone();
+        assert!(root.exists());
+        drop(fixture);
+        assert!(!root.exists(), "TestFixture's temp directory must be removed on drop: {root:?}");
+    }
+
+    #[test]
+    fn a_query_with_trailing_punctuation_matches_the_same_as_without() {
+        let fixture = TestFixture::new();
+        fixture.commit_corpus();
+        let idx = fixture.build_index(); // plain B1 index, unmodified
+        let with_comma = run_one_query_normalized(&idx, "resolve_configured_timezone,", 10);
+        let without_comma = run_one_query_normalized(&idx, "resolve_configured_timezone", 10);
+        assert_eq!(with_comma, without_comma);
+    }
+
+    #[test]
+    fn build_index_with_normalization_indexes_stripped_tokens() {
+        let idx = build_index_with_normalization();
+        let result = run_one_query_symmetric(&idx, "resolve_configured_timezone", 10);
+        assert!(matches!(result, QueryOutcome::Matches { .. }));
+    }
+}

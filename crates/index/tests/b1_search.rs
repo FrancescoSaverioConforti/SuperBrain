@@ -834,3 +834,336 @@ fn profiling_preserves_response_and_counts_both_accepted_and_filtered_candidates
     );
     assert!(!format!("{profile:?}").contains("needle"));
 }
+
+#[test]
+fn with_bm25_params_changes_real_search_scores() {
+    let f = Fixture::new();
+    f.write(&Note::new("short-note", "rust"), 0);
+    f.write(&Note::new("long-note", &"rust ".repeat(50)), 0);
+
+    let default_scores = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .search("rust", SearchFilters::default(), 10)
+        .unwrap();
+    let b_zero_scores = Index::new(&f.vault, &f.indexer, "project-x", date("2026-10-26"))
+        .with_bm25_params(1.2, 0.0) // b=0 disables length normalization entirely
+        .search("rust", SearchFilters::default(), 10)
+        .unwrap();
+
+    assert_ne!(
+        default_scores, b_zero_scores,
+        "b=0.0 must change real search scores vs the default b=0.75"
+    );
+}
+
+#[test]
+fn new_with_bm25_params_changes_candidate_prefilter_scores() {
+    let f = Fixture::new();
+    f.write(&Note::new("short-note", "rust"), 0);
+    f.write(&Note::new("long-note", &"rust ".repeat(50)), 0);
+
+    let default_indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &default_indexer).unwrap();
+    let default_ranked = default_indexer.bm25_ranked("rust", 10);
+
+    let b_zero_indexer = RealIndexer::new_with_bm25_params(1.2, 0.0);
+    index::indexer_impl::rebuild_index(&f.vault, &b_zero_indexer).unwrap();
+    let b_zero_ranked = b_zero_indexer.bm25_ranked("rust", 10);
+
+    assert_ne!(
+        default_ranked, b_zero_ranked,
+        "b=0.0 must change the candidate prefilter's own BM25 scores vs the default b=0.75"
+    );
+}
+
+#[test]
+fn new_with_text_normalizer_applies_the_hook_before_indexing_text() {
+    let f = Fixture::new();
+    f.write(&Note::new("note-a", "resolve_configured_timezone,"), 0);
+
+    let default_indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &default_indexer).unwrap();
+    // Default indexer: the trailing comma stays part of the indexed
+    // token, so a query WITHOUT the comma relies on prefix-free exact
+    // token matching alone and the comma-bearing token never equals it.
+    let default_hit_without_comma = default_indexer.bm25_ranked("resolve_configured_timezone", 10);
+
+    fn strip_trailing_comma(text: &str) -> String {
+        text.split_whitespace()
+            .map(|tok| tok.trim_end_matches(','))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let normalized_indexer = RealIndexer::new_with_text_normalizer(strip_trailing_comma);
+    index::indexer_impl::rebuild_index(&f.vault, &normalized_indexer).unwrap();
+    let normalized_hit_without_comma = normalized_indexer.bm25_ranked("resolve_configured_timezone", 10);
+
+    assert!(
+        default_hit_without_comma.is_empty(),
+        "sanity check: without the hook, the comma-bearing indexed token must not match the comma-free query"
+    );
+    assert!(
+        !normalized_hit_without_comma.is_empty(),
+        "the text normalizer hook must apply to indexed text before it reaches trigram/bm25 insertion"
+    );
+}
+
+// --- B3-TUNE-v2 Priority 3 Stage 1, P1: exact structural-identifier boost. ---
+
+#[test]
+fn identifier_boost_fires_on_exact_whole_token_match_against_source_fragment() {
+    let f = Fixture::new();
+    // Both notes share a body term so both are real BM25 candidates for
+    // the query regardless of the boost (candidate generation is
+    // unaffected by P1) — note-a's source additionally contains
+    // "...#SEC-001" per the frozen extraction rule, note-b's does not,
+    // so only the boost (not candidate membership) decides which ranks
+    // first once the query also contains the literal token "sec-001".
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "shared_probe_term extra filler words so note-b scores higher on shared_probe_term alone") }, 0);
+    f.write(&Note::new("note-b", "shared_probe_term shared_probe_term shared_probe_term"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    let plain_first = |outcome: index::search::SearchOutcome| match outcome {
+        index::search::SearchOutcome::Matches { first, .. } => first.note_id.as_str().to_string(),
+        index::search::SearchOutcome::NotPresent => panic!("expected a match"),
+    };
+    // Sanity check: without the boost, note-b's higher term frequency
+    // on "shared_probe_term" alone must outrank note-a (the query's
+    // "sec-001" token has zero BM25/trigram overlap with either note's
+    // indexed text on its own, since neither note's source token is an
+    // exact whole-token match for "sec-001" by itself).
+    let plain_outcome = plain.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
+    assert_eq!(plain_first(plain_outcome), "note-b", "sanity check: without the boost, note-b's term frequency must win");
+
+    let boosted_outcome = boosted.search("shared_probe_term sec-001", Default::default(), 10).unwrap().outcome;
+    assert_eq!(plain_first(boosted_outcome), "note-a", "the exact identifier match's boost must outrank note-b's higher term frequency");
+}
+
+#[test]
+fn identifier_boost_never_fires_on_a_substring_or_prefix_match() {
+    let f = Fixture::new();
+    // Both notes are genuine candidates (shared body term) regardless of
+    // the boost, so this test can actually distinguish "the boost fired"
+    // from "the candidate was never reachable" -- the Review finding
+    // confirmed the original version of this test (note-a isolated, no
+    // shared term) passed even when the matching rule was mutated to
+    // always fire, since note-a never became a candidate at all.
+    //
+    // To make this test actually falsifiable against a substring/prefix
+    // bug (e.g. a buggy rule using `contains`/`starts_with` instead of
+    // exact equality), note-b must have a genuinely higher base BM25
+    // score than note-a -- so that a WRONGLY-applied boost on note-a
+    // (from "sec" incorrectly matching "SEC-001" as a substring) would
+    // flip the ranking, while the correct exact-match rule (which
+    // declines to boost either note, since "sec" != "sec-001") leaves
+    // note-b's higher term frequency winning untouched.
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "shared_probe_term_b") }, 0);
+    f.write(&Note::new("note-b", "shared_probe_term_b shared_probe_term_b shared_probe_term_b extra filler words so note-b scores higher on term frequency alone"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    // "sec" is a substring/prefix of "SEC-001" but must never match it,
+    // so note-b's higher term frequency on shared_probe_term_b must
+    // still win even with the boost enabled -- a substring-matching bug
+    // would incorrectly boost note-a's score by IDENTIFIER_BOOST (100.0,
+    // far larger than any term-frequency difference) and flip this.
+    let response = idx.search("shared_probe_term_b sec", Default::default(), 10).unwrap();
+
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    assert_eq!(first.note_id.as_str(), "note-b", "\"sec\" must never match \"SEC-001\" as a substring/prefix");
+}
+
+#[test]
+fn identifier_boost_never_applies_to_a_sensitive_candidates_withheld_source() {
+    let f = Fixture::new();
+    // Both notes are genuine candidates (shared body term) regardless of
+    // the boost, mirroring the fix above -- a Sensitive note isolated
+    // with no shared term would never become a candidate at all, which
+    // would make this test pass vacuously (confirmed by Review mutation
+    // testing on the sibling test above).
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", classification: "sensitive", ..Note::new("note-a", "shared_probe_term_c") }, 0);
+    f.write(&Note::new("note-b", "shared_probe_term_c shared_probe_term_c shared_probe_term_c"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    // Sensitive: source is withheld by the existing pipeline before
+    // identifier_boost's logic can see it at all -- so the boosted
+    // ordering must be identical to the plain ordering even though the
+    // query contains the literal identifier and note-a would otherwise
+    // be eligible for the boost were its source not withheld.
+    let plain_outcome = plain.search("shared_probe_term_c sec-001", Default::default(), 10).unwrap().outcome;
+    let boosted_outcome = boosted.search("shared_probe_term_c sec-001", Default::default(), 10).unwrap().outcome;
+    assert_eq!(
+        format!("{plain_outcome:?}"), format!("{boosted_outcome:?}"),
+        "a Sensitive candidate's withheld source must never let the boost apply"
+    );
+}
+
+#[test]
+fn identifier_boost_does_not_change_the_candidate_set() {
+    let f = Fixture::new();
+    f.write(&Note { source: "docs/technical-debt.md#SEC-001", ..Note::new("note-a", "a note about sec-001 topic") }, 0);
+    f.write(&Note::new("note-b", "a note about sec-001 topic too"), 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let boosted = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_identifier_boost();
+
+    let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
+        match outcome {
+            index::search::SearchOutcome::NotPresent => Default::default(),
+            index::search::SearchOutcome::Matches { first, rest } => {
+                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                s.insert(first.note_id.as_str().to_string());
+                s
+            }
+        }
+    };
+    let plain_ids = ids(plain.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
+    let boosted_ids = ids(boosted.search("sec-001 topic", Default::default(), 10).unwrap().outcome);
+    assert_eq!(plain_ids, boosted_ids, "identifier_boost must only reorder, never change membership");
+}
+
+// --- B3-TUNE-v2 Priority 3 Stage 1, P2: status tie-break. ---
+
+#[test]
+fn status_tiebreak_fires_only_on_exactly_equal_bm25_scores() {
+    let f = Fixture::new();
+    // Both notes share identical text so their BM25 scores are
+    // bitwise-identical f64 values under the real pipeline.
+    f.write(&Note { status: "draft", ..Note::new("note-draft", "shared_term appears here") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-verified", "shared_term appears here") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let response = idx.search("shared_term", Default::default(), 10).unwrap();
+
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    assert_eq!(first.note_id.as_str(), "note-verified", "Verified must outrank Draft at an exact score tie");
+}
+
+#[test]
+fn status_tiebreak_never_fires_on_a_nonzero_score_difference() {
+    let f = Fixture::new();
+    // note-a has extra matching term frequency -> a strictly higher,
+    // non-tied BM25 score than note-b, despite note-b's higher status tier.
+    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term shared_term shared_term extra filler text to differ length") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let plain_outcome = plain.search("shared_term", Default::default(), 10).unwrap().outcome;
+    let tiebreak_outcome = tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome;
+
+    // Ordering must be identical whether or not the tiebreak flag is set,
+    // because the scores are NOT exactly equal.
+    assert_eq!(format!("{plain_outcome:?}"), format!("{tiebreak_outcome:?}"));
+}
+
+#[test]
+fn status_tiebreak_all_six_variants_map_to_the_frozen_tier_via_observed_ordering() {
+    // `status_tier` itself is private to `search.rs` and `#[cfg(test)]`
+    // does NOT cross the crate boundary into this integration-test binary
+    // (confirmed: Priority 2 Lever B had to duplicate logic locally for
+    // exactly this reason, and `indexer_impl.rs`'s own `#[cfg(test)]`
+    // helpers like `trigram_hits` are never called from this file today).
+    // So this test observes the tier ordering indirectly, through
+    // `with_status_tiebreak`'s real effect on search output, for every
+    // pair of tiers, rather than calling a private function directly.
+    let pairs = [
+        ("verified", "test-passed"),
+        ("reviewed", "test-passed"),
+        ("test-passed", "draft"),
+        ("draft", "superseded"),
+        ("draft", "contradicted"),
+    ];
+    for (higher_status, lower_status) in pairs {
+        let f = Fixture::new();
+        // Note ids are chosen so the HIGHER-tier note sorts AFTER the
+        // lower-tier note lexicographically ("note-z-higher" > "note-a-lower")
+        // -- the existing note-id tie-break alone would put note-a-lower
+        // first, so only a genuinely correct status_tier mapping can make
+        // note-z-higher win. The Review's mutation test confirmed the
+        // original id choice ("note-higher" < "note-lower") passed this
+        // test even with status_tier always returning Ordering::Equal,
+        // since the id tie-break alone already produced the expected
+        // order for every pair.
+        f.write(&Note { id: "note-z-higher", status: higher_status, ..Note::new("note-z-higher", "shared_tier_probe_term") }, 0);
+        f.write(&Note { id: "note-a-lower", status: lower_status, ..Note::new("note-a-lower", "shared_tier_probe_term") }, 0);
+        let indexer = RealIndexer::new();
+        index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+        let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+        let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+        let plain_response = plain.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+        let index::search::SearchOutcome::Matches { first: plain_first, .. } = plain_response.outcome else {
+            panic!("expected a match for {higher_status} vs {lower_status}");
+        };
+        assert_eq!(
+            plain_first.note_id.as_str(), "note-a-lower",
+            "control: without the tiebreak, the note-id order alone must put note-a-lower first for {higher_status} vs {lower_status}"
+        );
+
+        let tiebreak_response = tiebreak.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+        let index::search::SearchOutcome::Matches { first: tiebreak_first, .. } = tiebreak_response.outcome else {
+            panic!("expected a match for {higher_status} vs {lower_status}");
+        };
+        assert_eq!(
+            tiebreak_first.note_id.as_str(), "note-z-higher",
+            "{higher_status} must outrank {lower_status} at an exact score tie, reversing the note-id order"
+        );
+    }
+    // Same-tier pair: Verified and Reviewed must NOT have a defined
+    // relative order from this rule (falls through to note-id tie-break).
+    let f_same_tier = Fixture::new();
+    f_same_tier.write(&Note { id: "note-verified", status: "verified", ..Note::new("note-verified", "shared_tier_probe_term") }, 0);
+    f_same_tier.write(&Note { id: "note-reviewed", status: "reviewed", ..Note::new("note-reviewed", "shared_tier_probe_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f_same_tier.vault, &indexer).unwrap();
+    let idx = index::Index::new(&f_same_tier.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+    let response = idx.search("shared_tier_probe_term", Default::default(), 10).unwrap();
+    let index::search::SearchOutcome::Matches { first, .. } = response.outcome else {
+        panic!("expected a match");
+    };
+    // note-reviewed < note-verified lexicographically -> the existing
+    // note-id tie-break decides, unchanged by the same-tier status pair.
+    assert_eq!(first.note_id.as_str(), "note-reviewed");
+}
+
+#[test]
+fn status_tiebreak_does_not_change_the_candidate_set() {
+    let f = Fixture::new();
+    f.write(&Note { status: "draft", ..Note::new("note-a", "shared_term") }, 0);
+    f.write(&Note { status: "verified", ..Note::new("note-b", "shared_term") }, 0);
+    let indexer = RealIndexer::new();
+    index::indexer_impl::rebuild_index(&f.vault, &indexer).unwrap();
+    let plain = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26"));
+    let tiebreak = index::Index::new(&f.vault, &indexer, "project-x", date("2026-10-26")).with_status_tiebreak();
+
+    let ids = |outcome: index::search::SearchOutcome| -> std::collections::HashSet<String> {
+        match outcome {
+            index::search::SearchOutcome::NotPresent => Default::default(),
+            index::search::SearchOutcome::Matches { first, rest } => {
+                let mut s: std::collections::HashSet<String> = rest.iter().map(|r| r.note_id.as_str().to_string()).collect();
+                s.insert(first.note_id.as_str().to_string());
+                s
+            }
+        }
+    };
+    assert_eq!(
+        ids(plain.search("shared_term", Default::default(), 10).unwrap().outcome),
+        ids(tiebreak.search("shared_term", Default::default(), 10).unwrap().outcome),
+    );
+}

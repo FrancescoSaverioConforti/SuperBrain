@@ -1,0 +1,18 @@
+{
+  "target": "all-mpnet-base-v2",
+  "run_commit": "9822b32708ae0d38f308984b00d2e7700162a52b",
+  "startup_or_model_load_ms": 487.75649999999996,
+  "build_index_time_ms": 2181.4692999999997,
+  "warm_query_p50_ms": 38.969800000000006,
+  "warm_query_p95_ms": 40.6011,
+  "warm_query_sample_size": 49,
+  "embedding_inference_p50_ms": 38.5626,
+  "embedding_inference_p95_ms": 40.169700000000006,
+  "vector_search_p50_ms": 0.39530000000000004,
+  "vector_search_p95_ms": 0.4164,
+  "peak_rss_after_load_bytes": 484478976,
+  "peak_rss_after_build_bytes": 507281408,
+  "peak_rss_after_queries_bytes": 507437056,
+  "model_weight_bytes_on_disk": 435826548,
+  "vector_index_bytes_on_disk": 162816
+}

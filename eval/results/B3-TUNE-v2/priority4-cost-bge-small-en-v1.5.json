@@ -1,0 +1,18 @@
+{
+  "target": "bge-small-en-v1.5",
+  "run_commit": "9822b32708ae0d38f308984b00d2e7700162a52b",
+  "startup_or_model_load_ms": 198.2303,
+  "build_index_time_ms": 1036.2744,
+  "warm_query_p50_ms": 7.6131,
+  "warm_query_p95_ms": 9.459800000000001,
+  "warm_query_sample_size": 49,
+  "embedding_inference_p50_ms": 7.4275,
+  "embedding_inference_p95_ms": 9.275500000000001,
+  "vector_search_p50_ms": 0.188,
+  "vector_search_p95_ms": 0.2056,
+  "peak_rss_after_load_bytes": 182095872,
+  "peak_rss_after_build_bytes": 202178560,
+  "peak_rss_after_queries_bytes": 202530816,
+  "model_weight_bytes_on_disk": 133093490,
+  "vector_index_bytes_on_disk": 81408
+}

@@ -1,0 +1,161 @@
+{
+  "model": "all-MiniLM-L6-v2",
+  "split": "calibration",
+  "run_commit": "f57b36880070f44228c3778a681738649be35660",
+  "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+  "dense_top_n": 50,
+  "query_count": 30,
+  "answerable_query_count": 24,
+  "candidate_recall_hits": 24,
+  "candidate_recall_rate": 1.0,
+  "truncation_events": 0,
+  "total_embed_calls": 77,
+  "dense_recall_at_10": 1.0,
+  "dense_recall_at_10_ci": [
+    1.0,
+    1.0
+  ],
+  "dense_ndcg_at_10": 0.8614223731979377,
+  "dense_ndcg_at_10_ci": [
+    0.7608109284450495,
+    0.9455223360506796
+  ],
+  "delta_recall_vs_b1_frozen": 0.08333333333333337,
+  "delta_ndcg_vs_b1_frozen": 0.1523688283993493,
+  "by_category": {
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8576691395183482,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5730074185550449,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8222662065794719,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4667986197384159,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8769765845238191,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6309297535714574,
+        1.0
+      ],
+      "n": 3,
+      "low_confidence": true
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8436010519408085,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6538265712986061,
+        1.0
+      ],
+      "n": 6,
+      "low_confidence": false
+    },
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 2,
+      "low_confidence": true
+    },
+    "identifier-code": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8523719014285829,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7047438028571659,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    }
+  },
+  "by_difficulty": {
+    "medium": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7983043360032848,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6301605125909823,
+        0.9482433234612176
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8523719014285829,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7047438028571659,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9538662191964322,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8615986575892965,
+        1.0
+      ],
+      "n": 8,
+      "low_confidence": false
+    }
+  },
+  "abstention_confusion_matrix": {
+    "tp": 0,
+    "fp": 0,
+    "tn": 0,
+    "fn_": 6
+  }
+}

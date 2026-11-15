@@ -1,0 +1,363 @@
+{
+  "bug-2026-10-27-sec001-toctou": {
+    "category": "bugs-fixes",
+    "source": "docs/technical-debt.md#SEC-001",
+    "stratum": "project-history"
+  },
+  "bug-2026-10-27-sec002-fix-incomplete": {
+    "category": "bugs-fixes",
+    "source": "docs/technical-debt.md#SEC-002 (quarta revisione)",
+    "stratum": "project-history"
+  },
+  "bug-2026-10-27-sec002-symlink-aliasing": {
+    "category": "bugs-fixes",
+    "source": "docs/technical-debt.md#SEC-002",
+    "stratum": "project-history"
+  },
+  "bug-2026-10-27-sec003-hardlink-aliasing": {
+    "category": "bugs-fixes",
+    "source": "docs/technical-debt.md#SEC-003",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-08-b2-id018-opened": {
+    "category": "bugs-fixes",
+    "continuity_id": "d184pp",
+    "continuity_text": "B2-ID-018 opened (Important): TS interface_declaration not extracted \u2014 strict fix authorized and dispatched to background fork (agent a6c0f3e287d82e87b)",
+    "source": "continuity:d184pp",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-09-b2-id019-020-opened": {
+    "category": "bugs-fixes",
+    "continuity_id": "d186zr",
+    "continuity_text": "B2-ID-018 approved CLOSED; B2-ID-019 (generic heritage names) and B2-ID-020 (abstract_class_declaration invisible) opened as Important, strict fixes authorized and dispatched in sequence to background fork (agent a229007a81582138f)",
+    "source": "continuity:d186zr",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-10-b2-id019-020-closed": {
+    "category": "bugs-fixes",
+    "continuity_id": "d187ew",
+    "continuity_text": "B2-ID-019 and B2-ID-020 CLOSED (commits 6944094, d60d0c2) \u2014 both APPROVE, 0 genuine missed mutants; B2-EVAL-012 technically ready to resume (user's own call)",
+    "source": "continuity:d187ew",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-b2-eval012-ts-interfaces-missing": {
+    "category": "bugs-fixes",
+    "continuity_id": "d183dc",
+    "continuity_text": "B2-EVAL-012 (TS backend, domain-driven-hexagon@5c2d15a) PAUSED \u2014 new finding: TS interface_declaration never extracted (0/18 interfaces modeled, 0 Implements edges to local interfaces)",
+    "source": "continuity:d183dc",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-b2-id013-014-015-fixed": {
+    "category": "bugs-fixes",
+    "continuity_id": "d176ze",
+    "continuity_text": "CommonJS Extraction Checkpoint CLOSED (GO): B2-ID-013/014/015 all FIXED; new B2-ID-016 (Moderate) opened; A5 still not justified",
+    "source": "continuity:d176ze",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-b2-id017-parser-dispatch": {
+    "category": "bugs-fixes",
+    "continuity_id": "d180lt",
+    "continuity_text": "B2-ID-017 CLOSED (confirmed): parser_for() HTML/CSS dispatch gap fixed and verified",
+    "source": "continuity:d180lt",
+    "stratum": "project-history"
+  },
+  "bug-2026-11-java-scope-correction": {
+    "category": "bugs-fixes",
+    "continuity_id": "d170ij",
+    "continuity_text": "Correction: Java scope gap is NOT B2-ID-012 \u2014 that ID stays assigned to the pre-existing resolve_lineage O(n^2) finding; Java logged as documented future-language-support gap, not a defect",
+    "source": "continuity:d170ij",
+    "stratum": "project-history"
+  },
+  "code-api-lib-b1-callable-core": {
+    "category": "identifier-code",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/api/src/lib.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": null
+  },
+  "code-automation-rbac-actions-touch-device": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/automation_rbac.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "actions_touch_device"
+  },
+  "code-automation-rbac-collect-device-targets": {
+    "category": "cross-file-concept",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/automation_rbac.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "collect_device_targets"
+  },
+  "code-document-sensitive-vs-internal-fields": {
+    "category": "identifier-code",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/index/src/document.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": null
+  },
+  "code-document-text-searchable-classification": {
+    "category": "cross-file-concept",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/index/src/document.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": null
+  },
+  "code-parse-note-id-shared-validator": {
+    "category": "cross-file-concept",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/storage/src/propose.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": "parse_note_id"
+  },
+  "code-propose-propose-and-commit": {
+    "category": "identifier-code",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/storage/src/propose.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": "propose_and_commit"
+  },
+  "code-roles-add-remove-role-shared-state": {
+    "category": "cross-file-concept",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "add_role"
+  },
+  "code-roles-config-path-constant": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": null
+  },
+  "code-roles-list-roles": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "list_roles"
+  },
+  "code-roles-load-roles-reload-roles": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "load_roles"
+  },
+  "code-roles-remove-role-raises-keyerror": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "remove_role"
+  },
+  "code-roles-role-has-permission": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "Access_control/src/roles.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "role_has_permission"
+  },
+  "code-schedule-lock-guardrail-evaluate": {
+    "category": "cross-file-concept",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/schedule_lock_guardrail.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "evaluate_schedule_lock_guardrail"
+  },
+  "code-schedule-lock-guardrail-extract-device-ids": {
+    "category": "cross-file-concept",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/schedule_lock_guardrail.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "extract_trigger_condition_device_ids"
+  },
+  "code-search-provenance-withheld-for-sensitive": {
+    "category": "identifier-code",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/index/src/search.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": null
+  },
+  "code-sun-times-get-sun-times-today": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/sun_times.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "get_sun_times_today"
+  },
+  "code-sun-times-reset-cache-for-tests": {
+    "category": "cross-file-concept",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/sun_times.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "_reset_cache_for_tests"
+  },
+  "code-time-range-resolve-time-expression": {
+    "category": "identifier-code",
+    "commit": "e92dc781bcd32fcca5445295221f36aea2fe791e",
+    "path": "crates/index/src/time_range.rs",
+    "repository": "superbrain",
+    "stratum": "code",
+    "symbol": "resolve_time_expression"
+  },
+  "code-timezone-resolver-resolve-configured-timezone": {
+    "category": "identifier-code",
+    "commit": "ec274f4680c19f5b335a01a7a563c8f64546e7e2",
+    "path": "app/core/timezone_resolver.py",
+    "repository": "controllore",
+    "stratum": "code",
+    "symbol": "resolve_configured_timezone"
+  },
+  "decision-2026-10-26-a1-complete": {
+    "category": "notes-decisions",
+    "continuity_id": "m1j5",
+    "continuity_text": "A1 (Schema e storage) COMPLETED and merged to main \u2014 tag a1-complete",
+    "source": "continuity:m1j5",
+    "stratum": "project-history"
+  },
+  "decision-2026-10-26-c2-approval-channel": {
+    "category": "notes-decisions",
+    "source": "docs/Spec_mvp.md#C2",
+    "stratum": "project-history"
+  },
+  "decision-2026-10-26-faseb-deterministic-baseline": {
+    "category": "notes-decisions",
+    "source": "docs/Spec_mvp.md#Fase-B",
+    "stratum": "project-history"
+  },
+  "decision-2026-10-26-spec-frozen": {
+    "category": "notes-decisions",
+    "source": "docs/Spec_mvp.md",
+    "stratum": "project-history"
+  },
+  "decision-2026-10-a3-pii-design-rejected": {
+    "category": "notes-decisions",
+    "continuity_id": "x1ks",
+    "continuity_text": "A3 draft 1 design: gate unconditionally rejects Sensitive forever, PiiStore+Markdown pointer as two separately-recovered transactions, unauthenticated deletion-log reference file, Task 0 test requiring SEC-00x to stay vulnerable, and a new propose_delete public entry point [REJECTED]",
+    "source": "continuity:x1ks",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-03-b2-eval010-js-commonjs-complete": {
+    "category": "notes-decisions",
+    "continuity_id": "d174xx",
+    "continuity_text": "B2-EVAL-010 (JS/CommonJS domain, request/request@3c0cddc) COMPLETE \u2014 GO to next domain, A5 still not justified",
+    "source": "continuity:d174xx",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-04-b2-eval011-html-css-complete": {
+    "category": "notes-decisions",
+    "continuity_id": "d181cf",
+    "continuity_text": "B2-EVAL-011 (HTML/CSS domain, tbreuss/html-boilerplate@01d53fa) COMPLETE \u2014 GO to next domain, A5 still not justified",
+    "source": "continuity:d181cf",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-10-b2-closure-authorized": {
+    "category": "notes-decisions",
+    "continuity_id": "d189ks",
+    "continuity_text": "B2 Closure Summary authorized as final B2 task \u2014 no new code, B2-EVAL-013/A5/Task 10 still not started",
+    "source": "continuity:d189ks",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-12-b2-closure-summary-complete": {
+    "category": "notes-decisions",
+    "continuity_id": "d190t6",
+    "continuity_text": "B2 Closure Summary complete \u2014 GO to close B2, docs/research/B2-CLOSURE-SUMMARY.md",
+    "source": "continuity:d190t6",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-14-b2-closed": {
+    "category": "notes-decisions",
+    "continuity_id": "m2g9",
+    "continuity_text": "B2 (Code Graph) phase CLOSED \u2014 next macro-step is the non-blocking follow-up set below, not A5 or Task 10",
+    "source": "continuity:m2g9",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-14-b2-confirmed-closed": {
+    "category": "notes-decisions",
+    "continuity_id": "d191ij",
+    "continuity_text": "B2 \u2014 Code Graph: CLOSED / confirmed by user",
+    "source": "continuity:d191ij",
+    "stratum": "project-history"
+  },
+  "decision-2026-11-b2-eval010-scope-rejected": {
+    "category": "notes-decisions",
+    "continuity_id": "x2gi",
+    "continuity_text": "Treat the stray off-scope fork's untracked-file audit (EVAL-006/007/009 cleanup, including discarding b2-eval-008-polly-run.txt) as part of B2-EVAL-010 [REJECTED]",
+    "source": "continuity:x2gi",
+    "stratum": "project-history"
+  },
+  "pattern-2026-09-11-automation-engine-boundary": {
+    "category": "patterns-knowledge",
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/timezone_resolver.py",
+    "stratum": "project-history"
+  },
+  "pattern-2026-09-11-timezone-fallback-reuse": {
+    "category": "patterns-knowledge",
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/timezone_resolver.py",
+    "stratum": "project-history"
+  },
+  "pattern-2026-09-sun-times-never-raises": {
+    "category": "patterns-knowledge",
+    "source": "controllore@ec274f4680c19f5b335a01a7a563c8f64546e7e2:app/core/sun_times.py",
+    "stratum": "project-history"
+  },
+  "pattern-2026-10-26-c6-independent-gate-properties": {
+    "category": "patterns-knowledge",
+    "source": "docs/Spec_mvp.md#C6",
+    "stratum": "project-history"
+  },
+  "pattern-2026-10-26-deletion-log-three-step": {
+    "category": "patterns-knowledge",
+    "source": "docs/Spec_mvp.md#C5",
+    "stratum": "project-history"
+  },
+  "pattern-2026-10-26-write-visibility-linearization": {
+    "category": "patterns-knowledge",
+    "source": "docs/Spec_mvp.md#C1",
+    "stratum": "project-history"
+  },
+  "pattern-2026-10-27-handle-not-path": {
+    "category": "patterns-knowledge",
+    "source": "docs/technical-debt.md",
+    "stratum": "project-history"
+  },
+  "session-2026-11-02-b2-eval009-cpp-dispatched": {
+    "category": "notes-decisions",
+    "continuity_id": "d172ir",
+    "continuity_text": "B2-EVAL-009 (C++ domain) dispatched to background fork ad0d465264f7dc553",
+    "source": "continuity:d172ir",
+    "stratum": "project-history"
+  },
+  "session-2026-11-14-b2-closure-residuals": {
+    "category": "notes-decisions",
+    "source": "docs/research/B2-CLOSURE-SUMMARY.md",
+    "stratum": "project-history"
+  },
+  "session-2026-11-call-res-a4-perf": {
+    "category": "notes-decisions",
+    "continuity_id": "d163pa",
+    "continuity_text": "CALL-RES-A4 performance cost measured: Moderate overhead (commits 59510ae/f50c634)",
+    "source": "continuity:d163pa",
+    "stratum": "project-history"
+  }
+}

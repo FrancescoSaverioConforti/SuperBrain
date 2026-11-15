@@ -1,0 +1,153 @@
+{
+  "model": "bge-small-en-v1.5",
+  "split": "dev",
+  "run_commit": "3caea77a57e7d090b982e986cf77f73fe897234e",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "dense_top_n": 50,
+  "query_count": 60,
+  "answerable_query_count": 49,
+  "candidate_recall_hits": 49,
+  "candidate_recall_rate": 1.0,
+  "truncation_events": 0,
+  "total_embed_calls": 102,
+  "dense_recall_at_10": 1.0,
+  "dense_recall_at_10_ci": [
+    1.0,
+    1.0
+  ],
+  "dense_ndcg_at_10": 0.8815116212402966,
+  "dense_ndcg_at_10_ci": [
+    0.8195829275596708,
+    0.9349724606665246
+  ],
+  "by_category": {
+    "identifier-code": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7360550904946386,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5628303443114123,
+        0.8957340346272057
+      ],
+      "n": 9,
+      "low_confidence": false
+    },
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8596832229722856,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6844983107535833,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8564419374495752,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7319810059560715,
+        0.966448159415587
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 10,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8758471076530654,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7176741448979758,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    }
+  },
+  "by_difficulty": {
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8788212176697462,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7482135026090376,
+        0.9715834837335344
+      ],
+      "n": 12,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.888231054585851,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7764621091717021,
+        0.9753953169047639
+      ],
+      "n": 15,
+      "low_confidence": false
+    },
+    "medium": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.878397682270446,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.7843958526902387,
+        0.9604968069805208
+      ],
+      "n": 22,
+      "low_confidence": false
+    }
+  }
+}

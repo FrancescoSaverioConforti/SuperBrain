@@ -1,0 +1,18 @@
+{
+  "target": "nomic-embed-text-v1.5",
+  "run_commit": "9822b32708ae0d38f308984b00d2e7700162a52b",
+  "startup_or_model_load_ms": 591.7334,
+  "build_index_time_ms": 3418.0958,
+  "warm_query_p50_ms": 18.585199999999997,
+  "warm_query_p95_ms": 21.384199999999996,
+  "warm_query_sample_size": 49,
+  "embedding_inference_p50_ms": 18.2629,
+  "embedding_inference_p95_ms": 21.025599999999997,
+  "vector_search_p50_ms": 0.3327,
+  "vector_search_p95_ms": 0.36469999999999997,
+  "peak_rss_after_load_bytes": 598175744,
+  "peak_rss_after_build_bytes": 668028928,
+  "peak_rss_after_queries_bytes": 668299264,
+  "model_weight_bytes_on_disk": 547310275,
+  "vector_index_bytes_on_disk": 162816
+}

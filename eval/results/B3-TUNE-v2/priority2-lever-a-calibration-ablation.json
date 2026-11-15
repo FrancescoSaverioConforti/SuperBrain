@@ -1,0 +1,136 @@
+{
+  "split": "calibration",
+  "selected_k1": 1.8,
+  "selected_b": 0.75,
+  "a_score": {
+    "k1": 1.8,
+    "b": 0.75,
+    "variant": "A-score",
+    "split": "calibration",
+    "run_commit": "5d4196ac5ac8fd9d821ac24536de989a17171631",
+    "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+    "aggregate": {
+      "recall_at_10": 0.9166666666666666,
+      "ndcg_at_10": 0.6965640946110078,
+      "recall_ci": [
+        0.7916666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5545540639881074,
+        0.8203611878508621
+      ],
+      "n": 24,
+      "low_confidence": false
+    },
+    "abstention": {
+      "confusion_matrix": {
+        "tp": 0,
+        "tn": 24,
+        "fp": 0,
+        "fn": 6
+      },
+      "precision": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "recall": {
+        "value": 0.0,
+        "ci": [
+          0.0,
+          0.0
+        ],
+        "valid_resamples": 1999,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "f1": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "accuracy": {
+        "value": 0.8,
+        "ci": [
+          0.6666666666666666,
+          0.9333333333333333
+        ],
+        "valid_resamples": 2000,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "n": 30
+    }
+  },
+  "a_full": {
+    "k1": 1.8,
+    "b": 0.75,
+    "variant": "A-full",
+    "split": "calibration",
+    "run_commit": "5d4196ac5ac8fd9d821ac24536de989a17171631",
+    "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+    "aggregate": {
+      "recall_at_10": 0.9166666666666666,
+      "ndcg_at_10": 0.6965640946110078,
+      "recall_ci": [
+        0.7916666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5545540639881074,
+        0.8203611878508621
+      ],
+      "n": 24,
+      "low_confidence": false
+    },
+    "abstention": {
+      "confusion_matrix": {
+        "tp": 0,
+        "tn": 24,
+        "fp": 0,
+        "fn": 6
+      },
+      "precision": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "recall": {
+        "value": 0.0,
+        "ci": [
+          0.0,
+          0.0
+        ],
+        "valid_resamples": 1999,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "f1": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "accuracy": {
+        "value": 0.8,
+        "ci": [
+          0.6666666666666666,
+          0.9333333333333333
+        ],
+        "valid_resamples": 2000,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "n": 30
+    }
+  },
+  "a_full_vs_a_score_recall_at_10_delta": 0.0
+}

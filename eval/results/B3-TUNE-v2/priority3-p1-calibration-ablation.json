@@ -1,0 +1,194 @@
+{
+  "split": "calibration",
+  "run_commit": "101c7801545d941e608cadc39223d26f5da19958",
+  "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+  "identifier_boost_fired": 0,
+  "query_count": 30,
+  "aggregate": {
+    "recall_at_10": 0.9166666666666666,
+    "ndcg_at_10": 0.7090535447985884,
+    "recall_ci": [
+      0.7916666666666666,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.5658406074155423,
+      0.8353099178571526
+    ],
+    "n": 24,
+    "low_confidence": false
+  },
+  "by_category": {
+    "cross-file-concept": {
+      "recall_at_10": 0.6666666666666666,
+      "ndcg_at_10": 0.6666666666666666,
+      "recall_ci": [
+        0.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.0,
+        1.0
+      ],
+      "n": 3,
+      "low_confidence": true
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8551549589285763,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6884882922619097,
+        1.0
+      ],
+      "n": 6,
+      "low_confidence": false
+    },
+    "identifier-code": {
+      "recall_at_10": 0.8,
+      "ndcg_at_10": 0.4494849252042334,
+      "recall_ci": [
+        0.4,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.1806179973983887,
+        0.7863919498470877
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8154648767857287,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6309297535714574,
+        1.0
+      ],
+      "n": 2,
+      "low_confidence": true
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7654015779112125,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5308031558224252,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7365986575892965,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.47319731517859304,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    }
+  },
+  "by_difficulty": {
+    "medium": {
+      "recall_at_10": 0.9090909090909091,
+      "ndcg_at_10": 0.8300845230519507,
+      "recall_ci": [
+        0.7272727272727273,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6266172055194884,
+        0.966448159415587
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.575670875918525,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.369896923469826,
+        0.7892789260714372
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 0.875,
+      "ndcg_at_10": 0.6260001177502547,
+      "recall_ci": [
+        0.625,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.40103176718751266,
+        0.8432676793573902
+      ],
+      "n": 8,
+      "low_confidence": false
+    }
+  },
+  "abstention": {
+    "confusion_matrix": {
+      "tp": 0,
+      "tn": 24,
+      "fp": 0,
+      "fn": 6
+    },
+    "precision": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "recall": {
+      "value": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ],
+      "valid_resamples": 1999,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "f1": {
+      "value": null,
+      "ci": null,
+      "valid_resamples": 0,
+      "total_resamples": 2000,
+      "low_confidence": true
+    },
+    "accuracy": {
+      "value": 0.8,
+      "ci": [
+        0.6666666666666666,
+        0.9333333333333333
+      ],
+      "valid_resamples": 2000,
+      "total_resamples": 2000,
+      "low_confidence": false
+    },
+    "n": 30
+  }
+}

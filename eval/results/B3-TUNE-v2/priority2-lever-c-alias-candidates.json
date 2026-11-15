@@ -1,0 +1,56 @@
+[
+  {
+    "short_form": "SEC-001",
+    "note_id": "bug-2026-10-27-sec001-toctou",
+    "evidence": "bug-2026-10-27-sec001-toctou",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "SEC-002",
+    "note_id": "bug-2026-10-27-sec002-fix-incomplete",
+    "evidence": "bug-2026-10-27-sec002-fix-incomplete",
+    "dev_referenced": false
+  },
+  {
+    "short_form": "SEC-002",
+    "note_id": "bug-2026-10-27-sec002-symlink-aliasing",
+    "evidence": "bug-2026-10-27-sec002-symlink-aliasing",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "SEC-003",
+    "note_id": "bug-2026-10-27-sec003-hardlink-aliasing",
+    "evidence": "bug-2026-10-27-sec003-hardlink-aliasing",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "C2",
+    "note_id": "decision-2026-10-26-c2-approval-channel",
+    "evidence": "decision-2026-10-26-c2-approval-channel",
+    "dev_referenced": false
+  },
+  {
+    "short_form": "Fase-B",
+    "note_id": "decision-2026-10-26-faseb-deterministic-baseline",
+    "evidence": "decision-2026-10-26-faseb-deterministic-baseline",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "C6",
+    "note_id": "pattern-2026-10-26-c6-independent-gate-properties",
+    "evidence": "pattern-2026-10-26-c6-independent-gate-properties",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "C5",
+    "note_id": "pattern-2026-10-26-deletion-log-three-step",
+    "evidence": "pattern-2026-10-26-deletion-log-three-step",
+    "dev_referenced": true
+  },
+  {
+    "short_form": "C1",
+    "note_id": "pattern-2026-10-26-write-visibility-linearization",
+    "evidence": "pattern-2026-10-26-write-visibility-linearization",
+    "dev_referenced": true
+  }
+]

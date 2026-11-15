@@ -1,0 +1,180 @@
+{
+  "model": "nomic-embed-text-v1.5",
+  "split": "dev",
+  "run_commit": "c0921d42c1e37fb44b1097c8390caff85602d611",
+  "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+  "query_count": 60,
+  "answerable_query_count": 49,
+  "b1_lexical_only": {
+    "recall_at_10": 0.8367346938775511,
+    "ndcg_at_10": 0.7139021585460019,
+    "recall_ci": [
+      0.7346938775510204,
+      0.9387755102040817
+    ],
+    "ndcg_ci": [
+      0.6058832617246017,
+      0.8148598173679488
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "dense_standalone": {
+    "recall_at_10": 1.0,
+    "ndcg_at_10": 0.9088921166125319,
+    "recall_ci": [
+      1.0,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.8581164982396388,
+      0.9533111815352305
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "hybrid_rrf": {
+    "recall_at_10": 0.9387755102040817,
+    "ndcg_at_10": 0.8402067300505034,
+    "recall_ci": [
+      0.8775510204081632,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.7484351529206537,
+      0.9216652689500905
+    ],
+    "n": 49,
+    "low_confidence": false
+  },
+  "hybrid_by_category": {
+    "identifier-code": {
+      "recall_at_10": 0.7777777777777778,
+      "ndcg_at_10": 0.7037037037037037,
+      "recall_ci": [
+        0.4444444444444444,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.40740740740740744,
+        1.0
+      ],
+      "n": 9,
+      "low_confidence": false
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8053074717724613,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6106149435449229,
+        1.0
+      ],
+      "n": 10,
+      "low_confidence": false
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 0.8571428571428571,
+      "ndcg_at_10": 0.804418536224494,
+      "recall_ci": [
+        0.5714285714285714,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5187042505102082,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9262298982673152,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.8181818181818182,
+        1.0
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8520375838435416,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6513508467687199,
+        1.0
+      ],
+      "n": 7,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    }
+  },
+  "hybrid_by_difficulty": {
+    "medium": {
+      "recall_at_10": 0.9545454545454546,
+      "ndcg_at_10": 0.9242424242424242,
+      "recall_ci": [
+        0.8636363636363636,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.818181818181818,
+        1.0
+      ],
+      "n": 22,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 0.8666666666666667,
+      "ndcg_at_10": 0.7509339927604484,
+      "recall_ci": [
+        0.6666666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5620451038715595,
+        0.9240902077431191
+      ],
+      "n": 15,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7977322123112169,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6459543454789832,
+        0.9384882922619097
+      ],
+      "n": 12,
+      "low_confidence": false
+    }
+  }
+}

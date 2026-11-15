@@ -1,0 +1,128 @@
+{
+  "split": "calibration",
+  "run_commit": "daa622e471f667e2fd7c6d2da61b28703e45250f",
+  "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+  "normalization_policy_identical_to_frozen": true,
+  "b1_baseline_this_run": {
+    "variant": "B1-real-pipeline-this-run",
+    "aggregate": {
+      "recall_at_10": 0.9166666666666666,
+      "ndcg_at_10": 0.7090535447985884,
+      "recall_ci": [
+        0.7916666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5658406074155423,
+        0.8353099178571526
+      ],
+      "n": 24,
+      "low_confidence": false
+    },
+    "abstention": {
+      "confusion_matrix": {
+        "tp": 0,
+        "tn": 24,
+        "fp": 0,
+        "fn": 6
+      },
+      "precision": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "recall": {
+        "value": 0.0,
+        "ci": [
+          0.0,
+          0.0
+        ],
+        "valid_resamples": 1999,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "f1": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "accuracy": {
+        "value": 0.8,
+        "ci": [
+          0.6666666666666666,
+          0.9333333333333333
+        ],
+        "valid_resamples": 2000,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "n": 30
+    }
+  },
+  "b_symmetric_real_pipeline": {
+    "variant": "B-symmetric-real-pipeline",
+    "aggregate": {
+      "recall_at_10": 0.9166666666666666,
+      "ndcg_at_10": 0.6877216627425011,
+      "recall_ci": [
+        0.7916666666666666,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5479986554864699,
+        0.8165338572009109
+      ],
+      "n": 24,
+      "low_confidence": false
+    },
+    "abstention": {
+      "confusion_matrix": {
+        "tp": 0,
+        "tn": 24,
+        "fp": 0,
+        "fn": 6
+      },
+      "precision": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "recall": {
+        "value": 0.0,
+        "ci": [
+          0.0,
+          0.0
+        ],
+        "valid_resamples": 1999,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "f1": {
+        "value": null,
+        "ci": null,
+        "valid_resamples": 0,
+        "total_resamples": 2000,
+        "low_confidence": true
+      },
+      "accuracy": {
+        "value": 0.8,
+        "ci": [
+          0.6666666666666666,
+          0.9333333333333333
+        ],
+        "valid_resamples": 2000,
+        "total_resamples": 2000,
+        "low_confidence": false
+      },
+      "n": 30
+    }
+  },
+  "queries_with_changed_ranking": 14,
+  "query_count": 30
+}

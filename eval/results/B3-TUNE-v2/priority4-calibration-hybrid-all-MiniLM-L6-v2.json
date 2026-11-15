@@ -1,0 +1,192 @@
+{
+  "model": "all-MiniLM-L6-v2",
+  "split": "calibration",
+  "run_commit": "f57b36880070f44228c3778a681738649be35660",
+  "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+  "query_count": 30,
+  "answerable_query_count": 24,
+  "b1_lexical_only": {
+    "recall_at_10": 0.9166666666666666,
+    "ndcg_at_10": 0.7090535447985884,
+    "recall_ci": [
+      0.7916666666666666,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.5658406074155423,
+      0.8353099178571526
+    ],
+    "n": 24,
+    "low_confidence": false
+  },
+  "dense_standalone": {
+    "recall_at_10": 1.0,
+    "ndcg_at_10": 0.8614223731979377,
+    "recall_ci": [
+      1.0,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.7608109284450495,
+      0.9455223360506796
+    ],
+    "n": 24,
+    "low_confidence": false
+  },
+  "hybrid_rrf": {
+    "recall_at_10": 0.9583333333333334,
+    "ndcg_at_10": 0.7945294539277835,
+    "recall_ci": [
+      0.875,
+      1.0
+    ],
+    "ndcg_ci": [
+      0.6658032798244656,
+      0.9012887397321441
+    ],
+    "n": 24,
+    "low_confidence": false
+  },
+  "delta_hybrid_recall_vs_b1_frozen": 0.04166666666666674,
+  "delta_hybrid_ndcg_vs_b1_frozen": 0.08547590912919512,
+  "delta_hybrid_ndcg_vs_dense_standalone": -0.06689291927015417,
+  "dense_candidate_recall_rate": 1.0,
+  "fusion_cost_p50_ms": 0.0564,
+  "fusion_cost_p95_ms": 0.0982,
+  "hybrid_by_category": {
+    "temporal": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        1.0,
+        1.0
+      ],
+      "n": 2,
+      "low_confidence": true
+    },
+    "notes-decisions": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8154648767857287,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6309297535714574,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    },
+    "patterns-knowledge": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7217132018086354,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.4434264036172708,
+        1.0
+      ],
+      "n": 4,
+      "low_confidence": true
+    },
+    "identifier-code": {
+      "recall_at_10": 0.8,
+      "ndcg_at_10": 0.6261859507142915,
+      "recall_ci": [
+        0.4,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.25237190142858296,
+        0.9261859507142916
+      ],
+      "n": 5,
+      "low_confidence": false
+    },
+    "bugs-fixes": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.9166666666666666,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.75,
+        1.0
+      ],
+      "n": 6,
+      "low_confidence": false
+    },
+    "cross-file-concept": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.7630216087726293,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.2890648263178878,
+        1.0
+      ],
+      "n": 3,
+      "low_confidence": true
+    }
+  },
+  "hybrid_by_difficulty": {
+    "medium": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8006224897385352,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6331802236245743,
+        0.9545454545454546
+      ],
+      "n": 11,
+      "low_confidence": false
+    },
+    "easy": {
+      "recall_at_10": 0.875,
+      "ndcg_at_10": 0.7663662191964322,
+      "recall_ci": [
+        0.625,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.5163662191964322,
+        0.9538662191964322
+      ],
+      "n": 8,
+      "low_confidence": false
+    },
+    "hard": {
+      "recall_at_10": 1.0,
+      "ndcg_at_10": 0.8261859507142916,
+      "recall_ci": [
+        1.0,
+        1.0
+      ],
+      "ndcg_ci": [
+        0.6261859507142915,
+        1.0
+      ],
+      "n": 5,
+      "low_confidence": false
+    }
+  },
+  "abstention_confusion_matrix": {
+    "tp": 0,
+    "fp": 0,
+    "tn": 0,
+    "fn_": 6
+  }
+}

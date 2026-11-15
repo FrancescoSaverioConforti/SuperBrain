@@ -286,20 +286,46 @@ fn operational_gate_failures_are_errors_in_both_wrappers() {
 #[test]
 fn held_out_labels() {
     let f = Fixture::new();
-    let fixture = include_str!("../../../eval/rag/test/notes/isolation-smoke.md");
+    // Every real B3 corpus note must commit through the real gate/vault
+    // path, not just one mechanical fixture. Some notes cite other corpus
+    // notes via `relations` (e.g. `derived_from`, `supersedes`); since
+    // `std::fs::read_dir` gives no commit-order guarantee, the full set of
+    // corpus note ids is supplied as `known_ids` up front so a forward
+    // reference never looks like a BrokenLink.
+    let notes_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/rag/corpus/notes");
+    let note_paths: Vec<_> = std::fs::read_dir(notes_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    assert!(!note_paths.is_empty(), "no corpus notes found under {notes_dir}");
+    let known_ids: HashSet<NoteId> = note_paths
+        .iter()
+        .map(|path| {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            NoteId::parse(stem).unwrap()
+        })
+        .collect();
+    for path in &note_paths {
+        let note_text = std::fs::read_to_string(path).unwrap();
+        let outcome = storage::propose_and_commit(
+            &f.vault,
+            &note_text,
+            Version(0),
+            Uuid::new_v4(),
+            &known_ids,
+            &HashSet::new(),
+            &policy::Gate::new(policy::SecretPolicy::new(1)),
+            Some(&f.pii),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, storage::CommitResult::Committed(_)),
+            "corpus note {path:?} failed to commit: {outcome:?}"
+        );
+    }
+
     let labels = include_str!("../../../eval/rag/test/labels.jsonl");
-    let outcome = storage::propose_and_commit(
-        &f.vault,
-        fixture,
-        Version(0),
-        Uuid::new_v4(),
-        &HashSet::new(),
-        &HashSet::new(),
-        &policy::Gate::new(policy::SecretPolicy::new(1)),
-        Some(&f.pii),
-    )
-    .unwrap();
-    assert!(matches!(outcome, storage::CommitResult::Committed(_)));
     // Deliberately place a label copy under the vault to challenge accidental
     // recursive walks; ordinary runner operation rejects this layout.
     let adversarial = f.root.join("eval/rag/test");
@@ -312,8 +338,8 @@ fn held_out_labels() {
         let idx = Index::new(
             &f.vault,
             &fresh,
-            "project-x",
-            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+            "eval-b3",
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
         );
         for marker in ["HELDOUT_QUESTION_CANARY_901", "HELDOUT_ANSWER_CANARY_902"] {
             assert!(labels.contains(marker));
@@ -326,7 +352,7 @@ fn held_out_labels() {
             );
         }
         assert!(matches!(
-            search(&idx, &allow(), context(), query("rag-visible-needle"))
+            search(&idx, &allow(), context(), query("resolve_configured_timezone"))
                 .result
                 .unwrap()
                 .outcome,

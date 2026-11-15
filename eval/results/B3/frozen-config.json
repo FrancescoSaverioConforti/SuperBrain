@@ -1,0 +1,72 @@
+{
+  "frozen_at_utc": "2026-11-14T13:17:14Z",
+  "frozen_by": "user explicit approval, following B3.3/B3.4 report (continuity milestone m5mu)",
+  "freeze_commit": "c7ad08ea8949b4e7934282682dd3a3bcf554e41f",
+  "runner": {
+    "runner_commit": "e613edd07508985d157b32d81cc5b9704dd7a72f",
+    "runner_files": [
+      "crates/api/src/metrics.rs",
+      "crates/api/examples/b3_metric_runner.rs"
+    ],
+    "note": "runner_commit is the commit the dev/calibration reports were generated against (post final-review fix pass); freeze_commit is this file's own commit, one commit later, adding only this frozen-config.json itself."
+  },
+  "corpus": {
+    "corpus_manifest_sha256": "5fcc32eab09b9ea738b2cee89a68e051f03dae1a39d83e67b32f07383fcd2f51",
+    "corpus_manifest_path": "eval/rag/corpus-manifest.json",
+    "corpus_manifest_note_count": 53
+  },
+  "calibration_labels": {
+    "labels_sha256": "7ff4303a12003dbfb1e00b3875f9c1395f8df27d286952c2139562dd2151b049",
+    "labels_path": "eval/rag/calibration/labels.jsonl",
+    "query_count": 30
+  },
+  "dev_labels_for_reference": {
+    "labels_sha256": "60639a840cff1909344b01a4df49baa54e73428f297d77b1120c432a9e4347b6",
+    "labels_path": "eval/rag/dev/labels.jsonl",
+    "query_count": 60,
+    "note": "dev is diagnostic only per the design doc; thresholds below are calibrated from the calibration split, dev is recorded here only for traceability of the same freeze decision."
+  },
+  "source_reports": {
+    "dev_report": "eval/results/B3/dev-20261114T123322Z-e613edd.json",
+    "calibration_report": "eval/results/B3/calibration-20261114T123333Z-e613edd.json",
+    "verified_before_freeze": "Both report files confirmed git-committed (commit c7ad08e) before this file was written. Both corpus_manifest_sha256 and labels_sha256 values above were independently recomputed from the real files on disk (sha256sum) and confirmed to match the values already recorded inside each committed report, byte for byte."
+  },
+  "retrieval_config": "B1 deterministic trigram+BM25, no embeddings",
+  "thresholds": {
+    "recall_at_10": {
+      "minimum": 0.79,
+      "rationale": "Calibration split's observed Recall@10 bootstrap CI lower bound (95%, seed 0, 2000 resamples) was 0.7916666666666666 on n=24 answerable queries; set as the frozen minimum acceptable aggregate Recall@10 for the final-test run."
+    },
+    "ndcg_at_10": {
+      "minimum": 0.57,
+      "rationale": "Calibration split's observed nDCG@10 bootstrap CI lower bound (95%, seed 0, 2000 resamples) was 0.5658406074155423 on n=24 answerable queries; set as the frozen minimum acceptable aggregate nDCG@10 for the final-test run."
+    },
+    "abstention": {
+      "numeric_threshold": null,
+      "status": "no numeric threshold set",
+      "finding": "baseline abstention recall = 0; constant non-abstaining behavior on dev+calibration",
+      "detail": "Confusion matrix is TP=0, FP=0 on BOTH dev (11 FN/60) and calibration (6 FN/30): index::search never returned SearchOutcome::NotPresent for any of the 17 abstain-expected queries across both splits. Precision and F1 are mathematically undefined (zero denominator, correctly reported as null, never as 0.0). Recall is exactly 0.0 with CI [0.0, 0.0]. No meaningful precision/recall/F1 threshold can be calibrated from a constant classifier. This is a property of the B1 deterministic trigram+BM25 baseline on this corpus, not a runner defect (confirmed by independent review, continuity d202yy/m5mu)."
+    }
+  },
+  "bootstrap": {
+    "seed": 0,
+    "resamples": 2000,
+    "ci_method": "percentile bootstrap, 2.5th/97.5th percentile over resampled means, deterministic given the same seed (SplitMix64 PRNG, non-cryptographic, hand-rolled in crates/api/src/metrics.rs)",
+    "low_confidence_floor": 5,
+    "low_confidence_note": "Any breakdown group with fewer than 5 contributing queries (answerable count for recall/nDCG groups, valid-resample count for abstention precision/recall/F1) is flagged low_confidence: true in the per-run reports rather than silently reporting a CI computed from too few samples."
+  },
+  "metric_formulas": {
+    "recall_at_10": "|relevant_note_ids ∩ top_10_retrieved_note_ids| / |relevant_note_ids|, true fractional recall, never a 0/1 hit indicator. An answerable query returning SearchOutcome::NotPresent is scored as if it retrieved nothing (Recall@10 = 0.0), never excluded from aggregation.",
+    "hit_at_10": "1 if any relevant note appears in the top 10, else 0 — diagnostic only, never substituted for recall_at_10 or used in any threshold.",
+    "ndcg_at_10": "gain(rel) = 2^rel - 1; DCG@10 = sum_{i=1}^{10} gain(rel_i) / log2(i + 1), where rel_i is the graded_relevance value (0, 1, or 2; 0 if the retrieved note has no graded_relevance entry) of the note at rank i among the top 10 results; IDCG@10 = the same formula applied to the query's own graded_relevance values sorted descending and truncated to 10; nDCG@10 = DCG@10 / IDCG@10.",
+    "abstention_confusion_matrix": "Binary classification of 'is there evidence for this query': ground truth = label row's abstain_expected; prediction = index::search returned SearchOutcome::NotPresent. TP = abstain_expected and NotPresent (correct abstention); TN = answerable and Matches (correct answer); FP = answerable but NotPresent (a missed real answer); FN = abstain_expected but Matches (a false 'evidence exists'). precision = TP/(TP+FP), recall = TP/(TP+FN), f1 = 2*precision*recall/(precision+recall) — each is null, never 0.0, when its denominator is zero. accuracy = (TP+TN)/(TP+TN+FP+FN).",
+    "protocol_reference": "docs/superpowers/specs/2026-11-14-b3-metric-runner-design.md (B3.3/B3.4 design, approved with corrections, continuity d202yy) and docs/superpowers/plans/2026-11-14-b3-metric-runner.md (implementation plan). Both are committed in this repository and do not depend on external state; the formulas above are copied verbatim from that design so this frozen-config.json remains self-contained even if those docs are later edited."
+  },
+  "hard_rule": "Any change to retrieval_config, thresholds, bootstrap seed/resamples, or metric_formulas made AFTER reading any final-test (B3.5) result invalidates that final-test run as independent evidence for this configuration. A changed configuration requires a new freeze (a new frozen-config.json, or a new version of this one with the change and its date recorded), and any final-test run already read under the old configuration must be disclosed as having preceded the change, never silently superseded.",
+  "scope_notes": {
+    "final_test_not_run": "No code or process in this repository or this session has read eval/rag/test/labels.jsonl's content, nor executed any final-test (B3.5) run, as of this freeze.",
+    "no_mcp": "No MCP server exists or was built as part of B3.1 through this freeze.",
+    "no_merge_tag_push": "This freeze and all B3 work to date live only on local branch b3-retrieval-eval; no merge, tag, or push has been performed.",
+    "task_10_and_a5": "Not authorized, not touched."
+  }
+}

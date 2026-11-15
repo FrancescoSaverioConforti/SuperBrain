@@ -172,11 +172,59 @@ impl std::fmt::Display for SearchError {
 }
 impl std::error::Error for SearchError {}
 
+/// B3-TUNE-v2 Priority 3 Stage 1, Lever P1: a fixed additive bonus
+/// applied to a candidate's BM25 score when `Index::with_identifier_boost`
+/// is enabled and its frozen exact-identifier rule fires (see
+/// `apply_identifier_boost`). Pinned well above any realistically
+/// achievable BM25 score on this corpus: with `N` = 53 indexed notes
+/// (`eval/results/B3/calibration-20261114T123333Z-e613edd.json`'s
+/// `corpus_manifest_note_count`), the IDF ceiling for a term unique to
+/// one document is `ln((53 - 1 + 0.5) / (1 + 0.5) + 1) ≈ 4.07`, and the
+/// BM25 term-frequency factor saturates toward `k1 + 1 = 2.2` as `tf`
+/// grows — so a single term's score ceiling is in the ~9 range, and a
+/// multi-term query summing several such terms could in principle reach
+/// into the tens, but not into the hundreds on a corpus this small.
+/// `100.0` is chosen as a round constant comfortably above that
+/// ceiling, so the boost reliably promotes a matching candidate to the
+/// top of the ranking rather than merely nudging it.
+const IDENTIFIER_BOOST: f64 = 100.0;
+
 pub struct Index<'a> {
     vault: &'a Vault,
     indexer: &'a RealIndexer,
     active_project: String,
     reference_date: NaiveDate,
+    /// Final-scoring BM25 params, defaulted to the conventional (1.2,
+    /// 0.75) in `new()`. Overridable only via `with_bm25_params` — see
+    /// its own doc comment; every existing call site of `new()` is
+    /// unaffected.
+    bm25_k1: f64,
+    bm25_b: f64,
+    /// B3-TUNE-v2 Priority 3 Stage 1 Lever P1 (ablation use only — see
+    /// `with_identifier_boost`'s own doc comment). Defaults to `false`
+    /// in `new()`; every existing call site is unaffected.
+    identifier_boost: bool,
+    /// B3-TUNE-v2 Priority 3 Stage 1 Lever P2 (ablation use only — see
+    /// `with_status_tiebreak`'s own doc comment). Defaults to `false`
+    /// in `new()`; every existing call site is unaffected.
+    status_tiebreak: bool,
+}
+
+/// B3-TUNE-v2 Priority 3 Stage 1, Lever P2's frozen status-tier mapping
+/// (`docs/superpowers/specs/2026-11-14-b3-tune-v2-priority3-stage1-design.md`),
+/// confirmed against the real 6-variant `domain::NoteStatus` (which has
+/// no derived `Ord`): lower number sorts first (higher relevance tier).
+/// Tier 1: Verified, Reviewed. Tier 2: TestPassed. Tier 3: Draft.
+/// Tier 4: Superseded, Contradicted. Same-tier members (e.g. Verified
+/// vs. Reviewed) are NOT ordered by this function — they fall through
+/// to the existing note-id tie-break.
+fn status_tier(status: NoteStatus) -> u8 {
+    match status {
+        NoteStatus::Verified | NoteStatus::Reviewed => 1,
+        NoteStatus::TestPassed => 2,
+        NoteStatus::Draft => 3,
+        NoteStatus::Superseded | NoteStatus::Contradicted => 4,
+    }
 }
 
 impl<'a> Index<'a> {
@@ -191,7 +239,47 @@ impl<'a> Index<'a> {
             indexer,
             active_project: active_project.to_owned(),
             reference_date,
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
+            identifier_boost: false,
+            status_tiebreak: false,
         }
+    }
+
+    /// Additive builder for custom final-scoring BM25 `k1`/`b` (ablation
+    /// use only — the "A-score" variant: this overrides only the
+    /// per-query `fresh_scores` index built inside `search`, never
+    /// `indexer`'s own persistent candidate-prefilter `Bm25Index`, which
+    /// stays at whatever params `indexer` itself was constructed with).
+    pub fn with_bm25_params(mut self, k1: f64, b: f64) -> Self {
+        self.bm25_k1 = k1;
+        self.bm25_b = b;
+        self
+    }
+
+    /// Additive builder for B3-TUNE-v2 Priority 3 Stage 1 Lever P1
+    /// (ablation use only): when enabled, a candidate whose
+    /// `source:`-extracted `#<IDENTIFIER>` fragment exactly matches one
+    /// of the query's whitespace tokens (case-insensitive, never a
+    /// substring/prefix match) gets `IDENTIFIER_BOOST` added to its
+    /// final BM25 score before sorting. Never changes candidate
+    /// membership — only reorders candidates already present. Default
+    /// `false`; every existing call site of `new()` is unaffected.
+    pub fn with_identifier_boost(mut self) -> Self {
+        self.identifier_boost = true;
+        self
+    }
+
+    /// Additive builder for B3-TUNE-v2 Priority 3 Stage 1 Lever P2
+    /// (ablation use only): when enabled, two candidates whose final
+    /// BM25 scores are bitwise-equal `f64` values (never within an
+    /// epsilon — a real, however small, score difference always wins)
+    /// are additionally ordered by `status_tier`, before the existing
+    /// note-id tie-break. Never changes candidate membership. Default
+    /// `false`; every existing call site of `new()` is unaffected.
+    pub fn with_status_tiebreak(mut self) -> Self {
+        self.status_tiebreak = true;
+        self
     }
 
     pub fn search(
@@ -273,8 +361,13 @@ impl<'a> Index<'a> {
             })
             .transpose()?;
 
-        let mut fresh_scores = Bm25Index::new();
+        let mut fresh_scores = Bm25Index::new_with_params(self.bm25_k1, self.bm25_b);
         let mut fresh_results = Vec::new();
+        // Parallel to `fresh_results`, same push order: `document.status`
+        // (Copy) captured before `document` is consumed by the push below,
+        // for Lever P2's status tie-break (search_impl's sort reads this
+        // by index position, never by note id, so order must stay in sync).
+        let mut fresh_result_statuses: Vec<NoteStatus> = Vec::new();
         let candidates = {
             let _timer =
                 PhaseTimer::new(profile.as_deref_mut().map(|p| &mut p.candidate_generation));
@@ -351,6 +444,7 @@ impl<'a> Index<'a> {
                 Some(body) if !sensitive && query_match(&body, query).is_some() => body,
                 _ => document.text_searchable,
             };
+            fresh_result_statuses.push(document.status);
             fresh_results.push(SearchResult {
                 note_id: id,
                 version: record.version,
@@ -373,14 +467,36 @@ impl<'a> Index<'a> {
             .query_ranked(query, usize::MAX)
             .into_iter()
             .collect();
+        let query_tokens: HashSet<String> =
+            query.split_whitespace().map(|t| t.to_lowercase()).collect();
         for result in &mut fresh_results {
-            result.score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+            let base_score = scores.get(&result.note_id).copied().unwrap_or(0.0);
+            let boost = if self.identifier_boost && identifier_boost_applies(&result.provenance.source, &query_tokens) {
+                IDENTIFIER_BOOST
+            } else {
+                0.0
+            };
+            result.score = base_score + boost;
         }
-        fresh_results.sort_by(|a, b| {
+        // Paired with `fresh_result_statuses` (same push order, Section
+        // above) so Lever P2's status tie-break can compare each pair's
+        // status without widening `SearchResult`'s own public fields.
+        let mut paired: Vec<(SearchResult, NoteStatus)> =
+            fresh_results.into_iter().zip(fresh_result_statuses).collect();
+        let status_tiebreak = self.status_tiebreak;
+        paired.sort_by(|(a, a_status), (b, b_status)| {
             b.score
                 .total_cmp(&a.score)
+                .then_with(|| {
+                    if status_tiebreak && a.score == b.score {
+                        status_tier(*a_status).cmp(&status_tier(*b_status))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| a.note_id.as_str().cmp(b.note_id.as_str()))
         });
+        let mut fresh_results: Vec<SearchResult> = paired.into_iter().map(|(r, _)| r).collect();
         fresh_results.truncate(k);
         let mut results = fresh_results.into_iter();
         let outcome = match results.next() {
@@ -399,6 +515,39 @@ impl<'a> Index<'a> {
             outcome,
         })
     }
+}
+
+/// B3-TUNE-v2 Priority 3 Stage 1 Lever P1: true only if `source` has a
+/// `#<IDENTIFIER>` fragment that exactly equals (case-insensitive) one
+/// of `query_tokens`. `source: None` (withheld for `Sensitive` results,
+/// see `search_impl`'s redaction at lines above) always returns `false`
+/// — the boost never applies to a candidate whose source is withheld.
+fn identifier_boost_applies(source: &Option<String>, query_tokens: &HashSet<String>) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let Some(identifier) = extract_structural_identifier(source) else {
+        return false;
+    };
+    query_tokens.contains(&identifier.to_lowercase())
+}
+
+/// Reads `source`'s trailing `#<IDENTIFIER>` fragment (e.g.
+/// `docs/technical-debt.md#SEC-001` -> `Some("SEC-001")`), read up to
+/// the first non-identifier character. Returns `None` if `source` has
+/// no `#` fragment, or the fragment is empty. Same extraction rule as
+/// `b3_tune_v2_lever_c_alias_table.rs`'s `extract_structural_candidates`
+/// (duplicated here, not shared, since that function lives in an
+/// example binary this crate cannot depend on and additionally parses
+/// a whole note's frontmatter rather than a bare `source` string).
+fn extract_structural_identifier(source: &str) -> Option<String> {
+    let fragment_start = source.find('#')?;
+    let fragment = &source[fragment_start + 1..];
+    let identifier: String = fragment
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!identifier.is_empty()).then_some(identifier)
 }
 
 /// Same literal matching as trigram's confirmation, or any BM25 token overlap.

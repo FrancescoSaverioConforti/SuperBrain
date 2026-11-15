@@ -1,0 +1,20 @@
+{
+  "sha256": "be4fa30a3cef7a342f77552b799dd8d27855d1236f371e2e376d0e15c6bdd232",
+  "build_date": "2026-11-14",
+  "build_commit": "fb03c3eaf3f8b4c976205ab1cbfbe2a98f118b88",
+  "query_count": 60,
+  "category_counts": {
+    "bugs-fixes": 10,
+    "cross-file-concept": 11,
+    "identifier-code": 11,
+    "notes-decisions": 11,
+    "patterns-knowledge": 9,
+    "temporal": 8
+  },
+  "difficulty_counts": {
+    "easy": 22,
+    "medium": 26,
+    "hard": 12
+  },
+  "abstain_count": 15
+}
