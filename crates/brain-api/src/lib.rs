@@ -11,8 +11,10 @@
 //! See `docs/superpowers/specs/2026-11-15-b5-0-brain-api-contract-freeze.md`
 //! for the frozen contract this crate implements.
 
+mod error;
 mod policy_write;
 mod proposal;
+pub use error::BrainApiError;
 pub use policy_write::{WriteOperation, WritePolicy};
 pub use proposal::{
     InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
