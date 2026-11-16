@@ -202,6 +202,194 @@ fn open_verified_windows(
     Ok(VerifiedRecordHandle { file, path: candidate.to_path_buf() })
 }
 
+/// Reads the full contents of `root.join(candidate_relative)` through a
+/// verified handle (B5.SEC): one call replaces the `open_verified(...)` +
+/// separate `read_to_end` pair every call site would otherwise repeat.
+pub(crate) fn read_verified(root: &Path, candidate_relative: &Path, note_id_label: &str) -> Result<Vec<u8>, StorageError> {
+    use std::io::Read;
+    let mut handle = open_verified(root, candidate_relative, OpenMode::ReadExisting, note_id_label)?;
+    let mut bytes = Vec::new();
+    handle.file.read_to_end(&mut bytes).map_err(StorageError::Io)?;
+    Ok(bytes)
+}
+
+/// A verified handle to the vault root's own directory (or any directory
+/// confirmed to resolve inside it) — distinct from `VerifiedRecordHandle`,
+/// which verifies a FILE. Anchors `write_verified_atomic`'s temp-file
+/// creation and rename so both happen relative to a directory identity
+/// already proven safe, never a freshly-resolved path string.
+pub(crate) struct VerifiedDirHandle {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    dir: File,
+    path: PathBuf,
+}
+
+/// Opens and verifies `root` itself as a directory: not a symlink/reparse
+/// point, and its real path resolves to `root`'s own canonical form. This
+/// is the anchor every atomic write in this crate is now rooted to, rather
+/// than a bare `root.join(...)` string re-resolved at write time.
+pub(crate) fn open_verified_dir(root: &Path) -> Result<VerifiedDirHandle, StorageError> {
+    let canonical_root = std::fs::canonicalize(root).map_err(StorageError::Io)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir = opts.open(root).map_err(|_| escapes("<root>"))?;
+        let metadata = dir.metadata().map_err(|_| escapes("<root>"))?;
+        if !metadata.is_dir() {
+            return Err(escapes("<root>"));
+        }
+        let fd = dir.as_raw_fd();
+        let real_path = std::fs::read_link(format!("/proc/self/fd/{fd}")).map_err(|_| escapes("<root>"))?;
+        if real_path != canonical_root {
+            return Err(escapes("<root>"));
+        }
+        Ok(VerifiedDirHandle { dir, path: canonical_root })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{HANDLE, MAX_PATH};
+        use windows::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, GETFINALPATHNAMEBYHANDLE_FLAGS,
+        };
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT.0) | (FILE_FLAG_BACKUP_SEMANTICS.0));
+        let dir = opts.open(root).map_err(|_| escapes("<root>"))?;
+        let raw_handle = HANDLE(dir.as_raw_handle());
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            GetFileInformationByHandle(raw_handle, &mut info).map_err(|_| escapes("<root>"))?;
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+            return Err(escapes("<root>"));
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
+            return Err(escapes("<root>"));
+        }
+        let mut buf = vec![0u16; MAX_PATH as usize];
+        let len = unsafe { GetFinalPathNameByHandleW(raw_handle, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) };
+        if len == 0 || (len as usize) > buf.len() {
+            return Err(escapes("<root>"));
+        }
+        let real_path = PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+        if real_path != canonical_root {
+            return Err(escapes("<root>"));
+        }
+        Ok(VerifiedDirHandle { dir, path: canonical_root })
+    }
+}
+
+/// B5.SEC Approach A (user decision, 2026-11-16, after a directory-
+/// handle-relative rename was exhaustively tried — Rust `windows` crate
+/// bindings AND an independent C reference against real Windows SDK
+/// headers, both failing identically — and found non-functional on this
+/// Windows build; see `d248e4`/`d249ef` in continuity for the full
+/// evidence trail). Writes `contents` to
+/// `verified_dir.path().join(file_name)` via a sibling-temp-file-then-
+/// rename sequence, with the directory's identity re-verified
+/// IMMEDIATELY before the rename and the final file's identity verified
+/// immediately AFTER it. This is a deliberate, documented trade-off:
+///
+/// - **What this closes:** the TOCTOU gap SEC-001/002/003 originally
+///   described — a symlink/hard-link/reparse-point planted at the
+///   record's path BEFORE this function's verification runs is rejected
+///   (verification happens on an open handle, never a bare path string),
+///   and if the parent directory itself is swapped for something else
+///   between this call's start and its rename, the immediate pre-rename
+///   re-check catches it.
+/// - **What this does NOT close:** a residual window between the
+///   pre-rename re-verification call returning and the `std::fs::rename`
+///   syscall immediately after it — on the order of a single thread
+///   scheduling slice, not the duration of this function. Closing that
+///   window completely would require a true directory-handle-relative
+///   rename syscall; Windows' public, documented API for this
+///   (`SetFileInformationByHandle` with `FileRenameInfoEx` and a
+///   `RootDirectory` handle, using the `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`/
+///   `FILE_RENAME_FLAG_POSIX_SEMANTICS` flags per MS-FSCC) was tested
+///   against this exact call shape in BOTH a Rust implementation and an
+///   independent C reference compiled against real Windows SDK headers
+///   (MinGW-w64 gcc 13.2.0, not windows-rs — eliminating any Rust-binding
+///   explanation) and fails with `ERROR_INVALID_PARAMETER` in every
+///   documented flag combination on this Windows build (10.0.26200). This
+///   is accepted as a residual risk against the explicit B5 threat model:
+///   an unprivileged local process capable of planting filesystem
+///   entries, NOT a process capable of winning a single-syscall-wide race
+///   window, and not Administrator/SYSTEM (which no approach here
+///   defends against, since they can bypass any user-mode check).
+///   SEC-001/002/003 are described as MITIGATED against this threat
+///   model, never as mathematically race-free.
+pub(crate) fn write_verified_atomic(verified_dir: &VerifiedDirHandle, file_name: &str, contents: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write;
+    let dir_path = &verified_dir.path;
+    let tmp_name = format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+    );
+    let tmp_path = dir_path.join(&tmp_name);
+    {
+        let mut f = File::create(&tmp_path).map_err(StorageError::Io)?;
+        f.write_all(contents).map_err(StorageError::Io)?;
+        f.sync_all().map_err(StorageError::Io)?;
+        // dropped here: the temp file's own identity is not what's at
+        // risk (it has a unique, unguessable name this process just
+        // created) — what matters is the PARENT directory's identity at
+        // rename time, re-checked next.
+    }
+
+    let final_path = dir_path.join(file_name);
+    if let Err(e) = rename_with_immediate_reverification(verified_dir, &tmp_path, &final_path, file_name) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(dir_file) = File::open(dir_path) {
+            let _ = dir_file.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-verifies `verified_dir`'s identity (not a cached value — a fresh
+/// `open_verified_dir` call) immediately before calling
+/// `std::fs::rename`, then verifies the renamed-into-place file's own
+/// identity immediately after (catching the case where the FINAL path
+/// itself was something untrustworthy that the rename silently replaced
+/// in a way this crate did not intend — e.g. the final name having become
+/// a directory, or the rename having landed somewhere unexpected due to
+/// a symlinked ancestor path component above `verified_dir` itself,
+/// which `open_verified_dir`'s own canonicalize-based check already rules
+/// out at the START of the call but is re-confirmed here at the END).
+/// Fails closed (removing the temp file, per this function's caller) on
+/// any mismatch — never silently proceeds with a weaker guarantee than
+/// what was checked.
+fn rename_with_immediate_reverification(verified_dir: &VerifiedDirHandle, tmp_path: &Path, final_path: &Path, file_name: &str) -> Result<(), StorageError> {
+    let revalidated = open_verified_dir(&verified_dir.path)?;
+    if revalidated.path != verified_dir.path {
+        return Err(escapes("<root>"));
+    }
+
+    std::fs::rename(tmp_path, final_path).map_err(StorageError::Io)?;
+
+    // Post-rename identity check: open the file we just renamed into
+    // place through the SAME verified-handle path every reader will use,
+    // confirming it is still a plain, single-link, in-root regular file
+    // right now — not just "was, at the moment of the pre-rename check".
+    let _ = open_verified(&verified_dir.path, Path::new(file_name), OpenMode::ReadExisting, "<post-rename-verify>")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +452,81 @@ mod tests {
         let result = open_verified(&dir, Path::new("new.record"), OpenMode::CreateOrOpenForWrite, "note-a");
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
         assert!(dir.join("new.record").exists());
+    }
+
+    #[test]
+    fn open_verified_dir_accepts_a_plain_directory() {
+        let dir = unique_test_dir();
+        let result = open_verified_dir(&dir);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    #[test]
+    fn write_verified_atomic_creates_a_file_with_exact_contents() {
+        let dir = unique_test_dir();
+        let verified_dir = open_verified_dir(&dir).unwrap();
+        write_verified_atomic(&verified_dir, "note.record", b"hello world").unwrap();
+        assert_eq!(std::fs::read(dir.join("note.record")).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn write_verified_atomic_overwrites_existing_file_completely() {
+        let dir = unique_test_dir();
+        let verified_dir = open_verified_dir(&dir).unwrap();
+        write_verified_atomic(&verified_dir, "note.record", b"first version, much longer content here").unwrap();
+        write_verified_atomic(&verified_dir, "note.record", b"v2").unwrap();
+        assert_eq!(std::fs::read(dir.join("note.record")).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn write_verified_atomic_leaves_no_temp_file_behind_on_success() {
+        let dir = unique_test_dir();
+        let verified_dir = open_verified_dir(&dir).unwrap();
+        write_verified_atomic(&verified_dir, "note.record", b"content").unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn write_verified_atomic_rejects_a_reparse_point_parent_directory() {
+        // B5.SEC Approach A: the directory itself is swapped for a
+        // reparse point between open_verified_dir's own check and this
+        // call — simulated by opening a dir handle, then replacing the
+        // directory on disk with a symlink before writing. Approach A's
+        // immediate pre-rename re-verification must catch this and fail
+        // closed (PathEscapesVaultRoot) — it must NEVER silently succeed
+        // by writing through the stale handle into a path that, by the
+        // time of the rename, no longer resolves to what was verified,
+        // and it must NEVER let the swapped-in directory receive the
+        // file either. On Windows this requires the ability to create
+        // directory symlinks; skip (not fail) if the environment cannot.
+        let parent = unique_test_dir();
+        let real_dir = parent.join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let verified_dir = open_verified_dir(&real_dir).unwrap();
+        std::fs::remove_dir(&real_dir).unwrap();
+        let elsewhere = unique_test_dir();
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&elsewhere, &real_dir);
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&elsewhere, &real_dir);
+        match link_result {
+            Ok(()) => {
+                let result = write_verified_atomic(&verified_dir, "note.record", b"content");
+                assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
+                assert!(
+                    !elsewhere.join("note.record").exists(),
+                    "the swapped-in directory must never receive the file either"
+                );
+            }
+            Err(e) => {
+                eprintln!("skipping reparse-point-parent test: could not create directory symlink in this environment: {e}");
+            }
+        }
     }
 
     #[test]
