@@ -3522,6 +3522,65 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_rejects_a_symlink_planted_over_a_content_persisted_row_before_reopen() {
+        // B5.SEC adversarial test (plan Task 6, Step 5): a ContentPersisted
+        // row is left pending across a simulated crash, then — BEFORE the
+        // vault is reopened (which runs `reconcile`) — an attacker swaps the
+        // record path for a symlink pointing at an outside file with
+        // DIFFERENT content. `reconcile`'s fix_content_persisted must reject
+        // the symlink via `read_verified`'s O_NOFOLLOW/no-reparse-point
+        // check, never read the outside content as if it were this row's
+        // own bytes, and never treat the mismatch as an ordinary "restore
+        // the before-image" case that would succeed through the alias.
+        let (root, journal_path) = fresh_root_and_journal_path();
+        init_test_repo_at(&root);
+        let id = NoteId::parse("note-a").unwrap();
+        let op2 = Uuid::new_v4();
+        {
+            let vault = Vault::open_with_default_indexer(root.clone(), &journal_path).unwrap();
+            vault.write_record_unchecked(&id, "v1", Version(0), Uuid::new_v4()).unwrap();
+            let injector = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeContentPersisted);
+            let result = vault.write_record_unchecked_with_injector(&id, "v2", Version(1), op2, &injector);
+            assert!(matches!(result, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeContentPersisted))));
+        }
+
+        // Attacker: swap the record for a symlink to an outside file with
+        // attacker-controlled content, between the crash and the reopen.
+        let outside = unique_test_dir();
+        let outside_file = outside.join("victim.record");
+        std::fs::write(&outside_file, serialize_record("ATTACKER CONTENT", Version(99))).unwrap();
+        std::fs::remove_file(root.join("note-a.record")).unwrap();
+        symlink_file(&outside_file, &root.join("note-a.record"));
+
+        // Reopening runs reconcile. It must not crash, must not silently
+        // adopt the outside content, and must not leave the vault in a
+        // state where read_note returns the attacker's bytes.
+        let reopen_result = Vault::open_with_default_indexer(root.clone(), &journal_path);
+        match reopen_result {
+            Err(_) => {
+                // Failing closed to refuse starting at all is an acceptable
+                // outcome — never silently adopting the outside content.
+            }
+            Ok(vault) => {
+                let read_result = vault.read_note(&id);
+                if let Ok(record) = read_result {
+                    assert_ne!(record.content, "ATTACKER CONTENT", "the outside file's content must never be adopted as note-a's own");
+                }
+            }
+        }
+        // The outside file itself must be untouched: reconcile must never
+        // write through the symlink back to the attacker's file (which
+        // would happen if some rollback/restore path followed the link for
+        // a WRITE rather than just rejecting the read).
+        let outside_bytes_after = std::fs::read(&outside_file).unwrap();
+        assert_eq!(
+            outside_bytes_after,
+            serialize_record("ATTACKER CONTENT", Version(99)),
+            "the outside file's bytes must remain exactly as the attacker wrote them, never overwritten by a rollback/restore following the symlink"
+        );
+    }
+
+    #[test]
     fn crash_after_rename_before_content_persisted_on_a_first_write_rolls_forward_on_reopen() {
         let (root, journal_path) = fresh_root_and_journal_path();
         init_test_repo_at(&root);
