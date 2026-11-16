@@ -14,3 +14,4 @@ policy = { path = "../policy" }
 domain = { path = "../domain" }
 index = { path = "../index" }
 uuid = { version = "1", features = ["v4"] }
+thiserror = "1"

@@ -11,6 +11,12 @@
 //! See `docs/superpowers/specs/2026-11-15-b5-0-brain-api-contract-freeze.md`
 //! for the frozen contract this crate implements.
 
+mod proposal;
+pub use proposal::{
+    InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
+    valid_proposal_transition,
+};
+
 /// Identifies one Brain API call: schema version for forward-compat
 /// rejection, and an opaque correlation id for audit/tracing. Mirrors
 /// `api::RequestContext`'s shape deliberately (same two fields) — this is a
