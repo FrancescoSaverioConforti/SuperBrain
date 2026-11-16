@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 use vault_security::{DeletionLog, PiiStore, TrustedReferenceStore};
 
-use crate::atomic::{atomic_write, AtomicWriteError};
 use crate::fault::{FaultInjector, FaultPoint};
 use crate::git::{commit_operation, commit_operation_contents, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal};
@@ -1473,6 +1472,9 @@ impl Vault {
             return self.resume_existing_operation(row, Some(pii_store));
         }
 
+        // `record_path` kept only for `commit_to_git`'s signature; all
+        // actual read/write in this function goes through
+        // `handle_safety::{read_verified, write_verified_atomic}` (B5.SEC).
         let record_path = self.record_path_checked(note_id)?;
         injector.check(FaultPoint::AfterPathCheckedBeforeAtomicWrite).map_err(interrupted)?;
 
@@ -1498,10 +1500,12 @@ impl Vault {
             });
         }
 
-        let current_bytes = match std::fs::read(&record_path) {
+        let record_name = format!("{}.record", note_id.as_str());
+        let record_relative = PathBuf::from(&record_name);
+        let current_bytes = match crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str()) {
             Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(StorageError::Io(e)),
+            Err(StorageError::NotFound { .. }) => None,
+            Err(e) => return Err(e),
         };
         let actual_version = match &current_bytes {
             Some(bytes) => parse_record(bytes, note_id)?.version,
@@ -1609,7 +1613,8 @@ impl Vault {
 
         // Step 6: the Markdown pointer rename, exactly as ordinary content's
         // rename works.
-        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+        let verified_root = crate::handle_safety::open_verified_dir(&self.root)?;
+        crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &buffer)?;
         injector.check(FaultPoint::AfterRenameBeforeContentPersisted).map_err(interrupted)?;
         self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
         injector.check(FaultPoint::AfterRenameBeforeJournalCommitted).map_err(interrupted)?;
@@ -1624,14 +1629,14 @@ impl Vault {
         // write (no PII before-image exists), the live `.pii` file this
         // operation just committed is instead removed outright, since there
         // is no prior version to restore it to.
-        let written_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        let written_bytes = crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str())?;
         if content_hash(&written_bytes) != new_hash {
             if let Some(before_hash) = &before_image_hash {
                 if let Ok(before_bytes) = read_before_image(&self.root, note_id, operation_id) {
                     if content_hash(&before_bytes) == *before_hash
-                        && atomic_write(&record_path, &before_bytes).is_ok()
+                        && crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &before_bytes).is_ok()
                     {
-                        let rolled_back = std::fs::read(&record_path).map_err(StorageError::Io)?;
+                        let rolled_back = crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str())?;
                         if content_hash(&rolled_back) == *before_hash {
                             // PII first: if its fail-closed rollback refuses,
                             // nothing has been deleted yet and the row stays
@@ -1767,7 +1772,11 @@ impl Vault {
         // `_guard` already holds — never through `Vault::read_note`, which
         // would try to re-acquire that same lock (see `Indexer::mark_current`'s
         // contract).
-        let record_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        let record_bytes = crate::handle_safety::read_verified(
+            &self.root,
+            Path::new(&format!("{}.record", note_id.as_str())),
+            note_id.as_str(),
+        )?;
         self.mark_index_current(&note_id, operation_id, version, &record_bytes)?;
         Ok(version)
     }
@@ -1937,7 +1946,11 @@ impl Vault {
             .map_err(journal_err)?;
         let result_bytes = match own_bytes {
             Some(contents) => contents,
-            None => std::fs::read(record_path).map_err(StorageError::Io)?,
+            None => crate::handle_safety::read_verified(
+                &self.root,
+                Path::new(&format!("{}.record", note_id.as_str())),
+                note_id.as_str(),
+            )?,
         };
         Ok(Some(result_bytes))
     }
@@ -2284,6 +2297,7 @@ pub(crate) fn read_before_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atomic::atomic_write;
 
     const FULL_NOTE: &str = "---\nid: bug-2026-10-30-example\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-10-30\nupdated: 2026-10-30\nevent_period: 2026-10-30\nrelations: {}\n---\n# Body\nsome prose here\n";
 
