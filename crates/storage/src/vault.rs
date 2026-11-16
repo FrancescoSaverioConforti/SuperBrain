@@ -4687,20 +4687,32 @@ mod tests {
 
     // SEC-00x status anchor (audit pointer, not an executable check).
     //
-    // Current status per Continuity: [d5b9] SEC-001 open, [c16c6] SEC-002
-    // narrowed, [c17e8] SEC-003 narrowed.
+    // Status as of B5.SEC closure (commits b5-brain-api-mcp `2167ba8`..
+    // `90f1512`): SEC-001/002/003 CLOSED against the B5 threat model
+    // (an unprivileged local process with filesystem access) — not
+    // "mathematically race-free", and not a defense against Administrator/
+    // SYSTEM, which no user-mode check can stop. See
+    // `docs/security/security-audit.md`'s FS-02/FS-03/FS-04 rows and
+    // continuity decisions `d248e4`/`d249ef` for the full residual-risk
+    // statement (Approach A: verified-parent-directory + path-based atomic
+    // rename, re-verified immediately before the rename; a true
+    // directory-handle-relative rename was attempted on Windows and found
+    // non-functional, confirmed in both Rust and an independent C
+    // reference against real SDK headers).
     //
-    // The drift oracles for this status are the four existing tests below,
-    // each of which already panics with "re-evaluate the verdict" when its
-    // observed behavior changes:
-    //   - sec_001_toctou_window_between_path_check_and_write_still_exists
-    //     (vault.rs, ~line 3052)
-    //   - sec_001_toctou_read_side_leaks_an_outside_records_version_and_bytes_into_the_before_image
-    //     (vault.rs, ~line 3118)
-    //   - sec_002_read_path_rejects_both_aliasing_shapes_but_write_path_pre_read_does_not
-    //     (vault.rs, ~line 3204)
+    // The drift oracles for this status are the four tests below, renamed
+    // from their original "...still exists"/"...does not" vulnerability-
+    // confirming names to reflect the closed verdict; each still asserts a
+    // concrete, checkable outcome, so a future behavior change still fails
+    // loudly rather than silently:
+    //   - sec_001_toctou_window_between_path_check_and_write_is_closed
+    //   - sec_001_toctou_read_side_no_longer_leaks_an_outside_records_version_or_bytes
+    //   - sec_002_both_read_and_write_paths_reject_both_aliasing_shapes
     //   - sec_003_hard_link_aliasing_is_invisible_to_canonicalization_after_a2
-    //     (vault.rs, ~line 3356)
+    //     (name kept — canonicalization genuinely still cannot see a hard
+    //     link; what changed is that link-count verification on the open
+    //     handle catches it by an unrelated mechanism, so the test's own
+    //     assertions were inverted, not its name)
     //
     // This comment only exists so a human or future change can find the
     // status by searching for "SEC-00x status". It does not re-verify
