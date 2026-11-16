@@ -122,7 +122,12 @@ mod tests {
 
     #[test]
     fn missing_write_policy_on_request_context_denies_every_write_operation() {
-        let ctx = crate::RequestContext { schema_version: crate::SCHEMA_VERSION, correlation_id: uuid::Uuid::new_v4(), write_policy: None };
+        let ctx = crate::RequestContext {
+            schema_version: crate::SCHEMA_VERSION,
+            correlation_id: uuid::Uuid::new_v4(),
+            write_policy: None,
+            origin: crate::CallOrigin::McpSession("test-session".into()),
+        };
         let allowed = |op: WriteOperation| ctx.write_policy.as_ref().is_some_and(|p| p.allows(op));
         assert!(!allowed(WriteOperation::ProposeWrite));
         assert!(!allowed(WriteOperation::ApproveProposal));
@@ -135,6 +140,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
+            origin: crate::CallOrigin::TrustedLocal,
         };
         let allowed = |op: WriteOperation| ctx.write_policy.as_ref().is_some_and(|p| p.allows(op));
         assert!(allowed(WriteOperation::ApproveProposal));
