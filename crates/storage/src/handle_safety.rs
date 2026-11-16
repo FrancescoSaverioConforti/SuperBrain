@@ -211,6 +211,19 @@ fn open_verified_windows(
         return Err(escapes(note_id_label));
     }
 
+    // B5.SEC mutation-testing residual (plan Task 6, "where an attack
+    // cannot be reliably simulated in CI"): this check's two branches
+    // (API call failure -> len==0; real path longer than MAX_PATH ->
+    // len>buf.len()) have no portable, deterministic way to trigger in a
+    // test — forcing len==0 requires making GetFinalPathNameByHandleW
+    // itself fail (no stable way to do that on a valid, open handle), and
+    // forcing the overflow branch requires a real path longer than
+    // MAX_PATH, which depends on this machine's long-path-support
+    // registry setting, not something a test can control portably.
+    // Documented here as an accepted residual rather than a silently
+    // narrowed test: both branches fail closed (escapes(), never a
+    // silent pass-through), which is the property that matters even
+    // though no test can force either condition to actually occur.
     let mut buf = vec![0u16; MAX_PATH as usize];
     let len = unsafe { GetFinalPathNameByHandleW(raw_handle, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) };
     if len == 0 || (len as usize) > buf.len() {
@@ -245,6 +258,7 @@ pub(crate) fn read_verified(root: &Path, candidate_relative: &Path, note_id_labe
 /// which verifies a FILE. Anchors `write_verified_atomic`'s temp-file
 /// creation and rename so both happen relative to a directory identity
 /// already proven safe, never a freshly-resolved path string.
+#[derive(Debug)]
 pub(crate) struct VerifiedDirHandle {
     // Never read directly (Approach A re-verifies via a fresh
     // open_verified_dir call rather than reusing this handle — see
@@ -321,6 +335,10 @@ pub(crate) fn open_verified_dir(root: &Path) -> Result<VerifiedDirHandle, Storag
         if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
             return Err(escapes("<root>"));
         }
+        // Same accepted residual as open_verified_windows's identical check
+        // (see that function's comment on this exact pattern): not
+        // portably/deterministically forceable in a test, fails closed
+        // either way.
         let mut buf = vec![0u16; MAX_PATH as usize];
         let len = unsafe { GetFinalPathNameByHandleW(raw_handle, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) };
         if len == 0 || (len as usize) > buf.len() {
@@ -506,6 +524,19 @@ mod tests {
         let dir = unique_test_dir();
         let result = open_verified_dir(&dir);
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    #[test]
+    fn open_verified_dir_rejects_a_plain_file() {
+        // B5.SEC mutation-testing gap (plan Task 6 closure): open_verified_dir
+        // must reject a path that is a regular file, not a directory — the
+        // FILE_ATTRIBUTE_DIRECTORY/is_dir() check this pins. Mutating that
+        // check (e.g. `&` to `|`, or deleting a `!`) must fail this test.
+        let dir = unique_test_dir();
+        let file_path = dir.join("not-a-directory.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+        let result = open_verified_dir(&file_path);
+        assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
     }
 
     #[test]
