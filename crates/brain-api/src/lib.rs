@@ -14,8 +14,10 @@
 mod error;
 mod policy_write;
 mod proposal;
+mod proposal_store;
 pub use error::BrainApiError;
 pub use policy_write::{WriteOperation, WritePolicy};
+pub use proposal_store::{list_proposals, load_proposal, save_proposal};
 pub use proposal::{
     InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
     valid_proposal_transition,

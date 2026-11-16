@@ -171,6 +171,8 @@ dependencies = [
  "domain",
  "index",
  "policy",
+ "serde",
+ "serde_yaml",
  "storage",
  "thiserror 1.0.69",
  "uuid",

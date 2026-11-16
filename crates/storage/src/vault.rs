@@ -2037,6 +2037,127 @@ impl Vault {
         &self.root
     }
 
+    /// Crate-private general-purpose verified read, scoped to ANY relative
+    /// path under the root. Deliberately NOT `pub`: a public API taking an
+    /// arbitrary relative path is itself a second write/read surface this
+    /// crate's own A1 invariant guards against (confirmed by this change's
+    /// own history — `storage_exposes_exactly_one_public_write_function`'s
+    /// grep caught exactly this risk when an earlier draft of this method
+    /// was `pub`). The public surface for a sibling crate's own confined
+    /// resource class is [`Vault::save_proposal`]/[`Vault::load_proposal`]/
+    /// [`Vault::list_proposal_ids`] below — each hard-codes its own
+    /// resource's path shape and validates its own id, never accepting a
+    /// caller-chosen path.
+    fn read_relative_verified(&self, relative: &Path, label: &str) -> Result<Vec<u8>, StorageError> {
+        crate::handle_safety::read_verified(&self.root, relative, label)
+    }
+
+    /// Crate-private general-purpose verified atomic write, same rationale
+    /// as [`Vault::read_relative_verified`]: not `pub`, so no caller outside
+    /// this crate can reach an arbitrary-path write primitive. Uses the same
+    /// Approach A sequence (B5.SEC) every record write in this crate uses:
+    /// a sibling temp file in the verified parent directory, the
+    /// directory's identity re-verified immediately before the rename, the
+    /// renamed-into-place file's identity verified immediately after.
+    fn write_relative_verified_atomic(&self, relative_dir: &Path, file_name: &str, contents: &[u8]) -> Result<(), StorageError> {
+        let dir_path = self.root.join(relative_dir);
+        std::fs::create_dir_all(&dir_path).map_err(StorageError::Io)?;
+        let verified_dir = crate::handle_safety::open_verified_dir(&dir_path)?;
+        crate::handle_safety::write_verified_atomic(&verified_dir, file_name, contents)
+    }
+
+    /// Crate-private discovery-only directory listing, same non-`pub`
+    /// rationale. Mirrors [`Vault::list_note_ids`]'s own discipline
+    /// (`std::fs::read_dir` + `is_file()`, no handle verification — this is
+    /// name enumeration, not content access; the real security boundary is
+    /// each name's subsequent verified read).
+    fn list_relative_dir_entries(&self, relative_dir: &Path) -> Result<Vec<String>, StorageError> {
+        let dir_path = self.root.join(relative_dir);
+        let read_dir = match std::fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let mut names = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(StorageError::Io)?;
+            if !entry.file_type().map_err(StorageError::Io)?.is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// The `.proposals/` subdirectory name, confined to this one constant —
+    /// never a caller-supplied value.
+    const PROPOSALS_DIR: &'static str = ".proposals";
+
+    /// Validates `proposal_id` is safe to use as a bare file-name stem:
+    /// non-empty, ASCII alphanumeric plus `-` only (a UUID's own alphabet),
+    /// no path separator, no `..`, bounded length. This is NOT a general
+    /// path-safety check reused from elsewhere — it is deliberately
+    /// narrower than even `NoteId::parse`'s charset, because a proposal id
+    /// is always a UUID's string form (`brain-api`'s `ProposalId` already
+    /// enforces this at its own layer) and this is `storage`'s own,
+    /// independent re-validation at the boundary where a plain `&str`
+    /// crosses into this crate — this method does not trust that the
+    /// caller already validated it as a `ProposalId`; it validates the
+    /// bytes itself.
+    fn validate_proposal_id_str(proposal_id: &str) -> Result<(), StorageError> {
+        let escapes = || StorageError::PathEscapesVaultRoot { note_id: proposal_id.to_string() };
+        if proposal_id.is_empty() || proposal_id.len() > 64 {
+            return Err(escapes());
+        }
+        if !proposal_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(escapes());
+        }
+        Ok(())
+    }
+
+    /// Persists `contents` (the caller's already-serialized proposal
+    /// record) at `.proposals/{proposal_id}.proposal`, where
+    /// `proposal_id` is validated by this method itself — never a
+    /// caller-chosen path, never any path outside `.proposals/`, never
+    /// reachable toward `.record`/any other vault resource. The ONLY
+    /// public surface `brain-api`'s proposal storage (B5.1 Task 12) has
+    /// onto this crate's filesystem-safety primitives: confined to this
+    /// one resource class, not a general write primitive.
+    pub fn save_proposal(&self, proposal_id: &str, contents: &[u8]) -> Result<(), StorageError> {
+        Self::validate_proposal_id_str(proposal_id)?;
+        let file_name = format!("{proposal_id}.proposal");
+        self.write_relative_verified_atomic(Path::new(Self::PROPOSALS_DIR), &file_name, contents)
+    }
+
+    /// Reads back a proposal persisted by [`Vault::save_proposal`]. Same
+    /// id-validation and path confinement as `save_proposal` — `proposal_id`
+    /// can never resolve outside `.proposals/` or toward any other
+    /// resource.
+    pub fn load_proposal(&self, proposal_id: &str) -> Result<Vec<u8>, StorageError> {
+        Self::validate_proposal_id_str(proposal_id)?;
+        let relative = PathBuf::from(Self::PROPOSALS_DIR).join(format!("{proposal_id}.proposal"));
+        self.read_relative_verified(&relative, proposal_id)
+    }
+
+    /// Lists every currently-persisted proposal id (the `.proposal` file
+    /// stem of each entry under `.proposals/`, with any name that is not
+    /// a validated proposal-id-shaped stem silently skipped rather than
+    /// surfaced — the same "ignore anything that isn't this resource's
+    /// own shape" discipline `list_note_ids` applies to non-`.record`
+    /// entries). Discovery-only, per [`Vault::list_relative_dir_entries`]'s
+    /// own doc comment: each returned id must still be re-verified via
+    /// [`Vault::load_proposal`] to actually read it.
+    pub fn list_proposal_ids(&self) -> Result<Vec<String>, StorageError> {
+        let names = self.list_relative_dir_entries(Path::new(Self::PROPOSALS_DIR))?;
+        Ok(names
+            .into_iter()
+            .filter_map(|name| name.strip_suffix(".proposal").map(str::to_string))
+            .filter(|stem| Self::validate_proposal_id_str(stem).is_ok())
+            .collect())
+    }
+
     /// Test-only introspection: a locked handle onto this vault's journal,
     /// so a test can call crate-private `Journal`-taking functions (like
     /// `find_commit_for_operation`) directly against the exact journal
@@ -2375,6 +2496,116 @@ mod tests {
     /// builds its own non-git vault instead of using this helper.
     fn open_test_vault() -> Vault {
         open_test_vault_with_git_repo().0
+    }
+
+    // --- B5.1 Task 12: Vault's narrow public surface for sibling crates'
+    // (brain-api's) non-note persistence, kept entirely within storage's
+    // ownership of filesystem safety (no raw handle crosses the crate
+    // boundary) ---
+
+    #[test]
+    fn save_proposal_round_trips_through_load_proposal() {
+        let vault = open_test_vault();
+        vault.save_proposal("abc123", b"hello").unwrap();
+        let bytes = vault.load_proposal("abc123").unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn load_proposal_rejects_a_symlink_at_the_final_component() {
+        let vault = open_test_vault();
+        let root = vault.root_for_test().to_path_buf();
+        std::fs::create_dir_all(root.join(".proposals")).unwrap();
+        let outside = unique_test_dir();
+        let outside_file = outside.join("victim.proposal");
+        std::fs::write(&outside_file, b"attacker content").unwrap();
+        symlink_file(&outside_file, &root.join(".proposals").join("abc123.proposal"));
+        let result = vault.load_proposal("abc123");
+        assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
+    }
+
+    #[test]
+    fn save_proposal_rejects_a_hard_linked_target_by_replacing_it_cleanly() {
+        let vault = open_test_vault();
+        let root = vault.root_for_test().to_path_buf();
+        std::fs::create_dir_all(root.join(".proposals")).unwrap();
+        let outside = unique_test_dir();
+        let outside_file = outside.join("victim.proposal");
+        std::fs::write(&outside_file, b"attacker content").unwrap();
+        std::fs::hard_link(&outside_file, root.join(".proposals").join("abc123.proposal")).unwrap();
+        // Same rename-replaces-an-alias-cleanly semantics already proven
+        // for SEC-001's write-side scenario: the outside file is untouched,
+        // the local .proposals entry now holds the new content.
+        vault.save_proposal("abc123", b"new content").unwrap();
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"attacker content", "the outside file must be untouched");
+        let read_back = vault.load_proposal("abc123").unwrap();
+        assert_eq!(read_back, b"new content");
+    }
+
+    #[test]
+    fn load_proposal_on_a_missing_id_returns_not_found() {
+        let vault = open_test_vault();
+        let result = vault.load_proposal("missing123");
+        assert!(matches!(result, Err(StorageError::NotFound { .. })), "got {result:?}");
+    }
+
+    #[test]
+    fn list_proposal_ids_on_an_empty_vault_returns_empty_not_an_error() {
+        let vault = open_test_vault();
+        let ids = vault.list_proposal_ids().unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn list_proposal_ids_lists_saved_proposals() {
+        let vault = open_test_vault();
+        vault.save_proposal("aaa111", b"1").unwrap();
+        vault.save_proposal("bbb222", b"2").unwrap();
+        let mut ids = vault.list_proposal_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["aaa111".to_string(), "bbb222".to_string()]);
+    }
+
+    // --- the proposal API cannot be used to reach anything outside
+    //     .proposals/, cannot address .record, and only derives its
+    //     filename from the validated id string itself ---
+
+    #[test]
+    fn save_proposal_rejects_a_path_traversal_shaped_id() {
+        let vault = open_test_vault();
+        for bad_id in ["../../etc/passwd", "../escape", "a/b", "a\\b", ""] {
+            let result = vault.save_proposal(bad_id, b"x");
+            assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "input {bad_id:?} got {result:?}");
+        }
+    }
+
+    #[test]
+    fn save_proposal_rejects_an_id_shaped_to_target_the_record_extension() {
+        let vault = open_test_vault();
+        // Even an id crafted to make the final file_name look record-like
+        // cannot escape .proposals/ or collide with a real .record file,
+        // since save_proposal always appends ".proposal" and always
+        // resolves under the fixed PROPOSALS_DIR constant -- there is no
+        // way for a proposal_id string to address note-a.record.
+        let result = vault.save_proposal("note-a.record", b"x");
+        // ".record" contains a '.', which this validator's charset (ASCII
+        // alphanumeric + '-' only) rejects outright.
+        assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
+    }
+
+    #[test]
+    fn save_proposal_rejects_an_overlong_id() {
+        let vault = open_test_vault();
+        let too_long = "a".repeat(65);
+        let result = vault.save_proposal(&too_long, b"x");
+        assert!(matches!(result, Err(StorageError::PathEscapesVaultRoot { .. })), "got {result:?}");
+    }
+
+    #[test]
+    fn save_proposal_accepts_a_real_uuid_shaped_id() {
+        let vault = open_test_vault();
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(vault.save_proposal(&id, b"x").is_ok(), "a real UUID string must be accepted");
     }
 
     /// A vault whose root is ALSO a fresh git repository (with an initial
