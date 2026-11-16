@@ -111,6 +111,21 @@ fn open_verified_unix(
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
 
+    // A directory sitting where a record is expected is data corruption,
+    // not an aliasing attack — it must surface as an ordinary I/O failure
+    // (StorageError::Io), not PathEscapesVaultRoot, matching this crate's
+    // pre-B5.SEC behavior for this exact case. Checked via symlink_metadata
+    // (does not follow the final component) before the verified open, so a
+    // real directory is distinguished from a symlink pointing at one — the
+    // open below still rejects the symlink case via O_NOFOLLOW as before.
+    if let Ok(meta) = std::fs::symlink_metadata(candidate) {
+        if meta.is_dir() {
+            return Err(StorageError::Io(std::io::Error::other(format!(
+                "record path for note {note_id_label} is a directory, not a file"
+            ))));
+        }
+    }
+
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     match mode {
@@ -154,6 +169,18 @@ fn open_verified_windows(
         GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, GETFINALPATHNAMEBYHANDLE_FLAGS,
     };
+
+    // Same rationale as the Unix branch: a directory where a record is
+    // expected is data corruption, not an aliasing attack, and must
+    // surface as StorageError::Io — checked via symlink_metadata (does
+    // not follow the final component) before the verified open.
+    if let Ok(meta) = std::fs::symlink_metadata(candidate) {
+        if meta.is_dir() {
+            return Err(StorageError::Io(std::io::Error::other(format!(
+                "record path for note {note_id_label} is a directory, not a file"
+            ))));
+        }
+    }
 
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -219,7 +246,12 @@ pub(crate) fn read_verified(root: &Path, candidate_relative: &Path, note_id_labe
 /// creation and rename so both happen relative to a directory identity
 /// already proven safe, never a freshly-resolved path string.
 pub(crate) struct VerifiedDirHandle {
-    #[cfg_attr(not(windows), allow(dead_code))]
+    // Never read directly (Approach A re-verifies via a fresh
+    // open_verified_dir call rather than reusing this handle — see
+    // write_verified_atomic's doc comment) but kept open deliberately:
+    // holding it for VerifiedDirHandle's lifetime is a RAII anchor, not
+    // dead weight, even though nothing currently reads its value.
+    #[allow(dead_code)]
     dir: File,
     path: PathBuf,
 }
@@ -231,12 +263,27 @@ pub(crate) struct VerifiedDirHandle {
 pub(crate) fn open_verified_dir(root: &Path) -> Result<VerifiedDirHandle, StorageError> {
     let canonical_root = std::fs::canonicalize(root).map_err(StorageError::Io)?;
 
+    // `root` (the vault's own configured root path) is RESOLVED, not
+    // rejected, if it goes through a symlink/reparse point — the trust
+    // anchor is the CANONICAL location the root resolves to, which the
+    // caller already computed as `canonical_root`. This differs from
+    // `open_verified`'s file-open path, where a link at the final
+    // component is always an attack signal: the vault root is configured
+    // once, by the trusted local operator, and "reached via a symlinked
+    // ancestor" is an ordinary, legitimate deployment shape (ADR-equivalent
+    // precedent: `vault_root_reached_through_a_symlinked_ancestor_still_works`,
+    // pre-existing in this module's test suite). What this function still
+    // must refuse is a MISMATCH: whatever `root` resolves to right now,
+    // via the OS's own symlink-following open, must be exactly
+    // `canonical_root` (computed via `std::fs::canonicalize`, itself
+    // symlink-resolving) — any divergence means the two resolutions
+    // disagree, which is the actual anomaly worth rejecting.
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
         use std::os::unix::io::AsRawFd;
         let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        opts.read(true).custom_flags(libc::O_DIRECTORY);
         let dir = opts.open(root).map_err(|_| escapes("<root>"))?;
         let metadata = dir.metadata().map_err(|_| escapes("<root>"))?;
         if !metadata.is_dir() {
@@ -256,20 +303,20 @@ pub(crate) fn open_verified_dir(root: &Path) -> Result<VerifiedDirHandle, Storag
         use windows::Win32::Foundation::{HANDLE, MAX_PATH};
         use windows::Win32::Storage::FileSystem::{
             GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, GETFINALPATHNAMEBYHANDLE_FLAGS,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, GETFINALPATHNAMEBYHANDLE_FLAGS,
         };
+        // No FILE_FLAG_OPEN_REPARSE_POINT here: `root` resolving through a
+        // reparse point is legitimate (see this function's doc comment
+        // above) — CreateFileW follows it normally, landing on the real
+        // target directory, which is exactly what this function needs to
+        // then verify against `canonical_root`.
         let mut opts = std::fs::OpenOptions::new();
-        opts.read(true)
-            .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT.0) | (FILE_FLAG_BACKUP_SEMANTICS.0));
+        opts.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0);
         let dir = opts.open(root).map_err(|_| escapes("<root>"))?;
         let raw_handle = HANDLE(dir.as_raw_handle());
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         unsafe {
             GetFileInformationByHandle(raw_handle, &mut info).map_err(|_| escapes("<root>"))?;
-        }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
-            return Err(escapes("<root>"));
         }
         if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
             return Err(escapes("<root>"));

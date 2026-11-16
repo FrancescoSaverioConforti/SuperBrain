@@ -1195,11 +1195,16 @@ impl Vault {
             return self.resume_existing_operation(row, pii_store);
         }
 
+        // `record_path` is kept only for `commit_to_git`'s own signature;
+        // B5.SEC's verified-handle rewire below means every actual
+        // read/write in this function goes through
+        // `handle_safety::{read_verified, write_verified_atomic}`.
         let record_path = self.record_path_checked(note_id)?;
-        // Task 9 seam: lets a test pause right after the containment check
-        // judged `record_path` safe and swap it for a symlink before the
-        // write below touches it, to characterize SEC-001. Never armed by
-        // `FaultInjector::none()` (every production caller).
+        // Task 9 seam, B5.SEC note: originally paused BETWEEN separate
+        // "check path" and "touch path" steps to characterize SEC-001's
+        // race. Since read_verified now performs both as one handle-based
+        // operation, there is no window to pause IN; this fires right
+        // after the verified read below instead.
         injector.check(FaultPoint::AfterPathCheckedBeforeAtomicWrite).map_err(interrupted)?;
 
         // Step 1: intent_recorded. Deliberately before the per-note lock —
@@ -1240,10 +1245,16 @@ impl Vault {
             });
         }
 
-        let current_bytes = match std::fs::read(&record_path) {
+        // Built once as both a String (for write_verified_atomic's &str
+        // file_name parameter, used verbatim — no unwrap needed since this
+        // is already the &str it was built from, never re-derived from a
+        // PathBuf) and the PathBuf read_verified needs.
+        let record_name = format!("{}.record", note_id.as_str());
+        let record_relative = PathBuf::from(&record_name);
+        let current_bytes = match crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str()) {
             Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(StorageError::Io(e)),
+            Err(StorageError::NotFound { .. }) => None,
+            Err(e) => return Err(e),
         };
         let actual_version = match &current_bytes {
             Some(bytes) => parse_record(bytes, note_id)?.version,
@@ -1300,7 +1311,8 @@ impl Vault {
             .unwrap()
             .record_fields(operation_id, WriteState::IntentRecorded, fields.clone())
             .map_err(journal_err)?;
-        atomic_write(&record_path, &buffer).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+        let verified_root = crate::handle_safety::open_verified_dir(&self.root)?;
+        crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &buffer)?;
         injector.check(FaultPoint::AfterRenameBeforeContentPersisted).map_err(interrupted)?;
         self.journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
         // Checked AFTER the ContentPersisted advance (Task 7 fix round,
@@ -1314,14 +1326,14 @@ impl Vault {
         // Step 5: verify the bytes actually on disk hash to what was just
         // recorded. This closes the "hash della nuova versione verificato"
         // fault-matrix row.
-        let written_bytes = std::fs::read(&record_path).map_err(StorageError::Io)?;
+        let written_bytes = crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str())?;
         if content_hash(&written_bytes) != new_hash {
             if let Some(before_hash) = &before_image_hash {
                 if let Ok(before_bytes) = read_before_image(&self.root, note_id, operation_id) {
                     if content_hash(&before_bytes) == *before_hash
-                        && atomic_write(&record_path, &before_bytes).is_ok()
+                        && crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &before_bytes).is_ok()
                     {
-                        let rolled_back = std::fs::read(&record_path).map_err(StorageError::Io)?;
+                        let rolled_back = crate::handle_safety::read_verified(&self.root, &record_relative, note_id.as_str())?;
                         if content_hash(&rolled_back) == *before_hash {
                             // Delete the before-image BEFORE advancing to the
                             // terminal Failed state, matching recovery's row 2:
@@ -4249,11 +4261,17 @@ mod tests {
     }
 
     #[test]
-    fn sec_001_toctou_window_between_path_check_and_write_still_exists() {
-        // This test is EXPECTED to demonstrate the race still succeeds (NOT a
-        // regression to fix in this task) — it is the adversarial proof that
-        // hash verification alone does not close SEC-001, because the hash
-        // check happens AFTER the write, not before the path resolution race.
+    fn sec_001_toctou_window_between_path_check_and_write_is_closed() {
+        // B5.SEC Approach A closure (inverted from
+        // `..._still_exists`, which demonstrated the race succeeding):
+        // the fault point now fires AFTER the write path's one verified
+        // read (not mid-race between a path check and a separate later
+        // touch, since those are now the same handle-based operation) —
+        // a test can still pause here and swap the path for a symlink,
+        // but the write that follows goes through its OWN fresh
+        // open_verified_dir/write_verified_atomic call, which rejects the
+        // symlink outright. The race no longer silently proceeds through
+        // a swapped path at all.
         let root = unique_test_dir();
         init_git_repo_at(&root);
         let vault = Arc::new(Vault::open_with_default_indexer(root.clone(), &fresh_journal_path()).unwrap());
@@ -4262,9 +4280,6 @@ mod tests {
 
         let (pause_tx, pause_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        // Pause AFTER record_path_checked's canonicalization has already run
-        // and returned "inside root", but BEFORE atomic_write's own
-        // open/rename.
         let injector = FaultInjector::pause_at(FaultPoint::AfterPathCheckedBeforeAtomicWrite, pause_tx, resume_rx);
         let writer_vault = Arc::clone(&vault);
         let writer_id = id.clone();
@@ -4273,49 +4288,24 @@ mod tests {
         });
 
         pause_rx.recv().unwrap();
-        // Swap the now-checked-safe path for a symlink pointing outside,
-        // during the window.
         let _ = std::fs::remove_file(root.join("note-a.record"));
         symlink_file(&outside.join("victim"), &root.join("note-a.record"));
         resume_tx.send(()).unwrap();
         let write_result = writer.join().unwrap();
 
-        // DEVIATION FROM THE BRIEF, recorded here rather than silently
-        // "fixed" to match the brief's prediction (per this task's explicit
-        // instructions): the brief's original assertion checked
-        // `outside.join("victim").exists()`, predicting that the race makes
-        // `atomic_write`'s rename FOLLOW the symlink and land the new bytes
-        // at its target, inside `outside`. Measured directly against this
-        // platform's `atomic_write` (a bare `std::fs::rename(tmp, path)`,
-        // `crates/storage/src/atomic.rs`), that is not what happens: a
-        // rename onto a destination that is itself a symlink replaces the
-        // link (unlinks it and puts the new inode/file in its place) rather
-        // than writing through it to the link's target. So `outside/victim`
-        // is never created, and the race's observable effect is instead
-        // that the attacker's symlink is silently destroyed and replaced by
-        // the vault's own record — still a bug (the write proceeded through
-        // a path component the containment check had already approved
-        // before an attacker swapped it, violating the "write what you
-        // checked" invariant) but NOT the specific "write bytes outside the
-        // root" consequence the original finding predicted via THIS write
-        // primitive. Both facts are asserted below so this test fails loudly
-        // if either changes.
-        assert!(write_result.is_ok(), "the write must succeed despite the mid-flight symlink swap, got {write_result:?}");
-        let link_meta = root.join("note-a.record").symlink_metadata().unwrap();
-        let race_replaced_the_symlink_without_erroring = !link_meta.file_type().is_symlink();
         assert!(
-            race_replaced_the_symlink_without_erroring,
-            "SEC-001 verdict check: if this assertion fails (the path is still the attacker's symlink), the race no longer silently proceeds through a swapped path — re-evaluate the verdict rather than treating this as a test bug"
+            matches!(write_result, Err(StorageError::PathEscapesVaultRoot { .. })),
+            "SEC-001 write-path closure: a symlink swapped in during the pause must be rejected by the write's own fresh identity verification, not silently written through — got {write_result:?}"
         );
         let race_wrote_outside_the_root = outside.join("victim").exists();
         assert!(
             !race_wrote_outside_the_root,
-            "atomic_write's std::fs::rename onto the final path replaces a destination symlink rather than following it — this holds under both Windows and POSIX rename(2) semantics, so it is not a platform quirk. If this assertion fails, atomic_write's rename semantics changed and bytes now land outside the root, which is a MORE severe form of SEC-001 than previously measured"
+            "no bytes must ever land outside the root, whether the write succeeds or fails"
         );
     }
 
     #[test]
-    fn sec_001_toctou_read_side_leaks_an_outside_records_version_and_bytes_into_the_before_image() {
+    fn sec_001_toctou_read_side_no_longer_leaks_an_outside_records_version_or_bytes() {
         // Independent-review finding I-1: the write-side scenario above only
         // exercises atomic_write's own rename, which happens to replace a
         // destination symlink rather than follow it. But the SAME race
@@ -4383,25 +4373,26 @@ mod tests {
         resume_tx.send(()).unwrap();
         let write_result = writer.join().unwrap();
 
-        // Step 2 read Version(7) through the symlink, matched
-        // expected_version, so this is NOT a Conflict. The content itself
-        // is still durably persisted and journal-readable at this point
-        // (`JournalCommitted`) — `GitPending` is the spec's non-error
-        // response code for "no git repository yet", not a write failure.
+        // B5.SEC Approach A closure: step 2's read now goes through
+        // read_verified, which opens with O_NOFOLLOW/FILE_FLAG_OPEN_REPARSE_POINT
+        // — it no longer follows a symlink at all, so the outside file's
+        // Version(7)/content is never read through the swapped-in link.
+        // The write fails closed instead of reading through the alias.
         assert!(
-            matches!(write_result, Err(StorageError::GitPending { .. })),
-            "the write's content/journal steps must succeed (step 2 reads the outside file's real Version(7) through the symlink, matching expected_version); GitPending is expected here only because this test's root is deliberately not a git repository — got {write_result:?}"
+            matches!(write_result, Err(StorageError::PathEscapesVaultRoot { .. })),
+            "SEC-001 read-side closure: a symlink swapped in during the pause must be rejected by read_verified's O_NOFOLLOW/no-reparse-point check, never read through — got {write_result:?}"
         );
-        let before_image_bytes = read_before_image(&root, &id, op).expect("a before-image must have been persisted: step 2 saw an existing record (the outside file, through the symlink) before overwriting it");
-        assert_eq!(
-            before_image_bytes,
-            serialize_record("OUTSIDE CONTENT", Version(7)),
-            "SEC-001 read-side finding: the before-image persisted for THIS note now holds the OUTSIDE file's own bytes, pulled in through the race window's step-2 read, which DOES follow a symlink (unlike atomic_write's rename). If this assertion fails, step 2 no longer reads through a mid-race symlink swap and this read-side consequence no longer applies — re-evaluate the verdict rather than treating this as a test bug."
+        // No before-image can exist: the pipeline never got far enough to
+        // read the outside file's bytes at all, so none were ever pulled
+        // into the vault under this note's name.
+        assert!(
+            read_before_image(&root, &id, op).is_err(),
+            "no before-image should exist: the write must have failed before persist_before_image ever ran"
         );
     }
 
     #[test]
-    fn sec_002_read_path_rejects_both_aliasing_shapes_but_write_path_pre_read_does_not() {
+    fn sec_002_both_read_and_write_paths_reject_both_aliasing_shapes() {
         // Renamed (independent-review finding M-2) from
         // `sec_002_journal_hash_check_does_not_detect_aliasing_present_before_the_write`:
         // that name asserted the opposite of what this test's Scenario A
@@ -4532,38 +4523,29 @@ mod tests {
         // elsewhere in this module).
         let id_c = NoteId::parse("note-c").unwrap();
         symlink_file(&root.join("note-b.record"), &root.join("note-c.record"));
-        // note-b is at Version(1) (its one write above). A write to the
-        // never-written note-c, aliased to note-b, with expected_version
-        // matching note-b's ACTUAL version, takes that path: step 2 reads
-        // Version(1) through the alias, matches, and proceeds to persist
-        // note-b's CURRENT bytes as note-c's before-image, then overwrites
-        // the symlink with note-c's own new record (replaced exactly as
-        // SEC-001's write-side scenario showed: the rename destroys the
-        // symlink rather than writing through it, so note-b's own file is
-        // untouched — confirmed by the post-write assertions below).
+        // B5.SEC (Task 6) update: write_record_unchecked's step 2 now
+        // reads through `read_verified` (O_NOFOLLOW/no-reparse-point),
+        // which rejects the symlink outright instead of reading through
+        // it — closing the write-side half of SEC-002 that was
+        // previously fully open. The write fails closed before any
+        // before-image is ever persisted, and note-b's own file is
+        // naturally untouched since the write never got far enough to
+        // touch anything at all.
         let op_c = Uuid::new_v4();
-        // Interrupted right after the before-image is persisted and the
-        // rename lands (AfterRenameBeforeJournalCommitted), i.e. BEFORE
-        // write_record_unchecked's later git-commit step would delete the
-        // before-image on reaching GitCommitted (doc comment on step 7,
-        // above) — this test wants to inspect the before-image the write
-        // persisted, not watch it get cleaned up by normal completion.
         let interrupt_before_git = FaultInjector::trigger_at(FaultPoint::AfterRenameBeforeJournalCommitted);
         let write_through_alias = vault.write_record_unchecked_with_injector(&id_c, "note-c's new content", Version(1), op_c, &interrupt_before_git);
         assert!(
-            matches!(write_through_alias, Err(StorageError::Interrupted(FaultPoint::AfterRenameBeforeJournalCommitted))),
-            "the write's content/before-image steps must succeed (step 2 reads note-b's real Version(1) through the alias, matching expected_version) and reach exactly this fault point — got {write_through_alias:?}"
+            matches!(write_through_alias, Err(StorageError::PathEscapesVaultRoot { .. })),
+            "SEC-002 write-path closure: an in-root symlink at a never-written note id's path must be rejected by read_verified's identity check itself — got {write_through_alias:?}"
         );
-        let before_image_bytes = read_before_image(&root, &id_c, op_c).expect("step 2 must have persisted note-b's bytes as note-c's before-image: it read them through the alias before overwriting");
-        assert_eq!(
-            before_image_bytes,
-            serialize_record("note-b real content", Version(1)),
-            "SEC-002 write-path finding: note-c's before-image now holds note-b's OWN content — a cross-note version/content leak through write_record_unchecked's step 2, which is NOT gated by the per-note-id journal lookup that protects read_note. This is the write-side half of SEC-002 that remains fully open."
+        assert!(
+            read_before_image(&root, &id_c, op_c).is_err(),
+            "no before-image should exist: the write must have failed before persist_before_image ever ran"
         );
         assert_eq!(
             vault.read_note(&id_b).unwrap().content,
             "note-b real content",
-            "note-b's own file must be untouched by note-c's write: the rename at the end of write_record_unchecked replaces the symlink at note-c.record, exactly as SEC-001's write-side scenario showed, rather than writing through it to note-b's actual file"
+            "note-b's own file must be untouched by the rejected write to note-c"
         );
     }
 
