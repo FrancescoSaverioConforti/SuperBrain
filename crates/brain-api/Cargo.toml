@@ -1,0 +1,16 @@
+[package]
+name = "brain-api"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain Brain API orchestration layer: read delegation, write-proposal lifecycle, approval-gated execution."
+
+[dependencies]
+api = { path = "../api" }
+storage = { path = "../storage" }
+policy = { path = "../policy" }
+domain = { path = "../domain" }
+index = { path = "../index" }
+uuid = { version = "1", features = ["v4"] }
