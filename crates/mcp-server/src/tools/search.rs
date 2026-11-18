@@ -75,6 +75,21 @@ pub struct SuperBrainMcpServer {
     indexer: Arc<RealIndexer>,
     graph: Arc<CodeGraph>,
     active_project: String,
+    /// B5.2 Task 31 (E2E flow 1): an optional real `DenseScorer`, applied
+    /// to every `Index` this server builds for `search`/
+    /// `get_previous_solution` when present. `None` by default —
+    /// EVERY existing call site/test that constructs a
+    /// `SuperBrainMcpServer` via [`Self::new`] is completely unaffected
+    /// (identical `RetrievalMode::Lexical` behavior, matching
+    /// `index::Index::new`'s own default); only
+    /// [`Self::with_dense_retrieval`] opts a server instance into
+    /// `RetrievalMode::DenseV2`. This crate still never builds, loads, or
+    /// rebuilds a dense index itself — the caller (this crate's own
+    /// `tests/e2e_agent_search.rs`, today) supplies an already-built
+    /// `Arc<dyn DenseScorer>`, the same "dependency injection, not
+    /// lifecycle ownership" rule this struct's own module doc comment
+    /// already states for `vault`/`indexer`/`graph`.
+    dense_scorer: Option<Arc<dyn index::search::DenseScorer>>,
     /// The full, fixed tool surface (B5.2 Task 24): Task 22's `read_tools`
     /// plus Task 23's `graph_tools`/`memory_tools`/`knowledge_tools`,
     /// combined once at construction time via `ToolRouter`'s own `+`
@@ -98,7 +113,18 @@ impl SuperBrainMcpServer {
     /// results while looking like it works.
     pub fn new(vault: storage::Vault, indexer: Arc<RealIndexer>, graph: Arc<CodeGraph>, active_project: impl Into<String>) -> Self {
         let tool_router = Self::read_tools() + Self::graph_tools() + Self::memory_tools() + Self::knowledge_tools();
-        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router }
+        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router, dense_scorer: None }
+    }
+
+    /// Opts this server instance into `RetrievalMode::DenseV2` for
+    /// `search`/`get_previous_solution`, using `scorer` as the real
+    /// `DenseScorer` implementation. `scorer` must already be built and
+    /// current (the same "caller supplies it already-built" rule
+    /// `Self::new`'s own doc comment states for `indexer`/`graph`) —
+    /// this method never rebuilds, refreshes, or validates it.
+    pub fn with_dense_retrieval(mut self, scorer: Arc<dyn index::search::DenseScorer>) -> Self {
+        self.dense_scorer = Some(scorer);
+        self
     }
 
     pub(crate) fn mcp_ctx(&self) -> RequestContext {
@@ -121,7 +147,11 @@ impl SuperBrainMcpServer {
     }
 
     pub(crate) fn index(&self, reference_date: chrono::NaiveDate) -> index::Index<'_> {
-        index::Index::new(&self.vault, &self.indexer, &self.active_project, reference_date)
+        let idx = index::Index::new(&self.vault, &self.indexer, &self.active_project, reference_date);
+        match &self.dense_scorer {
+            Some(scorer) => idx.with_dense_scorer(scorer.as_ref()).with_retrieval_mode(index::search::RetrievalMode::DenseV2),
+            None => idx,
+        }
     }
 
     /// Read-only accessor for tests to assert on the injected `Vault`'s

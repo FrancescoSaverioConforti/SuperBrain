@@ -8,3 +8,7 @@
 # docs/superpowers/specs/2026-11-14-b3-tune-v2-priority4-stage1-dev-freeze.md
 # -- never committed, re-fetched by the harness if missing.
 /.priority4-model-cache/
+# B5.2 Task 31: shared cache for crates/mcp-server/tests/e2e_agent_search.rs's
+# real DenseV2 E2E test -- same pinned MiniLM ONNX/tokenizer artifacts,
+# never committed, re-fetched (via api::dense::setup) if missing.
+/.e2e-dense-model-cache/

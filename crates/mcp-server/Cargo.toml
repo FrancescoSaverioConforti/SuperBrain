@@ -7,6 +7,19 @@ license = "Apache-2.0"
 publish = false
 description = "SuperBrain MCP server: exposes brain-api's capabilities over the Model Context Protocol."
 
+[features]
+# Forwards brain-api's own dense-retrieval feature (itself forwarding
+# api's, B4.1) unchanged, through the full mcp-server -> brain-api -> api
+# chain. The only dense-retrieval-SPECIFIC code this crate itself adds
+# (Task 31) is SuperBrainMcpServer::with_dense_retrieval -- an
+# additive, optional builder (see tools/search.rs's own doc comment);
+# `brain_api::search`/`api::search` themselves stay unmodified. This
+# feature entry exists purely so a real external MCP client calling
+# `search` can reach DenseV2 results when the server process is built
+# with it (Task 31's own E2E requirement), without mcp-server inventing
+# a second meaning for the name.
+dense-retrieval = ["brain-api/dense-retrieval"]
+
 [dependencies]
 brain-api = { path = "../brain-api" }
 # These 7 core crates are direct dependencies ONLY because
