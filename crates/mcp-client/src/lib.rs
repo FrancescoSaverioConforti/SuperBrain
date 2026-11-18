@@ -21,21 +21,30 @@
 //! `McpServerRegistration`, `connect()`, and the one global kill-switch
 //! (`global_client_enabled()`).
 //!
-//! B5.9 (this task, Task 27): capability discovery and a tool metadata
-//! cache (`discover_tools`, `ToolCache`, `DiscoveredTool`) — calls a
-//! connected server's real `tools/list` and validates the reply before
-//! trusting any of it. Still does not classify, authorize, or invoke
-//! anything; `DiscoveredTool::classification` is an inert `Option<()>`
-//! placeholder, always `None`, never read by this crate. Authorization
-//! (Task 28) and invocation (Task 29) are later, separate modules this
-//! crate does not yet have.
+//! B5.9 (Task 27): capability discovery and a tool metadata cache
+//! (`discover_tools`, `ToolCache`, `DiscoveredTool`) — calls a connected
+//! server's real `tools/list` and validates the reply before trusting any
+//! of it. `DiscoveredTool::classification` is an inert `Option<()>`
+//! placeholder, always `None`, never read by anything in this crate.
+//!
+//! B5.9 (this task, Task 28): the external tool authorization model
+//! (`permission` module) — `ExternalToolMetadata`, `ToolClassification`,
+//! `Sensitivity`, `ApprovalPolicy`, `ScopeLimits`, and the one decision
+//! function `authorize`. Deliberately NOT connected to `discovery`:
+//! `authorize` never reads a `DiscoveredTool`, and nothing in this module
+//! derives `ExternalToolMetadata` from server-supplied data automatically
+//! — external tool metadata is untrusted input (see `permission`'s own
+//! module doc comment). Invocation (Task 29) is a later, separate module
+//! this crate does not yet have.
 
 mod discovery;
 mod error;
+mod permission;
 mod registration;
 
 pub use discovery::{DiscoveredTool, ToolCache, discover_tools};
 pub use error::McpClientError;
+pub use permission::{ApprovalPolicy, ExternalToolMetadata, ScopeLimits, Sensitivity, ToolClassification, authorize};
 pub use registration::{McpConnection, McpServerRegistration, TransportConfig, connect, connect_with_timeout, global_client_enabled};
 
 #[cfg(test)]

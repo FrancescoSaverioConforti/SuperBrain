@@ -6,15 +6,14 @@
 //! filesystem path, raw process spawn detail, or the external server's own
 //! internal error text verbatim — only a caller-facing category.
 
-/// The frozen `mcp-client` error vocabulary. Grows only with later tasks
-/// in this plan (B5.9's `authorize` denial) — Task 26 defined connection
-/// lifecycle's own two variants; Task 27 (this one) adds exactly the one
-/// `MalformedResponse` variant its own scope (rejecting an external
-/// server's untrustworthy `tools/list` reply) needs, matching the exact
-/// name the plan's own Task 29 text already uses for the same category of
-/// failure — not a new invention, the vocabulary this crate was always
-/// going to need for "the external server answered, but what it sent
-/// cannot be trusted."
+/// The frozen `mcp-client` error vocabulary. Task 26 defined connection
+/// lifecycle's own two variants; Task 27 added `MalformedResponse`
+/// (rejecting an external server's untrustworthy `tools/list` reply,
+/// matching the exact name the plan's own Task 29 text already uses for
+/// the same category of failure); Task 28 (this one) adds
+/// `PermissionDenied`, exactly the variant this module's own prior doc
+/// comment already anticipated needing for `authorize`'s denial outcome —
+/// not a new invention either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpClientError {
     /// The global client kill-switch (`global_client_enabled`) is off, or
@@ -41,6 +40,14 @@ pub enum McpClientError {
     /// carries a caller-facing reason, never the raw untrusted payload
     /// verbatim.
     MalformedResponse(String),
+    /// `authorize` (B5.9, Task 28) denied this tool under the given
+    /// `ApprovalPolicy` — deny-by-default is the only path that ever
+    /// produces this: an unregistered/unclassified tool, a policy that
+    /// does not cover the tool's real classification, or
+    /// `AskApprovalRequired` with no prior approval record. Never
+    /// produced by anything else in this crate (connection/discovery
+    /// failures use their own distinct variants above).
+    PermissionDenied,
 }
 
 impl std::fmt::Display for McpClientError {
@@ -50,6 +57,7 @@ impl std::fmt::Display for McpClientError {
             Self::Timeout => f.write_str("connection attempt timed out"),
             Self::ConnectionFailed(reason) => write!(f, "connection failed: {reason}"),
             Self::MalformedResponse(reason) => write!(f, "malformed response from external server: {reason}"),
+            Self::PermissionDenied => f.write_str("permission denied"),
         }
     }
 }
@@ -61,7 +69,13 @@ mod tests {
     use super::*;
 
     fn all_variants() -> Vec<McpClientError> {
-        vec![McpClientError::Disabled, McpClientError::Timeout, McpClientError::ConnectionFailed("x".into()), McpClientError::MalformedResponse("x".into())]
+        vec![
+            McpClientError::Disabled,
+            McpClientError::Timeout,
+            McpClientError::ConnectionFailed("x".into()),
+            McpClientError::MalformedResponse("x".into()),
+            McpClientError::PermissionDenied,
+        ]
     }
 
     #[test]
