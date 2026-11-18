@@ -27,23 +27,35 @@
 //! of it. `DiscoveredTool::classification` is an inert `Option<()>`
 //! placeholder, always `None`, never read by anything in this crate.
 //!
-//! B5.9 (this task, Task 28): the external tool authorization model
-//! (`permission` module) — `ExternalToolMetadata`, `ToolClassification`,
-//! `Sensitivity`, `ApprovalPolicy`, `ScopeLimits`, and the one decision
-//! function `authorize`. Deliberately NOT connected to `discovery`:
-//! `authorize` never reads a `DiscoveredTool`, and nothing in this module
-//! derives `ExternalToolMetadata` from server-supplied data automatically
-//! — external tool metadata is untrusted input (see `permission`'s own
-//! module doc comment). Invocation (Task 29) is a later, separate module
-//! this crate does not yet have.
+//! B5.9 (Task 28): the external tool authorization model (`permission`
+//! module) — `ExternalToolMetadata`, `ToolClassification`, `Sensitivity`,
+//! `ApprovalPolicy`, `ScopeLimits`, and the one decision function
+//! `authorize`. Deliberately NOT connected to `discovery`: `authorize`
+//! never reads a `DiscoveredTool`, and nothing in this module derives
+//! `ExternalToolMetadata` from server-supplied data automatically —
+//! external tool metadata is untrusted input (see `permission`'s own
+//! module doc comment).
+//!
+//! B5.9 (this task, Task 29): invocation (`invoke` module) —
+//! `invoke_external_tool`, the one path this crate has to actually call
+//! a tool on an already-connected external server. Always runs
+//! `authorize` first (a denial never touches the transport), always
+//! times out rather than hanging, and always validates a successful
+//! reply before trusting it. Also defines a deliberately minimal,
+//! LOCAL, provisional invocation log (`InvocationLogEntry`) — NOT Task
+//! 33's real `brain_api::AuditEvent` schema, which this crate has no
+//! dependency on and does not anticipate; see `invoke`'s own module doc
+//! comment for why.
 
 mod discovery;
 mod error;
+mod invoke;
 mod permission;
 mod registration;
 
 pub use discovery::{DiscoveredTool, ToolCache, discover_tools};
 pub use error::McpClientError;
+pub use invoke::{InvocationLogEntry, InvocationLogSink, InvocationOutcome, NullSink, invoke_external_tool, invoke_external_tool_logged, invoke_external_tool_with_timeout};
 pub use permission::{ApprovalPolicy, ExternalToolMetadata, ScopeLimits, Sensitivity, ToolClassification, authorize};
 pub use registration::{McpConnection, McpServerRegistration, TransportConfig, connect, connect_with_timeout, global_client_enabled};
 
