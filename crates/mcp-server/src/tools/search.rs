@@ -90,17 +90,26 @@ impl SuperBrainMcpServer {
         Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into() }
     }
 
-    fn mcp_ctx(&self) -> RequestContext {
+    pub(crate) fn mcp_ctx(&self) -> RequestContext {
         RequestContext {
             schema_version: brain_api::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::mcp_agent()),
-            read_policy: Some(policy::ReadPolicy::new(true, true).with_get_code_context(true)),
+            read_policy: Some(
+                policy::ReadPolicy::new(true, true)
+                    .with_get_code_context(true)
+                    .with_graph_query(true)
+                    .with_get_entity(true)
+                    .with_get_previous_solution(true)
+                    .with_get_rules(true)
+                    .with_get_regulations(true)
+                    .with_get_canon(true),
+            ),
             origin: CallOrigin::McpSession(MCP_SESSION_PLACEHOLDER.to_string()),
         }
     }
 
-    fn index(&self, reference_date: chrono::NaiveDate) -> index::Index<'_> {
+    pub(crate) fn index(&self, reference_date: chrono::NaiveDate) -> index::Index<'_> {
         index::Index::new(&self.vault, &self.indexer, &self.active_project, reference_date)
     }
 
@@ -111,6 +120,15 @@ impl SuperBrainMcpServer {
     /// `Vault` reads/writes of their own.
     pub fn vault_ref(&self) -> &storage::Vault {
         &self.vault
+    }
+
+    /// Read-only accessor for this server's injected `CodeGraph`, used by
+    /// `tools/graph.rs`'s `graph_query`/`get_entity` wrappers (the same
+    /// already-built-and-injected dependency `get_code_context` above
+    /// already uses via `self.graph`) — never built, rebuilt, or persisted
+    /// by this crate itself.
+    pub(crate) fn graph_ref(&self) -> &codegraph_index::graph::CodeGraph {
+        &self.graph
     }
 }
 

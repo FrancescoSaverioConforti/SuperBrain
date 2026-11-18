@@ -26,6 +26,16 @@ mod error;
 mod tools;
 
 pub use error::map_brain_api_error;
+pub use tools::graph::{
+    GetEntityInput, GetEntityOutput, GraphQueryInput, GraphQueryOutput, LinkEntitiesInput, LinkEntitiesOutput, McpEdgeKind, McpRelationKind,
+};
+pub use tools::knowledge::{
+    CanonEntryDto, GetCanonInput, GetCanonOutput, GetRegulationsInput, GetRegulationsOutput, GetRulesInput, GetRulesOutput, KnowledgeItemDto,
+};
+pub use tools::memory::{
+    GetPreviousSolutionInput, GetPreviousSolutionOutput, McpClassification, PreviousSolutionDto, SaveMemoryInput, SaveMemoryOutput,
+    UpdateMemoryInput, UpdateMemoryOutput,
+};
 pub use tools::search::{
     CodeContextEdgeDto, GetCodeContextInput, GetCodeContextOutput, McpNoteStatus, McpNoteType, RetrieveInput, RetrieveOutput, SearchInput,
     SearchOutput, SearchResultDto, SuperBrainMcpServer,
