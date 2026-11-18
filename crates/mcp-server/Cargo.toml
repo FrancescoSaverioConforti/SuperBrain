@@ -41,3 +41,13 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 git2 = "0.21"
+serde_json = "1"
+# `client` adds rmcp's client-role protocol logic (Peer::list_tools/
+# call_tool, ServiceExt::serve for RoleClient) -- needed ONLY by
+# tests/server_integration.rs (Task 24) to drive a real MCP client against
+# this crate's own server over a real transport. Cargo's resolver v2
+# unifies this feature into the SAME rmcp dependency only for dev/test
+# builds of this crate; the production (non-test) build of mcp-server
+# never gets rmcp's client role compiled in. Not a network transport
+# feature -- tests/no_bypass.rs's own guard only forbids those.
+rmcp = { version = "3.11.0", features = ["client"] }

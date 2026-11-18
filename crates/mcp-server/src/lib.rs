@@ -23,6 +23,7 @@
 //! docs already state for `originating_identity`).
 
 mod error;
+mod handler;
 mod tools;
 
 pub use error::map_brain_api_error;

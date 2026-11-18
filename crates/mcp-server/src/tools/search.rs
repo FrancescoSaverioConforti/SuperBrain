@@ -52,7 +52,7 @@ use codegraph_index::graph::CodeGraph;
 use index::indexer_impl::RealIndexer;
 use rmcp::{
     ErrorData as McpError,
-    handler::server::wrapper::{Json, Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::{Json, Parameters}},
     schemars,
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,16 @@ pub struct SuperBrainMcpServer {
     indexer: Arc<RealIndexer>,
     graph: Arc<CodeGraph>,
     active_project: String,
+    /// The full, fixed tool surface (B5.2 Task 24): Task 22's `read_tools`
+    /// plus Task 23's `graph_tools`/`memory_tools`/`knowledge_tools`,
+    /// combined once at construction time via `ToolRouter`'s own `+`
+    /// (`std::ops::Add`), never rebuilt per-request and never mutated after
+    /// construction. This is the single source `#[tool_handler(router =
+    /// self.tool_router)]` dispatches every real MCP `tools/call`/
+    /// `tools/list` request against — the exact same 12 tools this crate's
+    /// own `tests/*.rs` files already exercise by calling the `#[tool]`
+    /// methods directly, now also reachable over a real transport.
+    pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl SuperBrainMcpServer {
@@ -87,7 +97,8 @@ impl SuperBrainMcpServer {
     /// all, rather than silently getting one that always returns empty
     /// results while looking like it works.
     pub fn new(vault: storage::Vault, indexer: Arc<RealIndexer>, graph: Arc<CodeGraph>, active_project: impl Into<String>) -> Self {
-        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into() }
+        let tool_router = Self::read_tools() + Self::graph_tools() + Self::memory_tools() + Self::knowledge_tools();
+        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router }
     }
 
     pub(crate) fn mcp_ctx(&self) -> RequestContext {
