@@ -27,7 +27,7 @@ pub use graph::link_entities;
 pub use memory::{save_memory, update_memory, ProposedOperation, RelationKind};
 pub use policy_write::{WriteOperation, WritePolicy};
 pub use proposal_store::{load_proposal, save_proposal};
-pub use read::{get_code_context, retrieve, search, CodeContext, CodeContextEdge};
+pub use read::{get_code_context, get_entity, graph_query, retrieve, search, CodeContext, CodeContextEdge, Entity, GraphQuerySpec};
 pub use proposal::{
     InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
     valid_proposal_transition,

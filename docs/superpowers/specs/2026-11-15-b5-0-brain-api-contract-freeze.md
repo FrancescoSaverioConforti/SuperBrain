@@ -198,7 +198,7 @@ internally — B5.0 freezes the *contract* for this; the orchestration
 | 1 | `search` | read, direct | `ReadOperation::Search` (existing, `crates/policy/src/read.rs`) | DenseV2 mode unchanged from B4; BM25 scores comparable within one response only | `Ok(vec![])` on no match |
 | 2 | `retrieve` | read, direct | `ReadOperation::Retrieve` (existing) | Deterministic for a given committed version | `NotFound` for an unknown id; `Inconsistent`→`CorruptData` on hash mismatch (never a silent fallback, per `d9mm`) |
 | 3 | `graph_query` | read, direct | `ReadOperation::GraphQuery` (new variant) | Deterministic for a fixed graph snapshot; bounded traversal (depth/result limits, exact numbers at plan Task 35) | `Ok(vec![])` for no matching paths/nodes |
-| 4 | `get_entity` | read, direct | `ReadOperation::GetEntity` (new variant) | Deterministic for a fixed graph snapshot | `NotFound` for an unknown entity id |
+| 4 | `get_entity` | read, direct | `ReadOperation::GetEntity` (new variant) | Deterministic for a fixed graph snapshot; intrinsic entity facts only, no traversal | `NotFound` for an unknown entity id |
 | 5 | `get_code_context` | read, direct | `ReadOperation::GetCodeContext` (new variant) | Deterministic for a fixed index snapshot | `NotFound` for an unresolvable symbol/location |
 | 6 | `get_previous_solution` | read, direct | `ReadOperation::GetPreviousSolution` (new variant) | Deterministic for a fixed committed vault state | `Ok(vec![])` when nothing matches — never fabricated |
 | 7 | `get_rules` | read, direct | `ReadOperation::GetRules` (new variant) | Deterministic for a fixed set of binding policy documents | `Ok(vec![])` for an unmatched scope filter |
@@ -243,12 +243,37 @@ rule as `search`.
 
 ### 4. `get_entity`
 
-- **Input**: an entity id (`codegraph_domain::SymbolSnapshotId` or
-  equivalent, confirmed at plan Task 17).
-- **Output**: the entity's known facts (kind, evidence method, source
-  location) using the real `codegraph_domain::evidence` types.
-- **Errors**: `NotFound` for an unknown id; `InvalidInput` for a
-  malformed id.
+**Corrected at Task 17** (this document's original wording described a
+fact that does not exist in the real data model — see below).
+
+- **Input**: an entity id (`codegraph_domain::SymbolSnapshotId`,
+  confirmed real at plan Task 17 against `crates/codegraph-index/src/
+  graph/store.rs`'s own `CodeGraph::snapshot` lookup).
+- **Output**: the entity's own intrinsic facts only — `SymbolKind`,
+  name, signature, and source location (`RepositoryId`, `CommitHash`,
+  relative path, byte span) — read directly off `CodeGraph::snapshot`'s
+  `SymbolSnapshot`. No traversal, no neighboring edges.
+- **Errors**: `NotFound` for an unknown id.
+
+**Evidence correction**: the original wording ("kind, evidence method,
+source location") assumed an entity carries its own `Evidence`.
+Verified against the real types: `Evidence` is a property of an
+`Edge` (`crates/codegraph-index/src/edges/resolution.rs`), not of a
+`SymbolSnapshot` — `codegraph_index::snapshot::SymbolSnapshot` has no
+evidence field of any kind. There is no entity-level evidence fact in
+the current `CodeGraph` model to report. `get_entity` therefore
+returns intrinsic entity facts only, with no `evidence`/
+`evidence_method` field (not `None`/`NotApplicable` placeholder —
+removed from the schema outright, since adding a universally-absent
+field would misrepresent it as sometimes present). Evidence-bearing
+relationships remain exposed exactly where they already are: through
+`get_code_context`'s `outgoing`/`incoming` edges (Task 16) and
+`graph_query`'s traversal results (this task), never duplicated onto
+`get_entity`. This keeps `get_entity` (one entity, zero traversal) and
+`get_code_context` (entity + immediate neighborhood, edges and their
+evidence) behaviorally distinct rather than redundant. No change to
+`codegraph-index`/`codegraph-domain`'s real types was made or
+considered to manufacture a fact that was never there.
 
 ### 5. `get_code_context`
 
@@ -437,3 +462,15 @@ rule as `search`.
 - No capability bypasses the trust model frozen in the design doc; the
   proposal-creating three and the approval pair are restated, not
   altered.
+- **Task 17 correction**: verified `codegraph_index::snapshot::
+  SymbolSnapshot`'s real fields (`crates/codegraph-index/src/snapshot/
+  mod.rs:29-36`) and `Edge`'s real fields
+  (`crates/codegraph-index/src/edges/resolution.rs`) before
+  implementing `get_entity`. Found this document's original
+  `get_entity` output ("kind, evidence method, source location")
+  assumed an entity-level `Evidence` fact that does not exist —
+  `Evidence` is an `Edge` property only. Corrected `get_entity`'s
+  schema (§4) to intrinsic entity facts only, with no evidence field;
+  did not add `Evidence` to `SymbolSnapshot` or otherwise change
+  `codegraph-index`/`codegraph-domain`'s real types to manufacture the
+  originally-assumed fact.

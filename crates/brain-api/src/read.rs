@@ -173,6 +173,120 @@ pub fn get_code_context(ctx: &RequestContext, graph: &codegraph_index::graph::Co
     })
 }
 
+/// The maximum `max_depth` a `graph_query` caller may request.
+/// `CodeGraph::reachable_from` itself is already cycle-safe for any depth
+/// (its own visited-set guarantees termination — see `graph/traversal.rs`'s
+/// module doc comment) and needs no depth guard to stay safe; this bound
+/// exists purely to keep one public query's result size and cost
+/// predictable, per the B5.0 contract's "bounded traversal (depth/result
+/// limits, exact numbers at plan Task 35)" note. Provisional pending
+/// Task 35's own numeric pass over every capability at once — not
+/// invented in isolation, but not left unbounded either, since the task
+/// explicitly requires rejecting a query that exceeds its bound rather
+/// than assuming the underlying crate already enforces one.
+const MAX_GRAPH_QUERY_DEPTH: usize = 50;
+
+/// The maximum number of results `graph_query` returns. Same provisional
+/// status as [`MAX_GRAPH_QUERY_DEPTH`]. `CodeGraph::reachable_from`'s own
+/// result order is already deterministic (BFS discovery order over a
+/// fixed graph snapshot), so truncating to this length never discards
+/// results non-deterministically — the same `max_depth`+result set always
+/// truncates to the same prefix.
+const MAX_GRAPH_QUERY_RESULTS: usize = 500;
+
+/// A `graph_query` request: the entity to start from, which `EdgeKind` to
+/// follow (or every kind, if `None`), and how many hops to traverse.
+/// Mirrors exactly the parameters `CodeGraph::reachable_from` already
+/// takes — this does not invent a query grammar beyond what that real
+/// primitive supports, per the B5.0 contract's own instruction to ground
+/// this task's shape in the underlying crate's real public surface
+/// (`crates/codegraph-index/src/graph/traversal.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphQuerySpec {
+    pub start: codegraph_domain::SymbolSnapshotId,
+    pub kind: Option<codegraph_domain::EdgeKind>,
+    pub max_depth: usize,
+}
+
+/// Runs a bounded traversal from `request.start`, following
+/// `request.kind`-filtered outgoing edges up to `request.max_depth` hops,
+/// and returns at most `limit` reachable snapshot ids (BFS discovery
+/// order, truncated — never reordered). `ctx.read_policy` must allow
+/// `ReadOperation::GraphQuery` or this fails closed with
+/// `PermissionDenied` before `graph` is ever queried.
+///
+/// `request.max_depth` exceeding [`MAX_GRAPH_QUERY_DEPTH`] or `limit`
+/// exceeding [`MAX_GRAPH_QUERY_RESULTS`] returns `InvalidInput` without
+/// running any traversal — the bound is enforced here, in `brain-api`,
+/// since `CodeGraph::reachable_from` itself imposes no caller-facing
+/// limit (it is already cycle-safe for any depth; this is a cost/size
+/// bound on the public query surface, not a safety requirement of the
+/// underlying primitive). An unknown `start` id returns `Ok(vec![])`
+/// — exactly `CodeGraph::reachable_from`'s own behavior for an unknown
+/// start, since a traversal that cannot even begin has no paths/nodes to
+/// report and the B5.0 contract treats "no matching paths/nodes" as an
+/// empty result, never a `NotFound` error, for this capability.
+pub fn graph_query(ctx: &RequestContext, graph: &codegraph_index::graph::CodeGraph, request: GraphQuerySpec, limit: usize) -> Result<Vec<codegraph_domain::SymbolSnapshotId>, BrainApiError> {
+    check_read(ctx, policy::ReadOperation::GraphQuery)?;
+
+    if request.max_depth > MAX_GRAPH_QUERY_DEPTH {
+        return Err(BrainApiError::InvalidInput(format!("max_depth {} exceeds the maximum of {MAX_GRAPH_QUERY_DEPTH}", request.max_depth)));
+    }
+    if limit > MAX_GRAPH_QUERY_RESULTS {
+        return Err(BrainApiError::InvalidInput(format!("limit {limit} exceeds the maximum of {MAX_GRAPH_QUERY_RESULTS}")));
+    }
+
+    let mut reached = graph.reachable_from(request.start, request.kind, request.max_depth);
+    reached.truncate(limit);
+    Ok(reached)
+}
+
+/// An entity's own intrinsic facts: `SymbolKind`, name, signature, and
+/// source location — nothing derived from its graph neighborhood. See
+/// this crate's `get_entity` doc comment and the B5.0 contract's §4
+/// (corrected at Task 17) for why this type carries no evidence field:
+/// `Evidence` is a property of an `Edge`, never of a `SymbolSnapshot`,
+/// so an entity viewed in isolation has no evidence fact to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    pub id: codegraph_domain::SymbolSnapshotId,
+    pub kind: codegraph_domain::SymbolKind,
+    pub name: String,
+    pub signature: String,
+    pub repository: codegraph_domain::RepositoryId,
+    pub commit: codegraph_domain::CommitHash,
+    pub relative_path: String,
+    pub span_start: usize,
+    pub span_end: usize,
+}
+
+/// Looks up `id` in `graph` and returns its intrinsic facts only — no
+/// traversal, no neighboring edges (that is `get_code_context`'s job, a
+/// deliberately distinct capability; see this module's doc comment).
+/// `ctx.read_policy` must allow `ReadOperation::GetEntity` or this fails
+/// closed with `PermissionDenied` before `graph` is ever queried.
+/// `NotFound` if `id` is not present in `graph` — never a fuzzy/partial
+/// match, never a guess.
+pub fn get_entity(ctx: &RequestContext, graph: &codegraph_index::graph::CodeGraph, id: codegraph_domain::SymbolSnapshotId) -> Result<Entity, BrainApiError> {
+    check_read(ctx, policy::ReadOperation::GetEntity)?;
+
+    let snapshot = graph.snapshot(id).ok_or(BrainApiError::NotFound)?;
+    let span = snapshot.span();
+    let file = snapshot.file();
+
+    Ok(Entity {
+        id: snapshot.id(),
+        kind: snapshot.kind(),
+        name: snapshot.name().as_str().to_string(),
+        signature: snapshot.signature().as_str().to_string(),
+        repository: file.repository(),
+        commit: file.commit().clone(),
+        relative_path: file.relative_path().to_string(),
+        span_start: span.start,
+        span_end: span.end,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +584,237 @@ mod tests {
         let ctx = mcp_ctx_with_read(policy::ReadPolicy::new(false, false).with_get_code_context(true));
         let first = get_code_context(&ctx, &graph, caller_id).unwrap();
         let second = get_code_context(&ctx, &graph, caller_id).unwrap();
+        assert_eq!(first, second);
+    }
+
+    // --- graph_query / get_entity (Task 17) ---
+
+    fn test_repo() -> codegraph_domain::RepositoryId {
+        let mut registry = RepositoryRegistry::new();
+        registry.register(RepositoryRoot::parse(&std::env::current_dir().unwrap()).unwrap())
+    }
+
+    fn test_snapshot(repo: codegraph_domain::RepositoryId, path: &str, name: &str, signature: &str) -> codegraph_index::snapshot::SymbolSnapshot {
+        let commit = CommitHash::parse(&"a".repeat(40)).unwrap();
+        let file = FileIdentity::parse(repo, commit, path).unwrap();
+        let candidate = RawSymbolCandidate::new(name.to_string(), "function_item".to_string(), ByteSpan { start: 0, end: 10 }, signature.to_string()).unwrap();
+        promote(&candidate, file).unwrap()
+    }
+
+    fn graph_edge(from: codegraph_domain::SymbolSnapshotId, to: codegraph_domain::SymbolSnapshotId, kind: EdgeKind) -> GraphEdge {
+        GraphEdge { from, to, kind, evidence: codegraph_domain::Evidence::new(codegraph_domain::ResolutionMethod::StaticAnalysis, None, "test edge").unwrap() }
+    }
+
+    /// a -> b -> c, a plain chain (no cycle), for depth-bound assertions.
+    fn chain_graph() -> (CodeGraph, codegraph_domain::SymbolSnapshotId, codegraph_domain::SymbolSnapshotId, codegraph_domain::SymbolSnapshotId) {
+        let repo = test_repo();
+        let a = test_snapshot(repo, "src/lib.rs", "a", "fn a() { b(); }");
+        let b = test_snapshot(repo, "src/lib.rs", "b", "fn b() { c(); }");
+        let c = test_snapshot(repo, "src/lib.rs", "c", "fn c() {}");
+        let (a_id, b_id, c_id) = (a.id(), b.id(), c.id());
+        let mut graph = CodeGraph::new();
+        graph.insert_snapshot(a).unwrap();
+        graph.insert_snapshot(b).unwrap();
+        graph.insert_snapshot(c).unwrap();
+        graph.insert_edge(graph_edge(a_id, b_id, EdgeKind::Calls)).unwrap();
+        graph.insert_edge(graph_edge(b_id, c_id, EdgeKind::Calls)).unwrap();
+        (graph, a_id, b_id, c_id)
+    }
+
+    /// a <-> b, a two-node cycle, to prove graph_query never infinite-loops.
+    fn cyclic_graph() -> (CodeGraph, codegraph_domain::SymbolSnapshotId, codegraph_domain::SymbolSnapshotId) {
+        let repo = test_repo();
+        let a = test_snapshot(repo, "src/lib.rs", "a", "fn a() { b(); }");
+        let b = test_snapshot(repo, "src/lib.rs", "b", "fn b() { a(); }");
+        let (a_id, b_id) = (a.id(), b.id());
+        let mut graph = CodeGraph::new();
+        graph.insert_snapshot(a).unwrap();
+        graph.insert_snapshot(b).unwrap();
+        graph.insert_edge(graph_edge(a_id, b_id, EdgeKind::Calls)).unwrap();
+        graph.insert_edge(graph_edge(b_id, a_id, EdgeKind::Calls)).unwrap();
+        (graph, a_id, b_id)
+    }
+
+    fn allow_graph_query() -> policy::ReadPolicy {
+        policy::ReadPolicy::new(false, false).with_graph_query(true)
+    }
+
+    fn allow_get_entity() -> policy::ReadPolicy {
+        policy::ReadPolicy::new(false, false).with_get_entity(true)
+    }
+
+    // --- graph_query ---
+
+    #[test]
+    fn graph_query_within_bounds_returns_the_reachable_chain() {
+        let (graph, a_id, b_id, c_id) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: Some(EdgeKind::Calls), max_depth: 10 }, 100).unwrap();
+
+        assert_eq!(result, vec![a_id, b_id, c_id]);
+    }
+
+    #[test]
+    fn graph_query_exceeding_the_traversal_depth_bound_returns_invalid_input() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: None, max_depth: MAX_GRAPH_QUERY_DEPTH + 1 }, 100);
+
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
+    }
+
+    #[test]
+    fn graph_query_with_a_limit_exceeding_the_result_bound_returns_invalid_input() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: None, max_depth: 1 }, MAX_GRAPH_QUERY_RESULTS + 1);
+
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
+    }
+
+    #[test]
+    fn graph_query_truncates_results_to_the_requested_limit_deterministically() {
+        let (graph, a_id, b_id, _c_id) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: Some(EdgeKind::Calls), max_depth: 10 }, 2).unwrap();
+
+        assert_eq!(result, vec![a_id, b_id]);
+    }
+
+    #[test]
+    fn graph_query_on_an_unknown_start_returns_an_empty_vec_not_an_error() {
+        let (graph, _a_id, _b_id, _c_id) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+        let unknown = codegraph_domain::SymbolSnapshotId::derive(
+            &FileIdentity::parse(test_repo(), CommitHash::parse(&"b".repeat(40)).unwrap(), "src/other.rs").unwrap(),
+            codegraph_domain::SymbolKind::Function,
+            "nonexistent",
+            "fn nonexistent()",
+            0,
+            10,
+        );
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: unknown, kind: None, max_depth: 10 }, 100).unwrap();
+
+        assert_eq!(result, Vec::<codegraph_domain::SymbolSnapshotId>::new());
+    }
+
+    #[test]
+    fn graph_query_on_a_cyclic_graph_terminates_and_visits_each_node_once() {
+        let (graph, a_id, b_id) = cyclic_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: Some(EdgeKind::Calls), max_depth: MAX_GRAPH_QUERY_DEPTH }, MAX_GRAPH_QUERY_RESULTS).unwrap();
+
+        assert_eq!(result.len(), 2, "a two-node cycle must be visited exactly once per node, not loop forever even at the maximum allowed depth");
+        assert!(result.contains(&a_id));
+        assert!(result.contains(&b_id));
+    }
+
+    #[test]
+    fn graph_query_denied_without_read_policy() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_no_read_policy();
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: None, max_depth: 1 }, 10);
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn graph_query_denied_when_read_policy_does_not_allow_it() {
+        let (graph, a_id, ..) = chain_graph();
+        // every other read op allowed, but NOT graph_query -- proving it is
+        // gated independently, not folded into search/retrieve/get_code_context.
+        let ctx = mcp_ctx_with_read(policy::ReadPolicy::new(true, true).with_get_code_context(true));
+        let result = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: None, max_depth: 1 }, 10);
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn graph_query_is_deterministic() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_graph_query());
+        let first = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: Some(EdgeKind::Calls), max_depth: 10 }, 100).unwrap();
+        let second = graph_query(&ctx, &graph, GraphQuerySpec { start: a_id, kind: Some(EdgeKind::Calls), max_depth: 10 }, 100).unwrap();
+        assert_eq!(first, second);
+    }
+
+    // --- get_entity ---
+
+    #[test]
+    fn get_entity_for_a_valid_symbol_returns_its_intrinsic_facts_only() {
+        let (graph, a_id, _b_id, _c_id) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_get_entity());
+
+        let entity = get_entity(&ctx, &graph, a_id).unwrap();
+
+        assert_eq!(entity.id, a_id);
+        assert_eq!(entity.kind, codegraph_domain::SymbolKind::Function);
+        assert_eq!(entity.name, "a");
+        assert_eq!(entity.signature, "fn a() { b(); }");
+        assert_eq!(entity.relative_path, "src/lib.rs");
+        assert_eq!(entity.span_start, 0);
+        assert_eq!(entity.span_end, 10);
+    }
+
+    #[test]
+    fn get_entity_never_performs_any_traversal_unlike_get_code_context() {
+        // Behavioral proof the two capabilities are genuinely distinct:
+        // get_entity's return type has no outgoing/incoming field at all
+        // (compile-time proof) -- this test additionally confirms it
+        // returns the same facts regardless of the entity's edges.
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_get_entity());
+        let entity = get_entity(&ctx, &graph, a_id).unwrap();
+        assert_eq!(entity.name, "a");
+        // `Entity` has exactly 8 fields (id, kind, name, signature,
+        // repository, commit, relative_path, span_start, span_end) and no
+        // edge-shaped field -- enforced by construction above compiling.
+    }
+
+    #[test]
+    fn get_entity_for_unknown_symbol_returns_not_found() {
+        let (graph, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_get_entity());
+        let unknown = codegraph_domain::SymbolSnapshotId::derive(
+            &FileIdentity::parse(test_repo(), CommitHash::parse(&"b".repeat(40)).unwrap(), "src/other.rs").unwrap(),
+            codegraph_domain::SymbolKind::Function,
+            "nonexistent",
+            "fn nonexistent()",
+            0,
+            10,
+        );
+
+        let result = get_entity(&ctx, &graph, unknown);
+
+        assert_eq!(result, Err(BrainApiError::NotFound));
+    }
+
+    #[test]
+    fn get_entity_denied_without_read_policy() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_no_read_policy();
+        let result = get_entity(&ctx, &graph, a_id);
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn get_entity_denied_when_read_policy_does_not_allow_it() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(policy::ReadPolicy::new(true, true).with_get_code_context(true).with_graph_query(true));
+        let result = get_entity(&ctx, &graph, a_id);
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn get_entity_is_deterministic() {
+        let (graph, a_id, ..) = chain_graph();
+        let ctx = mcp_ctx_with_read(allow_get_entity());
+        let first = get_entity(&ctx, &graph, a_id).unwrap();
+        let second = get_entity(&ctx, &graph, a_id).unwrap();
         assert_eq!(first, second);
     }
 }

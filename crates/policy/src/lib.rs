@@ -7,4 +7,4 @@ pub use secrets::{SecretException, SecretFinding, SecretPolicy};
 pub use read::{ReadOperation, ReadPolicy};
 
 #[test]
-fn crate_builds() { assert!(true); }
+fn crate_builds() {}
