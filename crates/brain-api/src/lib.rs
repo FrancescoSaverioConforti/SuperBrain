@@ -24,7 +24,7 @@ pub use approval::{approve_proposal, list_proposals, reject_proposal};
 pub use cli::run_cli;
 pub use error::BrainApiError;
 pub use graph::link_entities;
-pub use memory::{save_memory, update_memory, ProposedOperation, RelationKind};
+pub use memory::{get_previous_solution, save_memory, update_memory, ProposedOperation, RelationKind};
 pub use policy_write::{WriteOperation, WritePolicy};
 pub use proposal_store::{load_proposal, save_proposal};
 pub use read::{get_code_context, get_entity, graph_query, retrieve, search, CodeContext, CodeContextEdge, Entity, GraphQuerySpec};

@@ -165,6 +165,111 @@ pub fn update_memory(
     create_proposal(ctx, vault, ProposedOperation::UpdateMemory { note_id: note_id.as_str().to_string(), body, expected_version }, now)
 }
 
+/// `brain-api`'s own `RequestContext.read_policy` gate for
+/// `get_previous_solution`, identical in shape to `read.rs`'s own
+/// `require_read_policy`/`check_read` helpers (kept local to this module
+/// rather than imported, since `read.rs`'s versions are private to that
+/// module and this capability's own doc/error-mapping concerns are
+/// distinct enough to warrant its own small helper rather than a
+/// cross-module `pub(crate)` leak for a single call site).
+fn check_previous_solution_read(ctx: &RequestContext) -> Result<&policy::ReadPolicy, BrainApiError> {
+    let read_policy = ctx.read_policy.as_ref().ok_or(BrainApiError::PermissionDenied)?;
+    if !read_policy.allows(policy::ReadOperation::GetPreviousSolution) {
+        return Err(BrainApiError::PermissionDenied);
+    }
+    Ok(read_policy)
+}
+
+fn map_split_record_error(err: storage::SplitRecordError) -> BrainApiError {
+    match err {
+        storage::SplitRecordError::InvalidUtf8 | storage::SplitRecordError::Schema(_) => BrainApiError::CorruptData,
+    }
+}
+
+/// Finds previously-recorded bug/decision notes matching `query`, with
+/// their `domain::Relations` intact so a result can be traced to linked
+/// context (fix notes, superseding decisions, etc.) when available — the
+/// B5.0 contract's §6 schema for this capability
+/// (`docs/superpowers/specs/2026-11-15-b5-0-brain-api-contract-freeze.md`).
+///
+/// **Composition, not a new subsystem**: there is no "Experience Memory"
+/// persistence, index, or note format anywhere in this codebase, and this
+/// function does not add one. It composes three already-real, already-
+/// public primitives: `api::search` (finds candidate note ids/versions by
+/// text+type filter), `storage::Vault::read_note` (reads each candidate's
+/// current committed bytes), and `storage::split_record` (the same public
+/// frontmatter/body split `api::retrieve` already uses internally) to
+/// recover each hit's full `domain::NoteMetadata` — including `relations`,
+/// which `index::search::SearchResult` itself does not carry. No linear
+/// vault scan, no new fuzzy matching, no embeddings, no LLM summarization.
+///
+/// **`index` lifecycle gap, same as Task 16/17's `search`/`graph_query`**:
+/// this function takes an already-built `&index::Index<'_>` as a caller-
+/// supplied parameter — `brain-api` does not construct a `RealIndexer`,
+/// does not call `index::indexer_impl::rebuild_index`, does not choose an
+/// active project or reference date, and does not fall back to
+/// `Vault::open_with_default_indexer`'s `NullIndexer`. This is a deviation
+/// from the plan's literal sketch signature (`get_previous_solution(ctx,
+/// vault, query)`, no `Index` parameter), required because `api::search`
+/// has no path that does not take one; the deviation follows exactly the
+/// query-semantics-vs-lifecycle boundary already approved for Task 16's
+/// `search`/Task 17's `get_entity`/`graph_query`, not a new principle.
+///
+/// `note_type` restricts the search to one `domain::NoteType` — per the
+/// B5.0 contract, `NoteType::Bug`/`NoteType::Decision` are this
+/// capability's primary intent (the two real variants that fit "previous
+/// solution" provenance), but the other 5 real variants are not excluded
+/// by construction; `None` searches across all types exactly as
+/// `api::search`'s own `SearchFilters::type_filter: None` already does.
+///
+/// No match is `Ok(vec![])`, never an error — the B5.0 contract's own
+/// frozen semantics for this capability (its table row: "`Ok(vec![])`
+/// when nothing matches — never fabricated"), the same empty/non-error
+/// convention `search` itself already uses. `CorruptData` surfaces a
+/// candidate whose persisted frontmatter fails to parse or whose id does
+/// not match its own record — never silently skipped, never a fabricated
+/// substitute, mirroring `retrieve`'s own `Inconsistent`→`CorruptData`
+/// discipline (constraint `d9mm`) through this composition.
+pub fn get_previous_solution(
+    ctx: &RequestContext,
+    vault: &storage::Vault,
+    index: &index::Index<'_>,
+    query: &str,
+    note_type: Option<domain::NoteType>,
+) -> Result<Vec<domain::NoteMetadata>, BrainApiError> {
+    check_previous_solution_read(ctx)?;
+
+    let filters = index::search::SearchFilters { type_filter: note_type, ..Default::default() };
+    let response = index.search(query, filters, usize::MAX).map_err(|err| match err {
+        index::search::SearchError::EmptyQuery | index::search::SearchError::InvalidLimit | index::search::SearchError::EmptyProject => BrainApiError::InvalidInput(err.to_string()),
+        index::search::SearchError::TimeResolution(_) => BrainApiError::InvalidInput(err.to_string()),
+        index::search::SearchError::ReadUnavailable => BrainApiError::RuntimeUnavailable,
+    })?;
+
+    let hits: Vec<storage::NoteId> = match response.outcome {
+        index::search::SearchOutcome::NotPresent => Vec::new(),
+        index::search::SearchOutcome::Matches { first, rest } => {
+            std::iter::once(first.note_id).chain(rest.into_iter().map(|r| r.note_id)).collect()
+        }
+    };
+
+    let mut results = Vec::with_capacity(hits.len());
+    for note_id in hits {
+        let record = vault.read_note(&note_id).map_err(|err| match err {
+            storage::StorageError::NotFound { .. } | storage::StorageError::Deleted { .. } | storage::StorageError::NoteDeleted { .. } => BrainApiError::CorruptData,
+            storage::StorageError::Inconsistent { .. } => BrainApiError::CorruptData,
+            _ => BrainApiError::RuntimeUnavailable,
+        })?;
+        let (metadata, _body) = storage::split_record(record.content.as_bytes()).map_err(map_split_record_error)?;
+        if metadata.id != note_id.as_str() {
+            return Err(BrainApiError::CorruptData);
+        }
+        results.push(metadata);
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +582,182 @@ mod tests {
         format!(
             "---\nid: {id}\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-11-16\nupdated: 2026-11-16\nevent_period: 2026-11-16\nrelations: {{}}\n---\noriginal content\n"
         )
+    }
+
+    // --- get_previous_solution (Task 18) ---
+
+    struct PreviousSolutionFixture {
+        vault: Vault,
+        indexer: std::sync::Arc<RealIndexer>,
+    }
+
+    impl PreviousSolutionFixture {
+        fn new() -> Self {
+            let root = unique_test_dir();
+            {
+                let repo = git2::Repository::init(&root).unwrap();
+                let sig = git2::Signature::now("Test", "test@localhost").unwrap();
+                let oid = repo.index().unwrap().write_tree().unwrap();
+                let tree = repo.find_tree(oid).unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[]).unwrap();
+            }
+            let journal_path = root.join("journal.sqlite");
+            let vault = Vault::open_with_default_indexer(root, &journal_path).unwrap();
+            Self { vault, indexer: std::sync::Arc::new(RealIndexer::new()) }
+        }
+
+        fn write(&self, id: &str, note_type: &str, relations_yaml: &str, body: &str) {
+            self.write_with_known_ids(id, note_type, relations_yaml, body, &std::collections::HashSet::new());
+        }
+
+        fn write_with_known_ids(&self, id: &str, note_type: &str, relations_yaml: &str, body: &str, known_ids: &std::collections::HashSet<storage::NoteId>) {
+            let text = format!(
+                "---\nid: {id}\nschema_version: 1\ntype: {note_type}\nstatus: reviewed\ntrust: official\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-11-18\nupdated: 2026-11-18\nevent_period: 2026-11-18\nrelations: {relations_yaml}\n---\n{body}"
+            );
+            let result = storage::propose_and_commit(
+                &self.vault,
+                &text,
+                storage::Version(0),
+                uuid::Uuid::new_v4(),
+                known_ids,
+                &std::collections::HashSet::new(),
+                &policy::Gate::new(policy::SecretPolicy::new(1)),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(result, storage::CommitResult::Committed(_) | storage::CommitResult::GitPending { .. }));
+            index::indexer_impl::rebuild_index(&self.vault, &self.indexer).unwrap();
+        }
+
+        fn index(&self) -> Index<'_> {
+            Index::new(&self.vault, &self.indexer, "project-x", chrono::NaiveDate::from_ymd_opt(2026, 11, 18).unwrap())
+        }
+    }
+
+    fn mcp_ctx_with_previous_solution_read() -> RequestContext {
+        RequestContext {
+            schema_version: crate::SCHEMA_VERSION,
+            correlation_id: uuid::Uuid::new_v4(),
+            write_policy: Some(WritePolicy::mcp_agent()),
+            read_policy: Some(policy::ReadPolicy::new(false, false).with_get_previous_solution(true)),
+            origin: CallOrigin::McpSession("session-prev-solution".into()),
+        }
+    }
+
+    use index::indexer_impl::RealIndexer;
+    use index::Index;
+    use storage::Vault;
+
+    #[test]
+    fn finds_a_bug_typed_note_with_a_linked_fix_and_preserves_its_relations() {
+        let fixture = PreviousSolutionFixture::new();
+        fixture.write("fix-timeout-retry", "decision", "{}", "applied exponential backoff with jitter to the retry loop");
+        fixture.write_with_known_ids(
+            "bug-timeout-retry",
+            "bug",
+            "{supports: [\"fix-timeout-retry\"]}",
+            "connection times out under load, root cause: missing retry backoff",
+            &std::collections::HashSet::from([storage::NoteId::parse("fix-timeout-retry").unwrap()]),
+        );
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let results = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "retry backoff", Some(domain::NoteType::Bug)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bug-timeout-retry");
+        assert_eq!(results[0].r#type, domain::NoteType::Bug);
+        assert_eq!(results[0].relations.supports, vec!["fix-timeout-retry".to_string()], "relations must be preserved so the result can be traced to its linked fix");
+    }
+
+    #[test]
+    fn no_match_returns_an_empty_vec_not_an_error() {
+        let fixture = PreviousSolutionFixture::new();
+        fixture.write("bug-unrelated", "bug", "{}", "completely unrelated content about rendering");
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let results = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "nonexistent unique phrase xyz123", None).unwrap();
+
+        assert_eq!(results, Vec::<domain::NoteMetadata>::new());
+    }
+
+    #[test]
+    fn note_type_filter_excludes_a_matching_note_of_a_different_type() {
+        let fixture = PreviousSolutionFixture::new();
+        fixture.write("decision-caching", "decision", "{}", "decided to cache retry backoff timing at the gateway layer");
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let results = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "retry backoff", Some(domain::NoteType::Bug)).unwrap();
+
+        assert_eq!(results, Vec::<domain::NoteMetadata>::new(), "a Decision-typed note must not satisfy a Bug-only filter");
+    }
+
+    #[test]
+    fn denied_without_read_policy() {
+        let fixture = PreviousSolutionFixture::new();
+        let ctx = RequestContext {
+            schema_version: crate::SCHEMA_VERSION,
+            correlation_id: uuid::Uuid::new_v4(),
+            write_policy: None,
+            read_policy: None,
+            origin: CallOrigin::McpSession("session-prev-solution".into()),
+        };
+
+        let result = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "anything", None);
+
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn denied_when_read_policy_allows_other_reads_but_not_this_one() {
+        // search/retrieve/get_code_context/graph_query/get_entity allowed,
+        // but NOT get_previous_solution -- proving it is gated
+        // independently, never implicitly derived from another read grant.
+        let fixture = PreviousSolutionFixture::new();
+        let ctx = RequestContext {
+            schema_version: crate::SCHEMA_VERSION,
+            correlation_id: uuid::Uuid::new_v4(),
+            write_policy: Some(WritePolicy::mcp_agent()),
+            read_policy: Some(policy::ReadPolicy::new(true, true).with_get_code_context(true).with_graph_query(true).with_get_entity(true)),
+            origin: CallOrigin::McpSession("session-prev-solution".into()),
+        };
+
+        let result = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "anything", None);
+
+        assert_eq!(result, Err(BrainApiError::PermissionDenied));
+    }
+
+    #[test]
+    fn is_deterministic_across_repeated_calls() {
+        let fixture = PreviousSolutionFixture::new();
+        fixture.write("bug-determinism", "bug", "{}", "flaky test due to shared mutable state");
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let first = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "shared mutable state", None).unwrap();
+        let second = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "shared mutable state", None).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn never_mutates_the_vault() {
+        let fixture = PreviousSolutionFixture::new();
+        fixture.write("bug-readonly", "bug", "{}", "read-only check content");
+        let ctx = mcp_ctx_with_previous_solution_read();
+        let before = fixture.vault.read_note(&storage::NoteId::parse("bug-readonly").unwrap()).unwrap();
+
+        get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "read-only check", None).unwrap();
+
+        let after = fixture.vault.read_note(&storage::NoteId::parse("bug-readonly").unwrap()).unwrap();
+        assert_eq!(before, after, "get_previous_solution must never write to the vault");
+    }
+
+    #[test]
+    fn empty_query_returns_invalid_input_not_a_panic_or_silent_empty_success() {
+        let fixture = PreviousSolutionFixture::new();
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let result = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), "", None);
+
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
     }
 }
