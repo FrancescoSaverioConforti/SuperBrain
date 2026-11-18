@@ -1,0 +1,19 @@
+[package]
+name = "mcp-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain MCP client: connects to external MCP servers under SuperBrain's own permission gate (B5.8+). Never reaches brain-api/storage -- the reverse direction of crates/mcp-server."
+
+[dependencies]
+# Official Rust MCP SDK (modelcontextprotocol/rust-sdk) -- the same crate
+# Task 21 chose for mcp-server, now used in CLIENT mode. `client` is the
+# client-role protocol logic (Peer::call_tool/list_tools, ServiceExt::serve
+# for RoleClient); `transport-child-process` is the realistic way to
+# connect to a real external MCP server: spawn it as a child process and
+# speak MCP over its stdio, the standard shape for a locally-registered
+# MCP tool (the same shape e.g. `npx @some/mcp-server` would take).
+rmcp = { version = "3.11.0", features = ["client", "transport-child-process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
