@@ -8,7 +8,7 @@
 //! design.
 //!
 //! **B5.1 Task 20's trust-boundary invariants apply unchanged to every
-//! tool this crate will register** (Tasks 22+): this crate depends on
+//! tool this crate registers** (Task 22+): this crate depends on
 //! `brain-api`, never the reverse, and has no access to anything
 //! `brain-api` itself keeps `pub(crate)` — there is no
 //! `brain_api::load_proposal`/`save_proposal` to call, no
@@ -16,15 +16,20 @@
 //! `CallOrigin::TrustedLocal` (its only constructor,
 //! `TrustedLocalToken::new`, is `pub(crate)` to `brain-api` and therefore
 //! unreachable from here). Every `RequestContext` this crate builds for an
-//! incoming MCP request must use `CallOrigin::McpSession` and
+//! incoming MCP request uses `CallOrigin::McpSession` and
 //! `WritePolicy::mcp_agent()` — the only two values of each this crate CAN
 //! construct — never derived from any field inside the MCP request payload
 //! itself (same anti-self-assertion principle `brain-api`'s own module
 //! docs already state for `originating_identity`).
-//!
-//! This module is intentionally empty beyond the crate-builds check: Task
-//! 21's own scope is choosing and scaffolding the MCP protocol dependency,
-//! not registering tools (Task 22+).
+
+mod error;
+mod tools;
+
+pub use error::map_brain_api_error;
+pub use tools::search::{
+    CodeContextEdgeDto, GetCodeContextInput, GetCodeContextOutput, McpNoteStatus, McpNoteType, RetrieveInput, RetrieveOutput, SearchInput,
+    SearchOutput, SearchResultDto, SuperBrainMcpServer,
+};
 
 #[cfg(test)]
 mod tests {

@@ -1112,9 +1112,21 @@ dependencies = [
 name = "mcp-server"
 version = "0.1.0"
 dependencies = [
+ "api",
  "brain-api",
+ "chrono",
+ "codegraph-domain",
+ "codegraph-index",
+ "domain",
+ "git2",
+ "index",
+ "policy",
  "rmcp",
+ "schemars",
+ "serde",
+ "storage",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

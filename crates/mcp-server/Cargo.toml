@@ -9,6 +9,23 @@ description = "SuperBrain MCP server: exposes brain-api's capabilities over the 
 
 [dependencies]
 brain-api = { path = "../brain-api" }
+# These 7 core crates are direct dependencies ONLY because
+# brain_api::read's functions take their already-built runtime objects by
+# reference (&storage::Vault, &index::Index<'_>,
+# &codegraph_index::graph::CodeGraph) -- read.rs's own doc comment: "the
+# caller is responsible for building and supplying both". This crate
+# never calls into any of their write/mutation/raw-persistence surface
+# directly (see tools/search.rs's module doc comment) -- it only holds
+# and passes along objects brain-api itself requires a caller to supply.
+# Task 20's layering-test discipline applies here too: see
+# tests/no_bypass.rs's dependency-direction guard.
+api = { path = "../api" }
+codegraph-domain = { path = "../codegraph-domain" }
+codegraph-index = { path = "../codegraph-index" }
+domain = { path = "../domain" }
+index = { path = "../index" }
+policy = { path = "../policy" }
+storage = { path = "../storage" }
 # Official Rust MCP SDK (modelcontextprotocol/rust-sdk). `server` + `macros`
 # are its own defaults (tool registration/dispatch); `transport-io` adds the
 # stdio server transport -- stdin/stdout only, no network -- which is the
@@ -16,6 +33,11 @@ brain-api = { path = "../brain-api" }
 # transport this task's scaffold needs: SuperBrain is a local, single-user
 # tool with no remote-network requirement for MCP itself.
 rmcp = { version = "3.11.0", features = ["transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+git2 = "0.21"
