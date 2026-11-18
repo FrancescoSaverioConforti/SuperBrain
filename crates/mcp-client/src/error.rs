@@ -7,9 +7,14 @@
 //! internal error text verbatim — only a caller-facing category.
 
 /// The frozen `mcp-client` error vocabulary. Grows only with later tasks
-/// in this plan (B5.9's `authorize` denial, B5.11's malformed-response
-/// rejection) — Task 26 defines exactly the variants its own scope
-/// (connection lifecycle, global disable) needs, no more.
+/// in this plan (B5.9's `authorize` denial) — Task 26 defined connection
+/// lifecycle's own two variants; Task 27 (this one) adds exactly the one
+/// `MalformedResponse` variant its own scope (rejecting an external
+/// server's untrustworthy `tools/list` reply) needs, matching the exact
+/// name the plan's own Task 29 text already uses for the same category of
+/// failure — not a new invention, the vocabulary this crate was always
+/// going to need for "the external server answered, but what it sent
+/// cannot be trusted."
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpClientError {
     /// The global client kill-switch (`global_client_enabled`) is off, or
@@ -26,6 +31,16 @@ pub enum McpClientError {
     /// text verbatim (which may contain a filesystem path or command
     /// line).
     ConnectionFailed(String),
+    /// The external server answered, but its response cannot be trusted
+    /// as-is: a malformed `tools/list` reply (Task 27 — an empty tool
+    /// name, a tool name repeated within the same list, or a name
+    /// containing a path-traversal-shaped character), and later (Task 29)
+    /// a malformed `tools/call` result or an envelope that claims to be
+    /// from a different tool than the one invoked. The response is
+    /// rejected outright, never partially trusted or passed through —
+    /// carries a caller-facing reason, never the raw untrusted payload
+    /// verbatim.
+    MalformedResponse(String),
 }
 
 impl std::fmt::Display for McpClientError {
@@ -34,6 +49,7 @@ impl std::fmt::Display for McpClientError {
             Self::Disabled => f.write_str("MCP client is disabled"),
             Self::Timeout => f.write_str("connection attempt timed out"),
             Self::ConnectionFailed(reason) => write!(f, "connection failed: {reason}"),
+            Self::MalformedResponse(reason) => write!(f, "malformed response from external server: {reason}"),
         }
     }
 }
@@ -45,7 +61,7 @@ mod tests {
     use super::*;
 
     fn all_variants() -> Vec<McpClientError> {
-        vec![McpClientError::Disabled, McpClientError::Timeout, McpClientError::ConnectionFailed("x".into())]
+        vec![McpClientError::Disabled, McpClientError::Timeout, McpClientError::ConnectionFailed("x".into()), McpClientError::MalformedResponse("x".into())]
     }
 
     #[test]

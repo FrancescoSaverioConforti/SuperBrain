@@ -17,3 +17,4 @@ description = "SuperBrain MCP client: connects to external MCP servers under Sup
 # MCP tool (the same shape e.g. `npx @some/mcp-server` would take).
 rmcp = { version = "3.11.0", features = ["client", "transport-child-process"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+serde_json = "1"

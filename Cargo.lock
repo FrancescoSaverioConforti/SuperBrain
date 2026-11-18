@@ -1119,6 +1119,7 @@ name = "mcp-client"
 version = "0.1.0"
 dependencies = [
  "rmcp",
+ "serde_json",
  "tokio",
 ]
 
