@@ -38,7 +38,7 @@ pub fn link_entities(
         None,
         operation,
     );
-    crate::save_proposal(vault, &proposal)?;
+    crate::proposal_store::save_proposal(vault, &proposal)?;
     Ok(proposal.id)
 }
 
@@ -109,7 +109,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 

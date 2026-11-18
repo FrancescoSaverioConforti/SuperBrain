@@ -35,7 +35,7 @@ fn authorize_and_load(
     if !ctx.write_policy.as_ref().is_some_and(|p| p.allows(op)) {
         return Err(BrainApiError::PermissionDenied);
     }
-    let proposal = crate::load_proposal(vault, id)?;
+    let proposal = crate::proposal_store::load_proposal(vault, id)?;
     if is_expired(&proposal, now) {
         return Err(BrainApiError::InvalidInput("proposal expired".to_string()));
     }
@@ -236,7 +236,7 @@ pub fn approve_proposal(ctx: &RequestContext, vault: &storage::Vault, id: &Propo
     let result = execute(vault, &proposal.operation, now)?;
 
     proposal.transition_to(target).map_err(|_| BrainApiError::Conflict)?;
-    crate::save_proposal(vault, &proposal)?;
+    crate::proposal_store::save_proposal(vault, &proposal)?;
 
     Ok(result)
 }
@@ -256,7 +256,7 @@ pub fn reject_proposal(ctx: &RequestContext, vault: &storage::Vault, id: &Propos
     }
 
     proposal.transition_to(target).map_err(|_| BrainApiError::Conflict)?;
-    crate::save_proposal(vault, &proposal)?;
+    crate::proposal_store::save_proposal(vault, &proposal)?;
     Ok(())
 }
 
@@ -325,7 +325,7 @@ mod tests {
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
             read_policy: None,
-            origin: CallOrigin::TrustedLocal,
+            origin: CallOrigin::TrustedLocal(crate::TrustedLocalToken::new()),
         }
     }
 
@@ -357,7 +357,7 @@ mod tests {
         let result = approve_proposal(&mcp_ctx(), &vault, &id, NOW);
         assert_eq!(result, Err(BrainApiError::PermissionDenied));
         // and the proposal is untouched: still Pending.
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 
@@ -397,7 +397,7 @@ mod tests {
         let note = vault.read_note(&storage::NoteId::parse("note-a").unwrap()).unwrap();
         assert!(note.content.contains("the real content"));
 
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Approved { approved_at: NOW.to_string() });
     }
 
@@ -463,7 +463,7 @@ mod tests {
 
         // the second proposal must still be Pending (not silently
         // consumed) -- the caller can re-propose with a fresh version.
-        let loaded = crate::load_proposal(&vault, &update_b).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &update_b).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 
@@ -516,7 +516,7 @@ mod tests {
                 body: "content".to_string(),
             },
         );
-        crate::save_proposal(&vault, &proposal).unwrap();
+        crate::proposal_store::save_proposal(&vault, &proposal).unwrap();
 
         let result = approve_proposal(&trusted_ctx(), &vault, &proposal.id, NOW);
         assert_eq!(result, Err(BrainApiError::InvalidInput("proposal expired".to_string())));
@@ -528,7 +528,7 @@ mod tests {
         ));
         // status on disk is untouched (still Pending) -- a mere approve
         // attempt on an expired proposal does not itself mutate status.
-        let loaded = crate::load_proposal(&vault, &proposal.id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &proposal.id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 
@@ -550,7 +550,7 @@ mod tests {
                 body: "content".to_string(),
             },
         );
-        crate::save_proposal(&vault, &proposal).unwrap();
+        crate::proposal_store::save_proposal(&vault, &proposal).unwrap();
 
         let result = reject_proposal(&trusted_ctx(), &vault, &proposal.id, "too late".into(), NOW);
         assert_eq!(result, Err(BrainApiError::InvalidInput("proposal expired".to_string())));
@@ -593,7 +593,7 @@ mod tests {
         let id = save_memory_proposal(&vault, "note-k", "v1");
         reject_proposal(&trusted_ctx(), &vault, &id, "bad idea".into(), NOW).unwrap();
 
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Rejected { reason: "bad idea".to_string(), rejected_at: NOW.to_string() });
 
         let result = approve_proposal(&trusted_ctx(), &vault, &id, LATER);
@@ -655,14 +655,14 @@ mod tests {
                 body: "content".to_string(),
             },
         );
-        crate::save_proposal(&vault, &proposal).unwrap();
+        crate::proposal_store::save_proposal(&vault, &proposal).unwrap();
 
         let proposals = list_proposals(&trusted_ctx(), &vault, NOW).unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(*proposals[0].status(), ProposalStatus::Expired);
 
         // the ON-DISK status is untouched by a mere list call.
-        let reloaded = crate::load_proposal(&vault, &proposal.id).unwrap();
+        let reloaded = crate::proposal_store::load_proposal(&vault, &proposal.id).unwrap();
         assert_eq!(*reloaded.status(), ProposalStatus::Pending);
     }
 
@@ -708,7 +708,7 @@ mod tests {
 
         // the proposal itself ends up Approved exactly once, not stuck
         // Pending and not corrupted by two concurrent writers.
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Approved { approved_at: NOW.to_string() });
     }
 }

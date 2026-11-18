@@ -14,14 +14,19 @@
 //! approval surface (CLI now; B6 UI later) may move a proposal to
 //! Approved/Rejected"). It is the ONE place in this crate that constructs
 //! `RequestContext { write_policy: Some(WritePolicy::trusted_cli()),
-//! origin: CallOrigin::TrustedLocal, .. }` — never from `args`, never from
-//! any value this function receives from its caller. `args` can only ever
-//! name a subcommand and a proposal id/reason; there is no argument shape
-//! through which a caller could set `write_policy` or `origin` to anything
-//! else, because this function's own signature has no such parameter and
-//! builds the trusted context itself, every call, unconditionally.
+//! origin: CallOrigin::TrustedLocal(TrustedLocalToken::new()), .. }` —
+//! never from `args`, never from any value this function receives from its
+//! caller. `args` can only ever name a subcommand and a proposal id/reason;
+//! there is no argument shape through which a caller could set
+//! `write_policy` or `origin` to anything else, because this function's
+//! own signature has no such parameter and builds the trusted context
+//! itself, every call, unconditionally. Both `WritePolicy::trusted_cli`
+//! and `TrustedLocalToken::new` are `pub(crate)` (B5 layering review): this
+//! module is the only place in the crate's public surface that can reach
+//! either, and nothing outside `brain-api` — including a future
+//! `mcp-server` crate — can call either one at all.
 
-use crate::{BrainApiError, CallOrigin, ProposalId, RequestContext, WritePolicy};
+use crate::{BrainApiError, CallOrigin, ProposalId, RequestContext, TrustedLocalToken, WritePolicy};
 
 fn trusted_ctx() -> RequestContext {
     RequestContext {
@@ -34,7 +39,7 @@ fn trusted_ctx() -> RequestContext {
         // least privilege): this context can never be handed to search/
         // retrieve/get_code_context and have it silently succeed.
         read_policy: None,
-        origin: CallOrigin::TrustedLocal,
+        origin: CallOrigin::TrustedLocal(TrustedLocalToken::new()),
     }
 }
 

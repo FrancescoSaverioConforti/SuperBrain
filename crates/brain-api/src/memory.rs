@@ -75,8 +75,8 @@ pub enum RelationKind {
 
 /// Checks `ctx.write_policy` allows `ProposeWrite` (fail-closed: `None`
 /// denies), then builds a fresh, `Pending`-status [`PendingWriteProposal`]
-/// carrying `operation`, persists it via [`crate::save_proposal`] (the
-/// Task 12 confined API — never a generic path write), and returns its
+/// carrying `operation`, persists it via `crate::proposal_store::save_proposal`
+/// (the Task 12 confined API — never a generic path write), and returns its
 /// id. Shared by all three proposal-creating operations so the permission
 /// check, id generation, and persistence call happen in exactly one place.
 ///
@@ -98,7 +98,7 @@ fn create_proposal(ctx: &RequestContext, vault: &storage::Vault, operation: Prop
         None, // expiry: no fixed default assigned yet — see module note below.
         operation,
     );
-    crate::save_proposal(vault, &proposal).map_err(|e| match e {
+    crate::proposal_store::save_proposal(vault, &proposal).map_err(|e| match e {
         BrainApiError::InvalidInput(_) => BrainApiError::InvalidInput("invalid proposal".into()),
         other => other,
     })?;
@@ -370,7 +370,7 @@ mod tests {
     fn save_memory_creates_a_pending_proposal_with_propose_write_permission() {
         let vault = test_vault();
         let id = save_memory_default(&mcp_ctx(), &vault, "note-a", "content").unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 
@@ -397,7 +397,7 @@ mod tests {
         let vault = test_vault();
         let ctx = mcp_ctx();
         let id = save_memory_default(&ctx, &vault, "note-a", "content").unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(loaded.originating_identity, ctx.origin.as_identity_label());
         assert_eq!(loaded.originating_identity, "session-abc");
     }
@@ -412,7 +412,7 @@ mod tests {
         let vault = test_vault();
         let ctx = mcp_ctx();
         let id = save_memory_with(&ctx, &vault, "note-a", "project-x", "trusted-local", "2026-11-16", "content").unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(loaded.originating_identity, "session-abc");
         match loaded.operation {
             ProposedOperation::SaveMemory { source, .. } => assert_eq!(source, "trusted-local"),
@@ -427,8 +427,8 @@ mod tests {
         let mut other_ctx = mcp_ctx();
         other_ctx.origin = CallOrigin::McpSession("session-xyz".into());
         let id_b = save_memory_default(&other_ctx, &vault, "note-b", "content").unwrap();
-        let loaded_a = crate::load_proposal(&vault, &id_a).unwrap();
-        let loaded_b = crate::load_proposal(&vault, &id_b).unwrap();
+        let loaded_a = crate::proposal_store::load_proposal(&vault, &id_a).unwrap();
+        let loaded_b = crate::proposal_store::load_proposal(&vault, &id_b).unwrap();
         assert_eq!(loaded_a.originating_identity, "session-abc");
         assert_eq!(loaded_b.originating_identity, "session-xyz");
         assert_ne!(loaded_a.originating_identity, loaded_b.originating_identity);
@@ -442,10 +442,10 @@ mod tests {
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
             read_policy: None,
-            origin: CallOrigin::TrustedLocal,
+            origin: CallOrigin::TrustedLocal(crate::TrustedLocalToken::new()),
         };
         let id = save_memory_default(&ctx, &vault, "note-a", "content").unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(loaded.originating_identity, "trusted-local");
     }
 
@@ -506,7 +506,7 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         match loaded.operation {
             ProposedOperation::SaveMemory { note_id, note_type, classification, project, source, event_period, body } => {
                 assert_eq!(note_id, "note-z");
@@ -536,7 +536,7 @@ mod tests {
         let vault = test_vault();
         let note_id = storage::NoteId::parse("note-a").unwrap();
         let id = update_memory(&mcp_ctx(), &vault, note_id, "new content".into(), storage::Version(1), NOW).unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         assert_eq!(*loaded.status(), ProposalStatus::Pending);
     }
 
@@ -545,7 +545,7 @@ mod tests {
         let vault = test_vault();
         let note_id = storage::NoteId::parse("note-a").unwrap();
         let id = update_memory(&mcp_ctx(), &vault, note_id, "new content".into(), storage::Version(7), NOW).unwrap();
-        let loaded = crate::load_proposal(&vault, &id).unwrap();
+        let loaded = crate::proposal_store::load_proposal(&vault, &id).unwrap();
         match loaded.operation {
             ProposedOperation::UpdateMemory { expected_version, .. } => assert_eq!(expected_version, storage::Version(7)),
             other => panic!("expected UpdateMemory, got {other:?}"),

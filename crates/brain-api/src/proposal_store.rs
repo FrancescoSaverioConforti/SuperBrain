@@ -265,14 +265,33 @@ fn from_persisted(persisted: PersistedProposal) -> Result<PendingWriteProposal, 
 /// comment). Maps every `storage::StorageError` onto the frozen
 /// `BrainApiError` vocabulary at this boundary — no internal detail
 /// (filesystem path, I/O error text) crosses into the public error.
-pub fn save_proposal(vault: &storage::Vault, proposal: &PendingWriteProposal) -> Result<(), BrainApiError> {
+///
+/// `pub(crate)`, not `pub`: raw persistence with no permission check at
+/// all — restricted during B5's layering review for the same reason
+/// `list_proposals` below already was at Task 14 (its own doc comment
+/// explains the precedent). `approve_proposal`/`reject_proposal`
+/// (`approval.rs`, Task 14) and `save_memory`/`update_memory`/
+/// `link_entities` (`memory.rs`/`graph.rs`, Task 13) are the crate's real,
+/// `WritePolicy`-gated public write/propose surface; none of them are
+/// bypassed by this restriction, since all of them already call this
+/// through `crate::proposal_store::save_proposal`, not through a crate-root
+/// re-export. No crate-external consumer depended on the old `pub`
+/// re-export (confirmed: `crates/brain-api/tests/*.rs` never names
+/// `brain_api::save_proposal`).
+pub(crate) fn save_proposal(vault: &storage::Vault, proposal: &PendingWriteProposal) -> Result<(), BrainApiError> {
     let persisted = to_persisted(proposal);
     let bytes = serde_yaml::to_string(&persisted).map_err(|_| BrainApiError::RuntimeUnavailable)?;
     vault.save_proposal(&proposal.id.to_string(), bytes.as_bytes()).map_err(map_storage_error)
 }
 
 /// Loads and reconstructs the proposal persisted under `id`.
-pub fn load_proposal(vault: &storage::Vault, id: &ProposalId) -> Result<PendingWriteProposal, BrainApiError> {
+///
+/// `pub(crate)`, not `pub`: same restriction and rationale as
+/// [`save_proposal`] above — raw, unauthenticated-by-itself persistence
+/// read with no permission check; `approve_proposal`/`reject_proposal`/
+/// `list_proposals` are the gated public surface that may read a persisted
+/// proposal.
+pub(crate) fn load_proposal(vault: &storage::Vault, id: &ProposalId) -> Result<PendingWriteProposal, BrainApiError> {
     let bytes = vault.load_proposal(&id.to_string()).map_err(map_storage_error)?;
     let text = String::from_utf8(bytes).map_err(|_| BrainApiError::CorruptData)?;
     let persisted: PersistedProposal = serde_yaml::from_str(&text).map_err(|_| BrainApiError::CorruptData)?;

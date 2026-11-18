@@ -28,7 +28,6 @@ pub use graph::link_entities;
 pub use knowledge::{get_canon, get_regulations, get_rules, BindingStatus, CanonEntry, KnowledgeItem};
 pub use memory::{get_previous_solution, save_memory, update_memory, ProposedOperation, RelationKind};
 pub use policy_write::{WriteOperation, WritePolicy};
-pub use proposal_store::{load_proposal, save_proposal};
 pub use read::{get_code_context, get_entity, graph_query, retrieve, search, CodeContext, CodeContextEdge, Entity, GraphQuerySpec};
 pub use proposal::{
     InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
@@ -56,10 +55,49 @@ pub use proposal::{
 ///   approval surface today; later, in B6, the UI acting on its own
 ///   initiative) — carries no identity string at all, since "trusted
 ///   local" IS the identity.
+///
+/// **Structural correction (B5, pre-closure):** the original shape of this
+/// enum made `TrustedLocal` a plain, no-field variant — constructible by
+/// ANY code that can name `brain_api::CallOrigin`, including a future
+/// `mcp-server` crate that merely depends on `brain-api`, with no
+/// constructor call to gate it at all. That violated the trust-boundary
+/// invariant this module's own doc comment already claimed ("`origin` is
+/// likewise never settable from an agent-facing payload"): the claim was
+/// true for `RequestContext`'s own field assignment, but not for the
+/// variant's constructibility itself. `TrustedLocal` now carries a
+/// [`TrustedLocalToken`], whose only constructor is `pub(crate)` — so
+/// external code can still *match* on `CallOrigin::TrustedLocal(_)` (or use
+/// [`CallOrigin::is_trusted_local`] below) to read which origin a context
+/// carries, but cannot construct one, no matter what payload a remote
+/// caller controls. This is not a public API compatibility guarantee being
+/// preserved — no stable external consumer depended on the old shape (the
+/// only crate-external reference, `crates/brain-api/tests/
+/// cli_approval_e2e.rs`, only ever constructs `McpSession`) — it is a
+/// pre-closure correction of a real gap found during B5's layering review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallOrigin {
     McpSession(String),
-    TrustedLocal,
+    TrustedLocal(TrustedLocalToken),
+}
+
+/// A zero-sized, crate-private-constructor marker: proof that whoever
+/// produced a [`CallOrigin::TrustedLocal`] went through `brain-api`'s own
+/// trusted boundary code (today, only `cli::trusted_ctx`), never through a
+/// payload field or a bare enum-variant literal written by an external
+/// crate. The type itself is `pub` (it has to be, to appear inside a `pub
+/// enum` variant that external code may still pattern-match on), but
+/// [`TrustedLocalToken::new`] is `pub(crate)` — there is no public way to
+/// obtain a value of this type from outside `brain-api`, and therefore no
+/// public way to construct `CallOrigin::TrustedLocal(_)` from outside it
+/// either. Carries no data: "trusted local" IS the identity, exactly as
+/// `CallOrigin`'s own doc comment already said before this correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedLocalToken(());
+
+impl TrustedLocalToken {
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
 }
 
 impl CallOrigin {
@@ -71,8 +109,18 @@ impl CallOrigin {
     pub fn as_identity_label(&self) -> String {
         match self {
             CallOrigin::McpSession(label) => label.clone(),
-            CallOrigin::TrustedLocal => "trusted-local".to_string(),
+            CallOrigin::TrustedLocal(_) => "trusted-local".to_string(),
         }
+    }
+
+    /// Read-only discriminator for external code that needs to distinguish
+    /// a trusted-local origin from an MCP one without being able to
+    /// construct either — e.g. a future audit/log facade deciding how to
+    /// render a context's origin. Never used by this crate's own
+    /// permission checks, which always match on `ctx.write_policy`/
+    /// `ctx.read_policy` directly, never on `origin` itself.
+    pub fn is_trusted_local(&self) -> bool {
+        matches!(self, CallOrigin::TrustedLocal(_))
     }
 }
 

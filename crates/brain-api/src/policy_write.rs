@@ -59,7 +59,15 @@ impl WritePolicy {
     /// Intended for the trusted local CLI approval surface (B5) and, later,
     /// the B6 UI's human-initiated approval path — never for a transport
     /// that accepts remote input.
-    pub fn trusted_cli() -> Self {
+    ///
+    /// `pub(crate)`, not `pub`: restricted during B5's layering review so a
+    /// future `mcp-server` crate (which only ever depends on `brain-api`,
+    /// never lives inside it) has no public call it could make — accidentally
+    /// or otherwise — to obtain approval authority. The only call site today
+    /// is `cli::trusted_ctx`; `crates/brain-api/tests/cli_approval_e2e.rs`
+    /// (the one crate-external consumer) only ever observes its effects
+    /// through `run_cli`, never calls this directly.
+    pub(crate) fn trusted_cli() -> Self {
         Self { propose_write_allowed: true, approve_write_allowed: true }
     }
 
@@ -142,7 +150,7 @@ mod tests {
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
             read_policy: None,
-            origin: crate::CallOrigin::TrustedLocal,
+            origin: crate::CallOrigin::TrustedLocal(crate::TrustedLocalToken::new()),
         };
         let allowed = |op: WriteOperation| ctx.write_policy.as_ref().is_some_and(|p| p.allows(op));
         assert!(allowed(WriteOperation::ApproveProposal));
