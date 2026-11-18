@@ -80,20 +80,23 @@ pub struct ProposalProvenance {
 /// advances only through [`valid_proposal_transition`]-checked moves made
 /// by a separate, privileged approval operation (Task 14), never by
 /// constructing or mutating this struct directly from agent-reachable code.
-/// `operation: ProposedOperation` (the design doc's `SaveMemory { .. } |
-/// UpdateMemory { .. } | LinkEntities { .. }` payload) is deliberately NOT
-/// yet a field here: that type's exact shape depends on `save_memory`/
-/// `update_memory`/`link_entities`'s own request schemas, designed in
-/// Task 13, not invented ahead of them here. Same ruling already applied
-/// to `RequestContext.write_policy` in Task 8 (deferred until
-/// `policy::WritePolicy` exists) — add the field when the type it depends
-/// on is real, not before.
+///
+/// `operation: ProposedOperation` is the exact write this proposal names —
+/// set once, at construction, from the payload `save_memory`/
+/// `update_memory`/`link_entities` (Task 13) validated and built, and never
+/// changed afterwards (no setter, no mutation path, not even `transition_to`
+/// touches it). This is the ONLY data `approve_proposal` (Task 14) may
+/// execute: its own signature takes no operation/payload parameter through
+/// which a caller could substitute something else at approval time — the
+/// persisted proposal is authoritative for what gets executed, by
+/// construction, not by convention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWriteProposal {
     pub id: ProposalId,
     pub originating_identity: String,
     pub provenance: ProposalProvenance,
     pub expires_at: Option<String>,
+    pub operation: crate::ProposedOperation,
     status: ProposalStatus,
 }
 
@@ -102,12 +105,19 @@ impl PendingWriteProposal {
     /// There is no constructor, in this module or any other, that can
     /// produce one already `Approved` — an agent calling `save_memory`/
     /// `update_memory`/`link_entities` can reach only this path.
-    pub fn new(id: ProposalId, originating_identity: String, provenance: ProposalProvenance, expires_at: Option<String>) -> Self {
+    pub fn new(
+        id: ProposalId,
+        originating_identity: String,
+        provenance: ProposalProvenance,
+        expires_at: Option<String>,
+        operation: crate::ProposedOperation,
+    ) -> Self {
         Self {
             id,
             originating_identity,
             provenance,
             expires_at,
+            operation,
             status: ProposalStatus::Pending,
         }
     }
@@ -180,6 +190,17 @@ mod tests {
     fn rejected() -> ProposalStatus {
         ProposalStatus::Rejected { reason: "r".into(), rejected_at: "2026-11-16T00:00:00Z".into() }
     }
+    fn sample_operation() -> crate::ProposedOperation {
+        crate::ProposedOperation::SaveMemory {
+            note_id: "note-sample".into(),
+            note_type: domain::NoteType::Bug,
+            classification: domain::Classification::Internal,
+            project: "project-x".into(),
+            source: "agent:coder@prompt-v3".into(),
+            event_period: "2026-11-16".into(),
+            body: "sample body".into(),
+        }
+    }
 
     // --- valid_proposal_transition: the three allowed moves ---
 
@@ -241,6 +262,7 @@ mod tests {
             "mcp-session-abc".into(),
             ProposalProvenance { source: "mcp-session-abc".into(), created_at: "2026-11-16T00:00:00Z".into() },
             None,
+            sample_operation(),
         );
         assert_eq!(*p.status(), ProposalStatus::Pending);
     }
@@ -252,6 +274,7 @@ mod tests {
             "mcp-session-abc".into(),
             ProposalProvenance { source: "mcp-session-abc".into(), created_at: "2026-11-16T00:00:00Z".into() },
             None,
+            sample_operation(),
         );
         assert!(p.transition_to(approved()).is_ok());
         assert_eq!(*p.status(), approved());
@@ -264,6 +287,7 @@ mod tests {
             "mcp-session-abc".into(),
             ProposalProvenance { source: "mcp-session-abc".into(), created_at: "2026-11-16T00:00:00Z".into() },
             None,
+            sample_operation(),
         );
         p.transition_to(approved()).unwrap();
         // Now Approved; attempting Approved -> Rejected must fail and leave status as Approved.
@@ -333,6 +357,7 @@ mod tests {
             "x".into(),
             ProposalProvenance { source: "x".into(), created_at: "2026-11-16T00:00:00Z".into() },
             None,
+            sample_operation(),
         );
         assert_eq!(*p.status(), ProposalStatus::Pending);
     }

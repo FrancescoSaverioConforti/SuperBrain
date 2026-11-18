@@ -311,18 +311,42 @@ rule as `search`.
 
 ### 10–12. `save_memory` / `update_memory` / `link_entities`
 
-- **Input** (per operation):
-  - `save_memory`: note content/body, intended `NoteType`,
-    classification, `originating_identity` (server-assigned, never
-    caller-supplied).
-  - `update_memory`: target `NoteId`, new content/body, expected
-    version (optimistic concurrency, mirroring `storage::propose_and_commit`'s
+- **Input** (per operation; this list is EXACT, corrected post-Task-13
+  against `crates/brain-api/src/memory.rs`'s real `ProposedOperation` —
+  a Task 13 draft under-specified both `save_memory` and `update_memory`
+  against this freeze's own original text; fixed as a Task 14
+  prerequisite before any execution code could be written against the
+  incomplete shape):
+  - `save_memory`: `note_id` (target `NoteId` for the brand-new note —
+    caller-chosen, since `update_memory`/`link_entities` need a stable
+    id to reference it by), `NoteType`, `Classification`, `project`
+    (`domain::NoteMetadata`'s field, `crates/domain/src/note.rs:27-40`),
+    `source` (same struct's field — frontmatter METADATA, e.g. an
+    agent/tool label; explicitly NOT a security identity and never a
+    substitute for `originating_identity`), `event_period` (mandatory
+    `String`, per `domain::parse_frontmatter`'s real, always-required
+    field — no `Option`, no derived-from-timestamp convention; the
+    caller states it explicitly as part of the note's intent), note
+    content/body, `originating_identity` (server-assigned, never
+    caller-supplied). `created`/`updated` are NOT inputs: both are
+    system-generated at `approve_proposal` execution time from whatever
+    timestamp it runs with (`updated = created` at creation, matching
+    `storage::propose_and_commit`'s own note-authoring convention — no
+    further update-timestamp semantics invented beyond what the storage
+    model already provides).
+  - `update_memory`: target `NoteId`, new content/body, `expected_version`
+    (optimistic concurrency, mirroring `storage::propose_and_commit`'s
     existing `expected_version` parameter — confirmed real at
-    `crates/storage/src/propose.rs`), `originating_identity`.
+    `crates/storage/src/propose.rs`; MANDATORY, not optional — without it
+    `approve_proposal` cannot detect that the target note changed between
+    proposal creation and approval), `originating_identity`.
   - `link_entities`: source/target identifiers, relation kind
     (constrained to `domain::Relations`'s real fields: `supports`,
     `contradicts`, `derived_from`, `supersedes`, `applies_to` —
     `crates/domain/src/note.rs:13-24`, confirmed real), `originating_identity`.
+    No `expected_version` — this operation's input list has never
+    included one, and adding relations is append-only (never a
+    replace-in-place that a stale read could silently clobber).
 - **Output**: `ProposalId` (new type, `crates/brain-api`), plus the
   `PendingWriteProposal`'s initial `status: Pending`.
 - **Errors**: `PermissionDenied` if the caller's `WritePolicy` doesn't

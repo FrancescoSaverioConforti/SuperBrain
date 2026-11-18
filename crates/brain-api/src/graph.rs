@@ -29,7 +29,6 @@ pub fn link_entities(
         to: to.as_str().to_string(),
         relation,
     };
-    let _ = &operation; // recorded in provenance for now; see memory.rs's module note on ProposedOperation's future use at approval time (Task 14).
 
     let identity = ctx.origin.as_identity_label();
     let proposal = PendingWriteProposal::new(
@@ -37,6 +36,7 @@ pub fn link_entities(
         identity.clone(),
         ProposalProvenance { source: identity, created_at: now.to_string() },
         None,
+        operation,
     );
     crate::save_proposal(vault, &proposal)?;
     Ok(proposal.id)

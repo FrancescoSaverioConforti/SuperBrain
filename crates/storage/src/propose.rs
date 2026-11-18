@@ -423,6 +423,467 @@ fn parse_note_id(field: &str, raw: &str) -> Result<NoteId, ProposeError> {
     })
 }
 
+/// Which [`domain::Relations`] field [`add_relation`] appends `target` to —
+/// exactly the 5 real fields (`crates/domain/src/note.rs:14-23`), never an
+/// arbitrary string, so this function cannot be asked to write a relation
+/// kind `domain::Relations` has no field for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationField {
+    Supports,
+    Contradicts,
+    DerivedFrom,
+    Supersedes,
+    AppliesTo,
+}
+
+/// Replaces an existing note's BODY only, leaving every frontmatter field
+/// (including `relations`) semantically unchanged, then commits through
+/// [`propose_and_commit`] — the one and only public write entry point this
+/// function is a typed facade over, never a second write primitive. Takes
+/// `note_id`, never a path; takes no raw YAML/frontmatter from the caller.
+///
+/// Sequence: read the current record (`Vault::read_note`) under `note_id`,
+/// split it into typed `NoteMetadata` + body via [`crate::split_record`],
+/// replace the body with `new_body`, canonically re-render the (unchanged)
+/// frontmatter via `domain::render_frontmatter`, compose the full
+/// `note_text`, and call `propose_and_commit` with `expected_version`
+/// (which performs its own real optimistic-concurrency check under the
+/// note's lock — this function does not duplicate that check, it only
+/// needs the CURRENT content to build the new `note_text` from).
+///
+/// Per `domain::render_frontmatter`'s own contract, this is a CANONICAL
+/// re-serialization of the frontmatter: semantic metadata (including every
+/// relation target) is preserved exactly, but original YAML formatting,
+/// whitespace, comments, and key presentation are not guaranteed
+/// byte-for-byte. `new_body: None` renders as an empty body (no body
+/// section at all), matching `propose_and_commit`'s own existing
+/// bare-frontmatter-with-empty-body handling.
+#[allow(clippy::too_many_arguments)]
+pub fn update_note_body(
+    vault: &Vault,
+    note_id: &NoteId,
+    expected_version: Version,
+    new_body: Option<&str>,
+    operation_id: Uuid,
+    known_ids: &HashSet<NoteId>,
+    pending_ids: &HashSet<String>,
+    gate: &policy::Gate,
+    pii_store: Option<&PiiStore>,
+) -> Result<CommitResult, ProposeError> {
+    let record = vault.read_note(note_id).map_err(ProposeError::Storage)?;
+    let (metadata, _old_body) = crate::vault::split_record(record.content.as_bytes())
+        .map_err(|_| ProposeError::Storage(StorageError::Inconsistent { note_id: note_id.as_str().to_string() }))?;
+    let note_text = compose_note_text(&metadata, new_body);
+    propose_and_commit(vault, &note_text, expected_version, operation_id, known_ids, pending_ids, gate, pii_store)
+}
+
+/// Appends `target` to the single `relation` field named, leaving the body
+/// and every other frontmatter field semantically unchanged, then commits
+/// through [`propose_and_commit`] exactly as [`update_note_body`] does — the
+/// same typed-facade-over-the-one-public-write-path discipline, the same
+/// canonical-re-serialization contract, `note_id` not a path, no raw YAML
+/// from the caller.
+///
+/// `target` is appended verbatim (not deduplicated — the caller, i.e.
+/// `brain-api`'s `approve_proposal`, decides what duplicate-relation
+/// semantics it wants, if any; this function's job is only to apply exactly
+/// the one relation addition it was asked for, the same "no silent
+/// reinterpretation" principle `storage` already applies everywhere else).
+#[allow(clippy::too_many_arguments)]
+pub fn add_relation(
+    vault: &Vault,
+    note_id: &NoteId,
+    expected_version: Version,
+    relation: RelationField,
+    target: &str,
+    operation_id: Uuid,
+    known_ids: &HashSet<NoteId>,
+    pending_ids: &HashSet<String>,
+    gate: &policy::Gate,
+    pii_store: Option<&PiiStore>,
+) -> Result<CommitResult, ProposeError> {
+    let record = vault.read_note(note_id).map_err(ProposeError::Storage)?;
+    let (mut metadata, old_body) = crate::vault::split_record(record.content.as_bytes())
+        .map_err(|_| ProposeError::Storage(StorageError::Inconsistent { note_id: note_id.as_str().to_string() }))?;
+    match relation {
+        RelationField::Supports => metadata.relations.supports.push(target.to_string()),
+        RelationField::Contradicts => metadata.relations.contradicts.push(target.to_string()),
+        RelationField::DerivedFrom => metadata.relations.derived_from.push(target.to_string()),
+        RelationField::Supersedes => metadata.relations.supersedes.push(target.to_string()),
+        RelationField::AppliesTo => metadata.relations.applies_to.push(target.to_string()),
+    }
+    let note_text = compose_note_text(&metadata, old_body.as_deref());
+    propose_and_commit(vault, &note_text, expected_version, operation_id, known_ids, pending_ids, gate, pii_store)
+}
+
+/// Composes a full `note_text` (frontmatter delimiters + canonically
+/// rendered frontmatter + body) from typed metadata and an optional body,
+/// in exactly the delimited form `frontmatter_of`/`body_of` already parse.
+fn compose_note_text(metadata: &domain::NoteMetadata, body: Option<&str>) -> String {
+    let frontmatter = domain::render_frontmatter(metadata);
+    match body {
+        Some(body) => format!("---\n{frontmatter}---\n{body}"),
+        None => format!("---\n{frontmatter}---\n"),
+    }
+}
+
+#[cfg(test)]
+mod update_body_and_add_relation_tests {
+    use super::*;
+    use crate::vault::Vault;
+
+    fn unique_test_dir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "superbrain-storage-propose-note-mutation-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_vault() -> Vault {
+        let dir = unique_test_dir();
+        Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap()
+    }
+
+    fn gate() -> policy::Gate {
+        policy::Gate::new(policy::SecretPolicy::new(1))
+    }
+
+    fn note_yaml(id: &str, body: &str) -> String {
+        format!(
+            "---\nid: {id}\nschema_version: 1\ntype: bug\nstatus: draft\ntrust: internal\nclassification: internal\nproject: project-x\nsource: agent:coder@prompt-v3\ncreated: 2026-11-16\nupdated: 2026-11-16\nevent_period: 2026-11-16\nrelations: {{}}\n---\n{body}"
+        )
+    }
+
+    fn create_note(vault: &Vault, id: &str, body: &str) {
+        propose_and_commit(
+            vault,
+            &note_yaml(id, body),
+            Version(0),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+    }
+
+    // --- update_note_body ---
+
+    #[test]
+    fn update_note_body_replaces_only_the_body() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "original body\n");
+
+        let result = update_note_body(
+            &vault,
+            &note_id,
+            Version(1),
+            Some("new body\n"),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+        // A test vault's root is not a git repository, so a successful
+        // write durably lands as GitPending, not Committed -- same
+        // non-error outcome `write_to_a_vault_root_that_is_not_a_git_repo_returns_git_pending_not_an_error`
+        // already documents for `propose_and_commit` itself; this facade
+        // delegates to it and inherits the same contract.
+        assert!(matches!(result, CommitResult::Committed(_) | CommitResult::GitPending { .. }));
+
+        let record = vault.read_note(&note_id).unwrap();
+        let (metadata, body) = crate::vault::split_record(record.content.as_bytes()).unwrap();
+        assert_eq!(body.as_deref(), Some("new body\n"));
+        assert_eq!(metadata.id, "note-a");
+        assert_eq!(metadata.project, "project-x");
+        assert!(metadata.relations.supports.is_empty());
+    }
+
+    #[test]
+    fn update_note_body_leaves_unrelated_metadata_unchanged() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "original body\n");
+        let before = vault.read_note(&note_id).unwrap();
+        let (before_metadata, _) = crate::vault::split_record(before.content.as_bytes()).unwrap();
+
+        update_note_body(
+            &vault,
+            &note_id,
+            Version(1),
+            Some("new body\n"),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+
+        let after = vault.read_note(&note_id).unwrap();
+        let (after_metadata, _) = crate::vault::split_record(after.content.as_bytes()).unwrap();
+        assert_eq!(after_metadata.schema_version, before_metadata.schema_version);
+        assert_eq!(after_metadata.r#type, before_metadata.r#type);
+        assert_eq!(after_metadata.status, before_metadata.status);
+        assert_eq!(after_metadata.trust, before_metadata.trust);
+        assert_eq!(after_metadata.classification, before_metadata.classification);
+        assert_eq!(after_metadata.project, before_metadata.project);
+        assert_eq!(after_metadata.source, before_metadata.source);
+        assert_eq!(after_metadata.created, before_metadata.created);
+        assert_eq!(after_metadata.event_period, before_metadata.event_period);
+    }
+
+    #[test]
+    fn update_note_body_result_passes_parse_frontmatter() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "original body\n");
+        update_note_body(&vault, &note_id, Version(1), Some("new body\n"), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate(), None)
+            .unwrap();
+        let record = vault.read_note(&note_id).unwrap();
+        assert!(domain::parse_frontmatter(frontmatter_of(&record.content)).is_ok());
+    }
+
+    #[test]
+    fn update_note_body_with_stale_expected_version_is_a_conflict_and_does_not_write() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "original body\n");
+        let before = vault.read_note(&note_id).unwrap();
+
+        let result = update_note_body(
+            &vault,
+            &note_id,
+            Version(0), // stale: real current version is 1
+            Some("new body\n"),
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &gate(),
+            None,
+        );
+        assert!(matches!(result, Err(ProposeError::Storage(StorageError::Conflict { .. }))));
+
+        let after = vault.read_note(&note_id).unwrap();
+        assert_eq!(after, before, "a stale expected_version must not write anything");
+    }
+
+    #[test]
+    fn update_note_body_on_an_unknown_note_id_returns_not_found() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        let result =
+            update_note_body(&vault, &note_id, Version(0), Some("body\n"), Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate(), None);
+        assert!(matches!(result, Err(ProposeError::Storage(StorageError::NotFound { .. }))));
+    }
+
+    #[test]
+    fn update_note_body_with_none_produces_an_empty_body() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "original body\n");
+        update_note_body(&vault, &note_id, Version(1), None, Uuid::new_v4(), &HashSet::new(), &HashSet::new(), &gate(), None).unwrap();
+        let record = vault.read_note(&note_id).unwrap();
+        let (_, body) = crate::vault::split_record(record.content.as_bytes()).unwrap();
+        assert_eq!(body, None);
+    }
+
+    // --- add_relation ---
+
+    #[test]
+    fn add_relation_appends_only_the_named_relation() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "body\n");
+
+        add_relation(
+            &vault,
+            &note_id,
+            Version(1),
+            RelationField::Supports,
+            "note-b",
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &["note-b".to_string()].into_iter().collect(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+
+        let record = vault.read_note(&note_id).unwrap();
+        let (metadata, body) = crate::vault::split_record(record.content.as_bytes()).unwrap();
+        assert_eq!(metadata.relations.supports, vec!["note-b".to_string()]);
+        assert!(metadata.relations.contradicts.is_empty());
+        assert!(metadata.relations.derived_from.is_empty());
+        assert!(metadata.relations.supersedes.is_empty());
+        assert!(metadata.relations.applies_to.is_empty());
+        assert_eq!(body.as_deref(), Some("body\n"));
+    }
+
+    #[test]
+    fn add_relation_preserves_the_body_and_unrelated_metadata() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "untouched body\n");
+        let before = vault.read_note(&note_id).unwrap();
+        let (before_metadata, _) = crate::vault::split_record(before.content.as_bytes()).unwrap();
+
+        add_relation(
+            &vault,
+            &note_id,
+            Version(1),
+            RelationField::Contradicts,
+            "note-c",
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &["note-c".to_string()].into_iter().collect(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+
+        let after = vault.read_note(&note_id).unwrap();
+        let (after_metadata, after_body) = crate::vault::split_record(after.content.as_bytes()).unwrap();
+        assert_eq!(after_body.as_deref(), Some("untouched body\n"));
+        assert_eq!(after_metadata.project, before_metadata.project);
+        assert_eq!(after_metadata.source, before_metadata.source);
+        assert_eq!(after_metadata.status, before_metadata.status);
+    }
+
+    #[test]
+    fn add_relation_for_each_of_the_five_fields_lands_in_the_right_field() {
+        let vault = test_vault();
+        for (i, (field, expected_getter)) in [
+            (RelationField::Supports, 0),
+            (RelationField::Contradicts, 1),
+            (RelationField::DerivedFrom, 2),
+            (RelationField::Supersedes, 3),
+            (RelationField::AppliesTo, 4),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = expected_getter;
+            let id = format!("note-{i}");
+            create_note(&vault, &id, "body\n");
+            let note_id = NoteId::parse(&id).unwrap();
+            let target = format!("target-{i}");
+            add_relation(
+                &vault,
+                &note_id,
+                Version(1),
+                field,
+                &target,
+                Uuid::new_v4(),
+                &HashSet::new(),
+                &[target.clone()].into_iter().collect(),
+                &gate(),
+                None,
+            )
+            .unwrap();
+            let record = vault.read_note(&note_id).unwrap();
+            let (metadata, _) = crate::vault::split_record(record.content.as_bytes()).unwrap();
+            let landed = match field {
+                RelationField::Supports => &metadata.relations.supports,
+                RelationField::Contradicts => &metadata.relations.contradicts,
+                RelationField::DerivedFrom => &metadata.relations.derived_from,
+                RelationField::Supersedes => &metadata.relations.supersedes,
+                RelationField::AppliesTo => &metadata.relations.applies_to,
+            };
+            assert_eq!(landed, &vec![target]);
+        }
+    }
+
+    #[test]
+    fn add_relation_result_passes_parse_frontmatter() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "body\n");
+        add_relation(
+            &vault,
+            &note_id,
+            Version(1),
+            RelationField::Supports,
+            "note-b",
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &["note-b".to_string()].into_iter().collect(),
+            &gate(),
+            None,
+        )
+        .unwrap();
+        let record = vault.read_note(&note_id).unwrap();
+        assert!(domain::parse_frontmatter(frontmatter_of(&record.content)).is_ok());
+    }
+
+    #[test]
+    fn add_relation_with_stale_expected_version_is_a_conflict_and_does_not_write() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        create_note(&vault, "note-a", "body\n");
+        let before = vault.read_note(&note_id).unwrap();
+
+        let result = add_relation(
+            &vault,
+            &note_id,
+            Version(0), // stale
+            RelationField::Supports,
+            "note-b",
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &["note-b".to_string()].into_iter().collect(),
+            &gate(),
+            None,
+        );
+        assert!(matches!(result, Err(ProposeError::Storage(StorageError::Conflict { .. }))));
+
+        let after = vault.read_note(&note_id).unwrap();
+        assert_eq!(after, before, "a stale expected_version must not write anything");
+    }
+
+    #[test]
+    fn add_relation_on_an_unknown_note_id_returns_not_found() {
+        let vault = test_vault();
+        let note_id = NoteId::parse("note-a").unwrap();
+        let result = add_relation(
+            &vault,
+            &note_id,
+            Version(0),
+            RelationField::Supports,
+            "note-b",
+            Uuid::new_v4(),
+            &HashSet::new(),
+            &["note-b".to_string()].into_iter().collect(),
+            &gate(),
+            None,
+        );
+        assert!(matches!(result, Err(ProposeError::Storage(StorageError::NotFound { .. }))));
+    }
+
+    // --- neither helper introduces a path-based / raw-YAML-from-caller surface ---
+
+    #[test]
+    fn neither_helper_takes_a_path_or_raw_frontmatter_parameter() {
+        // Compile-time property, not a runtime assertion: both signatures
+        // above take `&NoteId` (never `&Path`/`&str`-as-path) and no raw
+        // YAML/frontmatter string parameter -- this test's own successful
+        // compilation, calling both with only (vault, note_id, version,
+        // typed-payload, operation_id, known_ids, pending_ids, gate,
+        // pii_store), is the proof. Documented here as the canary a
+        // reviewer should notice if either signature ever grows a path or
+        // raw-text parameter.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::frontmatter_of;
