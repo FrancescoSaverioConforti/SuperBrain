@@ -1,0 +1,21 @@
+[package]
+name = "mcp-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain MCP server: exposes brain-api's capabilities over the Model Context Protocol."
+
+[dependencies]
+brain-api = { path = "../brain-api" }
+# Official Rust MCP SDK (modelcontextprotocol/rust-sdk). `server` + `macros`
+# are its own defaults (tool registration/dispatch); `transport-io` adds the
+# stdio server transport -- stdin/stdout only, no network -- which is the
+# standard way to launch a local MCP server as a child process and the only
+# transport this task's scaffold needs: SuperBrain is a local, single-user
+# tool with no remote-network requirement for MCP itself.
+rmcp = { version = "3.11.0", features = ["transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
