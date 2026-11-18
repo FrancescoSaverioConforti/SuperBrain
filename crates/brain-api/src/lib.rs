@@ -19,6 +19,7 @@ mod memory;
 mod policy_write;
 mod proposal;
 mod proposal_store;
+mod read;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
 pub use cli::run_cli;
 pub use error::BrainApiError;
@@ -26,6 +27,7 @@ pub use graph::link_entities;
 pub use memory::{save_memory, update_memory, ProposedOperation, RelationKind};
 pub use policy_write::{WriteOperation, WritePolicy};
 pub use proposal_store::{load_proposal, save_proposal};
+pub use read::{get_code_context, retrieve, search, CodeContext, CodeContextEdge};
 pub use proposal::{
     InvalidProposalTransition, PendingWriteProposal, ProposalId, ProposalIdError, ProposalProvenance, ProposalStatus,
     valid_proposal_transition,
@@ -95,11 +97,24 @@ impl CallOrigin {
 /// `link_entities` (Task 13) read `originating_identity` from THIS field,
 /// never from a separate function parameter — there is no such parameter
 /// on any of those three functions' public signatures.
+///
+/// `read_policy: Option<policy::ReadPolicy>` (B5.1 Task 16) follows the
+/// exact same deferral discipline `write_policy` (Task 10) and
+/// `PendingWriteProposal.operation` (Task 13/14) already established:
+/// added only once a real capability (`search`/`retrieve`/
+/// `get_code_context`) needed it, fail-closed default `None` (denies
+/// every read operation, mirroring `write_policy: None`'s own meaning).
+/// It is a SEPARATE field from `write_policy`, never conflated with it —
+/// a caller with read permission gains no write-shaped capability from
+/// that alone, and vice versa (same "no implicit escalation between axes"
+/// principle `policy_write.rs`'s own test suite already pins for
+/// `WritePolicy`/`ReadPolicy`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
     pub schema_version: u32,
     pub correlation_id: uuid::Uuid,
     pub write_policy: Option<WritePolicy>,
+    pub read_policy: Option<policy::ReadPolicy>,
     pub origin: CallOrigin,
 }
 

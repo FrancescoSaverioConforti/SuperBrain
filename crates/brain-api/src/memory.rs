@@ -192,6 +192,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::mcp_agent()),
+            read_policy: None,
             origin: CallOrigin::McpSession("session-abc".into()),
         }
     }
@@ -201,6 +202,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: None,
+            read_policy: None,
             origin: CallOrigin::McpSession("session-abc".into()),
         }
     }
@@ -334,6 +336,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
+            read_policy: None,
             origin: CallOrigin::TrustedLocal,
         };
         let id = save_memory_default(&ctx, &vault, "note-a", "content").unwrap();

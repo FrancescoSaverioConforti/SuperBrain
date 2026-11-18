@@ -41,6 +41,7 @@ fn mcp_ctx() -> brain_api::RequestContext {
         schema_version: brain_api::SCHEMA_VERSION,
         correlation_id: uuid::Uuid::new_v4(),
         write_policy: Some(brain_api::WritePolicy::mcp_agent()),
+        read_policy: None,
         origin: brain_api::CallOrigin::McpSession("session-cli-e2e".into()),
     }
 }

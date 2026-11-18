@@ -69,6 +69,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::mcp_agent()),
+            read_policy: None,
             origin: CallOrigin::McpSession("session-abc".into()),
         }
     }
@@ -82,6 +83,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: None,
+            read_policy: None,
             origin: CallOrigin::McpSession("session-abc".into()),
         };
         let result = link_entities(

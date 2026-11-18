@@ -126,6 +126,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: None,
+            read_policy: None,
             origin: crate::CallOrigin::McpSession("test-session".into()),
         };
         let allowed = |op: WriteOperation| ctx.write_policy.as_ref().is_some_and(|p| p.allows(op));
@@ -140,6 +141,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             correlation_id: uuid::Uuid::new_v4(),
             write_policy: Some(WritePolicy::trusted_cli()),
+            read_policy: None,
             origin: crate::CallOrigin::TrustedLocal,
         };
         let allowed = |op: WriteOperation| ctx.write_policy.as_ref().is_some_and(|p| p.allows(op));

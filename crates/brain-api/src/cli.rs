@@ -28,6 +28,12 @@ fn trusted_ctx() -> RequestContext {
         schema_version: crate::SCHEMA_VERSION,
         correlation_id: uuid::Uuid::new_v4(),
         write_policy: Some(WritePolicy::trusted_cli()),
+        // This CLI surface only ever calls approve_proposal/reject_proposal/
+        // list_proposals (Task 14/15) -- none of which check read_policy --
+        // so it has no need for read permission. Left None (principle of
+        // least privilege): this context can never be handed to search/
+        // retrieve/get_code_context and have it silently succeed.
+        read_policy: None,
         origin: CallOrigin::TrustedLocal,
     }
 }
