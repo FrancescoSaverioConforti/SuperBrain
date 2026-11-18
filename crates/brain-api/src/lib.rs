@@ -12,6 +12,7 @@
 //! for the frozen contract this crate implements.
 
 mod approval;
+mod cli;
 mod error;
 mod graph;
 mod memory;
@@ -19,6 +20,7 @@ mod policy_write;
 mod proposal;
 mod proposal_store;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
+pub use cli::run_cli;
 pub use error::BrainApiError;
 pub use graph::link_entities;
 pub use memory::{save_memory, update_memory, ProposedOperation, RelationKind};
