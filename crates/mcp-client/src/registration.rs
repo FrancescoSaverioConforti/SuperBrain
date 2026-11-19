@@ -20,9 +20,37 @@
 use std::time::Duration;
 
 use rmcp::ServiceExt;
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::async_rw::AsyncRwTransport;
 
 use crate::McpClientError;
+
+/// B5 remediation M2: bounds a single JSON-RPC line this crate will ever
+/// accept from an external MCP server's stdout, before that line is ever
+/// parsed or handed to any `brain-api`/policy code. Mirrors
+/// `brain_api::limits::MCP_MAX_PAYLOAD_BYTES`'s own documented value
+/// (1 MiB) BY CONVENTION, never by a shared import — this crate must
+/// never depend on `brain-api` at all (the frozen B5.10 isolation,
+/// `tests/separation.rs`), the exact same "same value, independently
+/// defined, pinned by a cross-crate regression test" pattern this
+/// crate's `lib.rs` already established for `DEFAULT_CONNECT_TIMEOUT`/
+/// `DEFAULT_INVOKE_TIMEOUT` against `brain_api::limits::DEFAULT_TIMEOUT_MS`
+/// (see `lib.rs`'s own `mcp_clients_default_timeouts_still_match_brain_apis_canonical_value`).
+///
+/// Without this, `rmcp`'s own upstream default (`AsyncRwTransport`'s
+/// built-in 16 MiB `DEFAULT_MAX_LINE_LENGTH`) would apply instead — a
+/// malicious or misbehaving external MCP server could otherwise send up
+/// to 16 MiB in one line before this crate's own choice ever took
+/// effect (the residual limitation `mcp-server`'s own `limits.rs` module
+/// doc comment already names from the server side of this same crate
+/// boundary).
+pub const MCP_MAX_RESPONSE_LINE_BYTES: usize = 1_048_576;
+
+const _: () = assert!(MCP_MAX_RESPONSE_LINE_BYTES > 0);
+// Mirrors brain_api::limits's own compile-time assertion that its choice
+// is deliberately smaller than rmcp's 16 MiB built-in default, never
+// larger (a larger value here would silently fall back to relying on
+// the upstream default instead of this crate's own stated choice).
+const _: () = assert!(MCP_MAX_RESPONSE_LINE_BYTES < 16 * 1024 * 1024);
 
 /// The env var this crate reads for the global kill-switch, per the design
 /// doc's "client deve poter essere disabilitato globalmente" (the client
@@ -79,25 +107,59 @@ pub struct McpServerRegistration {
 }
 
 /// A live connection to one external MCP server: the `RunningService`
-/// handle for the client-role session. Holds no capability/authorization
-/// state of its own (Task 28's job) — this is purely "the handshake
-/// succeeded and a session exists," nothing about what it may be asked to
-/// do.
+/// handle for the client-role session, plus the spawned child process
+/// itself. Holds no capability/authorization state of its own (Task 28's
+/// job) — this is purely "the handshake succeeded and a session exists,"
+/// nothing about what it may be asked to do.
+///
+/// Holds `child` directly (B5 remediation M2) rather than relying on
+/// `rmcp::transport::TokioChildProcess`'s own cleanup guard, since
+/// `connect_now` no longer constructs one (it needs `AsyncRwTransport`'s
+/// `with_max_line_length`, which `TokioChildProcess` has no way to
+/// expose) — this struct now carries the exact same "kill the spawned
+/// process on close" responsibility explicitly that `TokioChildProcess`'s
+/// `ChildWithCleanup` carried implicitly before.
 pub struct McpConnection {
-    service: rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    // `Option`-wrapped so `close`'s consuming `.cancel().await` can take
+    // ownership of the inner `RunningService` while `McpConnection`
+    // itself keeps a `Drop` impl (required for the child-process cleanup
+    // below) -- a type with a `Drop` impl cannot otherwise be partially
+    // moved out of by value.
+    service: Option<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+    child: tokio::process::Child,
 }
 
 impl McpConnection {
     /// Read-only accessor for later tasks (discovery/invocation) to reach
     /// the underlying session. Not used by this task itself.
     pub fn service(&self) -> &rmcp::service::RunningService<rmcp::RoleClient, ()> {
-        &self.service
+        self.service.as_ref().expect("service is only taken by close(), which consumes self")
     }
 
-    /// Closes the connection, shutting down the underlying transport (and,
-    /// for a child-process transport, the spawned process).
-    pub async fn close(self) -> Result<(), McpClientError> {
-        self.service.cancel().await.map_err(|e| McpClientError::ConnectionFailed(e.to_string())).map(|_| ())
+    /// Closes the connection, shutting down the underlying transport and
+    /// killing the spawned child process — the same two-step guarantee
+    /// `TokioChildProcess`'s own cleanup previously gave for free.
+    pub async fn close(mut self) -> Result<(), McpClientError> {
+        let service = self.service.take().expect("service is only taken once, here");
+        let cancel_result = service.cancel().await.map_err(|e| McpClientError::ConnectionFailed(e.to_string())).map(|_| ());
+        let _ = self.child.kill().await;
+        cancel_result
+    }
+}
+
+impl Drop for McpConnection {
+    /// A dropped (never explicitly `close()`d) connection must not leak
+    /// its spawned child process — `tokio::process::Child` does NOT kill
+    /// its child on drop by default (the exact reason `rmcp`'s own
+    /// `TokioChildProcess` wraps it in `ChildWithCleanup` in the first
+    /// place). `start_kill()` is synchronous/non-blocking (unlike
+    /// `kill().await`), the only option available from a non-async
+    /// `Drop::drop`; it sends the kill signal without waiting for exit,
+    /// matching `ChildWithCleanup::drop`'s own pattern of spawning a
+    /// detached task for the actual async wait rather than blocking drop
+    /// itself.
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 
@@ -132,15 +194,69 @@ pub async fn connect_with_timeout(registration: &McpServerRegistration, timeout:
     }
 }
 
+/// Spawns `registration`'s external MCP server and builds a transport
+/// over its real stdio, bounded by [`MCP_MAX_RESPONSE_LINE_BYTES`] on the
+/// READ side (what this crate accepts from the external server) — the
+/// enforcement point closest to the stream read itself, inside
+/// `AsyncRwTransport`'s own line-buffering loop, which never lets a
+/// partial line grow past the configured limit before rejecting it (the
+/// same mechanism and the same upstream type `mcp-server`'s own
+/// `limited_transport` already uses for the reverse direction).
+///
+/// Deliberately does NOT use `rmcp::transport::TokioChildProcess`/
+/// `TokioChildProcessBuilder`: that convenience wrapper builds its own
+/// `AsyncRwTransport` internally with no way to configure
+/// `max_line_length` (confirmed by reading `rmcp` 3.11.0's own source —
+/// the builder's `.stdin()`/`.stdout()`/`.stderr()` methods only
+/// configure `std::process::Stdio`, and the constructed `transport`
+/// field is private), so this function spawns the child process itself
+/// and builds the SAME transport type directly, with the one additional
+/// call `TokioChildProcess` has no way to expose. This loses no
+/// functionality this crate's existing code relies on: `McpConnection`
+/// never calls `TokioChildProcess::graceful_shutdown()`/`.id()` today
+/// (`close()` uses the underlying `RunningService::cancel()` only), and
+/// `AsyncRwTransport<RoleClient, _, _>` satisfies the same
+/// `IntoTransport`/`Transport<RoleClient>` bound `ServiceExt::serve`
+/// already requires, via `rmcp`'s own blanket impl.
 async fn connect_now(registration: &McpServerRegistration) -> Result<McpConnection, McpClientError> {
     let TransportConfig::ChildProcess { command, args } = &registration.transport;
 
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args);
-    let transport = TokioChildProcess::new(cmd).map_err(|e| McpClientError::ConnectionFailed(e.to_string()))?;
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::inherit());
 
-    let service = ().serve(transport).await.map_err(|e| McpClientError::ConnectionFailed(e.to_string()))?;
-    Ok(McpConnection { service })
+    let mut child = cmd.spawn().map_err(|e| McpClientError::ConnectionFailed(e.to_string()))?;
+    let stdout = child.stdout.take().ok_or_else(|| McpClientError::ConnectionFailed("child process stdout was not piped".to_string()))?;
+    let stdin = child.stdin.take().ok_or_else(|| McpClientError::ConnectionFailed("child process stdin was not piped".to_string()))?;
+
+    let transport = AsyncRwTransport::new_client(stdout, stdin).with_max_line_length(MCP_MAX_RESPONSE_LINE_BYTES);
+
+    let service = match ().serve(transport).await {
+        Ok(service) => service,
+        Err(err) => {
+            // The handshake never completed -- this connection attempt
+            // is abandoned, so the spawned child must not be left
+            // running/zombied. `AsyncRwTransport`'s own `Drop` closes the
+            // piped stdin/stdout handles, but does not kill the process
+            // itself (unlike `TokioChildProcess`'s own cleanup guard,
+            // which this function intentionally does not use, since it
+            // has no way to configure `max_line_length`) -- killing
+            // explicitly here preserves the same "a failed connect leaves
+            // nothing behind" guarantee the previous `TokioChildProcess`-
+            // based implementation provided for free via its own
+            // `ChildWithCleanup::drop`.
+            let _ = child.start_kill();
+            return Err(McpClientError::ConnectionFailed(err.to_string()));
+        }
+    };
+    // The handshake succeeded. `McpConnection` must keep `child` alive
+    // for the connection's whole lifetime and kill it on close/drop --
+    // the exact responsibility `TokioChildProcess`'s own
+    // `ChildWithCleanup` carried before this change, now made explicit
+    // here instead of implicit inside the bypassed convenience wrapper.
+    Ok(McpConnection { service: Some(service), child })
 }
 
 #[cfg(test)]

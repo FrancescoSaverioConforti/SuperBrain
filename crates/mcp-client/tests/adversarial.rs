@@ -64,10 +64,14 @@ fn metadata() -> ExternalToolMetadata {
 
 /// A real, minimal external MCP server whose `echo` tool echoes its own
 /// arguments back verbatim as structured content, and whose `big` tool
-/// answers with a very large structured payload — used to exercise an
-/// oversized real response without any mock framework.
+/// answers with a payload sized by its own `sys.argv[1]` (bytes) — used
+/// to exercise both a legitimate large-but-compliant response and a
+/// genuinely oversized one, against the SAME real external server
+/// script, without any mock framework.
 const ECHO_AND_BIG_SERVER_SCRIPT: &str = r#"
 import sys, json
+
+PAYLOAD_SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 2 * 1024 * 1024
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -94,7 +98,7 @@ for line in sys.stdin:
         if name == "big":
             send({"jsonrpc": "2.0", "id": req["id"], "result": {
                 "content": [],
-                "structuredContent": {"payload": "y" * (2 * 1024 * 1024)},
+                "structuredContent": {"payload": "y" * PAYLOAD_SIZE},
             }})
         else:
             send({"jsonrpc": "2.0", "id": req["id"], "result": {
@@ -106,13 +110,25 @@ for line in sys.stdin:
 "#;
 
 async fn spawn() -> mcp_client::McpConnection {
+    spawn_with_big_payload_size(2 * 1024 * 1024).await
+}
+
+/// Same real test server, with the `big` tool's payload size overridden
+/// via the script's own `sys.argv[1]` — lets a single real external
+/// process be exercised with both a compliant-size and an oversized
+/// payload, rather than hardcoding one fixed size.
+async fn spawn_with_big_payload_size(payload_size: usize) -> mcp_client::McpConnection {
     let python = python_or_skip()
         .expect("no python3/python interpreter found on PATH -- required for this end-to-end test");
     let registration = McpServerRegistration {
         name: "adversarial-test-server".to_string(),
         transport: TransportConfig::ChildProcess {
             command: python.to_string(),
-            args: vec!["-c".to_string(), ECHO_AND_BIG_SERVER_SCRIPT.to_string()],
+            args: vec![
+                "-c".to_string(),
+                ECHO_AND_BIG_SERVER_SCRIPT.to_string(),
+                payload_size.to_string(),
+            ],
         },
         enabled: true,
     };
@@ -121,18 +137,22 @@ async fn spawn() -> mcp_client::McpConnection {
         .expect("connect to the real test server must succeed")
 }
 
-// --- oversized real response: no payload-size limit exists yet (that
-//     enforcement is explicitly Task 35's job, B5.16, not this task's)
-//     -- this proves that, absent such a limit, a large real response
-//     from a real external server is still handled to completion, never
-//     hung or crashing this crate's own invocation path ---
+// --- B5 remediation M2: external-response payload limit, enforced on
+//     this crate's READ side by `AsyncRwTransport::with_max_line_length`
+//     (`registration.rs::MCP_MAX_RESPONSE_LINE_BYTES`) ---
 
+/// A legitimate, well-formed response comfortably under
+/// `MCP_MAX_RESPONSE_LINE_BYTES` (1 MiB) must still be accepted and
+/// handled to completion -- the payload-limit enforcement M2 adds must
+/// never reject a real, compliant response. 512 KiB leaves ample room
+/// for the surrounding JSON-RPC envelope under the 1 MiB line cap.
 #[tokio::test]
-async fn an_oversized_but_well_formed_external_tool_response_is_handled_to_completion_not_hung() {
+async fn a_large_but_compliant_response_is_still_accepted_and_handled_to_completion() {
     if skip_if_no_python() {
         return;
     }
-    let conn = spawn().await;
+    let compliant_payload_size = 512 * 1024;
+    let conn = spawn_with_big_payload_size(compliant_payload_size).await;
     let allow = ApprovalPolicy::AllowReadOnly;
     let big_metadata = ExternalToolMetadata {
         tool_name: "big".to_string(),
@@ -150,13 +170,14 @@ async fn an_oversized_but_well_formed_external_tool_response_is_handled_to_compl
         ),
     )
     .await
-    .expect("an oversized-but-well-formed response must not hang this crate's own invocation path");
+    .expect("a large-but-compliant response must not hang this crate's own invocation path");
 
-    let value =
-        result.expect("a large but well-formed response must still be accepted as a real result");
+    let value = result.expect(
+        "a well-formed response within the configured payload limit must still be accepted",
+    );
     assert_eq!(
         value["structuredContent"]["payload"].as_str().map(str::len),
-        Some(2 * 1024 * 1024)
+        Some(compliant_payload_size)
     );
 
     // The connection must still be fully usable afterwards.
@@ -168,13 +189,60 @@ async fn an_oversized_but_well_formed_external_tool_response_is_handled_to_compl
         Duration::from_secs(5),
     )
     .await
-    .expect("a normal call after the oversized one must still succeed");
+    .expect("a normal call after the large-but-compliant one must still succeed");
     assert_eq!(
         echo_result["structuredContent"]["echoed"]["text"],
         "still alive"
     );
 
     conn.close().await.unwrap();
+}
+
+/// A response whose single JSON-RPC line exceeds
+/// `MCP_MAX_RESPONSE_LINE_BYTES` must be dropped at the transport layer
+/// (never parsed, never handed to `invoke`'s own envelope validation) --
+/// the call must fail (never silently succeed with truncated/garbage
+/// data) and must never hang, panic, or leave the client's own memory
+/// use unbounded. This does NOT assert the connection necessarily
+/// survives afterward (the Phase 3 acceptance criteria for M2 explicitly
+/// do not presume survival is required) -- only that the failure is
+/// prompt, bounded, and does not corrupt this process's own state.
+#[tokio::test]
+async fn an_oversized_response_is_rejected_promptly_without_hanging_or_unbounded_memory() {
+    if skip_if_no_python() {
+        return;
+    }
+    let oversized_payload_size = 2 * 1024 * 1024; // comfortably over the 1 MiB line cap
+    let conn = spawn_with_big_payload_size(oversized_payload_size).await;
+    let allow = ApprovalPolicy::AllowReadOnly;
+    let big_metadata = ExternalToolMetadata {
+        tool_name: "big".to_string(),
+        ..metadata()
+    };
+
+    // Bounded wait proves this does not hang -- the oversized line is
+    // dropped by the transport itself (never buffered to completion), so
+    // this call must resolve (to a timeout/connection error, not a
+    // panic) well within a generous outer bound, not merely "eventually".
+    let outer_bound = tokio::time::timeout(
+        Duration::from_secs(10),
+        invoke_external_tool_with_timeout(
+            &conn,
+            &big_metadata,
+            &allow,
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("an oversized response must not hang this crate's own invocation path -- it must fail within the call's own timeout, not block indefinitely");
+
+    assert!(
+        outer_bound.is_err(),
+        "a response exceeding the configured payload limit must never be accepted as a successful result, got {outer_bound:?}"
+    );
+
+    let _ = conn.close().await;
 }
 
 // --- an injection-shaped argument string is forwarded and returned as

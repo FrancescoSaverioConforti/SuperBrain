@@ -82,6 +82,18 @@ mod tests {
         const BRAIN_API_DEFAULT_TIMEOUT_MS: u64 = 30_000; // brain_api::limits::DEFAULT_TIMEOUT_MS's documented value
         let brain_api_default = std::time::Duration::from_millis(BRAIN_API_DEFAULT_TIMEOUT_MS);
         assert_eq!(crate::registration::DEFAULT_CONNECT_TIMEOUT, brain_api_default, "mcp-client's connect timeout default has drifted from brain-api's canonical default");
+
         assert_eq!(crate::invoke::DEFAULT_INVOKE_TIMEOUT, brain_api_default, "mcp-client's invoke timeout default has drifted from brain-api's canonical default");
+    }
+
+    /// B5 remediation M2: `registration::MCP_MAX_RESPONSE_LINE_BYTES` is
+    /// this crate's own, independently-defined payload-limit default —
+    /// same pattern and same reasoning as the timeout test above (this
+    /// crate must never depend on `brain-api`, so the literal is pinned
+    /// here rather than imported).
+    #[test]
+    fn mcp_clients_response_line_limit_still_matches_brain_apis_canonical_payload_value() {
+        const BRAIN_API_MCP_MAX_PAYLOAD_BYTES: usize = 1_048_576; // brain_api::limits::MCP_MAX_PAYLOAD_BYTES's documented value
+        assert_eq!(crate::registration::MCP_MAX_RESPONSE_LINE_BYTES, BRAIN_API_MCP_MAX_PAYLOAD_BYTES, "mcp-client's external-response payload limit has drifted from brain-api's canonical server-side payload limit");
     }
 }
