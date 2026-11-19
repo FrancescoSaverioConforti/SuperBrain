@@ -109,8 +109,10 @@ impl SuperBrainMcpServer {
     pub async fn get_previous_solution(&self, Parameters(input): Parameters<GetPreviousSolutionInput>) -> Result<Json<GetPreviousSolutionOutput>, McpError> {
         let reference_date = chrono::Utc::now().date_naive();
         let idx = self.index(reference_date);
-        let results = brain_api::get_previous_solution(&self.mcp_ctx(), self.vault_ref(), &idx, &input.query, input.note_type.map(Into::into))
-            .map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::get_previous_solution(&ctx, self.vault_ref(), &idx, &input.query, input.note_type.map(Into::into));
+        self.record_tool_call("get_previous_solution", &result, &ctx);
+        let results = result.map_err(map_brain_api_error)?;
         Ok(Json(GetPreviousSolutionOutput {
             results: results
                 .into_iter()
@@ -129,8 +131,9 @@ impl SuperBrainMcpServer {
     pub async fn save_memory(&self, Parameters(input): Parameters<SaveMemoryInput>) -> Result<Json<SaveMemoryOutput>, McpError> {
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let proposal_id = brain_api::save_memory(
-            &self.mcp_ctx(),
+        let ctx = self.mcp_ctx();
+        let result = brain_api::save_memory(
+            &ctx,
             self.vault_ref(),
             note_id,
             input.note_type.into(),
@@ -140,8 +143,9 @@ impl SuperBrainMcpServer {
             input.event_period,
             input.body,
             &now,
-        )
-        .map_err(map_brain_api_error)?;
+        );
+        self.record_write_tool_call("save_memory", &result, &ctx);
+        let proposal_id = result.map_err(map_brain_api_error)?;
         Ok(Json(SaveMemoryOutput { proposal_id: proposal_id.to_string() }))
     }
 
@@ -151,8 +155,10 @@ impl SuperBrainMcpServer {
     pub async fn update_memory(&self, Parameters(input): Parameters<UpdateMemoryInput>) -> Result<Json<UpdateMemoryOutput>, McpError> {
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let proposal_id = brain_api::update_memory(&self.mcp_ctx(), self.vault_ref(), note_id, input.body, storage::Version(input.expected_version), &now)
-            .map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::update_memory(&ctx, self.vault_ref(), note_id, input.body, storage::Version(input.expected_version), &now);
+        self.record_write_tool_call("update_memory", &result, &ctx);
+        let proposal_id = result.map_err(map_brain_api_error)?;
         Ok(Json(UpdateMemoryOutput { proposal_id: proposal_id.to_string() }))
     }
 }

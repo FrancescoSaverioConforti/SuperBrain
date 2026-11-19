@@ -90,6 +90,15 @@ pub struct SuperBrainMcpServer {
     /// lifecycle ownership" rule this struct's own module doc comment
     /// already states for `vault`/`indexer`/`graph`.
     dense_scorer: Option<Arc<dyn index::search::DenseScorer>>,
+    /// B5.12 Task 33: the durable audit sink every tool call below records
+    /// a `ToolCall`/`PermissionDecision`/`WriteMemory` event to, via
+    /// `brain_api::audit`'s content-free schema. Defaults to
+    /// `brain_api::NullAuditSink` (see [`Self::new`]) — exactly the same
+    /// "additive, defaults to a no-op, every existing call site/test
+    /// unaffected" discipline `dense_scorer`'s own doc comment above
+    /// already established for Task 31; only [`Self::with_audit_sink`]
+    /// opts a server instance into a real destination.
+    audit: Arc<dyn brain_api::AuditSink>,
     /// The full, fixed tool surface (B5.2 Task 24): Task 22's `read_tools`
     /// plus Task 23's `graph_tools`/`memory_tools`/`knowledge_tools`,
     /// combined once at construction time via `ToolRouter`'s own `+`
@@ -113,7 +122,50 @@ impl SuperBrainMcpServer {
     /// results while looking like it works.
     pub fn new(vault: storage::Vault, indexer: Arc<RealIndexer>, graph: Arc<CodeGraph>, active_project: impl Into<String>) -> Self {
         let tool_router = Self::read_tools() + Self::graph_tools() + Self::memory_tools() + Self::knowledge_tools();
-        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router, dense_scorer: None }
+        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router, dense_scorer: None, audit: Arc::new(brain_api::NullAuditSink) }
+    }
+
+    /// Opts this server instance into a real [`brain_api::AuditSink`]
+    /// destination for every tool call's audit events (B5.12 Task 33).
+    /// `sink` must already be built and ready to receive events — this
+    /// method never constructs, persists, or owns the destination itself,
+    /// the same "caller supplies it already-built" rule [`Self::new`]'s own
+    /// doc comment states for `indexer`/`graph`/[`Self::with_dense_retrieval`]'s
+    /// `scorer`.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn brain_api::AuditSink>) -> Self {
+        self.audit = sink;
+        self
+    }
+
+    pub(crate) fn audit_sink(&self) -> &dyn brain_api::AuditSink {
+        self.audit.as_ref()
+    }
+
+    /// Records exactly one `ToolCall` event for `tool`, plus (only on a
+    /// `PermissionDenied` result) one `PermissionDecision`+`DeniedAction`
+    /// pair — every MCP tool wrapper in this crate calls this immediately
+    /// after its own `brain_api::*` call, before mapping the result onto
+    /// an MCP response. `now`/`ctx.correlation_id` tie every event from one
+    /// call together and back to the originating `RequestContext`.
+    pub(crate) fn record_tool_call<T>(&self, tool: &str, result: &Result<T, brain_api::BrainApiError>, ctx: &brain_api::RequestContext) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let allowed = brain_api::allowed_from_result(result);
+        brain_api::record_tool_call(self.audit_sink(), tool, allowed, &now, ctx.correlation_id);
+        if !allowed {
+            brain_api::record_permission_decision(self.audit_sink(), tool, false, Some("permission denied"), &now, ctx.correlation_id);
+        }
+    }
+
+    /// Same as [`Self::record_tool_call`], plus a `WriteMemory` event
+    /// carrying `proposal_id` on success — for the 3 proposal-creating
+    /// tools (`save_memory`/`update_memory`/`link_entities`), never for a
+    /// read capability (which has no proposal id to record).
+    pub(crate) fn record_write_tool_call(&self, tool: &str, result: &Result<brain_api::ProposalId, brain_api::BrainApiError>, ctx: &brain_api::RequestContext) {
+        self.record_tool_call(tool, result, ctx);
+        if let Ok(proposal_id) = result {
+            let now = chrono::Utc::now().to_rfc3339();
+            brain_api::record_write_memory(self.audit_sink(), &proposal_id.to_string(), &now, ctx.correlation_id);
+        }
     }
 
     /// Opts this server instance into `RetrievalMode::DenseV2` for
@@ -331,7 +383,10 @@ impl SuperBrainMcpServer {
         let request = api::SearchRequest { text: input.query, filters, k: input.k };
         let reference_date = chrono::Utc::now().date_naive();
         let idx = self.index(reference_date);
-        let response = brain_api::search(&self.mcp_ctx(), &idx, request).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::search(&ctx, &idx, request);
+        self.record_tool_call("search", &result, &ctx);
+        let response = result.map_err(map_brain_api_error)?;
 
         let results: Vec<SearchResultDto> = match response.outcome {
             index::search::SearchOutcome::NotPresent => Vec::new(),
@@ -357,7 +412,10 @@ impl SuperBrainMcpServer {
     pub async fn retrieve(&self, Parameters(input): Parameters<RetrieveInput>) -> Result<Json<RetrieveOutput>, McpError> {
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let request = api::RetrieveRequest { id: api::RetrieveTarget::Note(note_id) };
-        let response = brain_api::retrieve(&self.mcp_ctx(), &self.vault, request).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::retrieve(&ctx, &self.vault, request);
+        self.record_tool_call("retrieve", &result, &ctx);
+        let response = result.map_err(map_brain_api_error)?;
         Ok(Json(RetrieveOutput {
             note_id: response.id.as_str().to_string(),
             content: response.content,
@@ -377,7 +435,10 @@ impl SuperBrainMcpServer {
     pub async fn get_code_context(&self, Parameters(input): Parameters<GetCodeContextInput>) -> Result<Json<GetCodeContextOutput>, McpError> {
         let symbol_id: codegraph_domain::SymbolSnapshotId =
             input.symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
-        let context = brain_api::get_code_context(&self.mcp_ctx(), &self.graph, symbol_id).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::get_code_context(&ctx, &self.graph, symbol_id);
+        self.record_tool_call("get_code_context", &result, &ctx);
+        let context = result.map_err(map_brain_api_error)?;
         Ok(Json(GetCodeContextOutput {
             id: context.id.to_string(),
             kind: format!("{:?}", context.kind),

@@ -25,7 +25,7 @@ domain = { path = "../domain" }
 index = { path = "../index" }
 codegraph-index = { path = "../codegraph-index" }
 codegraph-domain = { path = "../codegraph-domain" }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -33,3 +33,4 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 
 [dev-dependencies]
 git2 = "0.21"
+serde_json = "1"

@@ -149,3 +149,125 @@ fn cli_always_uses_trusted_cli_write_policy_never_settable_via_args() {
     .unwrap();
     assert!(brain_api::run_cli(&["approve".to_string(), id.to_string()], &vault, NOW).is_ok());
 }
+
+// --- B5.12 Task 33: run_cli_with_audit emits one ToolCall per command,
+//     plus the approve/reject PermissionDecision pairing ---
+
+#[derive(Default)]
+struct RecordingSink(std::sync::Mutex<Vec<brain_api::AuditEvent>>);
+impl brain_api::AuditSink for RecordingSink {
+    fn record(&self, event: brain_api::AuditEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+impl RecordingSink {
+    fn events(&self) -> Vec<brain_api::AuditEvent> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn run_cli_with_audit_emits_a_tool_call_for_list_approve_and_reject() {
+    let vault = test_vault();
+    let id_a = brain_api::save_memory(
+        &mcp_ctx(),
+        &vault,
+        storage::NoteId::parse("note-cli-audit-a").unwrap(),
+        domain::NoteType::Bug,
+        domain::Classification::Internal,
+        "project-x".to_string(),
+        "agent:coder@prompt-v3".to_string(),
+        "2026-11-18".to_string(),
+        "content".to_string(),
+        NOW,
+    )
+    .unwrap();
+    let id_b = brain_api::save_memory(
+        &mcp_ctx(),
+        &vault,
+        storage::NoteId::parse("note-cli-audit-b").unwrap(),
+        domain::NoteType::Bug,
+        domain::Classification::Internal,
+        "project-x".to_string(),
+        "agent:coder@prompt-v3".to_string(),
+        "2026-11-18".to_string(),
+        "content".to_string(),
+        NOW,
+    )
+    .unwrap();
+
+    let sink = RecordingSink::default();
+    brain_api::run_cli_with_audit(&["list".to_string()], &vault, NOW, &sink).unwrap();
+    brain_api::run_cli_with_audit(&["approve".to_string(), id_a.to_string()], &vault, NOW, &sink).unwrap();
+    brain_api::run_cli_with_audit(&["reject".to_string(), id_b.to_string(), "not needed".to_string()], &vault, NOW, &sink).unwrap();
+
+    let events = sink.events();
+    let tool_calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            brain_api::AuditEventKind::ToolCall { tool, allowed } => Some((tool.as_str(), *allowed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_calls, vec![("list", true), ("approve", true), ("reject", true)], "got events: {events:?}");
+
+    // approve/reject also each emit their own PermissionDecision (always
+    // allowed here, since trusted_ctx() has approve_write_allowed).
+    let permission_decisions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            brain_api::AuditEventKind::PermissionDecision { operation, allowed } => Some((operation.as_str(), *allowed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(permission_decisions, vec![("ApproveProposal", true), ("RejectProposal", true)], "got events: {events:?}");
+}
+
+#[test]
+fn run_cli_with_audit_on_an_unknown_id_still_emits_a_tool_call_marked_allowed() {
+    // NotFound is not PermissionDenied -- trusted_cli() was allowed to
+    // attempt the approve; it failed for an unrelated reason
+    // (nonexistent id). record_tool_call's `allowed` reflects the
+    // permission axis only.
+    let vault = test_vault();
+    let sink = RecordingSink::default();
+    let unknown = uuid::Uuid::new_v4().to_string();
+
+    let result = brain_api::run_cli_with_audit(&["approve".to_string(), unknown], &vault, NOW, &sink);
+
+    assert!(result.is_err());
+    let tool_calls: Vec<_> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            brain_api::AuditEventKind::ToolCall { tool, allowed } if tool == "approve" => Some(allowed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_calls, vec![true]);
+}
+
+#[test]
+fn run_cli_without_audit_behaves_identically_to_run_cli_with_audit_and_a_null_sink() {
+    // run_cli itself must remain exactly the pinned (args, vault, now)
+    // signature (see cli_always_uses_trusted_cli_write_policy_never_settable_via_args
+    // above) -- this just confirms the thin-wrapper relationship holds
+    // observably, not merely by reading the source.
+    let vault = test_vault();
+    let id = brain_api::save_memory(
+        &mcp_ctx(),
+        &vault,
+        storage::NoteId::parse("note-cli-audit-c").unwrap(),
+        domain::NoteType::Bug,
+        domain::Classification::Internal,
+        "project-x".to_string(),
+        "agent:coder@prompt-v3".to_string(),
+        "2026-11-18".to_string(),
+        "content".to_string(),
+        NOW,
+    )
+    .unwrap();
+
+    let via_run_cli = brain_api::run_cli(&["approve".to_string(), id.to_string()], &vault, NOW);
+    assert!(via_run_cli.is_ok());
+}

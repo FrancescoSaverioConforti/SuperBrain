@@ -12,6 +12,7 @@
 //! for the frozen contract this crate implements.
 
 mod approval;
+mod audit;
 mod cli;
 mod error;
 mod graph;
@@ -22,7 +23,8 @@ mod proposal;
 mod proposal_store;
 mod read;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
-pub use cli::run_cli;
+pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, NullAuditSink};
+pub use cli::{run_cli, run_cli_with_audit};
 pub use error::BrainApiError;
 pub use graph::link_entities;
 pub use knowledge::{get_canon, get_regulations, get_rules, BindingStatus, CanonEntry, KnowledgeItem};

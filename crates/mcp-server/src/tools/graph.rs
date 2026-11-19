@@ -157,7 +157,10 @@ impl SuperBrainMcpServer {
         let start: codegraph_domain::SymbolSnapshotId =
             input.start_symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
         let spec = brain_api::GraphQuerySpec { start, kind: input.kind.map(Into::into), max_depth: input.max_depth };
-        let reached = brain_api::graph_query(&self.mcp_ctx(), self.graph_ref(), spec, input.limit).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::graph_query(&ctx, self.graph_ref(), spec, input.limit);
+        self.record_tool_call("graph_query", &result, &ctx);
+        let reached = result.map_err(map_brain_api_error)?;
         Ok(Json(GraphQueryOutput { symbol_ids: reached.into_iter().map(|id| id.to_string()).collect() }))
     }
 
@@ -168,7 +171,10 @@ impl SuperBrainMcpServer {
     pub async fn get_entity(&self, Parameters(input): Parameters<GetEntityInput>) -> Result<Json<GetEntityOutput>, McpError> {
         let symbol_id: codegraph_domain::SymbolSnapshotId =
             input.symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
-        let entity = brain_api::get_entity(&self.mcp_ctx(), self.graph_ref(), symbol_id).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::get_entity(&ctx, self.graph_ref(), symbol_id);
+        self.record_tool_call("get_entity", &result, &ctx);
+        let entity = result.map_err(map_brain_api_error)?;
         Ok(Json(GetEntityOutput {
             id: entity.id.to_string(),
             kind: format!("{:?}", entity.kind),
@@ -191,7 +197,10 @@ impl SuperBrainMcpServer {
         let from = storage::NoteId::parse(&input.from_note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let to = storage::NoteId::parse(&input.to_note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let proposal_id = brain_api::link_entities(&self.mcp_ctx(), self.vault_ref(), from, to, input.relation.into(), &now).map_err(map_brain_api_error)?;
+        let ctx = self.mcp_ctx();
+        let result = brain_api::link_entities(&ctx, self.vault_ref(), from, to, input.relation.into(), &now);
+        self.record_write_tool_call("link_entities", &result, &ctx);
+        let proposal_id = result.map_err(map_brain_api_error)?;
         Ok(Json(LinkEntitiesOutput { proposal_id: proposal_id.to_string() }))
     }
 }
