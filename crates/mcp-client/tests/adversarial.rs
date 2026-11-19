@@ -285,3 +285,191 @@ async fn an_injection_shaped_argument_string_is_forwarded_and_returned_as_inert_
 
     conn.close().await.unwrap();
 }
+
+// --- B5 remediation M3: child-process environment isolation ---
+//
+// A real, minimal external MCP server whose `env_report` tool reports
+// back, as structured content: whether a caller-named sentinel
+// environment variable is visible to it (`sentinel_value`, `null` if
+// unset -- this crate's own test sets a clearly-fake, non-secret value,
+// never a real credential), and whether `TEMP`/`TMP` (one of this
+// crate's allowlisted bootstrap variables) is visible
+// (`temp_or_tmp_present`, a boolean only -- this test never reads or
+// asserts on the actual path value, since that would vary by host and
+// is not the property under test).
+
+const ENV_REPORT_SERVER_SCRIPT: &str = r#"
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "env-report-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name")
+        args = params.get("arguments", {})
+        if name == "env_report":
+            sentinel_name = args.get("sentinel_name", "")
+            send({"jsonrpc": "2.0", "id": req["id"], "result": {
+                "content": [],
+                "structuredContent": {
+                    "sentinel_value": os.environ.get(sentinel_name),
+                    "temp_or_tmp_present": bool(os.environ.get("TEMP") or os.environ.get("TMP") or os.environ.get("TMPDIR")),
+                },
+            }})
+    elif req.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "method not found"}})
+"#;
+
+fn env_report_metadata() -> ExternalToolMetadata {
+    ExternalToolMetadata {
+        server: "env-report-test-server".to_string(),
+        tool_name: "env_report".to_string(),
+        classification: ToolClassification::Read,
+        network_required: false,
+        filesystem_scope: None,
+        sensitivity: Sensitivity::Internal,
+    }
+}
+
+async fn spawn_env_report_server() -> mcp_client::McpConnection {
+    let python = python_or_skip()
+        .expect("no python3/python interpreter found on PATH -- required for this end-to-end test");
+    let registration = McpServerRegistration {
+        name: "env-report-test-server".to_string(),
+        transport: TransportConfig::ChildProcess {
+            command: python.to_string(),
+            args: vec!["-c".to_string(), ENV_REPORT_SERVER_SCRIPT.to_string()],
+        },
+        enabled: true,
+    };
+    connect(&registration)
+        .await
+        .expect("connect to the real test server must succeed")
+}
+
+/// A sentinel variable present in THIS test process's own environment
+/// must NOT be visible to the spawned external MCP server -- proving
+/// `isolate_child_environment`'s `env_clear()` genuinely isolates the
+/// child, over a real spawned process, not just at the unit level.
+/// Uses a clearly-fake, obviously-non-secret sentinel value; never a
+/// real credential.
+#[tokio::test]
+async fn a_parent_sentinel_env_var_is_not_visible_to_the_spawned_external_server() {
+    if skip_if_no_python() {
+        return;
+    }
+    // SAFETY-adjacent note: `std::env::set_var` affects this whole test
+    // process; this test does not run concurrently with another test
+    // that reads/depends on this exact variable name, and the name is
+    // namespaced specifically to this test to avoid any real collision.
+    unsafe {
+        std::env::set_var(
+            "SUPERBRAIN_M3_TEST_SENTINEL",
+            "fake-non-secret-sentinel-value-12345",
+        );
+    }
+
+    let conn = spawn_env_report_server().await;
+    let allow = ApprovalPolicy::AllowReadOnly;
+    let result = invoke_external_tool_with_timeout(
+        &conn,
+        &env_report_metadata(),
+        &allow,
+        serde_json::json!({"sentinel_name": "SUPERBRAIN_M3_TEST_SENTINEL"}),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("env_report call must succeed");
+
+    assert!(
+        result["structuredContent"]["sentinel_value"].is_null(),
+        "a parent-process sentinel env var leaked into the spawned external server's own environment: {result:?}"
+    );
+
+    unsafe {
+        std::env::remove_var("SUPERBRAIN_M3_TEST_SENTINEL");
+    }
+    conn.close().await.unwrap();
+}
+
+/// The explicitly allowlisted bootstrap variables (`TEMP`/`TMP`/
+/// `TMPDIR`) must still be visible to the spawned external server when
+/// they are set in this test process's own environment -- environment
+/// isolation must not be so aggressive that it breaks a legitimate
+/// server's own, real bootstrap needs.
+#[tokio::test]
+async fn an_allowlisted_bootstrap_variable_remains_visible_to_the_spawned_external_server() {
+    if skip_if_no_python() {
+        return;
+    }
+    let has_temp_like_var = ["TEMP", "TMP", "TMPDIR"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    if !has_temp_like_var {
+        eprintln!("skipping: no TEMP/TMP/TMPDIR set in this test process's own environment");
+        return;
+    }
+
+    let conn = spawn_env_report_server().await;
+    let allow = ApprovalPolicy::AllowReadOnly;
+    let result = invoke_external_tool_with_timeout(
+        &conn,
+        &env_report_metadata(),
+        &allow,
+        serde_json::json!({"sentinel_name": "SUPERBRAIN_M3_NONEXISTENT_PROBE"}),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("env_report call must succeed");
+
+    assert_eq!(
+        result["structuredContent"]["temp_or_tmp_present"], true,
+        "an allowlisted bootstrap variable (TEMP/TMP/TMPDIR) must remain visible to the spawned external server: {result:?}"
+    );
+
+    conn.close().await.unwrap();
+}
+
+/// The legitimate test server used throughout this whole file (not just
+/// the dedicated env-report fixture) must still start correctly under
+/// the new environment isolation -- a real, end-to-end smoke test that
+/// M3 does not break ordinary server startup on this crate's actual
+/// supported Windows target.
+#[tokio::test]
+async fn a_legitimate_external_server_still_starts_correctly_under_environment_isolation() {
+    if skip_if_no_python() {
+        return;
+    }
+    let conn = spawn().await;
+    let allow = ApprovalPolicy::AllowReadOnly;
+    let result = invoke_external_tool_with_timeout(
+        &conn,
+        &metadata(),
+        &allow,
+        serde_json::json!({"text": "isolation does not break legitimate startup"}),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("a legitimate server must still start and respond correctly under the new environment isolation");
+    assert_eq!(
+        result["structuredContent"]["echoed"]["text"],
+        "isolation does not break legitimate startup"
+    );
+    conn.close().await.unwrap();
+}

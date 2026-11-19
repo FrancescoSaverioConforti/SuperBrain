@@ -218,11 +218,80 @@ pub async fn connect_with_timeout(registration: &McpServerRegistration, timeout:
 /// `AsyncRwTransport<RoleClient, _, _>` satisfies the same
 /// `IntoTransport`/`Transport<RoleClient>` bound `ServiceExt::serve`
 /// already requires, via `rmcp`'s own blanket impl.
+///
+/// Also applies [`isolate_child_environment`] (B5 remediation M3) to
+/// `cmd` before spawning: the external server's child process gets
+/// [`CHILD_PROCESS_ENV_ALLOWLIST`] only, never this process's full
+/// environment.
+/// B5 remediation M3: the bootstrap environment variables this crate
+/// passes to every spawned external MCP server — an explicit, minimal
+/// allowlist, never the parent process's full environment. Each entry
+/// is here because its ABSENCE causes a real, reproducible failure or
+/// degradation for a realistic external server (verified directly on
+/// this project's supported Windows target, never assumed):
+///
+/// - `SystemRoot` (Windows only): without it, a Python-based external
+///   server using `asyncio` (the standard way to implement concurrent
+///   I/O, and a realistic shape for any real MCP server implementation)
+///   fails immediately at import time with `OSError: [WinError 10106]`
+///   — Winsock's own service-provider initialization depends on it.
+///   Reproduced directly: `python -c "import asyncio; asyncio.run(...)"`
+///   under a fully cleared environment fails with exactly this error;
+///   re-adding only `SystemRoot` fixes it.
+/// - `TEMP`/`TMP` (Windows; `TMPDIR` is the POSIX equivalent, included
+///   for the same reason on Unix even though this crate's own test host
+///   is Windows-only): not required for a spawned server to start at
+///   all, but its absence causes a real external server that writes
+///   temporary files (e.g. via Python's `tempfile` module) to silently
+///   fall back to a hardcoded, possibly-wrong or non-writable default
+///   directory instead of the user's real temp location — a functional
+///   degradation this allowlist avoids rather than accepting.
+/// - `PATH`: NOT needed for THIS crate's own top-level executable
+///   resolution (`std::process::Command`, which `tokio::process::
+///   Command` wraps, resolves the first executable using the CALLING
+///   process's own `PATH`, confirmed by direct reproduction — a bare
+///   command name still resolves correctly under an otherwise fully
+///   cleared environment). It IS needed one level down: reproduced
+///   directly that `cmd /c more` — `cmd.exe`'s OWN internal resolution
+///   of `more` as `more.com` — fails ("'more' non è riconosciuto...")
+///   without `PATH` present in the CHILD's environment, because that
+///   resolution is `cmd.exe`'s own process doing a `PATH`-based lookup,
+///   a different step from the one that found `cmd.exe` itself. Any
+///   real external MCP server that itself shells out to another tool,
+///   or is launched via a wrapper/interpreter that does its own further
+///   `PATH`-based resolution, needs this for the same reason.
+///
+/// This list is deliberately small and general-purpose (process
+/// bootstrap only) — it is NOT a per-server configuration mechanism and
+/// must not become one without a new, explicit design decision; no
+/// credential or secret-shaped variable is ever a candidate for this
+/// list, by construction (this crate reads no such variable from any
+/// external server's needs today).
+const CHILD_PROCESS_ENV_ALLOWLIST: &[&str] = &["PATH", "SystemRoot", "TEMP", "TMP", "TMPDIR"];
+
+/// Configures `cmd` to run with an explicit, minimal environment instead
+/// of inheriting the parent process's own — every spawned external MCP
+/// server gets exactly [`CHILD_PROCESS_ENV_ALLOWLIST`]'s variables (only
+/// the ones actually set in THIS process's own environment; a listed but
+/// absent variable is simply not passed, never passed as an empty
+/// string), nothing else. This never reads, logs, or prints any
+/// variable's VALUE outside of passing it directly to the child process
+/// argument list `std::process::Command` itself manages.
+fn isolate_child_environment(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+    for name in CHILD_PROCESS_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+}
+
 async fn connect_now(registration: &McpServerRegistration) -> Result<McpConnection, McpClientError> {
     let TransportConfig::ChildProcess { command, args } = &registration.transport;
 
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args);
+    isolate_child_environment(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
