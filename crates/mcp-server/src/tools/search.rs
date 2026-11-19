@@ -99,6 +99,23 @@ pub struct SuperBrainMcpServer {
     /// already established for Task 31; only [`Self::with_audit_sink`]
     /// opts a server instance into a real destination.
     audit: Arc<dyn brain_api::AuditSink>,
+    /// B5.16 Task 35: bounds how many `#[tool]` handlers run at once
+    /// across this server instance. `Arc`-shared (not a plain
+    /// `tokio::sync::Semaphore` field) specifically so every `Clone` of
+    /// `SuperBrainMcpServer` shares the SAME permit pool, never an
+    /// independent one per clone — `rmcp` dispatches each incoming
+    /// `tools/call` request as its own `tokio::spawn`'d task running
+    /// against a cloned `SuperBrainMcpServer` (confirmed by reading
+    /// `rmcp::service`'s own request-dispatch loop: `shared_service =
+    /// Arc::new(service)`, then `service.clone()` per request), so a
+    /// semaphore that were re-created on every clone would impose no
+    /// real limit at all — every concurrent call would get its own,
+    /// always-available permit pool of 1. One `Arc<Semaphore>`,
+    /// constructed once in [`Self::new`] and carried by reference
+    /// through every clone, is the only shape that actually bounds
+    /// concurrency across the whole server instance. See
+    /// [`Self::acquire_concurrency_permit`] for where it's acquired.
+    concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// The full, fixed tool surface (B5.2 Task 24): Task 22's `read_tools`
     /// plus Task 23's `graph_tools`/`memory_tools`/`knowledge_tools`,
     /// combined once at construction time via `ToolRouter`'s own `+`
@@ -122,7 +139,38 @@ impl SuperBrainMcpServer {
     /// results while looking like it works.
     pub fn new(vault: storage::Vault, indexer: Arc<RealIndexer>, graph: Arc<CodeGraph>, active_project: impl Into<String>) -> Self {
         let tool_router = Self::read_tools() + Self::graph_tools() + Self::memory_tools() + Self::knowledge_tools();
-        Self { vault: Arc::new(vault), indexer, graph, active_project: active_project.into(), tool_router, dense_scorer: None, audit: Arc::new(brain_api::NullAuditSink) }
+        Self {
+            vault: Arc::new(vault),
+            indexer,
+            graph,
+            active_project: active_project.into(),
+            tool_router,
+            dense_scorer: None,
+            audit: Arc::new(brain_api::NullAuditSink),
+            concurrency_limit: Arc::new(tokio::sync::Semaphore::new(brain_api::limits::MAX_CONCURRENT_REQUESTS)),
+        }
+    }
+
+    /// Acquires one of this server's [`brain_api::limits::MAX_CONCURRENT_REQUESTS`]
+    /// permits, waiting (queueing) if none are free rather than rejecting
+    /// outright (the plan's own "queue or reject" choice, resolved to
+    /// queue — see [`Self::concurrency_limit`]'s own doc comment). Every
+    /// `#[tool]` handler calls this as its very first line and holds the
+    /// returned guard for its entire body (bound to a local variable,
+    /// never discarded with `let _ =`) so the permit is held across
+    /// every `.await` point the handler itself makes, released
+    /// automatically (RAII, `Drop`) the moment the handler returns —
+    /// on success, on an error return, or if the handler's own task is
+    /// cancelled/dropped while still waiting.
+    ///
+    /// `Semaphore::acquire_owned` on an `Arc<Semaphore>` only ever errors
+    /// if the semaphore itself has been closed (`Semaphore::close`,
+    /// never called anywhere in this codebase) — this server never
+    /// closes its own semaphore, so `.expect(...)` here can only panic
+    /// if that invariant is later violated, never under ordinary
+    /// concurrent load.
+    pub(crate) async fn acquire_concurrency_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.concurrency_limit.clone().acquire_owned().await.expect("this server's own concurrency semaphore is never closed")
     }
 
     /// Opts this server instance into a real [`brain_api::AuditSink`]
@@ -375,6 +423,7 @@ impl SuperBrainMcpServer {
     /// through both layers without this wrapper re-sorting anything.
     #[rmcp::tool(description = "Search notes by text, optionally filtered by type/status.")]
     pub async fn search(&self, Parameters(input): Parameters<SearchInput>) -> Result<Json<SearchOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let filters = index::search::SearchFilters {
             type_filter: input.type_filter.map(Into::into),
             status_filter: input.status_filter.map(Into::into),
@@ -410,6 +459,7 @@ impl SuperBrainMcpServer {
     /// called — never silently treated as "not found".
     #[rmcp::tool(description = "Retrieve one note's full content by id.")]
     pub async fn retrieve(&self, Parameters(input): Parameters<RetrieveInput>) -> Result<Json<RetrieveOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let request = api::RetrieveRequest { id: api::RetrieveTarget::Note(note_id) };
         let ctx = self.mcp_ctx();
@@ -433,6 +483,7 @@ impl SuperBrainMcpServer {
     /// own `NotFound`, exactly as it would for a direct `brain_api` caller.
     #[rmcp::tool(description = "Get one code symbol's intrinsic facts and immediate graph neighbors.")]
     pub async fn get_code_context(&self, Parameters(input): Parameters<GetCodeContextInput>) -> Result<Json<GetCodeContextOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let symbol_id: codegraph_domain::SymbolSnapshotId =
             input.symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
         let ctx = self.mcp_ctx();
@@ -450,5 +501,129 @@ impl SuperBrainMcpServer {
             outgoing: context.outgoing.into_iter().map(edge_dto).collect(),
             incoming: context.incoming.into_iter().map(edge_dto).collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod concurrency_limit_tests {
+    //! B5.16 Task 35: direct, white-box tests of
+    //! [`SuperBrainMcpServer::acquire_concurrency_permit`] and its
+    //! backing `Arc<Semaphore>` — `pub(crate)`, so only reachable from
+    //! inside this crate (this module), never from the external
+    //! integration tests in `tests/*.rs`, which instead prove the same
+    //! mechanism's REAL, end-to-end effect over the wire
+    //! (`tests/limits.rs`). Both are needed: this module proves the
+    //! mechanism's own shape (shared across clones, bounded exactly at
+    //! the configured limit, cancel-safe); `tests/limits.rs` proves it
+    //! is actually wired into every real `#[tool]` handler.
+
+    use super::*;
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "superbrain-mcp-server-concurrency-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn new_server() -> SuperBrainMcpServer {
+        let root = unique_test_dir("fixture");
+        let vault = storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
+        SuperBrainMcpServer::new(vault, Arc::new(RealIndexer::new()), Arc::new(CodeGraph::new()), "project-x")
+    }
+
+    #[tokio::test]
+    async fn exactly_max_concurrent_requests_permits_can_be_held_at_once() {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(server.acquire_concurrency_permit().await);
+        }
+        assert_eq!(held.len(), brain_api::limits::MAX_CONCURRENT_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_permit_beyond_the_limit_queues_until_one_is_released_never_exceeding_the_cap() {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(server.acquire_concurrency_permit().await);
+        }
+
+        // One more acquire, at the cap: must NOT resolve yet.
+        let extra_server = server.clone();
+        let extra = tokio::spawn(async move { extra_server.acquire_concurrency_permit().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!extra.is_finished(), "an acquire beyond the configured cap must queue, not succeed immediately");
+
+        // Releasing exactly one permit must let the queued acquire
+        // proceed -- never granting a permit beyond the configured cap
+        // (there is no way for two permits to be "free" at once here:
+        // releasing one and having the queued acquire succeed is itself
+        // the proof the cap was never exceeded).
+        held.pop();
+        let released_permit = tokio::time::timeout(std::time::Duration::from_secs(5), extra).await.expect("the queued acquire must resume once a permit frees up").expect("the spawned task must not panic");
+        drop(released_permit);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn every_clone_of_the_server_shares_the_same_permit_pool_not_an_independent_one() {
+        let server = new_server();
+        let clone = server.clone();
+
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        // Acquire half through the original, half through the clone --
+        // if each clone had its OWN semaphore, this would never
+        // saturate either one; because they share one Arc<Semaphore>,
+        // the combined total still hits the single real cap below.
+        for i in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            if i % 2 == 0 {
+                held.push(server.acquire_concurrency_permit().await);
+            } else {
+                held.push(clone.acquire_concurrency_permit().await);
+            }
+        }
+
+        let one_more_server = server.clone();
+        let one_more = tokio::spawn(async move { one_more_server.acquire_concurrency_permit().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!one_more.is_finished(), "clones must share one real permit pool -- the combined total from both handles must still be capped");
+
+        held.pop();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), one_more).await.expect("shared pool: releasing one permit from either handle must free a slot for the other").expect("spawned task must not panic");
+        drop(permit);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_task_still_waiting_for_a_permit_never_consumes_one() {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(server.acquire_concurrency_permit().await);
+        }
+
+        // A queued acquire, then abort the task waiting on it before it
+        // ever resolves -- tokio::sync::Semaphore's own documented
+        // cancel-safety: a dropped Acquire future is removed from the
+        // wait queue without taking a permit.
+        let waiting_server = server.clone();
+        let waiting = tokio::spawn(async move { waiting_server.acquire_concurrency_permit().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waiting.abort();
+        let _ = waiting.await;
+
+        // Release one permit. If the aborted waiter had somehow already
+        // consumed it, this fresh acquire would now queue instead of
+        // resolving immediately.
+        held.pop();
+        let fresh = tokio::time::timeout(std::time::Duration::from_millis(500), server.acquire_concurrency_permit()).await;
+        assert!(fresh.is_ok(), "a permit released after an aborted waiter must be available to a fresh acquire, not silently consumed by the cancelled task");
     }
 }

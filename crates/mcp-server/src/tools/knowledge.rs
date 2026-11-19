@@ -104,6 +104,7 @@ impl SuperBrainMcpServer {
     /// `scope` entirely returns rules across every known scope.
     #[rmcp::tool(description = "List the project's internal operating/engineering rules, optionally filtered by scope.")]
     pub async fn get_rules(&self, Parameters(input): Parameters<GetRulesInput>) -> Result<Json<GetRulesOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let ctx = self.mcp_ctx();
         let result = brain_api::get_rules(&ctx, input.scope.as_deref());
         self.record_tool_call("get_rules", &result, &ctx);
@@ -116,6 +117,7 @@ impl SuperBrainMcpServer {
     /// namespace from `get_rules`'s `scope`, never conflated with it.
     #[rmcp::tool(description = "List applicable external regulations, optionally filtered by regime.")]
     pub async fn get_regulations(&self, Parameters(input): Parameters<GetRegulationsInput>) -> Result<Json<GetRegulationsOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let ctx = self.mcp_ctx();
         let result = brain_api::get_regulations(&ctx, input.regime.as_deref());
         self.record_tool_call("get_regulations", &result, &ctx);
@@ -129,6 +131,7 @@ impl SuperBrainMcpServer {
     /// check still runs before that empty answer is given.
     #[rmcp::tool(description = "List the authoritative corpus of consolidated project truths, optionally filtered by topic.")]
     pub async fn get_canon(&self, Parameters(input): Parameters<GetCanonInput>) -> Result<Json<GetCanonOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let ctx = self.mcp_ctx();
         let result = brain_api::get_canon(&ctx, input.topic.as_deref());
         self.record_tool_call("get_canon", &result, &ctx);

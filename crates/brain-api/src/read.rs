@@ -80,8 +80,23 @@ fn map_search_error(err: index::search::SearchError) -> BrainApiError {
 /// Delegates to `api::search`. `ctx.read_policy` must allow
 /// `ReadOperation::Search` or this fails closed with `PermissionDenied`
 /// before `api::search`/the underlying index is ever touched.
+///
+/// B5.16 Task 35: `request.text` exceeding
+/// [`crate::limits::MAX_QUERY_LEN`] or `request.k` exceeding
+/// [`crate::limits::MAX_RESULT_COUNT`] is rejected as `InvalidInput`
+/// before `api::search`/the underlying index is ever touched — the same
+/// "validate before the expensive operation starts" discipline
+/// `graph_query` below already applies for its own `max_depth`/`limit`.
 pub fn search(ctx: &RequestContext, index: &index::Index<'_>, request: api::SearchRequest) -> Result<index::search::SearchResponse, BrainApiError> {
     check_read(ctx, policy::ReadOperation::Search)?;
+
+    if request.text.len() > crate::limits::MAX_QUERY_LEN {
+        return Err(BrainApiError::InvalidInput(format!("query length {} exceeds the maximum of {}", request.text.len(), crate::limits::MAX_QUERY_LEN)));
+    }
+    if request.k > crate::limits::MAX_RESULT_COUNT {
+        return Err(BrainApiError::InvalidInput(format!("k {} exceeds the maximum of {}", request.k, crate::limits::MAX_RESULT_COUNT)));
+    }
+
     // api::search's own ReadPolicy check is still real and still runs
     // (api::check consults the SAME read_policy this function already
     // checked above) -- this is intentional double enforcement, not
@@ -179,20 +194,27 @@ pub fn get_code_context(ctx: &RequestContext, graph: &codegraph_index::graph::Co
 /// module doc comment) and needs no depth guard to stay safe; this bound
 /// exists purely to keep one public query's result size and cost
 /// predictable, per the B5.0 contract's "bounded traversal (depth/result
-/// limits, exact numbers at plan Task 35)" note. Provisional pending
-/// Task 35's own numeric pass over every capability at once — not
-/// invented in isolation, but not left unbounded either, since the task
-/// explicitly requires rejecting a query that exceeds its bound rather
-/// than assuming the underlying crate already enforces one.
-const MAX_GRAPH_QUERY_DEPTH: usize = 50;
+/// limits, exact numbers at plan Task 35)" note.
+///
+/// B5.16 Task 35: this was a locally-defined provisional constant from
+/// Task 17 ("pending Task 35's own numeric pass over every capability at
+/// once"); it is now this module's own re-export of
+/// [`crate::limits::MAX_GRAPH_TRAVERSAL_DEPTH`] — the SAME value (50),
+/// now canonically defined once in `limits.rs` instead of duplicated —
+/// kept under this name so every existing call site in this file (and
+/// `graph.rs`'s own tests, if any reference it by this name) keeps
+/// compiling unchanged.
+use crate::limits::MAX_GRAPH_TRAVERSAL_DEPTH as MAX_GRAPH_QUERY_DEPTH;
 
-/// The maximum number of results `graph_query` returns. Same provisional
-/// status as [`MAX_GRAPH_QUERY_DEPTH`]. `CodeGraph::reachable_from`'s own
-/// result order is already deterministic (BFS discovery order over a
-/// fixed graph snapshot), so truncating to this length never discards
-/// results non-deterministically — the same `max_depth`+result set always
+/// The maximum number of results `graph_query` returns. Same provisional-
+/// now-consolidated status as [`MAX_GRAPH_QUERY_DEPTH`] above —
+/// re-exports [`crate::limits::MAX_GRAPH_QUERY_RESULTS`], unchanged
+/// value (500). `CodeGraph::reachable_from`'s own result order is
+/// already deterministic (BFS discovery order over a fixed graph
+/// snapshot), so truncating to this length never discards results
+/// non-deterministically — the same `max_depth`+result set always
 /// truncates to the same prefix.
-const MAX_GRAPH_QUERY_RESULTS: usize = 500;
+use crate::limits::MAX_GRAPH_QUERY_RESULTS;
 
 /// A `graph_query` request: the entity to start from, which `EdgeKind` to
 /// follow (or every kind, if `None`), and how many hops to traverse.
@@ -410,6 +432,49 @@ mod tests {
         let ctx = mcp_ctx_with_read(allow_search_and_retrieve());
 
         let result = search(&ctx, &index, search_request(""));
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
+    }
+
+    // --- B5.16 Task 35: MAX_QUERY_LEN / MAX_RESULT_COUNT ---
+
+    #[test]
+    fn search_with_a_query_exceeding_max_query_len_returns_invalid_input_before_touching_the_index() {
+        let fixture = Fixture::new();
+        let index = fixture.index();
+        let ctx = mcp_ctx_with_read(allow_search_and_retrieve());
+
+        let oversized_query = "x".repeat(crate::limits::MAX_QUERY_LEN + 1);
+        let result = search(&ctx, &index, search_request(&oversized_query));
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
+    }
+
+    #[test]
+    fn search_with_a_query_at_exactly_max_query_len_is_not_rejected_for_length() {
+        let fixture = Fixture::new();
+        fixture.write("note-exact-len", "the unique searchable phrase");
+        let index = fixture.index();
+        let ctx = mcp_ctx_with_read(allow_search_and_retrieve());
+
+        // Pads with trailing characters up to exactly MAX_QUERY_LEN, so a
+        // boundary-off-by-one bug in the length check itself would show
+        // up here as an unexpected InvalidInput, distinct from this
+        // query simply matching nothing.
+        let mut padded_query = "the unique searchable phrase".to_string();
+        padded_query.push_str(&" ".repeat(crate::limits::MAX_QUERY_LEN - padded_query.len()));
+        assert_eq!(padded_query.len(), crate::limits::MAX_QUERY_LEN);
+
+        let result = search(&ctx, &index, search_request(&padded_query));
+        assert!(!matches!(result, Err(BrainApiError::InvalidInput(_))), "a query at exactly the length limit must not be rejected for length, got {result:?}");
+    }
+
+    #[test]
+    fn search_with_k_exceeding_max_result_count_returns_invalid_input_before_touching_the_index() {
+        let fixture = Fixture::new();
+        let index = fixture.index();
+        let ctx = mcp_ctx_with_read(allow_search_and_retrieve());
+
+        let request = api::SearchRequest { text: "anything".into(), filters: Default::default(), k: crate::limits::MAX_RESULT_COUNT + 1 };
+        let result = search(&ctx, &index, request);
         assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
     }
 

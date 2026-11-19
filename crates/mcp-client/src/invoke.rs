@@ -60,7 +60,7 @@ use crate::{ApprovalPolicy, ExternalToolMetadata, McpClientError, McpConnection,
 /// `registration.rs`'s own `DEFAULT_CONNECT_TIMEOUT` convention — a
 /// caller needing a different value uses
 /// [`invoke_external_tool_with_timeout`].
-const DEFAULT_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The coarse outcome category this module's provisional log records —
 /// never the tool's real result content, never its real error text

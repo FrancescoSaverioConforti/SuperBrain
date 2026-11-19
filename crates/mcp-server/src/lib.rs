@@ -24,9 +24,11 @@
 
 mod error;
 mod handler;
+mod limits;
 mod tools;
 
 pub use error::map_brain_api_error;
+pub use limits::limited_transport;
 pub use tools::graph::{
     GetEntityInput, GetEntityOutput, GraphQueryInput, GraphQueryOutput, LinkEntitiesInput, LinkEntitiesOutput, McpEdgeKind, McpRelationKind,
 };

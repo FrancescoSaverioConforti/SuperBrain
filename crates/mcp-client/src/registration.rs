@@ -41,7 +41,7 @@ const GLOBAL_DISABLE_ENV_VAR: &str = "SUPERBRAIN_MCP_CLIENT_DISABLED";
 /// start (e.g. an `npx`-launched one resolving/installing a package) while
 /// still bounded — a caller needing a different value uses
 /// [`connect_with_timeout`].
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Reads the one global kill-switch this crate's `connect()` consults
 /// before anything else. A single config read, not cached — re-read on

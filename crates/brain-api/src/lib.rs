@@ -17,6 +17,7 @@ mod cli;
 mod error;
 mod graph;
 mod knowledge;
+pub mod limits;
 mod memory;
 mod policy_write;
 mod proposal;

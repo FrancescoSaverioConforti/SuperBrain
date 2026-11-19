@@ -154,6 +154,7 @@ impl SuperBrainMcpServer {
     /// responsibility, never duplicated here.
     #[rmcp::tool(description = "Run a bounded graph traversal from one code symbol, following edges of an optional kind, up to max_depth hops.")]
     pub async fn graph_query(&self, Parameters(input): Parameters<GraphQueryInput>) -> Result<Json<GraphQueryOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let start: codegraph_domain::SymbolSnapshotId =
             input.start_symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
         let spec = brain_api::GraphQuerySpec { start, kind: input.kind.map(Into::into), max_depth: input.max_depth };
@@ -169,6 +170,7 @@ impl SuperBrainMcpServer {
     /// no neighboring edges (that is `get_code_context`'s job, Task 22).
     #[rmcp::tool(description = "Get one code symbol's intrinsic facts only (no graph neighbors).")]
     pub async fn get_entity(&self, Parameters(input): Parameters<GetEntityInput>) -> Result<Json<GetEntityOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let symbol_id: codegraph_domain::SymbolSnapshotId =
             input.symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
         let ctx = self.mcp_ctx();
@@ -194,6 +196,7 @@ impl SuperBrainMcpServer {
     /// tool creates can never be self-approved through MCP.
     #[rmcp::tool(description = "Propose linking two notes by a relation kind. Creates a pending proposal; does not execute the link.")]
     pub async fn link_entities(&self, Parameters(input): Parameters<LinkEntitiesInput>) -> Result<Json<LinkEntitiesOutput>, McpError> {
+        let _permit = self.acquire_concurrency_permit().await;
         let from = storage::NoteId::parse(&input.from_note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let to = storage::NoteId::parse(&input.to_note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();

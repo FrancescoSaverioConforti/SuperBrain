@@ -239,8 +239,19 @@ pub fn get_previous_solution(
 ) -> Result<Vec<domain::NoteMetadata>, BrainApiError> {
     check_previous_solution_read(ctx)?;
 
+    // B5.16 Task 35: bounds the caller-supplied query length AND the
+    // result count this capability requests from `index::search` --
+    // previously `usize::MAX`, an unconditionally unbounded result set
+    // this task's own mandate (cap every capability's resource
+    // consumption) requires closing, even though no `limit` parameter
+    // exists on this function's own frozen signature to receive a
+    // caller-chosen value.
+    if query.len() > crate::limits::MAX_QUERY_LEN {
+        return Err(BrainApiError::InvalidInput(format!("query length {} exceeds the maximum of {}", query.len(), crate::limits::MAX_QUERY_LEN)));
+    }
+
     let filters = index::search::SearchFilters { type_filter: note_type, ..Default::default() };
-    let response = index.search(query, filters, usize::MAX).map_err(|err| match err {
+    let response = index.search(query, filters, crate::limits::MAX_RESULT_COUNT).map_err(|err| match err {
         index::search::SearchError::EmptyQuery | index::search::SearchError::InvalidLimit | index::search::SearchError::EmptyProject => BrainApiError::InvalidInput(err.to_string()),
         index::search::SearchError::TimeResolution(_) => BrainApiError::InvalidInput(err.to_string()),
         index::search::SearchError::ReadUnavailable => BrainApiError::RuntimeUnavailable,
@@ -667,6 +678,18 @@ mod tests {
         assert_eq!(results[0].id, "bug-timeout-retry");
         assert_eq!(results[0].r#type, domain::NoteType::Bug);
         assert_eq!(results[0].relations.supports, vec!["fix-timeout-retry".to_string()], "relations must be preserved so the result can be traced to its linked fix");
+    }
+
+    // --- B5.16 Task 35: MAX_QUERY_LEN ---
+
+    #[test]
+    fn get_previous_solution_with_a_query_exceeding_max_query_len_returns_invalid_input_before_touching_the_index() {
+        let fixture = PreviousSolutionFixture::new();
+        let ctx = mcp_ctx_with_previous_solution_read();
+
+        let oversized_query = "x".repeat(crate::limits::MAX_QUERY_LEN + 1);
+        let result = get_previous_solution(&ctx, &fixture.vault, &fixture.index(), &oversized_query, None);
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "expected InvalidInput, got {result:?}");
     }
 
     #[test]
