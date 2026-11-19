@@ -1,0 +1,26 @@
+[package]
+name = "brain-api-audit-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M5 Task 4: dedicated, cancellation-safe durable audit writer worker. Owns bounded command delivery, worker lifecycle and acknowledgment; owns no audit semantics or hash-chain logic of its own (brain-api) and no filesystem/DPAPI mechanics of its own (storage)."
+
+[dependencies]
+brain-api = { path = "../brain-api" }
+storage = { path = "../storage" }
+# Runtime-agnostic feature set only: no "rt-multi-thread", no "macros".
+# This crate never creates its own Tokio runtime and never requires one
+# per request -- `spawn_worker` just does `tokio::spawn` onto whatever
+# runtime its composition-root caller (mcp-server today; a future async
+# CLI composition root later) already has running. "time" is for the
+# worker's own bounded internal waits (none planned yet, kept available
+# for the shutdown-drain timeout); "sync" for mpsc/oneshot; "rt" for
+# `spawn_blocking`/`spawn`'s own trait surface to even name the types.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }

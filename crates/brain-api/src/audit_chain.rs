@@ -1,19 +1,21 @@
 //! B5 remediation M5, Task 1: pure, filesystem-independent hash-chain
 //! and recovery-scan primitives for a future durable audit log.
 //!
-//! **Scope discipline (explicit user authorization, this task only):**
-//! this module contains ONLY pure functions over in-memory byte slices —
-//! no file I/O, no locking, no DPAPI, no `AuditSink`/`AuditEventKind`
-//! changes, no production wiring. It is not yet called from anywhere in
-//! this crate. Later M5 tasks (filesystem writer, sink adapters, schema
-//! evolution, composition-root wiring) are explicitly NOT part of this
-//! module and require separate authorization before implementation.
+//! **Scope discipline (Task 1's own original authorization):** this
+//! module contains ONLY pure functions over in-memory byte slices — no
+//! file I/O, no locking, no DPAPI. `AuditEventKind`/production wiring
+//! stayed out of THIS module even after Task 4 gave it real callers —
+//! see `audit_record.rs` (the concrete line format) and
+//! `brain-api-audit-worker` (the actual filesystem-writing worker,
+//! M5 Task 4) for where that lives instead.
 //!
-//! `#![allow(dead_code)]`: every item here is intentionally unused by any
-//! other module YET — wiring it up is explicitly out of this task's
-//! authorized scope (see above). The alternative (adding a premature,
-//! throwaway call site just to silence the lint) would itself be a form
-//! of unauthorized production wiring, which this task must not do.
+//! **Task 4 update**: a narrow set of this module's items are now
+//! re-exported from this crate's own `lib.rs` (see that file's own `pub
+//! use audit_chain::{...}` doc comment for exactly which ones and why)
+//! so `brain-api-audit-worker` can reuse this module's pure chain
+//! verification rather than reimplementing it. The module itself stays
+//! private (`mod audit_chain;`, not `pub mod`) — only the facade's
+//! chosen items are reachable from outside this crate.
 //!
 //! **Design basis**, reusing an established pattern already proven in
 //! this codebase (`crates/vault-security/src/deletion_log.rs`'s own
@@ -36,7 +38,6 @@
 //! the job of a future, separate anchor mechanism (DPAPI-wrapped head
 //! reference on Windows, explicitly NOT built in this task), not this
 //! module.
-#![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
 

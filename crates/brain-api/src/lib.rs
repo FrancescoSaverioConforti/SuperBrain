@@ -13,10 +13,17 @@
 
 mod approval;
 mod audit;
-/// B5 remediation M5 Task 1: pure hash-chain/recovery-scan primitives
-/// only (no I/O, no AuditSink/AuditEventKind changes, not yet called
-/// from anywhere in this crate). See the module's own doc comment.
+/// B5 remediation M5 Task 1: pure hash-chain/recovery-scan primitives.
+/// Kept private (not `pub mod`): only the specific items
+/// `brain-api-audit-worker` (M5 Task 4) needs are re-exported below,
+/// through this crate's own top-level facade, never the whole module --
+/// see that `pub use` block's own doc comment for why each item is
+/// there.
 mod audit_chain;
+/// B5 remediation M5 Task 4: the concrete, versioned log line format
+/// (serialize/parse) -- kept separate from `audit_chain`'s own
+/// format-agnostic pure primitives. See the module's own doc comment.
+mod audit_record;
 mod cli;
 mod error;
 mod graph;
@@ -29,7 +36,38 @@ mod proposal_store;
 mod read;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
 pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, NullAuditSink};
+pub use audit_record::{parse_event, parse_line, serialize_record, AuditRecordParseError, AUDIT_RECORD_FORMAT_VERSION};
 pub use cli::{run_cli, run_cli_with_audit};
+
+/// M5 Task 4's narrow facade onto `audit_chain`'s otherwise-private pure
+/// primitives — re-exported individually, not `pub use audit_chain::*`,
+/// so this crate's public surface documents exactly what an external
+/// worker crate is authorized to depend on and why:
+///
+/// - [`audit_chain::GENESIS_HASH`]: the worker's in-memory chain-tail
+///   state starts here before any record exists; must be the exact
+///   constant, not an independently-duplicated literal.
+/// - [`audit_chain::ChainRecord`]/[`audit_chain::LineOutcome`]: plain
+///   data types the worker's startup recovery scan constructs and holds;
+///   carry no behavior of their own.
+/// - [`audit_chain::scan_chain`]: the one recovery/verification entry
+///   point Task 1 built for exactly this reuse — the worker must never
+///   reimplement chain-link verification itself.
+/// - [`audit_chain::ScanResult`]/[`audit_chain::ScanStopReason`]/
+///   [`audit_chain::ChainLinkError`]: `scan_chain`'s own return/error
+///   shapes; required simply to call and match on it.
+/// - [`audit_chain::may_resume_without_recovery`]: the worker's startup
+///   gate, reused rather than re-derived from `ScanResult` by hand.
+///
+/// Deliberately NOT exported: `verify_record_hash`/`verify_link`
+/// individually (the worker only ever needs the aggregate `scan_chain`
+/// result, never per-record verification standalone) and
+/// `compute_record_hash` (used internally by `audit_record::
+/// serialize_record`, which is this crate's own, not the worker's, job
+/// to call when producing new records).
+pub use audit_chain::{
+    may_resume_without_recovery, scan_chain, ChainLinkError, ChainRecord, LineOutcome, ScanResult, ScanStopReason, GENESIS_HASH,
+};
 pub use error::BrainApiError;
 pub use graph::link_entities;
 pub use knowledge::{get_canon, get_regulations, get_rules, BindingStatus, CanonEntry, KnowledgeItem};

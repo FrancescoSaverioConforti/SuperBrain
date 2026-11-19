@@ -39,14 +39,21 @@
 //! backed by a regression test that serializes every variant and checks
 //! for content-shaped substrings.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One durable audit record: a categorized event, when it happened, and the
 /// correlation id tying it back to the `RequestContext` that produced it
 /// (the same `correlation_id` already present on every `RequestContext`
 /// since `lib.rs`'s original B5.8 shape — this module adds no second id
 /// scheme).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// `Deserialize` added (M5 Task 4): purely additive, no field/variant/
+/// wire-format change — required so `audit_record::parse_event` can
+/// decode a verified record's own `content_bytes` back into a typed
+/// value for recovery/inspection. The B5.12 freeze is on the variant set
+/// and field shapes (still exactly 7 variants, still content-free), not
+/// on which serde traits are derived.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub kind: AuditEventKind,
     pub timestamp: String,
@@ -58,7 +65,7 @@ pub struct AuditEvent {
 /// arguments, or any other content-bearing payload; `reason` fields are a
 /// short category/explanation chosen by the emitting call site, never a
 /// verbatim echo of caller-supplied free text.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditEventKind {
     McpConnection { server: String },
