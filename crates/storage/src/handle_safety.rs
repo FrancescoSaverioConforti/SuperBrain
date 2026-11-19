@@ -30,6 +30,16 @@ use crate::vault::StorageError;
 pub(crate) enum OpenMode {
     ReadExisting,
     CreateOrOpenForWrite,
+    /// B5 remediation M5 Task 2: opens for append-only writes
+    /// (`O_APPEND`/`FILE_APPEND_DATA`), creating the file if absent.
+    /// Reuses every existing identity check unchanged (confirmed by
+    /// direct reproduction: `FILE_FLAG_OPEN_REPARSE_POINT` combined with
+    /// append mode still correctly opens a symlink's own reparse-point
+    /// data, never silently following it, so the existing
+    /// reparse-point/hard-link/containment checks below apply
+    /// identically to an append-mode handle) — only the `OpenOptions`
+    /// flags differ from `CreateOrOpenForWrite`.
+    AppendOrCreate,
 }
 
 /// A filesystem handle whose identity has already been verified: a regular
@@ -152,6 +162,9 @@ fn open_verified_unix(
         OpenMode::CreateOrOpenForWrite => {
             opts.write(true).create(true);
         }
+        OpenMode::AppendOrCreate => {
+            opts.append(true).create(true);
+        }
     }
     opts.custom_flags(libc::O_NOFOLLOW);
 
@@ -207,6 +220,9 @@ fn open_verified_windows(
         OpenMode::ReadExisting => {}
         OpenMode::CreateOrOpenForWrite => {
             opts.write(true).create(true);
+        }
+        OpenMode::AppendOrCreate => {
+            opts.append(true).create(true);
         }
     }
     opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);

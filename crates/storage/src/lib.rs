@@ -89,6 +89,10 @@
 //! ```
 
 mod atomic;
+/// B5 remediation M5 Task 2: a dedicated, narrowly-scoped durable audit
+/// log writer (`Vault::open_audit_writer`) — this vault's own fixed
+/// `.audit/audit.log` resource only, never a general append primitive.
+mod audit_writer;
 mod fault;
 mod git;
 mod handle_safety;
@@ -102,6 +106,7 @@ mod vault;
 // `atomic` is deliberately NOT re-exported: `atomic_write` is a raw,
 // ungated, unvalidated filesystem primitive and must stay crate-private (see
 // the crate docs above and Finding C1 of the A1 final review).
+pub use audit_writer::{AuditAppendError, AuditWriterHandle, AuditWriterOpenError};
 pub use note_id::{NoteId, NoteIdError};
 pub use propose::{
     add_relation, propose_and_commit, update_note_body, CommitOutcome, CommitResult, ProposeError, RelationField,
