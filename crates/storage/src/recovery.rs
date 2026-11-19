@@ -109,7 +109,6 @@ use domain::WriteState;
 use uuid::Uuid;
 use vault_security::{PiiStore, PiiStoreError};
 
-use crate::atomic::atomic_write;
 use crate::fault::{FaultInjector, FaultPoint, Interrupted};
 use crate::git::{commit_operation_contents, find_commit_for_operation, GitError, ScanDepth};
 use crate::journal::{AdvanceFields, Journal, JournalError, OperationRow};
@@ -332,11 +331,15 @@ fn fix_intent_recorded(
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
     if let Some(intended) = row.content_hash.as_deref() {
+        // Kept for the fallback-removal branch below (plain remove_file,
+        // where identity verification buys nothing — see its own comment).
         let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
-        let on_disk_hash = match std::fs::read(&record_path) {
+        let record_name = format!("{}.record", note_id.as_str());
+        let record_relative = Path::new(&record_name);
+        let on_disk_hash = match crate::handle_safety::read_verified(root, record_relative, note_id.as_str()) {
             Ok(bytes) => Some(content_hash(&bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(ReconcileError::Io(e)),
+            Err(StorageError::NotFound { .. }) => None,
+            Err(e) => return Err(from_storage(op, e)),
         };
         if on_disk_hash.as_deref() == Some(intended) {
             // Task 6: a sensitive write's pointer rename landed, but the
@@ -370,9 +373,11 @@ fn fix_intent_recorded(
                 if content_hash(&before_bytes) != before_hash {
                     return Err(inconsistent(op, "before-image restore failed: before-image does not match its recorded hash"));
                 }
-                atomic_write(&record_path, &before_bytes)
+                let verified_root = crate::handle_safety::open_verified_dir(root)
+                    .map_err(|e| inconsistent(op, format!("before-image restore failed: parent directory verification failed: {e}")))?;
+                crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &before_bytes)
                     .map_err(|e| inconsistent(op, format!("before-image restore failed: write failed: {e}")))?;
-                let restored = std::fs::read(&record_path)
+                let restored = crate::handle_safety::read_verified(root, record_relative, note_id.as_str())
                     .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot re-read record: {e}")))?;
                 if content_hash(&restored) != before_hash {
                     return Err(inconsistent(op, "before-image restore failed: restored record does not verify"));
@@ -747,18 +752,24 @@ fn fix_content_persisted(
 ) -> Result<WriteState, ReconcileError> {
     let op = row.operation_id;
     let note_id = parse_note_id(row)?;
+    // Kept for the fallback-removal branch below (plain remove_file, where
+    // identity verification buys nothing — unlinking a symlink/hard-link
+    // alias cannot leak content or corrupt the linked-to file).
     let record_path = record_path_checked(root, &note_id).map_err(|e| from_storage(op, e))?;
+    let record_name = format!("{}.record", note_id.as_str());
+    let record_relative = Path::new(&record_name);
     let expected_hash = row
         .content_hash
         .as_deref()
         .ok_or_else(|| inconsistent(op, "ContentPersisted row has no content_hash"))?;
 
     // A missing record counts as "does not match". The restore below can
-    // recreate it from the before-image.
-    let on_disk_hash = match std::fs::read(&record_path) {
+    // recreate it from the before-image. B5.SEC: verified on the open
+    // handle, not a bare path read.
+    let on_disk_hash = match crate::handle_safety::read_verified(root, record_relative, note_id.as_str()) {
         Ok(bytes) => Some(content_hash(&bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(ReconcileError::Io(e)),
+        Err(StorageError::NotFound { .. }) => None,
+        Err(e) => return Err(from_storage(op, e)),
     };
 
     if on_disk_hash.as_deref() == Some(expected_hash) {
@@ -859,9 +870,11 @@ fn fix_content_persisted(
         if content_hash(&before_bytes) != before_hash {
             return Err(inconsistent(op, "before-image restore failed: before-image does not match its recorded hash"));
         }
-        atomic_write(&record_path, &before_bytes)
+        let verified_root = crate::handle_safety::open_verified_dir(root)
+            .map_err(|e| inconsistent(op, format!("before-image restore failed: parent directory verification failed: {e}")))?;
+        crate::handle_safety::write_verified_atomic(&verified_root, &record_name, &before_bytes)
             .map_err(|e| inconsistent(op, format!("before-image restore failed: write failed: {e}")))?;
-        let restored = std::fs::read(&record_path)
+        let restored = crate::handle_safety::read_verified(root, record_relative, note_id.as_str())
             .map_err(|e| inconsistent(op, format!("before-image restore failed: cannot re-read record: {e}")))?;
         if content_hash(&restored) != before_hash {
             return Err(inconsistent(op, "before-image restore failed: restored record does not verify"));
@@ -1049,14 +1062,19 @@ pub(crate) fn own_content(
     note_id: &NoteId,
     record_path: &Path,
 ) -> Result<Option<Vec<u8>>, ReconcileError> {
+    let _ = record_path; // kept in the signature for existing callers; see B5.SEC note below.
     let Some(expected) = row.content_hash.as_deref() else {
         return Ok(None);
     };
-    match std::fs::read(record_path) {
+    // B5.SEC: verified on the open handle (identity checked), not a bare
+    // path read — `record_path`'s own containment check already ran in
+    // the caller, but the actual I/O now goes through the same
+    // handle-verification every other read in this crate does.
+    match crate::handle_safety::read_verified(root, Path::new(&format!("{}.record", note_id.as_str())), note_id.as_str()) {
         Ok(bytes) if content_hash(&bytes) == expected => return Ok(Some(bytes)),
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(ReconcileError::Io(e)),
+        Err(StorageError::NotFound { .. }) => {}
+        Err(e) => return Err(from_storage(row.operation_id, e)),
     }
     for successor in journal.operations_with_before_image_hash(note_id.as_str(), expected)? {
         if successor.operation_id == row.operation_id {

@@ -1,0 +1,66 @@
+[package]
+name = "mcp-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain MCP server: exposes brain-api's capabilities over the Model Context Protocol."
+
+[features]
+# Forwards brain-api's own dense-retrieval feature (itself forwarding
+# api's, B4.1) unchanged, through the full mcp-server -> brain-api -> api
+# chain. The only dense-retrieval-SPECIFIC code this crate itself adds
+# (Task 31) is SuperBrainMcpServer::with_dense_retrieval -- an
+# additive, optional builder (see tools/search.rs's own doc comment);
+# `brain_api::search`/`api::search` themselves stay unmodified. This
+# feature entry exists purely so a real external MCP client calling
+# `search` can reach DenseV2 results when the server process is built
+# with it (Task 31's own E2E requirement), without mcp-server inventing
+# a second meaning for the name.
+dense-retrieval = ["brain-api/dense-retrieval"]
+
+[dependencies]
+brain-api = { path = "../brain-api" }
+# These 7 core crates are direct dependencies ONLY because
+# brain_api::read's functions take their already-built runtime objects by
+# reference (&storage::Vault, &index::Index<'_>,
+# &codegraph_index::graph::CodeGraph) -- read.rs's own doc comment: "the
+# caller is responsible for building and supplying both". This crate
+# never calls into any of their write/mutation/raw-persistence surface
+# directly (see tools/search.rs's module doc comment) -- it only holds
+# and passes along objects brain-api itself requires a caller to supply.
+# Task 20's layering-test discipline applies here too: see
+# tests/no_bypass.rs's dependency-direction guard.
+api = { path = "../api" }
+codegraph-domain = { path = "../codegraph-domain" }
+codegraph-index = { path = "../codegraph-index" }
+domain = { path = "../domain" }
+index = { path = "../index" }
+policy = { path = "../policy" }
+storage = { path = "../storage" }
+# Official Rust MCP SDK (modelcontextprotocol/rust-sdk). `server` + `macros`
+# are its own defaults (tool registration/dispatch); `transport-io` adds the
+# stdio server transport -- stdin/stdout only, no network -- which is the
+# standard way to launch a local MCP server as a child process and the only
+# transport this task's scaffold needs: SuperBrain is a local, single-user
+# tool with no remote-network requirement for MCP itself.
+rmcp = { version = "3.11.0", features = ["transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+git2 = "0.21"
+serde_json = "1"
+# `client` adds rmcp's client-role protocol logic (Peer::list_tools/
+# call_tool, ServiceExt::serve for RoleClient) -- needed ONLY by
+# tests/server_integration.rs (Task 24) to drive a real MCP client against
+# this crate's own server over a real transport. Cargo's resolver v2
+# unifies this feature into the SAME rmcp dependency only for dev/test
+# builds of this crate; the production (non-test) build of mcp-server
+# never gets rmcp's client role compiled in. Not a network transport
+# feature -- tests/no_bypass.rs's own guard only forbids those.
+rmcp = { version = "3.11.0", features = ["client"] }

@@ -103,14 +103,23 @@ const DOMAIN_SEPARATOR_V2: &[u8] = b"superbrain-symbol-snapshot-v2";
 /// `(RepositoryId, CommitHash, relative path, SymbolKind, validated
 /// name, signature, span_start, span_end)` under the
 /// `superbrain-symbol-snapshot-v2` encoding — never from raw free text
-/// alone, and never constructible from a caller-supplied string. The
-/// only constructor is [`SymbolSnapshotId::derive`], taking already-
-/// validated inputs (a [`FileIdentity`], which itself binds a
-/// `RepositoryId` and `CommitHash`). This mirrors `SymbolLineageId`'s
-/// "never parsed from a string" discipline for the same reason: nothing
-/// about this value is meaningful except as the deterministic output of
-/// hashing validated identity under this specific encoding, so there is
-/// nothing for an external caller to validate by parsing one back.
+/// alone. The only PRODUCTION constructor is [`SymbolSnapshotId::derive`],
+/// taking already-validated inputs (a [`FileIdentity`], which itself binds
+/// a `RepositoryId` and `CommitHash`): nothing about this value is
+/// meaningful except as the deterministic output of hashing validated
+/// identity under this specific encoding.
+///
+/// **Transport round-trip (added B5.1/Task 22, additive, non-breaking):**
+/// [`std::fmt::Display`]/[`std::str::FromStr`] give this type a canonical
+/// 64-character lowercase-hex text form, purely so an id already produced
+/// by `derive` can cross an MCP/JSON boundary and come back byte-identical
+/// — `FromStr::from_str` never re-derives or validates that the bytes it
+/// parses name a real, previously-extracted symbol (the same way the raw
+/// 32 bytes themselves never carried that guarantee on their own; a
+/// `CodeGraph` lookup's own `NotFound` is still what rejects an id that
+/// doesn't name anything real). This does NOT reopen "never parsed from a
+/// string" as a construction-validity claim — it only adds a lossless
+/// encoding of bytes that already exist.
 ///
 /// Deterministic (not random, unlike `RepositoryId`/`SymbolLineageId`):
 /// re-extracting the same symbol at the same commit, at the same source
@@ -156,6 +165,83 @@ impl SymbolSnapshotId {
 
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Canonical text round-trip for [`SymbolSnapshotId`] (transport
+/// interoperability support, added for the B5.1/Task 22 MCP boundary —
+/// NOT a new subsystem, NOT a change to hashing, equality, ordering, or
+/// `derive`'s construction rule). The only purpose of this format is to
+/// let an id already produced by [`SymbolSnapshotId::derive`] cross a
+/// JSON/MCP wire boundary and come back unchanged; [`FromStr::from_str`]
+/// never validates that the bytes it parses name a real symbol — exactly
+/// as true of the original 32 raw bytes themselves, which never carried
+/// that guarantee either. This module's own earlier doc comment ("never
+/// constructible from a caller-supplied string") described the ABSENCE of
+/// any such round-trip, not a safety property parsing would violate: nothing
+/// about accepting opaque bytes back from a caller makes those bytes any
+/// more "real" than the caller already asserting a `SymbolSnapshotId` by
+/// forging 32 arbitrary bytes would have (which [`SymbolSnapshotId::derive`]
+/// being the only constructor already prevents in-process; this format
+/// doesn't change that — `get_code_context`/`get_entity`'s own `NotFound`
+/// branch is still what rejects an id that doesn't name a real snapshot in
+/// a given `CodeGraph`).
+impl std::fmt::Display for SymbolSnapshotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Exactly 64 hex characters (32 bytes), parsed case-insensitively —
+/// deliberately looser than [`crate::identity::CommitHash::parse`]'s
+/// refusal to accept uppercase, since that type's stricter rule exists to
+/// keep it byte-identical to real git output (which this type is not: it
+/// has no external authority to stay consistent with, only its own
+/// `Display`). [`SymbolSnapshotId`]'s `Display` always emits lowercase,
+/// so `FromStr::from_str(&id.to_string()) == Ok(id)` always holds; this is
+/// simply the more permissive parse direction accepting what a
+/// case-insensitive peer or copy-paste might send back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SymbolSnapshotIdParseError {
+    #[error("symbol snapshot id must not be empty")]
+    Empty,
+    #[error("symbol snapshot id must be exactly 64 hex characters, got {actual}")]
+    WrongLength { actual: usize },
+    #[error("symbol snapshot id must be hex, found {found:?}")]
+    NotHex { found: char },
+}
+
+impl std::str::FromStr for SymbolSnapshotId {
+    type Err = SymbolSnapshotIdParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw.is_empty() {
+            return Err(SymbolSnapshotIdParseError::Empty);
+        }
+        if raw.len() != 64 {
+            return Err(SymbolSnapshotIdParseError::WrongLength { actual: raw.len() });
+        }
+        let mut bytes = [0u8; 32];
+        let (pairs, _remainder) = raw.as_bytes().as_chunks::<2>();
+        for (i, pair) in pairs.iter().enumerate() {
+            let hi = hex_nibble(pair[0]).ok_or(SymbolSnapshotIdParseError::NotHex { found: pair[0] as char })?;
+            let lo = hex_nibble(pair[1]).ok_or(SymbolSnapshotIdParseError::NotHex { found: pair[1] as char })?;
+            bytes[i] = (hi << 4) | lo;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+/// `None` for any byte that isn't an ASCII hex digit, accepting either case.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -425,5 +511,96 @@ mod tests {
         let v1_style_digest = v1_style_hasher.finalize();
 
         assert_ne!(v2_id.as_bytes().as_slice(), v1_style_digest.as_slice(), "the v2 domain separator must change every derived id relative to the old v1 scheme");
+    }
+
+    // --- Display/FromStr: transport interoperability (Task 22 prerequisite) ---
+
+    #[test]
+    fn display_of_known_bytes_produces_expected_lowercase_hex() {
+        let file = test_file_identity();
+        let id = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        let expected: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(id.to_string(), expected);
+        assert_eq!(id.to_string().len(), 64);
+    }
+
+    #[test]
+    fn display_then_from_str_round_trips_exactly() {
+        let file = test_file_identity();
+        let id = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        let text = id.to_string();
+        let reparsed: SymbolSnapshotId = text.parse().unwrap();
+        assert_eq!(id, reparsed);
+    }
+
+    #[test]
+    fn from_str_accepts_uppercase_hex_but_display_still_emits_lowercase() {
+        let file = test_file_identity();
+        let id = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        let lowercase = id.to_string();
+        let uppercase = lowercase.to_uppercase();
+        assert_ne!(lowercase, uppercase, "the test's own input must actually exercise case-insensitivity");
+
+        let from_upper: SymbolSnapshotId = uppercase.parse().unwrap();
+        assert_eq!(from_upper, id);
+        assert_eq!(from_upper.to_string(), lowercase, "Display must always emit canonical lowercase, regardless of the case FromStr accepted");
+    }
+
+    #[test]
+    fn from_str_accepts_mixed_case_hex() {
+        let file = test_file_identity();
+        let id = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        let lowercase = id.to_string();
+        let mixed: String = lowercase.chars().enumerate().map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c }).collect();
+        let from_mixed: SymbolSnapshotId = mixed.parse().unwrap();
+        assert_eq!(from_mixed, id);
+    }
+
+    #[test]
+    fn from_str_rejects_empty_input() {
+        let result = "".parse::<SymbolSnapshotId>();
+        assert_eq!(result, Err(SymbolSnapshotIdParseError::Empty));
+    }
+
+    #[test]
+    fn from_str_rejects_wrong_length() {
+        assert_eq!("ab".parse::<SymbolSnapshotId>(), Err(SymbolSnapshotIdParseError::WrongLength { actual: 2 }));
+        assert_eq!("a".repeat(63).parse::<SymbolSnapshotId>(), Err(SymbolSnapshotIdParseError::WrongLength { actual: 63 }));
+        assert_eq!("a".repeat(65).parse::<SymbolSnapshotId>(), Err(SymbolSnapshotIdParseError::WrongLength { actual: 65 }));
+    }
+
+    #[test]
+    fn from_str_rejects_non_hex_characters() {
+        let not_hex = format!("{}g", "a".repeat(63));
+        assert_eq!(not_hex.len(), 64);
+        assert_eq!(not_hex.parse::<SymbolSnapshotId>(), Err(SymbolSnapshotIdParseError::NotHex { found: 'g' }));
+    }
+
+    #[test]
+    fn from_str_rejects_a_path_traversal_shaped_string_as_not_hex_or_wrong_length() {
+        for bad in ["../../etc/passwd", "/etc/passwd", "..", "."] {
+            assert!("".parse::<SymbolSnapshotId>().is_err());
+            assert!(bad.parse::<SymbolSnapshotId>().is_err(), "input {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn from_str_never_panics_on_arbitrary_short_or_malformed_input() {
+        for input in ["", " ", "\n", "zz", "00", &"0".repeat(64), &"f".repeat(64)] {
+            let _ = input.parse::<SymbolSnapshotId>();
+        }
+    }
+
+    #[test]
+    fn existing_derive_hashing_and_equality_semantics_are_unchanged_by_the_new_display_impl() {
+        // Canary: adding Display/FromStr must not have touched derive's
+        // construction rule, equality, or hashing -- re-pins the same
+        // property identical_inputs_produce_identical_ids already covers,
+        // from this new test's own vantage point.
+        let file = test_file_identity();
+        let a = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        let b = SymbolSnapshotId::derive(&file, SymbolKind::Function, "foo::bar", "fn bar()", 0, 10);
+        assert_eq!(a, b);
+        assert_eq!(a.to_string(), b.to_string());
     }
 }

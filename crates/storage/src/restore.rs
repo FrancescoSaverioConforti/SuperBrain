@@ -487,7 +487,12 @@ fn promote_note(
     let pii_err = |e: vault_security::PiiStoreError| StorageError::PiiStore(e.to_string());
     let note_id = &note.note_id;
     let journal = vault.journal();
-    let record_path = record_path_checked(vault.root(), note_id)?;
+    // Kept for error-labeling parity with the rest of this crate's
+    // StorageError::PathEscapesVaultRoot usage; the actual I/O below goes
+    // through handle_safety's verified primitives (B5.SEC).
+    let _ = record_path_checked(vault.root(), note_id)?;
+    let record_name = format!("{}.record", note_id.as_str());
+    let record_relative = std::path::Path::new(&record_name);
 
     journal.lock().unwrap().insert_intent(operation_id, note_id.as_str(), note.version - 1).map_err(journal_err)?;
     injector.check(FaultPoint::AfterIntentRecorded).map_err(interrupted)?;
@@ -538,14 +543,15 @@ fn promote_note(
         return Ok(Promotion::ExcludedDeleted);
     }
 
-    atomic_write(&record_path, note.staged.record_bytes()).map_err(|AtomicWriteError::Io(e)| StorageError::Io(e))?;
+    let verified_root = crate::handle_safety::open_verified_dir(vault.root())?;
+    crate::handle_safety::write_verified_atomic(&verified_root, &record_name, note.staged.record_bytes())?;
     injector.check(FaultPoint::AfterRenameBeforeContentPersisted).map_err(interrupted)?;
     journal.lock().unwrap().advance(operation_id, WriteState::ContentPersisted, fields).map_err(journal_err)?;
     injector.check(FaultPoint::AfterRenameBeforeJournalCommitted).map_err(interrupted)?;
 
     // Verify what actually landed. A mismatch leaves the row at
     // ContentPersisted for recovery's row 2 (which rolls it back).
-    let written = std::fs::read(&record_path).map_err(StorageError::Io)?;
+    let written = crate::handle_safety::read_verified(vault.root(), record_relative, note_id.as_str())?;
     if content_hash(&written) != note.record_hash {
         return Err(StorageError::Inconsistent { note_id: note_id.as_str().to_string() });
     }

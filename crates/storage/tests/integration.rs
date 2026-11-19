@@ -134,17 +134,118 @@ relations:
     )
 }
 
+/// Extracts `(name, body)` for every top-level `pub fn` in `source`, where
+/// `body` is the function's full source text from its signature's opening
+/// `{` through its matching closing `}` (brace-depth tracked textually,
+/// ignoring string/char literals and comments is unnecessary here: this
+/// crate's own source has no brace inside a string/comment that would
+/// mislead the count in a function signature-adjacent region, and a false
+/// match would only make this guard MORE strict, never silently permissive).
+/// Only functions whose `pub fn` line is at column 0 (module-level, not
+/// nested inside an `impl` or another function) are returned, matching
+/// exactly what the original line-based grep in this test already scoped
+/// to ("top-level public function in propose.rs").
+fn public_function_bodies(source: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel_pos) = source[search_from..].find("\npub fn ") {
+        let sig_start = search_from + rel_pos + 1; // skip the leading '\n'
+        let name_start = sig_start + "pub fn ".len();
+        let name_end = source[name_start..]
+            .find(|c: char| c == '(' || c == '<' || c.is_whitespace())
+            .map(|i| name_start + i)
+            .unwrap_or(source.len());
+        let name = source[name_start..name_end].to_string();
+
+        let Some(brace_offset) = source[sig_start..].find('{') else {
+            search_from = name_end;
+            continue;
+        };
+        let body_start = sig_start + brace_offset;
+        let mut depth = 0usize;
+        let mut body_end = body_start;
+        for (i, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        results.push((name, source[body_start..body_end].to_string()));
+        search_from = body_end.max(name_end);
+    }
+    results
+}
+
+/// Names of the raw write primitives A1 says must never be reachable from
+/// outside this crate: `Vault::write_record_unchecked` (and its two sibling
+/// entry points, `_with_pii_store`/`_with_injector`, which all funnel into
+/// the same `write_record_impl`), `Vault::write_sensitive_record_unchecked`
+/// (the Sensitive-note write path), and `atomic::atomic_write` (the
+/// lowest-level primitive both of those eventually reach through
+/// `handle_safety::write_verified_atomic`). A call to any of these,
+/// textually present in a public function's own body, is exactly the
+/// bypass A1 forbids.
+const RAW_WRITE_PRIMITIVE_CALLS: &[&str] = &[
+    "write_record_unchecked(",
+    "write_record_unchecked_with_pii_store(",
+    "write_record_unchecked_with_injector(",
+    "write_sensitive_record_unchecked(",
+    "atomic_write(",
+    "write_verified_atomic(",
+];
+
+/// The complete, explicitly reviewed set of public write-shaped functions
+/// `propose.rs` may expose, and why each is safe: every one of them is a
+/// typed, resource-confined facade that reaches persistence ONLY by calling
+/// `propose_and_commit` itself (never a raw primitive directly), so A1's
+/// real invariant — `propose_and_commit` is the sole public function whose
+/// body can reach a raw write primitive — still holds for all of them.
+/// Adding a new entry here is a conscious, reviewed decision, not something
+/// that can happen silently: a `pub fn` in `propose.rs` not named here fails
+/// `storage_exposes_exactly_one_raw_write_authority` outright.
+///
+/// - `propose_and_commit`: THE raw write authority itself.
+/// - `update_note_body` (B5 Task 14 prerequisite): reads the current note,
+///   replaces only its body, re-renders its frontmatter canonically via
+///   `domain::render_frontmatter`, and calls `propose_and_commit` with the
+///   composed `note_text` — never touches a raw primitive itself.
+/// - `add_relation` (same prerequisite): identical shape, appends to one
+///   `Relations` field instead of replacing the body.
+const ALLOWED_PUBLIC_WRITE_FNS_IN_PROPOSE: &[&str] = &["propose_and_commit", "update_note_body", "add_relation"];
+
 #[test]
-fn storage_exposes_exactly_one_public_write_function() {
-    // The "no bypass" guarantee for A1 is: both raw write primitives —
-    // Vault::write_record_unchecked and atomic::atomic_write — are pub(crate),
-    // unreachable from outside this crate, neither is re-exported from lib.rs,
-    // and propose_and_commit is the only public function whose body can reach
-    // them. The compiler-level proof is the set of compile_fail doctests in
-    // lib.rs; this textual test is a belt-and-braces regression guard over the
-    // same shape, so a future change adding a second public write path (in any
-    // of vault.rs, propose.rs, atomic.rs, or lib.rs's re-exports) fails here
-    // and forces a conscious review, rather than landing silently.
+fn storage_exposes_exactly_one_raw_write_authority() {
+    // A1's real guarantee is narrower than "propose.rs has exactly one pub
+    // fn": it is that `propose_and_commit` is the only public function
+    // whose OWN body can reach a raw write primitive
+    // (`Vault::write_record_unchecked`/`write_sensitive_record_unchecked`/
+    // `atomic::atomic_write`, all `pub(crate)`, unreachable from outside
+    // this crate and never re-exported from lib.rs). A typed, resource-
+    // confined facade that itself calls ONLY `propose_and_commit` (never a
+    // raw primitive) does not weaken this guarantee — it is write authority
+    // delegated through the one real gate, not a second gate. This test
+    // enforces that shape precisely: every public function in propose.rs
+    // must be in the explicit, reviewed `ALLOWED_PUBLIC_WRITE_FNS_IN_PROPOSE`
+    // allowlist, and every one of them EXCEPT `propose_and_commit` itself
+    // must call `propose_and_commit(` somewhere in its own body and must
+    // NOT call any raw write primitive directly. `propose_and_commit`
+    // itself is exempted from the "must call propose_and_commit" half (it
+    // cannot call itself) but is the only function allowed to reach a raw
+    // primitive directly, which the loop below's `is_the_raw_authority`
+    // branch asserts by requiring IT (and no one else) to actually do so.
+    //
+    // The compiler-level proof this textual test backs up is still the set
+    // of compile_fail doctests in lib.rs; this is the belt-and-braces
+    // regression guard over the same shape, extended to admit explicitly
+    // reviewed facades above the one real gate instead of forbidding any
+    // second public function outright.
     let lib_source = include_str!("../src/lib.rs");
     let atomic_source = include_str!("../src/atomic.rs");
     let vault_source = include_str!("../src/vault.rs");
@@ -157,6 +258,7 @@ fn storage_exposes_exactly_one_public_write_function() {
             l.contains("atomic")
                 || l.contains("AtomicWriteError")
                 || l.contains("write_record_unchecked")
+                || l.contains("write_sensitive_record_unchecked")
         })
         .collect();
     assert!(
@@ -184,16 +286,43 @@ fn storage_exposes_exactly_one_public_write_function() {
         pub_write_fns_in_vault.is_empty(),
         "vault.rs must expose no public write function, found: {pub_write_fns_in_vault:?}"
     );
-    let pub_write_fns_in_propose: Vec<&str> = propose_source
-        .lines()
-        .filter(|l| l.trim_start().starts_with("pub fn"))
-        .collect();
-    assert_eq!(
-        pub_write_fns_in_propose.len(),
-        1,
-        "propose.rs must expose exactly one public function, found: {pub_write_fns_in_propose:?}"
-    );
-    assert!(pub_write_fns_in_propose[0].contains("propose_and_commit"));
+
+    for (name, body) in public_function_bodies(propose_source) {
+        assert!(
+            ALLOWED_PUBLIC_WRITE_FNS_IN_PROPOSE.contains(&name.as_str()),
+            "propose.rs exposes an unreviewed public function `{name}` -- add it to \
+             ALLOWED_PUBLIC_WRITE_FNS_IN_PROPOSE only after confirming it reaches \
+             persistence exclusively through propose_and_commit, never a raw write \
+             primitive directly"
+        );
+
+        let is_the_raw_authority = name == "propose_and_commit";
+        let calls_propose_and_commit = body.contains("propose_and_commit(");
+        let raw_calls_in_body: Vec<&str> =
+            RAW_WRITE_PRIMITIVE_CALLS.iter().copied().filter(|p| body.contains(p)).collect();
+
+        if is_the_raw_authority {
+            assert!(
+                !raw_calls_in_body.is_empty(),
+                "propose_and_commit itself must be the function that reaches a raw write \
+                 primitive -- found none in its body, which would mean NO function in \
+                 propose.rs reaches real persistence at all"
+            );
+        } else {
+            assert!(
+                calls_propose_and_commit,
+                "`{name}` is an allowed public facade but does not call propose_and_commit( \
+                 in its own body -- every facade must delegate to the one real write \
+                 authority, never reach persistence by its own separate path"
+            );
+            assert!(
+                raw_calls_in_body.is_empty(),
+                "`{name}` calls a raw write primitive directly ({raw_calls_in_body:?}) -- \
+                 this is exactly the second write path A1 forbids; a facade must reach \
+                 persistence ONLY by calling propose_and_commit, never a raw primitive"
+            );
+        }
+    }
 
     // A3 final review, I1: restore.rs's one public function bootstraps a
     // BRAND-NEW vault from an authenticated backup (it refuses an existing

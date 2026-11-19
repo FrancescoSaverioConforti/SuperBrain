@@ -1,0 +1,36 @@
+[package]
+name = "brain-api"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain Brain API orchestration layer: read delegation, write-proposal lifecycle, approval-gated execution."
+
+[features]
+# Forwards api's own dense-retrieval feature (B4.1) unchanged -- brain-api
+# itself has no dense-retrieval-specific code of its own (its read.rs
+# delegates to api::search unmodified); this entry exists purely so a
+# caller building brain-api with the feature enabled gets the real
+# ONNX/embedding dependencies linked through the same chain api itself
+# already defines, without brain-api inventing a second meaning for the
+# name.
+dense-retrieval = ["api/dense-retrieval"]
+
+[dependencies]
+api = { path = "../api" }
+storage = { path = "../storage" }
+policy = { path = "../policy" }
+domain = { path = "../domain" }
+index = { path = "../index" }
+codegraph-index = { path = "../codegraph-index" }
+codegraph-domain = { path = "../codegraph-domain" }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+git2 = "0.21"
+serde_json = "1"

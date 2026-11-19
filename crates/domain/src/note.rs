@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::schema::{Classification, NoteStatus, NoteType, TrustLevel, ValidationError};
@@ -8,7 +8,13 @@ use crate::schema::{Classification, NoteStatus, NoteType, TrustLevel, Validation
 /// link validation (A1 final review, Finding I1). `parse_frontmatter` also
 /// checks the keys itself first, against [`RELATION_FIELDS`], so it can
 /// report the exact offending key as `ValidationError::UnknownField`.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `Serialize` is derived purely symmetrically to the existing `Deserialize`
+/// (same 5 fields, same names, no `deny_unknown_fields`-equivalent concern
+/// on the output side) — added for [`render_frontmatter`]'s canonical
+/// re-serialization (B5 Task 14 prerequisite), not a format change: nothing
+/// about what `parse_frontmatter` accepts as input changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relations {
     #[serde(default)]
@@ -23,7 +29,7 @@ pub struct Relations {
     pub applies_to: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteMetadata {
     pub id: String,
     pub schema_version: u32,
@@ -150,6 +156,87 @@ pub fn parse_frontmatter(yaml: &str) -> Result<NoteMetadata, ValidationError> {
         event_period,
         relations,
     })
+}
+
+/// Renders `metadata` back to YAML frontmatter text, in the same field
+/// order `FIELD_ORDER` validates on the way in (`id`, `schema_version`,
+/// `type`, `status`, `trust`, `classification`, `project`, `source`,
+/// `created`, `updated`, `event_period`, `relations`).
+///
+/// This is a CANONICAL re-serialization, not a byte-for-byte preservation
+/// of whatever text `metadata` was originally parsed from: `parse_frontmatter`
+/// does not retain comments, original key order (beyond what it already
+/// requires), or whitespace, so there is nothing for this function to
+/// preserve beyond the semantic field values it was given. The guaranteed
+/// property is `parse_frontmatter(&render_frontmatter(&m)) == Ok(m)` for
+/// every `m` `parse_frontmatter` can itself produce — never
+/// `render_frontmatter(&parse_frontmatter(original_text)?) == original_text`.
+///
+/// Every enum field (`type`/`status`/`trust`/`classification`) renders via
+/// its own `Serialize` impl (`#[serde(rename_all = "kebab-case")]` in
+/// `schema.rs`) — this function never hand-writes an enum's string
+/// spelling, so the two directions cannot drift apart from each other.
+pub fn render_frontmatter(metadata: &NoteMetadata) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "id: {}", yaml_scalar(&metadata.id));
+    let _ = writeln!(out, "schema_version: {}", metadata.schema_version);
+    let _ = writeln!(out, "type: {}", enum_scalar(&metadata.r#type));
+    let _ = writeln!(out, "status: {}", enum_scalar(&metadata.status));
+    let _ = writeln!(out, "trust: {}", enum_scalar(&metadata.trust));
+    let _ = writeln!(out, "classification: {}", enum_scalar(&metadata.classification));
+    let _ = writeln!(out, "project: {}", yaml_scalar(&metadata.project));
+    let _ = writeln!(out, "source: {}", yaml_scalar(&metadata.source));
+    let _ = writeln!(out, "created: {}", yaml_scalar(&metadata.created));
+    let _ = writeln!(out, "updated: {}", yaml_scalar(&metadata.updated));
+    let _ = writeln!(out, "event_period: {}", yaml_scalar(&metadata.event_period));
+    out.push_str("relations:\n");
+    let _ = writeln!(out, "  supports: {}", yaml_scalar_list(&metadata.relations.supports));
+    let _ = writeln!(out, "  contradicts: {}", yaml_scalar_list(&metadata.relations.contradicts));
+    let _ = writeln!(out, "  derived_from: {}", yaml_scalar_list(&metadata.relations.derived_from));
+    let _ = writeln!(out, "  supersedes: {}", yaml_scalar_list(&metadata.relations.supersedes));
+    let _ = writeln!(out, "  applies_to: {}", yaml_scalar_list(&metadata.relations.applies_to));
+    out
+}
+
+/// Renders one enum field via its own `Serialize` impl (through
+/// `serde_yaml::to_value`, never a hand-written match on variant names),
+/// then unwraps it as the plain scalar string `parse_frontmatter`'s
+/// `require_string`/`parse_enum` path expects. Every domain enum this
+/// function is called with (`NoteType`/`NoteStatus`/`TrustLevel`/
+/// `Classification`) serializes to a YAML string scalar by construction
+/// (`#[serde(rename_all = "kebab-case")]`, no variant carries data), so the
+/// `as_str` always succeeds; this is pinned by `render_round_trips_every_field`
+/// below rather than asserted here, to keep this helper infallible.
+fn enum_scalar<T: Serialize>(value: &T) -> String {
+    serde_yaml::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Renders a plain string field as a YAML scalar via `serde_yaml` itself
+/// (never hand-written quoting), so a value containing YAML-significant
+/// characters (`:`, `#`, leading/trailing whitespace, etc.) is quoted
+/// exactly as `serde_yaml` would quote it, and the two directions cannot
+/// drift apart on escaping rules either.
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+/// Renders a `Vec<String>` relation-target list as a YAML flow sequence
+/// (`[a, b]` / `[]`), via `serde_yaml::to_value` + its own `Display`-like
+/// rendering through `serde_yaml::to_string`, so individual target strings
+/// are quoted exactly as `serde_yaml` would quote them.
+fn yaml_scalar_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered: Vec<String> = values.iter().map(|v| yaml_scalar(v)).collect();
+    format!("[{}]", rendered.join(", "))
 }
 
 fn require_string(value: &Value, field: &str) -> Result<String, ValidationError> {
@@ -285,6 +372,83 @@ relations:
             ValidationError::UnknownField(f) => assert_eq!(f, "totally_unknown"),
             other => panic!("expected UnknownField(totally_unknown), got {other:?}"),
         }
+    }
+
+    // --- render_frontmatter: canonical re-serialization (B5 Task 14 prereq) ---
+
+    fn sample_metadata() -> NoteMetadata {
+        parse_frontmatter(&base_yaml_with_classification("internal")).unwrap()
+    }
+
+    #[test]
+    fn render_then_parse_round_trips_to_an_equal_metadata() {
+        let original = sample_metadata();
+        let rendered = render_frontmatter(&original);
+        let reparsed = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn render_then_parse_round_trips_with_non_empty_relations() {
+        let mut original = sample_metadata();
+        original.relations.supports.push("note-a".to_string());
+        original.relations.contradicts.push("note-b".to_string());
+        let rendered = render_frontmatter(&original);
+        let reparsed = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn render_is_deterministic() {
+        let metadata = sample_metadata();
+        assert_eq!(render_frontmatter(&metadata), render_frontmatter(&metadata));
+    }
+
+    #[test]
+    fn render_output_is_always_re_accepted_by_parse_frontmatter() {
+        let metadata = sample_metadata();
+        let rendered = render_frontmatter(&metadata);
+        assert!(parse_frontmatter(&rendered).is_ok(), "rendered frontmatter must always be re-parseable, got:\n{rendered}");
+    }
+
+    #[test]
+    fn render_preserves_every_enum_field_exactly() {
+        // Pin that each enum field renders through its own Serialize impl
+        // correctly for every real variant, not just the "internal"/"bug"/
+        // "draft" happy-path sample used elsewhere in this module.
+        let yaml = r#"
+id: decision-2026-10-23-use-fastapi
+schema_version: 1
+type: decision
+status: reviewed
+trust: official
+classification: public
+project: project-x
+source: agent:coder@prompt-v3
+created: 2026-10-23
+updated: 2026-10-23
+event_period: 2026-10-23
+relations:
+  supports: []
+  contradicts: []
+  derived_from: []
+  supersedes: []
+  applies_to: []
+"#;
+        let original = parse_frontmatter(yaml).unwrap();
+        let rendered = render_frontmatter(&original);
+        let reparsed = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn render_quotes_relation_targets_and_string_fields_containing_special_characters() {
+        let mut original = sample_metadata();
+        original.relations.supports.push("note: with a colon".to_string());
+        original.source = "agent:coder@prompt-v3".to_string(); // already contains ':', exercised again for emphasis
+        let rendered = render_frontmatter(&original);
+        let reparsed = parse_frontmatter(&rendered).unwrap();
+        assert_eq!(reparsed, original);
     }
 
     #[test]

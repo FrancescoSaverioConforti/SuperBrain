@@ -15,5 +15,5 @@ pub use identity::{
 };
 pub use kind::{EdgeKind, SymbolKind, UnrecognizedEdgeKind, UnrecognizedSymbolKind};
 pub use lineage::{LineageStatus, LineageStatusError, SymbolLineageId};
-pub use snapshot_id::SymbolSnapshotId;
+pub use snapshot_id::{SymbolSnapshotId, SymbolSnapshotIdParseError};
 pub use source::{RepositorySource, SourceError};
