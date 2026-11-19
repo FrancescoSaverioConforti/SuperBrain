@@ -101,6 +101,25 @@ pub(crate) fn open_verified(
     }
 }
 
+// B5.17 Task 36 mutation-testing note: `cargo mutants`, run on a Windows
+// host, reports every mutant inside this `#[cfg(unix)]` function (the
+// `Ok(Default::default())` return-value mutant, and the `!`-deletion/
+// `!=`→`==` mutants in its body) as MISSED. This is a tooling-platform
+// artifact, not a real test-coverage gap: on a Windows build this
+// function is excluded from compilation entirely by `#[cfg(unix)]`, so
+// `cargo mutants`' own mutated-source-text diff still compiles cleanly
+// (the mutation never changes anything a Windows build actually links
+// in) and the full test suite trivially "passes" against it, since no
+// code path on this platform ever executes the mutated body. The
+// equivalent-mutant argument here is structural (the project's own
+// `MUTATION_TESTING_POLICY.md` requirement): a `#[cfg(unix)]` function
+// is provably unreachable on a `#[cfg(windows)]` build, by Rust's own
+// conditional-compilation semantics, not by any claim about this
+// function's logic being hard to exercise. A genuine mutation pass
+// against this function's own logic requires running `cargo mutants`
+// on a Unix host — not done as part of this Windows-hosted B5 session;
+// documented here as a residual verification gap, not swept under
+// "equivalent."
 #[cfg(unix)]
 fn open_verified_unix(
     canonical_root: &Path,
@@ -292,6 +311,13 @@ pub(crate) fn open_verified_dir(root: &Path) -> Result<VerifiedDirHandle, Storag
     // `canonical_root` (computed via `std::fs::canonicalize`, itself
     // symlink-resolving) — any divergence means the two resolutions
     // disagree, which is the actual anomaly worth rejecting.
+    //
+    // B5.17 Task 36 mutation-testing note: same tooling-platform artifact
+    // as `open_verified_unix`'s own note above — on a Windows host,
+    // `cargo mutants` reports the mutants inside this `#[cfg(unix)]`
+    // block as MISSED because the block never compiles into a Windows
+    // build at all, not because of a real test gap. A genuine mutation
+    // pass against this block requires a Unix host.
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};

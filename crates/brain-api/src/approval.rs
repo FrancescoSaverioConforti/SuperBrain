@@ -492,6 +492,158 @@ mod tests {
         assert_eq!(metadata.relations.supports, vec!["note-f".to_string()]);
     }
 
+    // --- B5.17 Task 36 mutation-testing gaps: map_storage_error_for_write/
+    //     map_storage_error_for_read's named StorageError arms, proven
+    //     distinguishable from the `_ => CorruptData` catch-all through
+    //     the real public approve_proposal surface, not a direct unit
+    //     test of the private mapping function itself. A proposal's
+    //     target note id is never validated at proposal-creation time
+    //     (update_memory/link_entities's own doc comments: existence is
+    //     checked only at approval time) -- proposing against a note id
+    //     that was never actually created is a real, reachable path to
+    //     StorageError::NotFound surfacing through execute()'s
+    //     update_note_body/add_relation/vault.read_note calls.
+
+    #[test]
+    fn approve_proposal_on_update_memory_targeting_a_never_created_note_is_not_found_not_corrupt_data() {
+        let vault = test_vault();
+        let update_id =
+            crate::update_memory(&mcp_ctx(), &vault, storage::NoteId::parse("note-never-created").unwrap(), "body".to_string(), storage::Version(0), NOW)
+                .unwrap();
+
+        let result = approve_proposal(&trusted_ctx(), &vault, &update_id, LATER);
+
+        assert_eq!(result, Err(BrainApiError::NotFound), "update_note_body's real StorageError::NotFound must map to BrainApiError::NotFound, never fall through to the CorruptData catch-all");
+    }
+
+    #[test]
+    fn approve_proposal_on_link_entities_whose_from_note_was_never_created_is_not_found_not_corrupt_data() {
+        let vault = test_vault();
+        let to = save_memory_proposal(&vault, "note-g", "b");
+        approve_proposal(&trusted_ctx(), &vault, &to, NOW).unwrap();
+
+        let link_id = crate::link_entities(
+            &mcp_ctx(),
+            &vault,
+            storage::NoteId::parse("note-from-never-created").unwrap(),
+            storage::NoteId::parse("note-g").unwrap(),
+            crate::RelationKind::Supports,
+            NOW,
+        )
+        .unwrap();
+
+        let result = approve_proposal(&trusted_ctx(), &vault, &link_id, LATER);
+
+        // link_entities's own execute() path calls vault.read_note on
+        // `from` BEFORE add_relation -- this exercises
+        // map_storage_error_for_read's NotFound arm specifically, not
+        // map_storage_error_for_write's.
+        assert_eq!(result, Err(BrainApiError::NotFound), "vault.read_note's real StorageError::NotFound must map to BrainApiError::NotFound through map_storage_error_for_read, never fall through to the CorruptData catch-all");
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+    #[cfg(unix)]
+    fn try_symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    /// Same real attack `storage::vault`'s own
+    /// `record_symlink_resolving_inside_the_vault_root_is_rejected_as_an_alias_not_followed`
+    /// (SEC-002 closure) exercises directly against `Vault::read_note` --
+    /// replayed here through `brain-api`'s own public `approve_proposal`
+    /// surface, since `map_storage_error_for_write`'s `PathEscapesVaultRoot`
+    /// arm is reachable through exactly this path (`update_memory`'s
+    /// `execute()` calls `storage::update_note_body`, whose first step is
+    /// `vault.read_note`) and is a real, not equivalent, mutant: deleting
+    /// this arm would fall the outcome through to `CorruptData`, a
+    /// materially different, less specific error for a caller to act on.
+    #[test]
+    fn approve_proposal_on_update_memory_whose_target_record_was_swapped_for_a_symlink_is_invalid_input_not_corrupt_data() {
+        let dir = unique_test_dir();
+        let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+        let create_id = save_memory_proposal(&vault, "note-h", "original");
+        approve_proposal(&trusted_ctx(), &vault, &create_id, NOW).unwrap();
+
+        let update_id =
+            crate::update_memory(&mcp_ctx(), &vault, storage::NoteId::parse("note-h").unwrap(), "updated".to_string(), storage::Version(1), NOW).unwrap();
+
+        // Swap the committed record file for a symlink pointing at an
+        // equally well-formed record elsewhere -- the aliasing attack
+        // this function's own on-disk identity check must reject, never
+        // silently follow.
+        std::fs::create_dir(dir.join("store")).unwrap();
+        let outside_target = dir.join("store").join("real.record");
+        std::fs::rename(dir.join("note-h.record"), &outside_target).unwrap();
+        if try_symlink_file(&outside_target, &dir.join("note-h.record")).is_err() {
+            eprintln!("skipping: could not create a symlink in this environment");
+            return;
+        }
+
+        let result = approve_proposal(&trusted_ctx(), &vault, &update_id, LATER);
+
+        assert!(matches!(result, Err(BrainApiError::InvalidInput(_))), "a real StorageError::PathEscapesVaultRoot must map to BrainApiError::InvalidInput, never fall through to the CorruptData catch-all, got {result:?}");
+    }
+
+    /// A directory sitting where a note's `.record` file is expected is
+    /// data corruption, not an aliasing attack (`handle_safety.rs::
+    /// open_verified`'s own documented distinction) — it surfaces as a
+    /// real `StorageError::Io`, genuinely constructible with no special
+    /// privilege (unlike the symlink case above, which some CI
+    /// environments cannot create). Exercises `map_storage_error_for_write`'s
+    /// `Io(_) | Journal(_)` arm through `update_memory`'s real
+    /// `approve_proposal` path.
+    #[test]
+    fn approve_proposal_on_update_memory_whose_target_record_path_is_a_directory_is_runtime_unavailable_not_corrupt_data() {
+        let dir = unique_test_dir();
+        let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+        let create_id = save_memory_proposal(&vault, "note-i", "original");
+        approve_proposal(&trusted_ctx(), &vault, &create_id, NOW).unwrap();
+
+        let update_id =
+            crate::update_memory(&mcp_ctx(), &vault, storage::NoteId::parse("note-i").unwrap(), "updated".to_string(), storage::Version(1), NOW).unwrap();
+
+        std::fs::remove_file(dir.join("note-i.record")).unwrap();
+        std::fs::create_dir(dir.join("note-i.record")).unwrap();
+
+        let result = approve_proposal(&trusted_ctx(), &vault, &update_id, LATER);
+
+        assert_eq!(result, Err(BrainApiError::RuntimeUnavailable), "a real StorageError::Io must map to BrainApiError::RuntimeUnavailable through map_storage_error_for_write, never fall through to the CorruptData catch-all, got {result:?}");
+    }
+
+    /// Same real `StorageError::Io` cause as the test above, reached
+    /// through `link_entities`'s `vault.read_note(&from_id)` call instead
+    /// -- exercises `map_storage_error_for_read`'s `Io(_) | Journal(_)`
+    /// arm specifically.
+    #[test]
+    fn approve_proposal_on_link_entities_whose_from_record_path_is_a_directory_is_runtime_unavailable_not_corrupt_data() {
+        let dir = unique_test_dir();
+        let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+        let from_id = save_memory_proposal(&vault, "note-j", "a");
+        let to_id = save_memory_proposal(&vault, "note-k", "b");
+        approve_proposal(&trusted_ctx(), &vault, &from_id, NOW).unwrap();
+        approve_proposal(&trusted_ctx(), &vault, &to_id, NOW).unwrap();
+
+        let link_id = crate::link_entities(
+            &mcp_ctx(),
+            &vault,
+            storage::NoteId::parse("note-j").unwrap(),
+            storage::NoteId::parse("note-k").unwrap(),
+            crate::RelationKind::Supports,
+            NOW,
+        )
+        .unwrap();
+
+        std::fs::remove_file(dir.join("note-j.record")).unwrap();
+        std::fs::create_dir(dir.join("note-j.record")).unwrap();
+
+        let result = approve_proposal(&trusted_ctx(), &vault, &link_id, LATER);
+
+        assert_eq!(result, Err(BrainApiError::RuntimeUnavailable), "a real StorageError::Io must map to BrainApiError::RuntimeUnavailable through map_storage_error_for_read, never fall through to the CorruptData catch-all, got {result:?}");
+    }
+
     // --- expiry: defense in depth ---
 
     #[test]

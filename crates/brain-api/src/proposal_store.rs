@@ -333,6 +333,31 @@ pub(crate) fn list_proposals(vault: &storage::Vault) -> Result<Vec<PendingWriteP
 /// for this module's two call sites. Explicit per-variant mapping — no
 /// blanket `From` impl, so a future `StorageError` variant added upstream
 /// fails to compile here rather than silently collapsing into a default.
+/// B5.17 Task 36 mutation-testing notes on this match's two structurally
+/// unreachable arms (mutation-testing-verified equivalent mutants, not
+/// assumed):
+/// - `PathEscapesVaultRoot`: only ever raised by `storage::Vault`'s own
+///   `validate_proposal_id_str` (empty, >64 bytes, or a non-
+///   `[A-Za-z0-9-]` character). Every string this module ever passes to
+///   `save_proposal`/`load_proposal`/`list_proposal_ids` is a
+///   `ProposalId::to_string()` — and `ProposalId` is always backed by a
+///   real `uuid::Uuid` (`ProposalId::generate`/`parse`, this crate's only
+///   two constructors), whose canonical string form is always exactly 36
+///   bytes of hex digits and hyphens. That grammar is a strict subset of
+///   `validate_proposal_id_str`'s accepted charset and length bound, so
+///   this check can never fail for any value this module could ever
+///   construct -- a grammar-level impossibility, the same argument shape
+///   `MUTATION_TESTING_POLICY.md` already accepts (B2-ID-010 precedent).
+/// - `Conflict`: only ever raised by `storage::Vault`'s own
+///   optimistic-concurrency version check inside `write_record_impl` (the
+///   Note-record write path) -- never inside `write_relative_verified_atomic`/
+///   `read_relative_verified`/`list_relative_dir_entries`, the only three
+///   `storage::Vault` methods this module's `save_proposal`/
+///   `load_proposal`/`list_proposal_ids` ever call. `.proposals/` entries
+///   carry no version field and are overwritten unconditionally
+///   (`handle_safety::write_verified_atomic`'s own documented semantics);
+///   the version-check code path that could ever construct a `Conflict`
+///   is simply never reached by any call this module makes.
 fn map_storage_error(err: storage::StorageError) -> BrainApiError {
     match err {
         storage::StorageError::NotFound { .. } => BrainApiError::NotFound,
@@ -362,6 +387,12 @@ mod tests {
     fn test_vault() -> storage::Vault {
         let dir = unique_test_dir();
         storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap()
+    }
+
+    fn test_vault_with_root() -> (storage::Vault, std::path::PathBuf) {
+        let dir = unique_test_dir();
+        let vault = storage::Vault::open_with_default_indexer(dir.clone(), &dir.join("journal.sqlite")).unwrap();
+        (vault, dir)
     }
 
     fn sample_save_memory_operation(body: &str) -> ProposedOperation {
@@ -430,6 +461,26 @@ mod tests {
         vault.save_proposal(&id.to_string(), b"not: valid: yaml: at: all: [").unwrap();
         let result = load_proposal(&vault, &id);
         assert_eq!(result, Err(BrainApiError::CorruptData));
+    }
+
+    /// B5.17 Task 36 mutation-testing gap: `map_storage_error`'s
+    /// `Io(_) | Journal(_)` arm, proven distinguishable from the
+    /// `_ => CorruptData` catch-all through a real, genuinely
+    /// constructible I/O failure -- a directory sitting where the
+    /// proposal's `.proposal` file is expected (same real precondition
+    /// `handle_safety::open_verified` itself documents and surfaces as
+    /// `StorageError::Io` for the analogous note-record case), not a
+    /// synthetic/unreachable scenario.
+    #[test]
+    fn load_proposal_whose_file_path_is_a_directory_returns_runtime_unavailable_not_corrupt_data() {
+        let (vault, root) = test_vault_with_root();
+        let id = ProposalId::generate();
+        let proposals_dir = root.join(".proposals");
+        std::fs::create_dir_all(proposals_dir.join(format!("{id}.proposal"))).unwrap();
+
+        let result = load_proposal(&vault, &id);
+
+        assert_eq!(result, Err(BrainApiError::RuntimeUnavailable), "a real StorageError::Io must map to BrainApiError::RuntimeUnavailable, never fall through to the CorruptData catch-all, got {result:?}");
     }
 
     #[test]
