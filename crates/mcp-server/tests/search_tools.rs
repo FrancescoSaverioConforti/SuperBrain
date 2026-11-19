@@ -148,7 +148,7 @@ async fn mcp_search_delegates_to_brain_api_and_returns_real_results() {
     let server = fixture.server();
 
     let input = mcp_server::SearchInput { query: "unique mcp fixture phrase".to_string(), k: 10, type_filter: None, status_filter: None };
-    let output = server.search(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.search(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.results.len(), 1, "expected exactly one real result, got {:?}", output.0.results);
     assert_eq!(output.0.results[0].note_id, "note-fixture-a");
@@ -160,7 +160,7 @@ async fn mcp_search_with_zero_k_is_a_typed_invalid_params_error_not_an_empty_suc
     let server = fixture.server();
 
     let input = mcp_server::SearchInput { query: "anything".to_string(), k: 0, type_filter: None, status_filter: None };
-    let result = server.search(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.search(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "k=0 must be a typed error, not a silent empty success");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -177,7 +177,7 @@ async fn mcp_search_with_no_matches_returns_an_empty_result_list_not_an_error() 
     // scoring can still rank as a match, which is correct engine
     // behavior, not something this test should fight).
     let input = mcp_server::SearchInput { query: "zzyzx qqrrss nonoverlap".to_string(), k: 10, type_filter: None, status_filter: None };
-    let output = server.search(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.search(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(output.0.results.is_empty());
 }
@@ -193,7 +193,7 @@ async fn mcp_search_with_a_type_filter_excluding_the_only_note_returns_empty() {
         type_filter: Some(mcp_server::McpNoteType::Decision), // the fixture note is type bug
         status_filter: None,
     };
-    let output = server.search(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.search(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(output.0.results.is_empty(), "a Bug-typed note must not satisfy a Decision-only filter");
 }
@@ -204,8 +204,8 @@ async fn mcp_search_is_deterministic_across_repeated_identical_calls() {
     let server = fixture.server();
 
     let input = || mcp_server::SearchInput { query: "unique mcp fixture phrase".to_string(), k: 10, type_filter: None, status_filter: None };
-    let first = server.search(rmcp::handler::server::wrapper::Parameters(input())).await.unwrap();
-    let second = server.search(rmcp::handler::server::wrapper::Parameters(input())).await.unwrap();
+    let first = server.search(rmcp::handler::server::wrapper::Parameters(input()), tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let second = server.search(rmcp::handler::server::wrapper::Parameters(input()), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(first.0, second.0);
 }
@@ -217,7 +217,7 @@ async fn mcp_search_never_mutates_the_vault() {
     let before = server.vault_ref().read_note(&NoteId::parse("note-fixture-a").unwrap()).unwrap();
 
     let input = mcp_server::SearchInput { query: "unique mcp fixture phrase".to_string(), k: 10, type_filter: None, status_filter: None };
-    server.search(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    server.search(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     let after = server.vault_ref().read_note(&NoteId::parse("note-fixture-a").unwrap()).unwrap();
     assert_eq!(before, after, "search must never write to the vault");
@@ -231,7 +231,7 @@ async fn mcp_retrieve_delegates_to_brain_api_and_returns_the_real_note() {
     let server = fixture.server();
 
     let input = mcp_server::RetrieveInput { note_id: "note-fixture-a".to_string() };
-    let output = server.retrieve(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.retrieve(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.note_id, "note-fixture-a");
     assert!(output.0.content.contains("the unique mcp fixture phrase"));
@@ -244,7 +244,7 @@ async fn mcp_retrieve_on_an_unknown_note_id_is_a_typed_not_found_error() {
     let server = fixture.server();
 
     let input = mcp_server::RetrieveInput { note_id: "note-does-not-exist".to_string() };
-    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "an unknown note id must be a typed error");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -256,7 +256,7 @@ async fn mcp_retrieve_on_a_malformed_note_id_is_rejected_before_calling_brain_ap
     let server = fixture.server();
 
     let input = mcp_server::RetrieveInput { note_id: "../../etc/passwd".to_string() };
-    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     assert!(result.is_err(), "a path-traversal-shaped note id must be rejected as invalid input");
 }
@@ -271,7 +271,7 @@ async fn mcp_get_code_context_delegates_to_brain_api_against_the_injected_graph(
     let server = fixture.server();
 
     let input = mcp_server::GetCodeContextInput { symbol_id: caller_id.to_string() };
-    let output = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.id, caller_id.to_string());
     assert_eq!(output.0.name, "caller");
@@ -287,7 +287,7 @@ async fn mcp_get_code_context_with_a_wrong_length_symbol_id_is_rejected_as_inval
     let server = fixture.server();
 
     let input = mcp_server::GetCodeContextInput { symbol_id: "not-a-real-hex-id".to_string() };
-    let result = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "a malformed symbol_id must be rejected");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -302,7 +302,7 @@ async fn mcp_get_code_context_with_a_well_formed_but_unknown_symbol_id_reaches_b
     // this fixture's graph.
     let unknown = "0".repeat(64);
     let input = mcp_server::GetCodeContextInput { symbol_id: unknown };
-    let result = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.get_code_context(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "an unknown but well-formed symbol_id must still be a typed error");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -317,11 +317,11 @@ async fn mcp_get_code_context_symbol_id_round_trips_through_display_and_the_mcp_
     // Round-trip proof: the id this test gets back from the tool output,
     // fed back in as input, resolves to the exact same symbol again.
     let first = server
-        .get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: caller_id.to_string() }))
+        .get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: caller_id.to_string() }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
     let second = server
-        .get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: first.0.id.clone() }))
+        .get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: first.0.id.clone() }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -342,6 +342,6 @@ async fn mcp_tools_never_fall_back_to_a_raw_core_primitive_when_brain_api_errors
     let server = fixture.server();
 
     let input = mcp_server::RetrieveInput { note_id: "note-does-not-exist".to_string() };
-    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
     assert!(result.is_err());
 }

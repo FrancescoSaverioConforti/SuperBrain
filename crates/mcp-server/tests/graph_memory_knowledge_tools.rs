@@ -168,7 +168,7 @@ async fn mcp_graph_query_delegates_to_brain_api_and_returns_the_reachable_chain(
     let server = fixture.server();
 
     let input = mcp_server::GraphQueryInput { start_symbol_id: a_id.to_string(), kind: Some(mcp_server::McpEdgeKind::Calls), max_depth: 10, limit: 100 };
-    let output = server.graph_query(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.graph_query(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.symbol_ids, vec![a_id.to_string(), b_id.to_string()]);
 }
@@ -179,7 +179,7 @@ async fn mcp_graph_query_with_a_malformed_start_symbol_id_is_rejected_as_invalid
     let server = fixture.server();
 
     let input = mcp_server::GraphQueryInput { start_symbol_id: "not-a-real-hex-id".to_string(), kind: None, max_depth: 10, limit: 100 };
-    let result = server.graph_query(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.graph_query(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "a malformed start_symbol_id must be rejected");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -192,7 +192,7 @@ async fn mcp_graph_query_exceeding_the_depth_bound_is_a_typed_invalid_params_err
     let server = fixture.server();
 
     let input = mcp_server::GraphQueryInput { start_symbol_id: a_id.to_string(), kind: None, max_depth: 10_000, limit: 100 };
-    let result = server.graph_query(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.graph_query(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "max_depth exceeding the bound must be a typed error");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -207,7 +207,7 @@ async fn mcp_get_entity_delegates_to_brain_api_and_returns_intrinsic_facts_only(
     let server = fixture.server();
 
     let input = mcp_server::GetEntityInput { symbol_id: a_id.to_string() };
-    let output = server.get_entity(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_entity(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.id, a_id.to_string());
     assert_eq!(output.0.name, "a");
@@ -221,7 +221,7 @@ async fn mcp_get_entity_with_a_well_formed_but_unknown_symbol_id_is_a_typed_not_
 
     let unknown = "0".repeat(64);
     let input = mcp_server::GetEntityInput { symbol_id: unknown };
-    let result = server.get_entity(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.get_entity(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "an unknown but well-formed symbol_id must still be a typed error");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -235,7 +235,7 @@ async fn mcp_link_entities_returns_a_proposal_id_never_a_committed_result() {
     let server = fixture.server();
 
     let input = mcp_server::LinkEntitiesInput { from_note_id: "note-a".to_string(), to_note_id: "note-b".to_string(), relation: mcp_server::McpRelationKind::Supports };
-    let output = server.link_entities(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.link_entities(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(uuid::Uuid::parse_str(&output.0.proposal_id).is_ok(), "proposal_id must be a real UUID, got {:?}", output.0.proposal_id);
 }
@@ -246,7 +246,7 @@ async fn mcp_link_entities_never_mutates_either_note_directly() {
     let server = fixture.server();
 
     let input = mcp_server::LinkEntitiesInput { from_note_id: "note-never-created-a".to_string(), to_note_id: "note-never-created-b".to_string(), relation: mcp_server::McpRelationKind::Contradicts };
-    server.link_entities(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    server.link_entities(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(matches!(server.vault_ref().read_note(&NoteId::parse("note-never-created-a").unwrap()), Err(storage::StorageError::NotFound { .. })));
     assert!(matches!(server.vault_ref().read_note(&NoteId::parse("note-never-created-b").unwrap()), Err(storage::StorageError::NotFound { .. })));
@@ -258,7 +258,7 @@ async fn mcp_link_entities_with_a_malformed_note_id_is_rejected_as_invalid_param
     let server = fixture.server();
 
     let input = mcp_server::LinkEntitiesInput { from_note_id: "../../etc/passwd".to_string(), to_note_id: "note-b".to_string(), relation: mcp_server::McpRelationKind::Supports };
-    let result = server.link_entities(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.link_entities(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     assert!(result.is_err(), "a path-traversal-shaped note id must be rejected as invalid input");
 }
@@ -279,7 +279,7 @@ async fn mcp_save_memory_returns_a_proposal_id_never_a_committed_note() {
         event_period: "2026-11-18".to_string(),
         body: "proposed via mcp".to_string(),
     };
-    let output = server.save_memory(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.save_memory(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(uuid::Uuid::parse_str(&output.0.proposal_id).is_ok());
     // The proposed note must not exist as a real, committed note yet.
@@ -300,7 +300,7 @@ async fn mcp_save_memory_with_a_malformed_note_id_is_rejected_as_invalid_params_
         event_period: "2026-11-18".to_string(),
         body: "x".to_string(),
     };
-    let result = server.save_memory(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.save_memory(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     assert!(result.is_err(), "a path-traversal-shaped note id must be rejected as invalid input");
 }
@@ -313,7 +313,7 @@ async fn mcp_update_memory_returns_a_proposal_id_never_a_committed_note() {
     let server = fixture.server();
 
     let input = mcp_server::UpdateMemoryInput { note_id: "note-bug-a".to_string(), body: "updated body via mcp".to_string(), expected_version: 1 };
-    let output = server.update_memory(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.update_memory(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(uuid::Uuid::parse_str(&output.0.proposal_id).is_ok());
     // The real note's content must be unchanged by a mere proposal.
@@ -330,7 +330,7 @@ async fn mcp_get_previous_solution_delegates_to_brain_api_and_returns_real_resul
     let server = fixture.server();
 
     let input = mcp_server::GetPreviousSolutionInput { query: "unique previous-solution phrase".to_string(), note_type: None };
-    let output = server.get_previous_solution(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_previous_solution(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(output.0.results.len(), 1, "expected exactly one real result, got {:?}", output.0.results);
     assert_eq!(output.0.results[0].note_id, "note-bug-a");
@@ -342,7 +342,7 @@ async fn mcp_get_previous_solution_with_no_matches_returns_an_empty_result_list_
     let server = fixture.server();
 
     let input = mcp_server::GetPreviousSolutionInput { query: "zzyzx qqrrss nonoverlap".to_string(), note_type: None };
-    let output = server.get_previous_solution(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_previous_solution(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(output.0.results.is_empty());
 }
@@ -355,7 +355,7 @@ async fn mcp_get_rules_returns_real_registry_entries() {
     let server = fixture.server();
 
     let input = mcp_server::GetRulesInput { scope: None };
-    let output = server.get_rules(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_rules(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(!output.0.items.is_empty(), "the known rules registry must not be empty");
 }
@@ -366,7 +366,7 @@ async fn mcp_get_rules_with_an_empty_scope_string_is_a_typed_invalid_params_erro
     let server = fixture.server();
 
     let input = mcp_server::GetRulesInput { scope: Some(String::new()) };
-    let result = server.get_rules(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.get_rules(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "an empty scope filter must be a typed error, not a silent empty success");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -378,7 +378,7 @@ async fn mcp_get_regulations_with_no_regime_filter_succeeds() {
     let server = fixture.server();
 
     let input = mcp_server::GetRegulationsInput { regime: None };
-    let output = server.get_regulations(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_regulations(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(output.0.items.is_empty(), "no regulatory regime is registered yet, per brain_api::get_regulations's own documented behavior");
 }
@@ -389,7 +389,7 @@ async fn mcp_get_canon_always_returns_an_empty_list_today_but_still_succeeds() {
     let server = fixture.server();
 
     let input = mcp_server::GetCanonInput { topic: None };
-    let output = server.get_canon(rmcp::handler::server::wrapper::Parameters(input)).await.unwrap();
+    let output = server.get_canon(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert!(output.0.entries.is_empty(), "no canonization mechanism exists yet, per brain_api::get_canon's own documented behavior");
 }
@@ -400,7 +400,7 @@ async fn mcp_get_canon_with_an_empty_topic_string_is_a_typed_invalid_params_erro
     let server = fixture.server();
 
     let input = mcp_server::GetCanonInput { topic: Some(String::new()) };
-    let result = server.get_canon(rmcp::handler::server::wrapper::Parameters(input)).await;
+    let result = server.get_canon(rmcp::handler::server::wrapper::Parameters(input), tokio_util::sync::CancellationToken::new()).await;
 
     let err = expect_mcp_error(result, "an empty topic filter must be a typed error");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);

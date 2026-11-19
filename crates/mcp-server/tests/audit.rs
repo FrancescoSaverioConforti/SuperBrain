@@ -144,7 +144,7 @@ async fn search_emits_exactly_one_allowed_tool_call_on_success() {
     let server = Fixture::new().server(sink.clone());
 
     let _ = server
-        .search(rmcp::handler::server::wrapper::Parameters(mcp_server::SearchInput { query: "retry backoff".into(), k: 10, type_filter: None, status_filter: None }))
+        .search(rmcp::handler::server::wrapper::Parameters(mcp_server::SearchInput { query: "retry backoff".into(), k: 10, type_filter: None, status_filter: None }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -156,7 +156,7 @@ async fn retrieve_emits_exactly_one_allowed_tool_call_on_success() {
     let sink = RecordingSink::default();
     let server = Fixture::new().server(sink.clone());
 
-    let _ = server.retrieve(rmcp::handler::server::wrapper::Parameters(mcp_server::RetrieveInput { note_id: "note-audit-a".into() })).await.unwrap();
+    let _ = server.retrieve(rmcp::handler::server::wrapper::Parameters(mcp_server::RetrieveInput { note_id: "note-audit-a".into() }), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(sink.tool_calls("retrieve"), vec![true]);
 }
@@ -170,7 +170,7 @@ async fn retrieve_on_an_unknown_note_still_emits_exactly_one_tool_call_marked_al
     let sink = RecordingSink::default();
     let server = Fixture::new().server(sink.clone());
 
-    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(mcp_server::RetrieveInput { note_id: "note-nonexistent".into() })).await;
+    let result = server.retrieve(rmcp::handler::server::wrapper::Parameters(mcp_server::RetrieveInput { note_id: "note-nonexistent".into() }), tokio_util::sync::CancellationToken::new()).await;
 
     assert!(result.is_err());
     assert_eq!(sink.tool_calls("retrieve"), vec![true]);
@@ -183,7 +183,7 @@ async fn get_code_context_emits_exactly_one_tool_call() {
     let symbol_id = fixture.symbol_id;
     let server = fixture.server(sink.clone());
 
-    let _ = server.get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: symbol_id.to_string() })).await.unwrap();
+    let _ = server.get_code_context(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCodeContextInput { symbol_id: symbol_id.to_string() }), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(sink.tool_calls("get_code_context"), vec![true]);
 }
@@ -196,7 +196,7 @@ async fn graph_query_emits_exactly_one_tool_call() {
     let server = fixture.server(sink.clone());
 
     let _ = server
-        .graph_query(rmcp::handler::server::wrapper::Parameters(mcp_server::GraphQueryInput { start_symbol_id: symbol_id.to_string(), kind: None, max_depth: 2, limit: 10 }))
+        .graph_query(rmcp::handler::server::wrapper::Parameters(mcp_server::GraphQueryInput { start_symbol_id: symbol_id.to_string(), kind: None, max_depth: 2, limit: 10 }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -210,7 +210,7 @@ async fn get_entity_emits_exactly_one_tool_call() {
     let symbol_id = fixture.symbol_id;
     let server = fixture.server(sink.clone());
 
-    let _ = server.get_entity(rmcp::handler::server::wrapper::Parameters(mcp_server::GetEntityInput { symbol_id: symbol_id.to_string() })).await.unwrap();
+    let _ = server.get_entity(rmcp::handler::server::wrapper::Parameters(mcp_server::GetEntityInput { symbol_id: symbol_id.to_string() }), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(sink.tool_calls("get_entity"), vec![true]);
 }
@@ -221,7 +221,7 @@ async fn get_previous_solution_emits_exactly_one_tool_call() {
     let server = Fixture::new().server(sink.clone());
 
     let _ = server
-        .get_previous_solution(rmcp::handler::server::wrapper::Parameters(mcp_server::GetPreviousSolutionInput { query: "retry backoff".into(), note_type: None }))
+        .get_previous_solution(rmcp::handler::server::wrapper::Parameters(mcp_server::GetPreviousSolutionInput { query: "retry backoff".into(), note_type: None }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -233,9 +233,9 @@ async fn get_rules_get_regulations_get_canon_each_emit_exactly_one_tool_call() {
     let sink = RecordingSink::default();
     let server = Fixture::new().server(sink.clone());
 
-    let _ = server.get_rules(rmcp::handler::server::wrapper::Parameters(mcp_server::GetRulesInput { scope: None })).await.unwrap();
-    let _ = server.get_regulations(rmcp::handler::server::wrapper::Parameters(mcp_server::GetRegulationsInput { regime: None })).await.unwrap();
-    let _ = server.get_canon(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCanonInput { topic: None })).await.unwrap();
+    let _ = server.get_rules(rmcp::handler::server::wrapper::Parameters(mcp_server::GetRulesInput { scope: None }), tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let _ = server.get_regulations(rmcp::handler::server::wrapper::Parameters(mcp_server::GetRegulationsInput { regime: None }), tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let _ = server.get_canon(rmcp::handler::server::wrapper::Parameters(mcp_server::GetCanonInput { topic: None }), tokio_util::sync::CancellationToken::new()).await.unwrap();
 
     assert_eq!(sink.tool_calls("get_rules"), vec![true]);
     assert_eq!(sink.tool_calls("get_regulations"), vec![true]);
@@ -258,7 +258,7 @@ async fn save_memory_emits_a_tool_call_and_a_write_memory_event_with_the_real_pr
             source: "agent:coder@prompt-v3".into(),
             event_period: "2026-11-19".into(),
             body: "proposed content".into(),
-        }))
+        }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -272,7 +272,7 @@ async fn update_memory_emits_a_tool_call_and_a_write_memory_event_with_the_real_
     let server = Fixture::new().server(sink.clone());
 
     let output = server
-        .update_memory(rmcp::handler::server::wrapper::Parameters(mcp_server::UpdateMemoryInput { note_id: "note-audit-a".into(), body: "updated content".into(), expected_version: 1 }))
+        .update_memory(rmcp::handler::server::wrapper::Parameters(mcp_server::UpdateMemoryInput { note_id: "note-audit-a".into(), body: "updated content".into(), expected_version: 1 }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -290,7 +290,7 @@ async fn link_entities_emits_a_tool_call_and_a_write_memory_event_with_the_real_
             from_note_id: "note-audit-a".into(),
             to_note_id: "note-audit-b".into(),
             relation: mcp_server::McpRelationKind::Supports,
-        }))
+        }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -314,7 +314,7 @@ async fn every_event_from_one_call_shares_the_same_correlation_id() {
             source: "agent:coder@prompt-v3".into(),
             event_period: "2026-11-19".into(),
             body: "content".into(),
-        }))
+        }), tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
 
@@ -369,7 +369,7 @@ async fn a_panicking_audit_sink_does_not_change_save_memorys_own_outcome() {
                 source: "agent:coder@prompt-v3".into(),
                 event_period: "2026-11-19".into(),
                 body: "content".into(),
-            }))
+            }), tokio_util::sync::CancellationToken::new())
             .await
     });
     let result = handle.await;

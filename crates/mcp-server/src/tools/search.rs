@@ -163,14 +163,42 @@ impl SuperBrainMcpServer {
     /// on success, on an error return, or if the handler's own task is
     /// cancelled/dropped while still waiting.
     ///
+    /// B5 remediation M4-C: races the acquire against `cancellation_token`
+    /// (the real, per-request `tokio_util::sync::CancellationToken` an
+    /// `rmcp`-dispatched handler receives via its own `FromContextPart`
+    /// extractor — `ct.cancel()` is fired by `rmcp`'s own dispatch loop
+    /// when it receives a real `notifications/cancelled` for this exact
+    /// request id; see `rmcp::service`'s own source). This only guards
+    /// the WAIT: a permit already acquired is never revoked, and nothing
+    /// here races or wraps the tool handler's own body after this call
+    /// returns `Ok` — cancellation while queued and cancellation of an
+    /// already-running operation are two different things, and this
+    /// function only ever addresses the first. Returns `Err(())` (not a
+    /// full `McpError`, since a cancelled request's response is silently
+    /// dropped by `rmcp`'s own dispatch loop regardless of what this
+    /// handler returns — confirmed in `rmcp` 3.11.0's own source: a
+    /// response whose request id was already removed from
+    /// `local_ct_pool` on cancellation is logged and discarded, never
+    /// sent to the transport) if the token fires before a permit frees
+    /// up; the caller must not proceed to its real operation in that
+    /// case.
+    ///
     /// `Semaphore::acquire_owned` on an `Arc<Semaphore>` only ever errors
     /// if the semaphore itself has been closed (`Semaphore::close`,
     /// never called anywhere in this codebase) — this server never
     /// closes its own semaphore, so `.expect(...)` here can only panic
     /// if that invariant is later violated, never under ordinary
     /// concurrent load.
-    pub(crate) async fn acquire_concurrency_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.concurrency_limit.clone().acquire_owned().await.expect("this server's own concurrency semaphore is never closed")
+    pub(crate) async fn acquire_concurrency_permit(
+        &self,
+        cancellation_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
+        let semaphore = self.concurrency_limit.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => Err(()),
+            permit = semaphore.acquire_owned() => Ok(permit.expect("this server's own concurrency semaphore is never closed")),
+        }
     }
 
     /// Opts this server instance into a real [`brain_api::AuditSink`]
@@ -422,14 +450,27 @@ impl SuperBrainMcpServer {
     /// identical calls is `index::search`'s own guarantee, inherited
     /// through both layers without this wrapper re-sorting anything.
     #[rmcp::tool(description = "Search notes by text, optionally filtered by type/status.")]
-    pub async fn search(&self, Parameters(input): Parameters<SearchInput>) -> Result<Json<SearchOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
+    pub async fn search(
+        &self,
+        Parameters(input): Parameters<SearchInput>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Json<SearchOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error(
+                "request cancelled while waiting for a concurrency permit",
+                None,
+            ));
+        };
         let filters = index::search::SearchFilters {
             type_filter: input.type_filter.map(Into::into),
             status_filter: input.status_filter.map(Into::into),
             ..Default::default()
         };
-        let request = api::SearchRequest { text: input.query, filters, k: input.k };
+        let request = api::SearchRequest {
+            text: input.query,
+            filters,
+            k: input.k,
+        };
         let reference_date = chrono::Utc::now().date_naive();
         let idx = self.index(reference_date);
         let ctx = self.mcp_ctx();
@@ -458,10 +499,22 @@ impl SuperBrainMcpServer {
     /// `storage::NoteId::parse` before `brain_api::retrieve` is ever
     /// called — never silently treated as "not found".
     #[rmcp::tool(description = "Retrieve one note's full content by id.")]
-    pub async fn retrieve(&self, Parameters(input): Parameters<RetrieveInput>) -> Result<Json<RetrieveOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
-        let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let request = api::RetrieveRequest { id: api::RetrieveTarget::Note(note_id) };
+    pub async fn retrieve(
+        &self,
+        Parameters(input): Parameters<RetrieveInput>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Json<RetrieveOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error(
+                "request cancelled while waiting for a concurrency permit",
+                None,
+            ));
+        };
+        let note_id = storage::NoteId::parse(&input.note_id)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let request = api::RetrieveRequest {
+            id: api::RetrieveTarget::Note(note_id),
+        };
         let ctx = self.mcp_ctx();
         let result = brain_api::retrieve(&ctx, &self.vault, request);
         self.record_tool_call("retrieve", &result, &ctx);
@@ -481,11 +534,25 @@ impl SuperBrainMcpServer {
     /// `brain_api::get_code_context` is ever called; a well-formed id that
     /// names no real snapshot in `self.graph` still reaches `brain_api`'s
     /// own `NotFound`, exactly as it would for a direct `brain_api` caller.
-    #[rmcp::tool(description = "Get one code symbol's intrinsic facts and immediate graph neighbors.")]
-    pub async fn get_code_context(&self, Parameters(input): Parameters<GetCodeContextInput>) -> Result<Json<GetCodeContextOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
-        let symbol_id: codegraph_domain::SymbolSnapshotId =
-            input.symbol_id.parse().map_err(|e: codegraph_domain::SymbolSnapshotIdParseError| McpError::invalid_params(e.to_string(), None))?;
+    #[rmcp::tool(
+        description = "Get one code symbol's intrinsic facts and immediate graph neighbors."
+    )]
+    pub async fn get_code_context(
+        &self,
+        Parameters(input): Parameters<GetCodeContextInput>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Json<GetCodeContextOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error(
+                "request cancelled while waiting for a concurrency permit",
+                None,
+            ));
+        };
+        let symbol_id: codegraph_domain::SymbolSnapshotId = input.symbol_id.parse().map_err(
+            |e: codegraph_domain::SymbolSnapshotIdParseError| {
+                McpError::invalid_params(e.to_string(), None)
+            },
+        )?;
         let ctx = self.mcp_ctx();
         let result = brain_api::get_code_context(&ctx, &self.graph, symbol_id);
         self.record_tool_call("get_code_context", &result, &ctx);
@@ -524,7 +591,10 @@ mod concurrency_limit_tests {
         let dir = std::env::temp_dir().join(format!(
             "superbrain-mcp-server-concurrency-{label}-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -533,8 +603,25 @@ mod concurrency_limit_tests {
 
     fn new_server() -> SuperBrainMcpServer {
         let root = unique_test_dir("fixture");
-        let vault = storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
-        SuperBrainMcpServer::new(vault, Arc::new(RealIndexer::new()), Arc::new(CodeGraph::new()), "project-x")
+        let vault =
+            storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite"))
+                .unwrap();
+        SuperBrainMcpServer::new(
+            vault,
+            Arc::new(RealIndexer::new()),
+            Arc::new(CodeGraph::new()),
+            "project-x",
+        )
+    }
+
+    /// A fresh, never-cancelled token — every pre-existing white-box
+    /// semaphore test in this module exercises the semaphore's own
+    /// acquire/queue/cancel-safety behavior, not the M4-C cancellation
+    /// race itself (that's `cancellation_tests` below); these tests pass
+    /// a token that is simply never fired, so `.unwrap()` on the `Result`
+    /// never reaches the `Err` arm.
+    fn never_cancelled() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
     }
 
     #[tokio::test]
@@ -542,7 +629,12 @@ mod concurrency_limit_tests {
         let server = new_server();
         let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
         for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
-            held.push(server.acquire_concurrency_permit().await);
+            held.push(
+                server
+                    .acquire_concurrency_permit(&never_cancelled())
+                    .await
+                    .unwrap(),
+            );
         }
         assert_eq!(held.len(), brain_api::limits::MAX_CONCURRENT_REQUESTS);
     }
@@ -552,14 +644,26 @@ mod concurrency_limit_tests {
         let server = new_server();
         let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
         for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
-            held.push(server.acquire_concurrency_permit().await);
+            held.push(
+                server
+                    .acquire_concurrency_permit(&never_cancelled())
+                    .await
+                    .unwrap(),
+            );
         }
 
         // One more acquire, at the cap: must NOT resolve yet.
         let extra_server = server.clone();
-        let extra = tokio::spawn(async move { extra_server.acquire_concurrency_permit().await });
+        let extra = tokio::spawn(async move {
+            extra_server
+                .acquire_concurrency_permit(&never_cancelled())
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!extra.is_finished(), "an acquire beyond the configured cap must queue, not succeed immediately");
+        assert!(
+            !extra.is_finished(),
+            "an acquire beyond the configured cap must queue, not succeed immediately"
+        );
 
         // Releasing exactly one permit must let the queued acquire
         // proceed -- never granting a permit beyond the configured cap
@@ -567,7 +671,11 @@ mod concurrency_limit_tests {
         // releasing one and having the queued acquire succeed is itself
         // the proof the cap was never exceeded).
         held.pop();
-        let released_permit = tokio::time::timeout(std::time::Duration::from_secs(5), extra).await.expect("the queued acquire must resume once a permit frees up").expect("the spawned task must not panic");
+        let released_permit = tokio::time::timeout(std::time::Duration::from_secs(5), extra)
+            .await
+            .expect("the queued acquire must resume once a permit frees up")
+            .expect("the spawned task must not panic")
+            .expect("a never-cancelled token must never yield Err");
         drop(released_permit);
         drop(held);
     }
@@ -584,19 +692,33 @@ mod concurrency_limit_tests {
         // the combined total still hits the single real cap below.
         for i in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
             if i % 2 == 0 {
-                held.push(server.acquire_concurrency_permit().await);
+                held.push(
+                    server
+                        .acquire_concurrency_permit(&never_cancelled())
+                        .await
+                        .unwrap(),
+                );
             } else {
-                held.push(clone.acquire_concurrency_permit().await);
+                held.push(
+                    clone
+                        .acquire_concurrency_permit(&never_cancelled())
+                        .await
+                        .unwrap(),
+                );
             }
         }
 
         let one_more_server = server.clone();
-        let one_more = tokio::spawn(async move { one_more_server.acquire_concurrency_permit().await });
+        let one_more = tokio::spawn(async move {
+            one_more_server
+                .acquire_concurrency_permit(&never_cancelled())
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!one_more.is_finished(), "clones must share one real permit pool -- the combined total from both handles must still be capped");
 
         held.pop();
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), one_more).await.expect("shared pool: releasing one permit from either handle must free a slot for the other").expect("spawned task must not panic");
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), one_more).await.expect("shared pool: releasing one permit from either handle must free a slot for the other").expect("spawned task must not panic").expect("a never-cancelled token must never yield Err");
         drop(permit);
         drop(held);
     }
@@ -606,7 +728,12 @@ mod concurrency_limit_tests {
         let server = new_server();
         let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
         for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
-            held.push(server.acquire_concurrency_permit().await);
+            held.push(
+                server
+                    .acquire_concurrency_permit(&never_cancelled())
+                    .await
+                    .unwrap(),
+            );
         }
 
         // A queued acquire, then abort the task waiting on it before it
@@ -614,7 +741,11 @@ mod concurrency_limit_tests {
         // cancel-safety: a dropped Acquire future is removed from the
         // wait queue without taking a permit.
         let waiting_server = server.clone();
-        let waiting = tokio::spawn(async move { waiting_server.acquire_concurrency_permit().await });
+        let waiting = tokio::spawn(async move {
+            waiting_server
+                .acquire_concurrency_permit(&never_cancelled())
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         waiting.abort();
         let _ = waiting.await;
@@ -623,7 +754,336 @@ mod concurrency_limit_tests {
         // consumed it, this fresh acquire would now queue instead of
         // resolving immediately.
         held.pop();
-        let fresh = tokio::time::timeout(std::time::Duration::from_millis(500), server.acquire_concurrency_permit()).await;
+        let fresh = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            server.acquire_concurrency_permit(&never_cancelled()),
+        )
+        .await;
         assert!(fresh.is_ok(), "a permit released after an aborted waiter must be available to a fresh acquire, not silently consumed by the cancelled task");
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    //! B5 remediation M4-C: direct, white-box tests of
+    //! [`SuperBrainMcpServer::acquire_concurrency_permit`]'s cancellation
+    //! race itself — distinct from `concurrency_limit_tests` above, which
+    //! exercises the semaphore's own shape with a token that never fires.
+    //! The real, end-to-end proof that an actual `notifications/cancelled`
+    //! over a real MCP wire connection stops a queued tool call before it
+    //! ever reaches `brain_api` is proven by `real_mcp_wire_tests` below,
+    //! in this same module tree (needed for access to `pub(crate)`
+    //! `acquire_concurrency_permit` to saturate permits deterministically
+    //! before driving the real wire for the queued/cancelled request).
+
+    use super::*;
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "superbrain-mcp-server-cancellation-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn new_server() -> SuperBrainMcpServer {
+        let root = unique_test_dir("fixture");
+        let vault =
+            storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite"))
+                .unwrap();
+        SuperBrainMcpServer::new(
+            vault,
+            Arc::new(RealIndexer::new()),
+            Arc::new(CodeGraph::new()),
+            "project-x",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_queued_acquire_returns_err_promptly_when_its_token_is_cancelled_before_a_permit_frees_up(
+    ) {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(
+                server
+                    .acquire_concurrency_permit(&tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Saturated: a new acquire must queue, never a permit beyond the cap.
+        let token = tokio_util::sync::CancellationToken::new();
+        let queued_server = server.clone();
+        let queued_token = token.clone();
+        let queued = tokio::spawn(async move {
+            queued_server
+                .acquire_concurrency_permit(&queued_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !queued.is_finished(),
+            "a queued acquire must not resolve while every permit is held"
+        );
+
+        token.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+            .await
+            .expect("a cancelled wait must resolve promptly, never hang")
+            .expect("the spawned task must not panic");
+        assert!(
+            result.is_err(),
+            "a cancelled queued acquire must return Err, never a permit"
+        );
+
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_acquire_never_consumes_a_permit_and_never_deadlocks_a_subsequent_real_acquire(
+    ) {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(
+                server
+                    .acquire_concurrency_permit(&tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let queued_server = server.clone();
+        let queued_token = token.clone();
+        let queued = tokio::spawn(async move {
+            queued_server
+                .acquire_concurrency_permit(&queued_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+            .await
+            .unwrap();
+
+        // Release one real permit -- a real, fresh acquire must succeed
+        // promptly: no deadlock, and the cancelled waiter's own drop must
+        // not have left the semaphore's internal state inconsistent.
+        held.pop();
+        let fresh = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.acquire_concurrency_permit(&tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect("a fresh acquire after a cancelled queued one must not deadlock");
+        assert!(fresh.is_ok(), "a fresh, non-cancelled acquire after a cancelled queued one must succeed -- the cancelled waiter must not have left a phantom hold on the released permit");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_non_cancelled_queued_acquire_still_succeeds_normally_once_a_permit_frees_up() {
+        let server = new_server();
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(
+                server
+                    .acquire_concurrency_permit(&tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let queued_server = server.clone();
+        let queued_token = token.clone();
+        let queued = tokio::spawn(async move {
+            queued_server
+                .acquire_concurrency_permit(&queued_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!queued.is_finished());
+
+        // Never cancelled -- releasing a permit must let it succeed normally.
+        held.pop();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+            .await
+            .expect("must resolve once a permit frees up")
+            .expect("task must not panic");
+        assert!(result.is_ok(), "a queued acquire whose token was never cancelled must still succeed once a permit frees up, got {result:?}");
+        drop(held);
+    }
+}
+
+#[cfg(test)]
+mod real_mcp_wire_tests {
+    //! B5 remediation M4-C, acceptance criterion 6: proves the
+    //! cancellation race over a REAL MCP protocol connection (real
+    //! JSON-RPC lines over a real `tokio::io::duplex` transport, a real
+    //! `rmcp` server loop), not just the white-box semaphore tests above.
+    //! Needs `pub(crate)` access to [`SuperBrainMcpServer::
+    //! acquire_concurrency_permit`] to saturate every real permit
+    //! deterministically (no timing race) before driving the actual wire
+    //! for the queued/cancelled request — the reason this lives inside
+    //! the crate rather than in `tests/limits.rs`.
+
+    use super::*;
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "superbrain-mcp-server-real-wire-cancel-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn new_server() -> SuperBrainMcpServer {
+        let root = unique_test_dir("fixture");
+        let vault =
+            storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite"))
+                .unwrap();
+        SuperBrainMcpServer::new(
+            vault,
+            Arc::new(RealIndexer::new()),
+            Arc::new(CodeGraph::new()),
+            "project-x",
+        )
+    }
+
+    async fn next_line(
+        reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) -> String {
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("server must reply promptly, not hang")
+        .expect("read should not error");
+        line
+    }
+
+    #[tokio::test]
+    async fn a_queued_tool_call_cancelled_via_a_real_notifications_cancelled_message_never_runs_and_the_connection_survives(
+    ) {
+        let server = new_server();
+        // Saturate every real permit via the SAME shared Arc<Semaphore>
+        // the wire-served clone below will contend on -- deterministic,
+        // no sleep-based timing race.
+        let mut held = Vec::with_capacity(brain_api::limits::MAX_CONCURRENT_REQUESTS);
+        for _ in 0..brain_api::limits::MAX_CONCURRENT_REQUESTS {
+            held.push(
+                server
+                    .acquire_concurrency_permit(&tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let (server_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(server_io);
+        let server_handle = tokio::spawn(server.clone().serve((reader, writer)));
+
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+        let mut peer_reader = BufReader::new(peer_read);
+
+        peer_write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test-client\",\"version\":\"0.0.1\"}}}\n").await.unwrap();
+        let init_reply: serde_json::Value =
+            serde_json::from_str(next_line(&mut peer_reader).await.trim()).unwrap();
+        assert!(
+            init_reply.get("result").is_some(),
+            "initialize must succeed before this test's real subject"
+        );
+        peer_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+
+        // A real `search` call, over the real wire, while every permit is
+        // already held -- this request must queue on the real semaphore.
+        peer_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"search\",\"arguments\":{\"query\":\"anything\",\"k\":10}}}\n")
+            .await
+            .unwrap();
+
+        // Give the request time to actually reach the queued-on-permit
+        // state (it must NOT have a reply yet -- every permit is held).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A real `notifications/cancelled` for request id 2, sent over
+        // the real wire -- the exact MCP-protocol mechanism `rmcp`'s own
+        // dispatch loop (confirmed by direct source read) uses to fire
+        // that specific request's `RequestContext::ct`.
+        peer_write.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"test cancellation\"}}\n").await.unwrap();
+
+        // Release every held permit now -- if cancellation worked, the
+        // cancelled request must never consume one of these and must
+        // never produce a response; if it did NOT work, releasing these
+        // permits would let the stale request proceed into `brain_api`
+        // and eventually send a real `search` result for id 2.
+        drop(held);
+
+        // A fresh, real request sent right after must still get a real
+        // reply -- proving the connection survived the cancellation and
+        // the released permits are genuinely available again (not
+        // leaked/stuck on the cancelled waiter).
+        peer_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        let list_reply: serde_json::Value = serde_json::from_str(next_line(&mut peer_reader).await.trim()).expect("a fresh request after the cancellation must still get a real reply, proving the connection survived and permits were not leaked");
+        assert!(
+            list_reply.get("result").is_some(),
+            "tools/list after the cancellation must still succeed, got {list_reply}"
+        );
+        assert_eq!(list_reply["id"], 3, "the id-3 reply must be the one just requested, not a stale id-2 response arriving late");
+
+        // No response for the cancelled id-2 request must EVER arrive --
+        // rmcp's own dispatch loop silently drops it (confirmed in
+        // source: a response whose request id was already removed from
+        // `local_ct_pool` on cancellation is discarded, never sent to
+        // the transport), and this crate's own handler must also never
+        // have reached `brain_api::search` for it. A short bounded wait
+        // proves no late id-2 line is still in flight behind the id-3
+        // reply already received above.
+        let late_line = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            next_line(&mut peer_reader),
+        )
+        .await;
+        assert!(
+            late_line.is_err(),
+            "no response must ever arrive for the cancelled request id 2, got {late_line:?}"
+        );
+
+        drop(peer_write);
+        drop(peer_reader);
+        server_handle
+            .await
+            .unwrap()
+            .expect("server task must not have panicked or errored")
+            .cancel()
+            .await
+            .expect("server should still be cancellable after the cancellation test");
     }
 }

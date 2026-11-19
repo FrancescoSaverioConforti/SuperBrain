@@ -106,8 +106,10 @@ impl SuperBrainMcpServer {
     /// query is rejected as `InvalidInput` before `brain_api` is ever
     /// called; no match is `Ok(vec![])`, never an error.
     #[rmcp::tool(description = "Find previously-recorded bug/decision notes matching a query, for provenance tracing.")]
-    pub async fn get_previous_solution(&self, Parameters(input): Parameters<GetPreviousSolutionInput>) -> Result<Json<GetPreviousSolutionOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
+    pub async fn get_previous_solution(&self, Parameters(input): Parameters<GetPreviousSolutionInput>, cancellation_token: tokio_util::sync::CancellationToken) -> Result<Json<GetPreviousSolutionOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error("request cancelled while waiting for a concurrency permit", None));
+        };
         let reference_date = chrono::Utc::now().date_naive();
         let idx = self.index(reference_date);
         let ctx = self.mcp_ctx();
@@ -129,8 +131,10 @@ impl SuperBrainMcpServer {
     /// (`ApproveProposal`/`RejectProposal` denied), so the proposal this
     /// tool creates can never be self-approved through MCP.
     #[rmcp::tool(description = "Propose saving new content as a fresh note. Creates a pending proposal; does not execute the save.")]
-    pub async fn save_memory(&self, Parameters(input): Parameters<SaveMemoryInput>) -> Result<Json<SaveMemoryOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
+    pub async fn save_memory(&self, Parameters(input): Parameters<SaveMemoryInput>, cancellation_token: tokio_util::sync::CancellationToken) -> Result<Json<SaveMemoryOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error("request cancelled while waiting for a concurrency permit", None));
+        };
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();
         let ctx = self.mcp_ctx();
@@ -154,8 +158,10 @@ impl SuperBrainMcpServer {
     /// `update_memory`: delegates to `brain_api::update_memory`, same
     /// proposal-only discipline as `save_memory`.
     #[rmcp::tool(description = "Propose replacing an existing note's content. Creates a pending proposal; does not execute the update.")]
-    pub async fn update_memory(&self, Parameters(input): Parameters<UpdateMemoryInput>) -> Result<Json<UpdateMemoryOutput>, McpError> {
-        let _permit = self.acquire_concurrency_permit().await;
+    pub async fn update_memory(&self, Parameters(input): Parameters<UpdateMemoryInput>, cancellation_token: tokio_util::sync::CancellationToken) -> Result<Json<UpdateMemoryOutput>, McpError> {
+        let Ok(_permit) = self.acquire_concurrency_permit(&cancellation_token).await else {
+            return Err(McpError::internal_error("request cancelled while waiting for a concurrency permit", None));
+        };
         let note_id = storage::NoteId::parse(&input.note_id).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let now = chrono::Utc::now().to_rfc3339();
         let ctx = self.mcp_ctx();

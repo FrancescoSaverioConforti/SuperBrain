@@ -50,6 +50,15 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std"] }
+# B5 remediation M4-C: `tokio_util::sync::CancellationToken` is already a
+# non-optional transitive dependency of `rmcp` itself (confirmed:
+# `rmcp`'s own Cargo.toml depends on `tokio-util = "0.7"` unconditionally,
+# resolved to 0.7.20 in this workspace's Cargo.lock already); this is a
+# direct dependency declaration only, so this crate's own code can name
+# the type `rmcp`'s own `FromContextPart<C> for CancellationToken`
+# extractor already hands a `#[rmcp::tool]` handler that declares a
+# parameter of this type -- not a new capability, not a new transport.
+tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
