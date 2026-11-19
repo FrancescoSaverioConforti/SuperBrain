@@ -1142,6 +1142,7 @@ version = "0.1.0"
 dependencies = [
  "api",
  "brain-api",
+ "brain-api-audit-worker",
  "chrono",
  "codegraph-domain",
  "codegraph-index",

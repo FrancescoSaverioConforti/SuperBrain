@@ -64,6 +64,19 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 git2 = "0.21"
 serde_json = "1"
+# M5 Task 6: used ONLY by examples/serve_stdio.rs (the real composition
+# root) to construct the dedicated audit writer worker and inject it via
+# the existing SuperBrainMcpServer::with_audit_sink(...) builder -- never
+# by this crate's own library code, which stays exactly as unaware of the
+# worker's existence as it is of any other AuditSink implementation (the
+# same "caller supplies an already-built destination" rule with_audit_sink
+# already documents). A dev-dependency (not [dependencies]) is deliberate:
+# an [[example]] target is built with [dependencies] + [dev-dependencies]
+# available (same mechanism this crate's own dev-only `rmcp` client
+# feature above already relies on for tests/server_integration.rs), so
+# this is available to the example without widening tests/no_bypass.rs's
+# PRODUCTION dependency allowlist, which only inspects [dependencies].
+brain-api-audit-worker = { path = "../brain-api-audit-worker" }
 # `client` adds rmcp's client-role protocol logic (Peer::list_tools/
 # call_tool, ServiceExt::serve for RoleClient) -- needed ONLY by
 # tests/server_integration.rs (Task 24) to drive a real MCP client against
