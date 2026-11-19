@@ -118,6 +118,15 @@ const AUDIT_REFERENCE_FORMAT_VERSION: u32 = 1;
 /// value, not by shared type, the same "same value, independently
 /// defined" discipline this project already uses elsewhere, e.g.
 /// `mcp-client`'s own timeout constants against `brain_api::limits`).
+///
+/// `#[cfg(test)]`-only (M5 Task 6 correctness fix): this module's own
+/// production code never compares anything against this value anymore
+/// — see `verify_reference_agreement`'s own doc comment on the defense-
+/// in-depth check that USED to do so and was removed for being
+/// unsatisfiable by any real record. Test fixtures below still use this
+/// constant as a synthetic (not a realistic) `record_hash` for their own
+/// first-record writes, via `handle.append(_, 0, GENESIS_CHAIN_HASH)`.
+#[cfg(test)]
 const GENESIS_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Why opening a new [`AuditWriterHandle`] failed — distinguishing an
@@ -466,17 +475,23 @@ impl Vault {
                 if r.store_id.as_deref() != Some(AUDIT_REFERENCE_STORE_ID) || r.format_version != Some(AUDIT_REFERENCE_FORMAT_VERSION) {
                     return Err(AuditWriterOpenError::ReferenceInconsistent("head reference does not belong to this audit log (store_id/format_version mismatch)".to_string()));
                 }
-                // Defense-in-depth: a reference claiming generation 0
-                // (the genesis generation) must carry the fixed genesis
-                // hash exactly -- generation 0 has no real predecessor
-                // record to have produced any other hash, so any other
-                // value at generation 0 is implausible on its face,
-                // corrupt or forged, never a legitimate real state.
-                if r.generation == 0 && r.chain_hash != GENESIS_CHAIN_HASH {
-                    return Err(AuditWriterOpenError::ReferenceInconsistent(
-                        "head reference claims generation 0 but does not carry the genesis chain hash".to_string(),
-                    ));
-                }
+                // NOTE: there is deliberately no separate "generation 0
+                // must carry the genesis hash" defense-in-depth check
+                // here (M5 Task 6 correctness fix: an earlier version of
+                // this check rejected every legitimate first-ever real
+                // record, since `chain_hash` at generation 0 is always
+                // the REAL SHA-256 `record_hash` this module's own
+                // `append` computed for that one real record -- `[1,
+                // 2]`'s own `GENESIS_CHAIN_HASH` is `prev_record_hash`'s
+                // value for sequence 0, a field this reference never
+                // stores at all, so comparing `chain_hash` against it at
+                // generation 0 could only ever match a contrived
+                // all-zero record_hash, never genuine content. The
+                // `seq == r.generation` arm immediately below already
+                // provides the real check this one was trying to add:
+                // the caller's own independently chain-verified hash at
+                // this exact generation must match the reference's
+                // hash, bit for bit, genesis generation included.
                 if seq == r.generation {
                     if hash != r.chain_hash {
                         return Err(AuditWriterOpenError::ReferenceInconsistent(format!(

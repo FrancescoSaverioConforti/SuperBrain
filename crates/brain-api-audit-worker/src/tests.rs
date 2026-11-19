@@ -305,6 +305,31 @@ async fn reopening_a_new_worker_against_the_same_log_after_a_graceful_shutdown_s
     assert_eq!(ack.sequence, 2, "the new worker must correctly resume from sequence 2, proving its own startup recovery read the prior worker's 2 records back correctly");
 }
 
+// --- M5 Task 6 regression: reopening after EXACTLY ONE real record was
+//     ever written (never exercised above, which always writes 2+ before
+//     reopening) -- discovered via the real serve_stdio launcher's own
+//     acceptance tests, where a vault's very first tool call is exactly
+//     this shape.
+
+#[tokio::test]
+async fn reopening_a_new_worker_after_exactly_one_real_record_was_ever_written_succeeds() {
+    let root = unique_test_dir("reopen-after-exactly-one-record");
+    let vault1 = storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
+    let worker1 = spawn_worker(vault1, WorkerConfig::default()).unwrap();
+    worker1.record_durable(sample_event()).await.unwrap();
+    worker1.shutdown().await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let vault2 = storage::Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
+    let worker2 = spawn_worker(vault2, WorkerConfig::default());
+    assert!(
+        worker2.is_ok(),
+        "a worker must be able to reopen a log holding exactly one real, durably-written record -- the head reference at generation 0 legitimately carries that record's REAL computed record_hash (a SHA-256 digest), never the all-zero genesis sentinel, so a reopen must not be rejected on that basis, got {worker2:?}"
+    );
+    worker2.unwrap().shutdown().await.unwrap();
+}
+
 // --- 11: actual runtime threads are not blocked by synchronous disk I/O
 //     on Tokio workers ---
 
