@@ -13,6 +13,10 @@
 
 mod approval;
 mod audit;
+/// B5 remediation M5 Task 1: pure hash-chain/recovery-scan primitives
+/// only (no I/O, no AuditSink/AuditEventKind changes, not yet called
+/// from anywhere in this crate). See the module's own doc comment.
+mod audit_chain;
 mod cli;
 mod error;
 mod graph;

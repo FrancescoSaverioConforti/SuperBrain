@@ -30,6 +30,12 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# B5 remediation M5 Task 1: pure hash-chain functions for a future
+# durable audit log (crates/brain-api/src/audit_chain.rs). Same version
+# constraint as crates/vault-security's own existing sha2 dependency
+# (already resolves to 0.10.9 in this workspace's Cargo.lock) -- reused
+# for consistency, not a new version introduced.
+sha2 = "0.10"
 
 [dev-dependencies]
 git2 = "0.21"
