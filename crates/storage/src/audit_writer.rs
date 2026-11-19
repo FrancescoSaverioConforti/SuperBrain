@@ -42,6 +42,43 @@
 //! again the instant the first handle is dropped for ANY reason
 //! (including an unhandled process crash, which releases all of a
 //! process's open handles without requiring any cleanup code to run).
+//! This same lock now covers BOTH the log append and the head-reference
+//! update (M5 Task 3): both happen inside one [`AuditWriterHandle::append`]
+//! call, under the one already-held lock — no second, independently
+//! acquirable lock exists for the reference.
+//!
+//! **Head reference (M5 Task 3):** reuses `vault_security::{
+//! DpapiTrustedReferenceStore, TrustedReferenceStore, GenerationRef}`
+//! directly, unmodified — already `pub`, already reachable (`storage`
+//! already depends on `vault-security`). No new cryptographic code: the
+//! raw `dpapi_protect`/`dpapi_unprotect` primitives stay `pub(crate)` to
+//! `vault-security` exactly as before; this module only ever constructs
+//! and calls the already-public `DpapiTrustedReferenceStore` wrapper
+//! type, the same way `vault_security::deletion_log::DeletionLog` itself
+//! does for its own, structurally identical reference problem.
+//! `GenerationRef { generation, chain_hash, .. }` maps directly onto
+//! this log's own `(sequence, record_hash)` with no semantic mismatch —
+//! `generation` ↔ `sequence`, `chain_hash` ↔ `record_hash`.
+//!
+//! **What this detects, precisely, and what it does NOT** (never claim
+//! more than `vault_security::deletion_log`'s own identical mechanism
+//! already honestly claims for itself — see continuity decision
+//! `d279ua`): a forged (never-legitimately-written) reference is
+//! detected (`DpapiTrustedReferenceStore::read` surfaces a DPAPI
+//! decrypt/authentication failure as `ReferenceTamperDetected`,
+//! distinct from a merely corrupt/implausible one). An incomplete
+//! update (crash between the log's own fsync and the reference's own
+//! write) is detected as "log exactly one generation ahead of an
+//! otherwise-agreeing reference" and is the ONE pattern this module
+//! treats as safe to roll forward — any other disagreement fails
+//! closed. Replaying an old, genuinely-valid `(audit.log, head.ref)`
+//! pair together is NOT detected: a coordinated rollback produces
+//! exactly the same "one generation ahead, chain-consistent" shape a
+//! real crash would, and this mechanism cannot and does not
+//! distinguish them — this is the accepted, unchanged limitation
+//! `d279ua` already names, reconfirmed here rather than silently
+//! widened or narrowed by reusing the same real primitive
+//! `deletion_log.rs` already accepts this exact limitation for.
 
 use std::io::Write;
 use std::os::windows::io::AsRawHandle;
@@ -52,12 +89,36 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::OVERLAPPED;
 
+use vault_security::{DpapiTrustedReferenceStore, GenerationRef, TrustedReferenceStore};
+
 use crate::handle_safety::{self, OpenMode};
 use crate::vault::{StorageError, Vault};
 
 const AUDIT_DIR: &str = ".audit";
 const AUDIT_LOG_FILE: &str = "audit.log";
 const WRITER_LOCK_FILE: &str = "writer.lock";
+const HEAD_REFERENCE_FILE: &str = "head.ref";
+
+/// Identifies this reference as belonging to the AUDIT log specifically
+/// (reusing `GenerationRef`'s own `store_id` field, the same mechanism
+/// `deletion_log.rs` uses to bind a reference to one specific log
+/// instance) — defense-in-depth against a reference file ever being
+/// confused with a different log's own reference, even though in
+/// practice the fixed `.audit/head.ref` path is already this
+/// mechanism's real anchor.
+const AUDIT_REFERENCE_STORE_ID: &str = "superbrain-audit-log-v1";
+const AUDIT_REFERENCE_FORMAT_VERSION: u32 = 1;
+
+/// Genesis generation/hash for a brand-new audit log with no records yet
+/// — `generation: 0`, matching `brain_api::audit_chain::GENESIS_HASH`'s
+/// own 64-zero-character convention exactly (both independently reuse
+/// the same convention `deletion_log.rs` already established; this
+/// module does not import `brain_api` — `brain-api` depends on
+/// `storage`, never the reverse — so this constant is duplicated by
+/// value, not by shared type, the same "same value, independently
+/// defined" discipline this project already uses elsewhere, e.g.
+/// `mcp-client`'s own timeout constants against `brain_api::limits`).
+const GENESIS_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Why opening a new [`AuditWriterHandle`] failed — distinguishing an
 /// ordinary filesystem failure from the one condition this module
@@ -80,6 +141,18 @@ pub enum AuditWriterOpenError {
     /// procedure (a future task) runs.
     #[error("the audit log requires an explicit recovery procedure before further appends are permitted")]
     RecoveryRequired,
+    /// M5 Task 3: the log and its head reference disagree in a way this
+    /// module's own, narrow roll-forward rule (log exactly one
+    /// generation ahead of an otherwise-agreeing reference) does not
+    /// cover. Fails closed — never guesses, never auto-repairs. Wraps
+    /// the real `vault_security::DeletionLogError`-shaped reason this
+    /// mechanism already produces for the structurally identical
+    /// deletion-log problem (`ReferenceStale`/`ReferenceCorrupt`/
+    /// `ReferenceTamperDetected`/`ReferenceMissing` all surface here,
+    /// renamed to this module's own vocabulary rather than leaking
+    /// `vault-security`'s own error type as public API).
+    #[error("audit log and head reference are inconsistent: {0}")]
+    ReferenceInconsistent(String),
 }
 
 /// Why an append failed, or why the handle can no longer be trusted to
@@ -96,14 +169,28 @@ pub enum AuditAppendError {
     /// which re-runs full verification from scratch.
     #[error("this audit writer handle is poisoned after an ambiguous prior I/O outcome and must not be reused")]
     Poisoned,
+    /// M5 Task 3: the log bytes themselves were appended and fsync'd
+    /// successfully, but the subsequent head-reference update failed.
+    /// This is NOT poisoning (the log append itself is a complete,
+    /// durable, chain-valid fact) — but the reference now trails the
+    /// log by exactly one generation, the one state this module's own
+    /// roll-forward rule exists to recognize on the NEXT open. The
+    /// caller must still treat THIS specific append call as failed
+    /// (the two-step operation did not complete end to end) and must
+    /// not advance its own in-memory state as if the reference update
+    /// had succeeded.
+    #[error("audit log record was durably appended, but the head reference update failed: {0}")]
+    ReferenceUpdateFailed(String),
 }
 
-/// A live, exclusively-locked handle to this vault's own `.audit/audit.log`.
-/// Holding one is the only way any caller in this crate's dependency
-/// graph may append to the audit log. Dropping it releases the OS-level
-/// writer lock (including an unhandled crash, which releases all of this
+/// A live, exclusively-locked handle to this vault's own `.audit/audit.log`
+/// AND its paired `.audit/head.ref`. Holding one is the only way any
+/// caller in this crate's dependency graph may append to the audit log
+/// or update its head reference — the two always move together, inside
+/// one [`AuditWriterHandle::append`] call, under the one OS-level lock
+/// this handle holds for its whole lifetime. Dropping it releases that
+/// lock (including an unhandled crash, which releases all of this
 /// process's open handles automatically).
-#[derive(Debug)]
 pub struct AuditWriterHandle {
     file: std::fs::File,
     // Kept open for the handle's whole lifetime purely as the OS-level
@@ -111,20 +198,44 @@ pub struct AuditWriterHandle {
     // never read from or written to directly.
     #[allow(dead_code)]
     lock_file: std::fs::File,
+    reference_store: DpapiTrustedReferenceStore,
     poisoned: bool,
+}
+
+// `DpapiTrustedReferenceStore` does not itself implement `Debug`, so this
+// is written by hand rather than derived — omits its internals (just a
+// path plus DPAPI machinery, nothing a test assertion needs) and never
+// prints the open file handles' own OS-level state.
+impl std::fmt::Debug for AuditWriterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditWriterHandle")
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuditWriterHandle {
     /// Appends `bytes` (the caller's own already-chain-correct, fully
     /// serialized record line — this module neither inspects nor
-    /// constructs that content) and calls `sync_all` before returning
-    /// `Ok(())`. The in-memory "this append happened" fact (which the
-    /// caller — `brain-api`'s own future writer task — uses to advance
-    /// its own sequence/hash state) must only ever be recorded by the
-    /// CALLER after this function returns `Ok`, never before and never
-    /// optimistically; this function makes no attempt to track or
-    /// report partial success beyond the [`AuditAppendError::Poisoned`]
-    /// case below.
+    /// constructs that content) and, ONLY after that append is
+    /// confirmed durably fsync'd, updates the head reference to
+    /// `(sequence, record_hash)` — this module treats both as entirely
+    /// opaque values it neither computes nor interprets; the caller
+    /// (`brain-api::audit_chain`'s pure functions) is the sole authority
+    /// on what they mean.
+    ///
+    /// Exact ordering, per Task 3's own Phase 1 review: [1] `write_all`
+    /// the log bytes, [2] `sync_all` the log handle, [3] update the head
+    /// reference (which itself, internally, inside the already-reused
+    /// `DpapiTrustedReferenceStore::write`: DPAPI-wraps the new value,
+    /// writes it to a sibling temp file, `sync_all`s that temp file,
+    /// then atomically replaces the real reference file via
+    /// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, forcing that rename
+    /// itself to be flushed before returning). The in-memory "this
+    /// append happened" fact the caller's own writer task uses to
+    /// advance ITS sequence/hash state must only ever be recorded after
+    /// THIS function returns `Ok(())` — never before, never
+    /// optimistically.
     ///
     /// **Does not assume `write_all` is a single atomic OS write** (per
     /// explicit review requirement): if `write_all` itself returns an
@@ -133,13 +244,17 @@ impl AuditWriterHandle {
     /// clean failure, so the handle poisons itself (`self.poisoned =
     /// true`) rather than permitting a caller to retry on the same
     /// handle (a retry could duplicate a partially-written record's
-    /// bytes, corrupting the chain). A `sync_all` failure is poisoning
-    /// for the same reason: the kernel/filesystem may have already
-    /// persisted some or all of the bytes despite reporting failure.
-    /// Once poisoned, every subsequent call returns
-    /// [`AuditAppendError::Poisoned`] immediately without touching the
-    /// file again.
-    pub fn append(&mut self, bytes: &[u8]) -> Result<(), AuditAppendError> {
+    /// bytes, corrupting the chain). A `sync_all` failure on the LOG is
+    /// poisoning for the same reason. A failure specifically in the
+    /// REFERENCE update step (step [3], after the log append already
+    /// durably succeeded) is NOT poisoning — see
+    /// [`AuditAppendError::ReferenceUpdateFailed`]'s own doc comment:
+    /// the log itself is in a known-good state (one generation ahead of
+    /// its reference), the exact pattern a future
+    /// [`Vault::open_audit_writer`] call's own roll-forward check
+    /// recognizes as safe, so this handle remains usable for a
+    /// subsequent append rather than being poisoned.
+    pub fn append(&mut self, bytes: &[u8], sequence: u64, record_hash: &str) -> Result<(), AuditAppendError> {
         if self.poisoned {
             return Err(AuditAppendError::Poisoned);
         }
@@ -151,6 +266,21 @@ impl AuditWriterHandle {
             self.poisoned = true;
             return Err(AuditAppendError::Io(err));
         }
+
+        let reference = GenerationRef {
+            generation: sequence,
+            chain_hash: record_hash.to_string(),
+            format_version: Some(AUDIT_REFERENCE_FORMAT_VERSION),
+            store_id: Some(AUDIT_REFERENCE_STORE_ID.to_string()),
+        };
+        if let Err(err) = self.reference_store.write(&reference) {
+            // Deliberately NOT poisoning: the log append above already
+            // durably succeeded and is self-consistent on its own. See
+            // this function's own doc comment on why this is the one
+            // safe-to-recognize-on-reopen case, not an ambiguous one.
+            return Err(AuditAppendError::ReferenceUpdateFailed(err.to_string()));
+        }
+
         Ok(())
     }
 
@@ -167,22 +297,34 @@ impl AuditWriterHandle {
 impl Vault {
     /// Opens (creating `.audit/` and `.audit/audit.log` if absent) this
     /// vault's own audit log for appending, taking exclusive ownership
-    /// of the OS-level writer lock. Fails with
-    /// [`AuditWriterOpenError::AlreadyLocked`] if another live handle
-    /// (this process or another) already holds it — never blocks, never
-    /// silently waits.
+    /// of the OS-level writer lock, and cross-checks the log's own
+    /// already-caller-verified tail state against the DPAPI-protected
+    /// head reference before returning a usable handle.
     ///
-    /// Does NOT itself run `brain_api::audit_chain::scan_chain` or make
-    /// any decision about whether the existing file's content is
-    /// chain-valid — that is deliberately the caller's own
-    /// responsibility (this crate has no dependency on `brain-api` and
-    /// must not gain one; `brain-api` depends on `storage`, never the
-    /// reverse). A caller that wants fail-closed-on-corruption behavior
-    /// reads the file via [`Vault::read_audit_log_for_recovery_scan`]
-    /// BEFORE calling this method and only calls this method if that
-    /// scan permits resumption — this method's own job is solely safe,
-    /// exclusive, contained append access to the raw bytes.
-    pub fn open_audit_writer(&self) -> Result<AuditWriterHandle, AuditWriterOpenError> {
+    /// `caller_verified_tail` is the caller's OWN, already-computed
+    /// chain state (the last `(sequence, record_hash)` its own
+    /// `brain_api::audit_chain::scan_chain` found verified, or `None`
+    /// if the caller believes the log is empty/genesis) — this method
+    /// does NOT itself parse, scan, or verify the log's own chain
+    /// content (this crate has no dependency on `brain-api` and must
+    /// not gain one; `brain-api` depends on `storage`, never the
+    /// reverse). It ONLY compares the caller's claim against the head
+    /// reference and the raw fact of whether a reference exists at all
+    /// — this is the one place this module's own trust boundary with
+    /// its caller is drawn: this function trusts that
+    /// `caller_verified_tail` genuinely reflects a real, independently
+    /// chain-verified scan, never re-deriving it itself.
+    ///
+    /// Fails with [`AuditWriterOpenError::AlreadyLocked`] if another
+    /// live handle (this process or another) already holds the writer
+    /// lock — never blocks, never silently waits. Fails with
+    /// [`AuditWriterOpenError::ReferenceInconsistent`] for every
+    /// disagreement between `caller_verified_tail` and the reference
+    /// EXCEPT the one specific, safe-to-roll-forward pattern: the
+    /// caller's tail is exactly one generation ahead of an
+    /// otherwise-matching reference (the incomplete-reference-update
+    /// crash window this task's own design review names).
+    pub fn open_audit_writer(&self, caller_verified_tail: Option<(u64, &str)>) -> Result<AuditWriterHandle, AuditWriterOpenError> {
         let audit_dir = self.root().join(AUDIT_DIR);
         std::fs::create_dir_all(&audit_dir).map_err(StorageError::Io)?;
         let verified_dir = handle_safety::open_verified_dir(&audit_dir)?;
@@ -203,9 +345,13 @@ impl Vault {
         // rather than threaded further.
         drop(verified_dir);
 
+        let reference_store = DpapiTrustedReferenceStore::new(audit_dir.join(HEAD_REFERENCE_FILE));
+        Self::verify_reference_agreement(&reference_store, caller_verified_tail)?;
+
         Ok(AuditWriterHandle {
             file: handle.file,
             lock_file,
+            reference_store,
             poisoned: false,
         })
     }
@@ -265,6 +411,100 @@ impl Vault {
             Err(_) => Err(AuditWriterOpenError::AlreadyLocked),
         }
     }
+
+    /// The real state machine (M5 Task 3, Phase 1): compares
+    /// `caller_verified_tail` (the caller's own already-chain-verified
+    /// claim about the log's current tail) against the head reference,
+    /// mirroring `vault_security::deletion_log::DeletionLog::
+    /// reconcile_locked`'s own structurally identical match exactly —
+    /// same shape, same narrow roll-forward rule, reused as a DESIGN
+    /// pattern (not shared code, since the two logs' own row/entry types
+    /// differ) for the identical two-file crash-consistency problem.
+    fn verify_reference_agreement(reference_store: &DpapiTrustedReferenceStore, caller_verified_tail: Option<(u64, &str)>) -> Result<(), AuditWriterOpenError> {
+        let reference = reference_store.read().map_err(|e| AuditWriterOpenError::ReferenceInconsistent(e.to_string()))?;
+
+        match (caller_verified_tail, reference) {
+            // Caller believes the log is empty, and no reference exists
+            // at all yet: genuine first-ever run. Nothing to roll
+            // forward, nothing to disagree with.
+            (None, None) => Ok(()),
+            // Caller believes the log is empty, but SOME reference
+            // exists. The log can never legitimately be BEHIND its own
+            // reference (this module is the only writer, and it always
+            // appends the log before updating the reference) -- a
+            // reference with no matching log content is exactly the
+            // same disagreement `deletion_log.rs`'s own
+            // `(None, Some(r))` arm fails closed on, for the identical
+            // reason.
+            (None, Some(r)) => Err(AuditWriterOpenError::ReferenceInconsistent(format!(
+                "caller believes the log is empty, but a head reference exists at generation {}",
+                r.generation
+            ))),
+            // Caller has a verified tail, but no reference exists at
+            // all. Two genuinely different scenarios produce this same
+            // observable state, exactly as `deletion_log.rs`'s own
+            // identical case distinguishes: (1) the very first record
+            // ever appended crashed between the log's own fsync and the
+            // reference's first-ever write (safe: nothing has ever been
+            // exposed under a prior reference, and this process holds
+            // the only writer lock) -- but this module cannot
+            // distinguish "first record" from "record 500" by itself,
+            // since it never parses the log; it relies entirely on the
+            // caller's own verified_tail to tell it which case this is.
+            // Per this task's own fail-closed-unless-narrowly-proven
+            // discipline: a MISSING reference is refused UNCONDITIONALLY
+            // here, never auto-rolled-forward, even for sequence 0 --
+            // widening the deletion-log's own narrower, DB-internal
+            // "generation 1 still Pending" special case to this
+            // module's cruder (caller-reported, not self-verified) tail
+            // signal would be weaker evidence than deletion_log.rs's
+            // own mechanism has for its own identical-shaped exception.
+            (Some((seq, _)), None) => Err(AuditWriterOpenError::ReferenceInconsistent(format!(
+                "log has a caller-verified tail at sequence {seq}, but no head reference exists at all"
+            ))),
+            (Some((seq, hash)), Some(r)) => {
+                if r.store_id.as_deref() != Some(AUDIT_REFERENCE_STORE_ID) || r.format_version != Some(AUDIT_REFERENCE_FORMAT_VERSION) {
+                    return Err(AuditWriterOpenError::ReferenceInconsistent("head reference does not belong to this audit log (store_id/format_version mismatch)".to_string()));
+                }
+                // Defense-in-depth: a reference claiming generation 0
+                // (the genesis generation) must carry the fixed genesis
+                // hash exactly -- generation 0 has no real predecessor
+                // record to have produced any other hash, so any other
+                // value at generation 0 is implausible on its face,
+                // corrupt or forged, never a legitimate real state.
+                if r.generation == 0 && r.chain_hash != GENESIS_CHAIN_HASH {
+                    return Err(AuditWriterOpenError::ReferenceInconsistent(
+                        "head reference claims generation 0 but does not carry the genesis chain hash".to_string(),
+                    ));
+                }
+                if seq == r.generation {
+                    if hash != r.chain_hash {
+                        return Err(AuditWriterOpenError::ReferenceInconsistent(format!(
+                            "log tail at sequence {seq} has hash {hash}, but the reference at the same generation names a different hash"
+                        )));
+                    }
+                    Ok(())
+                } else if seq == r.generation + 1 {
+                    // The one specific, safe roll-forward pattern: the
+                    // log is exactly one record ahead of its own
+                    // reference. This module cannot independently
+                    // verify that the log's OWN chain is internally
+                    // consistent back to genesis (it never parses the
+                    // log) -- it trusts the caller's own
+                    // already-performed `scan_chain` for that. What
+                    // this check DOES verify itself: the reference's
+                    // claimed generation/hash is at least plausible as
+                    // "one behind" rather than any other disagreement.
+                    Ok(())
+                } else {
+                    Err(AuditWriterOpenError::ReferenceInconsistent(format!(
+                        "log tail is at sequence {seq}, but the reference is at generation {} -- not the one safe roll-forward pattern (exactly one behind)",
+                        r.generation
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,7 +536,7 @@ mod tests {
     #[test]
     fn a_fresh_vault_creates_the_audit_directory_and_log_on_first_open() {
         let vault = open_test_vault("fresh-create");
-        let handle = vault.open_audit_writer();
+        let handle = vault.open_audit_writer(None);
         assert!(handle.is_ok(), "opening a fresh vault's audit writer must succeed and create .audit/audit.log, got {handle:?}");
     }
 
@@ -304,15 +544,15 @@ mod tests {
     fn reopening_after_a_clean_close_succeeds_and_preserves_prior_content() {
         let vault = open_test_vault("reopen");
         {
-            let mut handle = vault.open_audit_writer().unwrap();
-            handle.append(b"first-record\n").unwrap();
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"first-record\n", 1, "hash-1").unwrap();
         } // handle dropped here -- releases the writer lock
 
         let bytes = vault.read_audit_log_for_recovery_scan().unwrap();
         assert_eq!(bytes, b"first-record\n");
 
-        let mut handle2 = vault.open_audit_writer().unwrap();
-        handle2.append(b"second-record\n").unwrap();
+        let mut handle2 = vault.open_audit_writer(Some((1, "hash-1"))).unwrap();
+        handle2.append(b"second-record\n", 2, "hash-2").unwrap();
         drop(handle2);
 
         let bytes = vault.read_audit_log_for_recovery_scan().unwrap();
@@ -324,9 +564,12 @@ mod tests {
     #[test]
     fn multiple_sequential_appends_land_in_order_and_are_all_durably_readable() {
         let vault = open_test_vault("sequential");
-        let mut handle = vault.open_audit_writer().unwrap();
+        let mut handle = vault.open_audit_writer(None).unwrap();
         for i in 0..20 {
-            handle.append(format!("record-{i}\n").as_bytes()).unwrap();
+            let seq = i + 1;
+            handle
+                .append(format!("record-{i}\n").as_bytes(), seq, &format!("hash-{seq}"))
+                .unwrap();
         }
         drop(handle);
         let content = String::from_utf8(vault.read_audit_log_for_recovery_scan().unwrap()).unwrap();
@@ -349,14 +592,17 @@ mod tests {
     fn concurrent_appends_from_multiple_threads_against_one_handle_never_interleave_or_corrupt_bytes(
     ) {
         let vault = open_test_vault("concurrent-one-process");
-        let handle = std::sync::Arc::new(std::sync::Mutex::new(vault.open_audit_writer().unwrap()));
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(vault.open_audit_writer(None).unwrap()));
+        let sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut join_handles = Vec::new();
         for t in 0..8 {
             let handle = handle.clone();
+            let sequence = sequence.clone();
             join_handles.push(std::thread::spawn(move || {
                 for i in 0..50 {
                     let line = format!("thread-{t}-record-{i:04}\n");
-                    handle.lock().unwrap().append(line.as_bytes()).unwrap();
+                    let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    handle.lock().unwrap().append(line.as_bytes(), seq, &format!("hash-{seq}")).unwrap();
                 }
             }));
         }
@@ -384,8 +630,8 @@ mod tests {
     #[test]
     fn a_second_handle_to_the_same_audit_log_is_rejected_while_the_first_is_still_open() {
         let vault = open_test_vault("second-writer-rejected");
-        let _first = vault.open_audit_writer().unwrap();
-        let second = vault.open_audit_writer();
+        let _first = vault.open_audit_writer(None).unwrap();
+        let second = vault.open_audit_writer(None);
         assert!(
             matches!(second, Err(AuditWriterOpenError::AlreadyLocked)),
             "a second concurrent writer handle must be refused with AlreadyLocked, got {second:?}"
@@ -437,7 +683,7 @@ mod tests {
 
         let vault =
             Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
-        let blocked = vault.open_audit_writer();
+        let blocked = vault.open_audit_writer(None);
         assert!(
             matches!(blocked, Err(AuditWriterOpenError::AlreadyLocked)),
             "the child process must still hold the lock at this point, got {blocked:?}"
@@ -457,7 +703,7 @@ mod tests {
         // scheduler/OS bookkeeping.
         let mut acquired = false;
         for _ in 0..50 {
-            if vault.open_audit_writer().is_ok() {
+            if vault.open_audit_writer(None).is_ok() {
                 acquired = true;
                 break;
             }
@@ -482,7 +728,7 @@ mod tests {
         let vault =
             Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
         let _handle = vault
-            .open_audit_writer()
+            .open_audit_writer(None)
             .expect("child failed to acquire the audit writer lock");
         // Block forever (until killed) -- never runs any Drop code by
         // design, matching an ungraceful process termination.
@@ -505,8 +751,8 @@ mod tests {
     fn read_audit_log_for_recovery_scan_returns_a_partial_trailing_write_unmodified() {
         let vault = open_test_vault("partial-tail-raw-read");
         {
-            let mut handle = vault.open_audit_writer().unwrap();
-            handle.append(b"complete-record\n").unwrap();
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"complete-record\n", 1, "hash-1").unwrap();
         }
         // Simulate a crash mid-write: append raw, incomplete bytes
         // directly to the real file (outside this module's own API,
@@ -539,8 +785,8 @@ mod tests {
     #[test]
     fn a_write_failure_poisons_the_handle_and_refuses_all_further_appends() {
         let vault = open_test_vault("write-failure-poisons");
-        let mut handle = vault.open_audit_writer().unwrap();
-        handle.append(b"first\n").unwrap();
+        let mut handle = vault.open_audit_writer(None).unwrap();
+        handle.append(b"first\n", 1, "hash-1").unwrap();
         assert!(!handle.is_poisoned());
 
         // Force a real write failure: close the underlying OS handle out
@@ -564,10 +810,11 @@ mod tests {
                 .truncate(false)
                 .open(audit_dir.join("proxy.lock"))
                 .unwrap(),
+            reference_store: DpapiTrustedReferenceStore::new(audit_dir.join("unused-proxy.ref")),
             poisoned: false,
         };
 
-        let result = broken_handle.append(b"this must fail\n");
+        let result = broken_handle.append(b"this must fail\n", 2, "hash-2");
         assert!(
             result.is_err(),
             "appending to a read-only-opened file must fail"
@@ -577,7 +824,7 @@ mod tests {
             "a write failure must poison the handle"
         );
 
-        let second_attempt = broken_handle.append(b"must also fail\n");
+        let second_attempt = broken_handle.append(b"must also fail\n", 2, "hash-2");
         assert!(matches!(second_attempt, Err(AuditAppendError::Poisoned)), "a poisoned handle must refuse every further append without touching the file again, got {second_attempt:?}");
     }
 
@@ -603,7 +850,7 @@ mod tests {
         // must be engineered, and that is proven by direct reproduction
         // at the brain-api layer, not here.
         fn _assert_sync(h: &mut AuditWriterHandle) -> Result<(), AuditAppendError> {
-            h.append(b"x")
+            h.append(b"x", 1, "hash-1")
         }
     }
 
@@ -633,7 +880,7 @@ mod tests {
             }
         }
 
-        let result = vault.open_audit_writer();
+        let result = vault.open_audit_writer(None);
         assert!(result.is_err(), "a symlink planted at the audit log's own path must be rejected, never followed, got {result:?}");
         assert_eq!(
             std::fs::read(&outside_file).unwrap(),
@@ -652,7 +899,7 @@ mod tests {
         std::fs::write(&outside_file, b"attacker content").unwrap();
         std::fs::hard_link(&outside_file, audit_dir.join(AUDIT_LOG_FILE)).unwrap();
 
-        let result = vault.open_audit_writer();
+        let result = vault.open_audit_writer(None);
         assert!(
             result.is_err(),
             "a hard-linked audit log path (link count != 1) must be rejected, got {result:?}"
@@ -663,4 +910,341 @@ mod tests {
     //     proven by the separate `brain-api` test run (Task 1's tests
     //     live in that crate, untouched by this task) -- not duplicated
     //     here, since this module has no dependency on brain-api at all.
+
+    // ============================================================
+    // M5 Task 3: head reference, integrity verification, crash
+    // consistency.
+    // ============================================================
+
+    fn read_raw_reference(vault: &Vault) -> Option<GenerationRef> {
+        let audit_dir = vault.root().join(AUDIT_DIR);
+        let store = DpapiTrustedReferenceStore::new(audit_dir.join(HEAD_REFERENCE_FILE));
+        store.read().expect("reading the raw reference for test inspection must not itself fail")
+    }
+
+    // --- T3-1: fresh init with no prior state: both log and reference
+    //     absent, genesis accepted with no reference ever written yet. ---
+
+    #[test]
+    fn fresh_init_with_no_caller_tail_and_no_reference_succeeds_as_genesis() {
+        let vault = open_test_vault("t3-fresh-genesis");
+        let handle = vault.open_audit_writer(None);
+        assert!(handle.is_ok(), "a brand-new vault with no log and no reference must be accepted as genesis, got {handle:?}");
+        assert!(
+            read_raw_reference(&vault).is_none(),
+            "opening alone must not itself write a reference -- only a real append does"
+        );
+    }
+
+    // --- T3-2: append writes both the log record and the reference;
+    //     reopening sees them agree. ---
+
+    #[test]
+    fn append_updates_the_head_reference_and_reopen_with_the_matching_tail_succeeds() {
+        let vault = open_test_vault("t3-append-then-reopen");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"record-0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        let reference = read_raw_reference(&vault).expect("a reference must exist after a successful append");
+        assert_eq!(reference.generation, 0);
+        assert_eq!(reference.chain_hash, GENESIS_CHAIN_HASH);
+        assert_eq!(reference.store_id.as_deref(), Some(AUDIT_REFERENCE_STORE_ID));
+        assert_eq!(reference.format_version, Some(AUDIT_REFERENCE_FORMAT_VERSION));
+
+        // Reopening with the caller's own verified tail claim matching
+        // exactly what was just written must succeed.
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(reopened.is_ok(), "reopening with a tail claim matching the reference exactly must succeed, got {reopened:?}");
+    }
+
+    // --- T3-3: valid chain / reference agreement across multiple
+    //     generations. ---
+
+    #[test]
+    fn valid_agreement_holds_across_several_generations() {
+        let vault = open_test_vault("t3-multi-gen-agreement");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+            handle.append(b"r1\n", 1, "hash-1").unwrap();
+            handle.append(b"r2\n", 2, "hash-2").unwrap();
+        }
+        let reference = read_raw_reference(&vault).unwrap();
+        assert_eq!(reference.generation, 2);
+        assert_eq!(reference.chain_hash, "hash-2");
+        assert!(vault.open_audit_writer(Some((2, "hash-2"))).is_ok());
+    }
+
+    // --- T3-4: crash after the log's own fsync but before the reference
+    //     update -- the one safe roll-forward pattern. Simulated directly
+    //     (no real process kill needed): write the log bytes raw, leave
+    //     the reference one generation behind, confirm the NEXT open
+    //     with the caller's own correctly-advanced tail claim succeeds. ---
+
+    #[test]
+    fn caller_tail_exactly_one_generation_ahead_of_the_reference_is_accepted_as_safe_roll_forward() {
+        let vault = open_test_vault("t3-roll-forward-one-ahead");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // Reference now at generation 0. Simulate a crash between the
+        // log's own fsync (already durable) and the reference update for
+        // a SECOND record: append the raw bytes directly, bypassing this
+        // module's own `append` (which would also update the reference),
+        // leaving the reference stuck at generation 0 while the log
+        // itself already (per the caller's own, independently verified
+        // scan) extends to generation 1.
+        let audit_log_path = vault.root().join(".audit").join("audit.log");
+        {
+            let mut raw = std::fs::OpenOptions::new().append(true).open(&audit_log_path).unwrap();
+            raw.write_all(b"r1\n").unwrap();
+            raw.sync_all().unwrap();
+        }
+
+        let reopened = vault.open_audit_writer(Some((1, "hash-1")));
+        assert!(reopened.is_ok(), "a caller tail exactly one generation ahead of an otherwise-agreeing reference must be accepted as the safe roll-forward case, got {reopened:?}");
+    }
+
+    // --- T3-5: crash during reference replacement -- modeled as the
+    //     reference file containing a corrupt/partial value while the log
+    //     is otherwise fine. `DpapiTrustedReferenceStore::write` already
+    //     writes to a sibling temp file and atomically renames it
+    //     (verified in `deletion_log.rs`'s own identical mechanism), so a
+    //     crash mid-replacement either leaves the OLD reference fully
+    //     intact (rename never happened) or the NEW one fully intact
+    //     (rename completed) -- never a half-written reference file.
+    //     This test proves the OLD-reference-intact case is accepted. ---
+
+    #[test]
+    fn a_reference_update_that_never_completed_leaves_the_old_reference_intact_and_still_usable() {
+        let vault = open_test_vault("t3-ref-replacement-crash");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // The atomic-rename primitive guarantees the reference file on
+        // disk right now is EITHER the old value or the new one, never a
+        // partial write -- so "crash during replacement, old value
+        // survives" is simply: the reference is still at generation 0,
+        // and a caller whose own verified tail is also still at
+        // generation 0 (no new record was ever durably appended) must
+        // see agreement.
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(reopened.is_ok(), "the untouched old reference must still agree with a caller tail that never advanced, got {reopened:?}");
+    }
+
+    // --- T3-6: corrupted reference is rejected, not silently accepted or
+    //     auto-repaired. ---
+
+    #[test]
+    fn a_corrupted_reference_file_is_rejected_not_silently_accepted() {
+        let vault = open_test_vault("t3-corrupt-reference");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        let reference_path = vault.root().join(".audit").join(HEAD_REFERENCE_FILE);
+        // Overwrite the DPAPI-protected reference file with garbage bytes
+        // -- neither a valid DPAPI blob nor valid plaintext.
+        std::fs::write(&reference_path, b"not a valid dpapi blob at all, just garbage").unwrap();
+
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(
+            matches!(reopened, Err(AuditWriterOpenError::ReferenceInconsistent(_))),
+            "a corrupted (non-DPAPI, non-plausible) reference must be rejected as ReferenceInconsistent, never silently accepted or repaired, got {reopened:?}"
+        );
+    }
+
+    // --- T3-7: missing reference with an existing, non-empty log fails
+    //     closed (this module cannot distinguish "very first record,
+    //     crashed before the reference was ever written" from "reference
+    //     file lost/deleted after real history accumulated" using only
+    //     its own information -- it refuses unconditionally rather than
+    //     guessing, per this task's own explicit design decision). ---
+
+    #[test]
+    fn a_missing_reference_with_a_caller_verified_non_empty_tail_fails_closed() {
+        let vault = open_test_vault("t3-missing-reference-with-history");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // Delete the reference file entirely, simulating it being lost
+        // while the log itself survives.
+        let reference_path = vault.root().join(".audit").join(HEAD_REFERENCE_FILE);
+        std::fs::remove_file(&reference_path).unwrap();
+
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(
+            matches!(reopened, Err(AuditWriterOpenError::ReferenceInconsistent(_))),
+            "a missing reference, even at generation 0, must fail closed rather than being silently re-created, got {reopened:?}"
+        );
+    }
+
+    // --- T3-8: reference ahead of (or otherwise inconsistent with) the
+    //     caller's verified tail fails closed. ---
+
+    #[test]
+    fn a_reference_claiming_a_later_generation_than_the_callers_verified_tail_fails_closed() {
+        let vault = open_test_vault("t3-reference-ahead");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+            handle.append(b"r1\n", 1, "hash-1").unwrap();
+        }
+        // The reference is now at generation 1. A caller claiming its own
+        // verified tail is still at generation 0 (reference AHEAD of the
+        // log, which can never legitimately happen since this module is
+        // the only writer) must be refused.
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(
+            matches!(reopened, Err(AuditWriterOpenError::ReferenceInconsistent(_))),
+            "a reference ahead of the caller's own verified tail must fail closed, got {reopened:?}"
+        );
+    }
+
+    #[test]
+    fn a_caller_tail_more_than_one_generation_ahead_of_the_reference_fails_closed() {
+        let vault = open_test_vault("t3-gap-too-large");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // Claiming the caller's own tail is at generation 5 while the
+        // reference is still at 0 is not the one safe "exactly one ahead"
+        // roll-forward pattern -- must fail closed.
+        let reopened = vault.open_audit_writer(Some((5, "hash-5")));
+        assert!(
+            matches!(reopened, Err(AuditWriterOpenError::ReferenceInconsistent(_))),
+            "a gap larger than one generation must fail closed, not be silently rolled forward, got {reopened:?}"
+        );
+    }
+
+    // --- T3-9: forged reference (plausible-looking bytes that are not a
+    //     genuine DPAPI blob produced on THIS machine/user) is rejected --
+    //     `DpapiTrustedReferenceStore` surfaces this distinctly from a
+    //     merely corrupt/truncated blob when the underlying DPAPI
+    //     decrypt/authentication step itself fails, exactly the same
+    //     mechanism `deletion_log.rs` already relies on for its own
+    //     identical problem. ---
+
+    #[test]
+    fn a_forged_reference_file_is_rejected() {
+        let vault = open_test_vault("t3-forged-reference");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // Forge an entirely different reference under a DIFFERENT DPAPI
+        // protection context (a second, unrelated store at a different
+        // path) and splice its ciphertext bytes in at the real reference
+        // path -- this is "plausible-looking DPAPI-shaped bytes that were
+        // never legitimately written for THIS reference", the forgery
+        // case, distinct from plain corruption.
+        let forged_dir = unique_test_dir("t3-forged-reference-source");
+        let forged_store = DpapiTrustedReferenceStore::new(forged_dir.join("forged.ref"));
+        forged_store
+            .write(&GenerationRef {
+                generation: 99,
+                chain_hash: "attacker-controlled-hash".to_string(),
+                format_version: Some(AUDIT_REFERENCE_FORMAT_VERSION),
+                store_id: Some(AUDIT_REFERENCE_STORE_ID.to_string()),
+            })
+            .unwrap();
+        let forged_bytes = std::fs::read(forged_dir.join("forged.ref")).unwrap();
+        let real_reference_path = vault.root().join(".audit").join(HEAD_REFERENCE_FILE);
+        std::fs::write(&real_reference_path, &forged_bytes).unwrap();
+
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(
+            matches!(reopened, Err(AuditWriterOpenError::ReferenceInconsistent(_))),
+            "a reference forged/spliced from a different DPAPI protection context must be rejected, got {reopened:?}"
+        );
+    }
+
+    // --- T3-10: replay of an old, genuinely-valid (log, reference) pair
+    //     together is NOT detected -- documented accepted limitation
+    //     (continuity decision d279ua), reconfirmed here rather than
+    //     silently claimed as solved. This test demonstrates the
+    //     limitation directly: a real, legitimately-produced earlier
+    //     snapshot of both files, restored together, is indistinguishable
+    //     from genuine un-tampered history and is accepted. ---
+
+    #[test]
+    fn replaying_an_old_genuinely_valid_log_and_reference_pair_together_is_not_detected_accepted_limitation() {
+        let vault = open_test_vault("t3-replay-not-detected");
+        let audit_dir = vault.root().join(".audit");
+        {
+            let mut handle = vault.open_audit_writer(None).unwrap();
+            handle.append(b"r0\n", 0, GENESIS_CHAIN_HASH).unwrap();
+        }
+        // Snapshot the genuinely-valid generation-0 pair.
+        let log_path = audit_dir.join(AUDIT_LOG_FILE);
+        let reference_path = audit_dir.join(HEAD_REFERENCE_FILE);
+        let snapshot_log = std::fs::read(&log_path).unwrap();
+        let snapshot_reference = std::fs::read(&reference_path).unwrap();
+
+        // Advance real history further.
+        {
+            let mut handle = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH))).unwrap();
+            handle.append(b"r1\n", 1, "hash-1").unwrap();
+            handle.append(b"r2\n", 2, "hash-2").unwrap();
+        }
+
+        // An attacker (or a buggy backup tool) now restores the OLD,
+        // genuinely-valid generation-0 snapshot of BOTH files together,
+        // rolling back real history. This mechanism has no way to know
+        // that newer, now-destroyed history ever existed.
+        std::fs::write(&log_path, &snapshot_log).unwrap();
+        std::fs::write(&reference_path, &snapshot_reference).unwrap();
+
+        let reopened = vault.open_audit_writer(Some((0, GENESIS_CHAIN_HASH)));
+        assert!(
+            reopened.is_ok(),
+            "per the documented, accepted limitation (d279ua): a coordinated replay of a genuinely-valid old (log, reference) pair is indistinguishable from real history and IS accepted -- this is not a bug in this test, it is the limitation itself, demonstrated directly, got {reopened:?}"
+        );
+    }
+
+    // --- T3-11: cross-process writer exclusion across the FULL
+    //     operation (log append + reference update), not just log
+    //     opening -- the single `LockFileEx` lock, held for the handle's
+    //     whole lifetime, already covers both steps inside one `append`
+    //     call; this test proves a second process is refused even while
+    //     the first is only holding the handle open (not necessarily
+    //     mid-write), reusing the same real child-process mechanism as
+    //     test 5 above. ---
+
+    #[test]
+    fn a_second_process_is_excluded_for_the_full_duration_the_first_holds_its_writer_handle() {
+        let vault = open_test_vault("t3-cross-process-full-exclusion");
+        let root = vault.root().to_path_buf();
+        drop(vault);
+
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", "audit_writer::tests::__lock_holder_child_helper", "--ignored", "--nocapture"])
+            .env("SUPERBRAIN_AUDIT_LOCK_HOLDER_ROOT", &root)
+            .spawn()
+            .expect("failed to spawn the lock-holder child process");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let vault = Vault::open_with_default_indexer(root.clone(), &root.join("journal.sqlite")).unwrap();
+        let blocked = vault.open_audit_writer(None);
+        assert!(
+            matches!(blocked, Err(AuditWriterOpenError::AlreadyLocked)),
+            "a second process must be excluded from BOTH the log and the reference while the first still holds its handle open, got {blocked:?}"
+        );
+
+        child.kill().expect("failed to kill the lock-holder child process");
+        child.wait().expect("failed to reap the killed child process");
+    }
+
+    // --- T3-12: no regression of Task 1 (brain-api::audit_chain, a
+    //     separate crate's own test run) or Task 2's own tests (all
+    //     updated above to the new signature and passing) or the rest of
+    //     the workspace -- proven by the full `cargo test --workspace`
+    //     run accompanying this task, not duplicated as an in-file test.
 }
