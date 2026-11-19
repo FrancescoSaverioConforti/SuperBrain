@@ -50,9 +50,11 @@ use serde::{Deserialize, Serialize};
 /// `Deserialize` added (M5 Task 4): purely additive, no field/variant/
 /// wire-format change — required so `audit_record::parse_event` can
 /// decode a verified record's own `content_bytes` back into a typed
-/// value for recovery/inspection. The B5.12 freeze is on the variant set
-/// and field shapes (still exactly 7 variants, still content-free), not
-/// on which serde traits are derived.
+/// value for recovery/inspection. The B5.12 freeze is on the ORIGINAL 7
+/// variants' own names and field shapes (still exactly those 7,
+/// unchanged, still content-free); M5 Task 5 adds two further variants
+/// (`ApprovalAttempted`/`CommitOutcome`) additively, never touching the
+/// frozen 7.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub kind: AuditEventKind,
@@ -60,11 +62,12 @@ pub struct AuditEvent {
     pub correlation_id: uuid::Uuid,
 }
 
-/// The frozen set of audit event categories (B5.12). Exactly these 7
-/// variants — no field anywhere carries note content, query text, tool
-/// arguments, or any other content-bearing payload; `reason` fields are a
-/// short category/explanation chosen by the emitting call site, never a
-/// verbatim echo of caller-supplied free text.
+/// The frozen set of audit event categories (B5.12), plus M5 Task 5's two
+/// additive variants below — the original 7 keep their exact names and
+/// field shapes unchanged. No field anywhere carries note content, query
+/// text, tool arguments, or any other content-bearing payload; `reason`
+/// fields are a short category/explanation chosen by the emitting call
+/// site, never a verbatim echo of caller-supplied free text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditEventKind {
@@ -75,6 +78,76 @@ pub enum AuditEventKind {
     WriteMemory { proposal_id: String },
     ExternalExecution { server: String, tool: String },
     FallbackOrError { context: String },
+    /// M5 Task 5: records that an approval attempt was MADE on
+    /// `proposal_id` — distinct from `WriteMemory` (which records a
+    /// successful commit's `proposal_id` alone, with no notion of "an
+    /// attempt" at all) and distinct from the proposal's own existence
+    /// (a `PendingWriteProposal` being present in the store is never, by
+    /// itself, evidence that anyone ever called `approve_proposal` on
+    /// it). `attempt_id` is a fresh identifier minted by the caller at
+    /// the moment of the attempt — never derived from `proposal_id` or
+    /// `correlation_id` — so two separate attempts against the same
+    /// proposal (e.g. a retried approval after a transient failure)
+    /// produce two distinct `ApprovalAttempted` records, each
+    /// independently correlatable with its own eventual `CommitOutcome`
+    /// via that same `attempt_id`. `correlation_id` is carried on the
+    /// enclosing `AuditEvent` as usual (the request that initiated this
+    /// attempt); `proposal_id` here is the target being approved, kept
+    /// as its own field (not inferred from `correlation_id`) because one
+    /// request's correlation id and the proposal id it acts on are
+    /// independent identifiers with no fixed relationship.
+    ApprovalAttempted { attempt_id: String, proposal_id: String },
+    /// M5 Task 5: the terminal outcome of exactly one `ApprovalAttempted`
+    /// (linked by `attempt_id`, never re-derived from `proposal_id`
+    /// alone, since a proposal can accumulate more than one attempt
+    /// over time). `reject_proposal` must NEVER emit this variant — a
+    /// rejection is a pure status transition with no commit of any kind,
+    /// so there is no outcome here to record; only `approve_proposal`'s
+    /// own call site may emit it, and only after an `ApprovalAttempted`
+    /// for the same `attempt_id` already exists.
+    CommitOutcome { attempt_id: String, outcome: CommitOutcomeKind },
+}
+
+/// The terminal classification of one approval attempt's commit —
+/// mirrors `storage::CommitResult`'s own two success shapes
+/// (`Committed`/`GitPending`) plus one categorized failure bucket for
+/// everything `approve_proposal` can return as `Err` (`BrainApiError`'s
+/// own variants, never the error's full `Display` text — that could
+/// carry caller-supplied detail this schema's content-free discipline
+/// forbids). This module does not import `storage::CommitResult` or
+/// `BrainApiError` into this enum directly (this module must stay a pure
+/// schema definition, no behavioral dependency on either type's own
+/// evolution) — a future, separately authorized wiring task maps between
+/// them; this enum only defines the SHAPE of what gets persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitOutcomeKind {
+    /// The write reached full commit (storage's own `CommitResult::Committed`).
+    Committed,
+    /// The write durably reached the journal but git has not yet
+    /// committed it (storage's own `CommitResult::GitPending`) — not a
+    /// failure of the approval itself.
+    GitPending,
+    /// The approval attempt did not commit at all, categorized by which
+    /// kind of operational failure it was — never the raw error message.
+    Failed { category: CommitFailureCategory },
+}
+
+/// A coarse, content-free bucket for why an approval attempt's commit
+/// failed — one variant per `BrainApiError` case `approve_proposal` can
+/// actually return (`PermissionDenied` is excluded: a permission failure
+/// never reaches `execute`, so it is never the OUTCOME of an attempt that
+/// got far enough to commit; a denied attempt is recorded by the
+/// existing `PermissionDecision`/`DeniedAction` variants instead, not by
+/// a `CommitOutcome` at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitFailureCategory {
+    NotFound,
+    InvalidInput,
+    Conflict,
+    RuntimeUnavailable,
+    CorruptData,
 }
 
 /// Emission destination for [`AuditEvent`]s. Mirrors `mcp_client::
@@ -170,6 +243,22 @@ mod tests {
             AuditEventKind::WriteMemory { proposal_id: "11111111-1111-1111-1111-111111111111".into() },
             AuditEventKind::ExternalExecution { server: "ext".into(), tool: "echo".into() },
             AuditEventKind::FallbackOrError { context: "dense retrieval unavailable".into() },
+            AuditEventKind::ApprovalAttempted {
+                attempt_id: "22222222-2222-2222-2222-222222222222".into(),
+                proposal_id: "11111111-1111-1111-1111-111111111111".into(),
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "22222222-2222-2222-2222-222222222222".into(),
+                outcome: CommitOutcomeKind::Committed,
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "22222222-2222-2222-2222-222222222222".into(),
+                outcome: CommitOutcomeKind::GitPending,
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "22222222-2222-2222-2222-222222222222".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+            },
         ]
     }
 
@@ -198,6 +287,135 @@ mod tests {
             let json = serde_json::to_string(&kind).unwrap();
             assert!(!json.is_empty());
         }
+    }
+
+    // --- M5 Task 5: ApprovalAttempted / CommitOutcome schema ---
+
+    #[test]
+    fn every_new_variant_round_trips_through_serde_json_exactly() {
+        for kind in [
+            AuditEventKind::ApprovalAttempted { attempt_id: "a1".into(), proposal_id: "p1".into() },
+            AuditEventKind::CommitOutcome { attempt_id: "a1".into(), outcome: CommitOutcomeKind::Committed },
+            AuditEventKind::CommitOutcome { attempt_id: "a1".into(), outcome: CommitOutcomeKind::GitPending },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "a1".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::NotFound },
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "a1".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::InvalidInput },
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "a1".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "a1".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::RuntimeUnavailable },
+            },
+            AuditEventKind::CommitOutcome {
+                attempt_id: "a1".into(),
+                outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::CorruptData },
+            },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: AuditEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind, "round trip through JSON must reproduce the exact original variant, got {json}");
+        }
+    }
+
+    #[test]
+    fn approval_attempted_and_commit_outcome_are_correlated_by_attempt_id_not_proposal_id() {
+        // Two separate attempts against the SAME proposal_id must be
+        // distinguishable by attempt_id -- proposal_id alone can never
+        // tell two attempts apart.
+        let attempted_1 = AuditEventKind::ApprovalAttempted { attempt_id: "attempt-1".into(), proposal_id: "p1".into() };
+        let attempted_2 = AuditEventKind::ApprovalAttempted { attempt_id: "attempt-2".into(), proposal_id: "p1".into() };
+        assert_ne!(attempted_1, attempted_2, "two distinct attempts against the same proposal must not collapse into equal events");
+
+        let outcome_1 = AuditEventKind::CommitOutcome { attempt_id: "attempt-1".into(), outcome: CommitOutcomeKind::Committed };
+        let outcome_2 = AuditEventKind::CommitOutcome {
+            attempt_id: "attempt-2".into(),
+            outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+        };
+        // Each outcome's own attempt_id is what ties it back to its own
+        // attempt -- never proposal_id, which CommitOutcome does not even
+        // carry.
+        if let (AuditEventKind::ApprovalAttempted { attempt_id: a1, .. }, AuditEventKind::CommitOutcome { attempt_id: o1, .. }) = (&attempted_1, &outcome_1) {
+            assert_eq!(a1, o1);
+        } else {
+            panic!("pattern must match");
+        }
+        if let (AuditEventKind::ApprovalAttempted { attempt_id: a2, .. }, AuditEventKind::CommitOutcome { attempt_id: o2, .. }) = (&attempted_2, &outcome_2) {
+            assert_eq!(a2, o2);
+        } else {
+            panic!("pattern must match");
+        }
+    }
+
+    #[test]
+    fn commit_outcome_never_carries_a_proposal_id_field_only_attempt_id() {
+        // Structural guard for requirement 1: a proposal's existence (or
+        // its id) is never, by itself, sufficient to reconstruct whether
+        // or what a CommitOutcome says -- CommitOutcome's own shape has
+        // no proposal_id field at all, only attempt_id, so a reader can
+        // never mistake "a proposal exists" for "this specific commit
+        // outcome happened to it" without first finding the matching
+        // ApprovalAttempted record carrying that attempt_id.
+        let json = serde_json::to_string(&AuditEventKind::CommitOutcome { attempt_id: "a1".into(), outcome: CommitOutcomeKind::Committed }).unwrap();
+        assert!(!json.contains("proposal_id"), "CommitOutcome's own serialized shape must never carry a proposal_id field, got {json}");
+    }
+
+    #[test]
+    fn no_commit_outcome_variant_serializes_a_raw_error_message_string() {
+        // CommitFailureCategory is a closed, content-free enum -- there is
+        // no String field anywhere in the Failed variant's own shape for
+        // a raw BrainApiError::InvalidInput(String)'s own caller-supplied
+        // detail to leak into, by construction. The real guard: the
+        // serialized form stays short and bounded, same discipline as the
+        // existing content-free regression test, and carries only the
+        // closed category label, never free text.
+        let json = serde_json::to_string(&AuditEventKind::CommitOutcome {
+            attempt_id: "a1".into(),
+            outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::InvalidInput },
+        })
+        .unwrap();
+        assert!(json.len() < 150, "a categorized failure must stay short and bounded, got {json}");
+        assert!(json.contains("invalid_input"), "the closed category label must appear, got {json}");
+    }
+
+    #[test]
+    fn the_new_variants_are_compatible_with_the_pure_hash_chain_functions_and_recovery_scan() {
+        // Task 5 requirement 6: the new schema must round-trip cleanly
+        // through audit_record::serialize_record/parse_line/parse_event
+        // and verify through audit_chain::scan_chain exactly like any
+        // existing variant -- proven directly here, not assumed.
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let proposal_id = uuid::Uuid::new_v4().to_string();
+        let correlation_id = uuid::Uuid::new_v4();
+
+        let e0 = event(AuditEventKind::ApprovalAttempted { attempt_id: attempt_id.clone(), proposal_id: proposal_id.clone() }, "2026-11-19T00:00:00Z", correlation_id);
+        let (line0, hash0) = crate::audit_record::serialize_record(&e0, 0, crate::audit_chain::GENESIS_HASH);
+
+        let e1 = event(AuditEventKind::CommitOutcome { attempt_id: attempt_id.clone(), outcome: CommitOutcomeKind::Committed }, "2026-11-19T00:00:01Z", correlation_id);
+        let (line1, hash1) = crate::audit_record::serialize_record(&e1, 1, &hash0);
+
+        let mut raw = line0.clone();
+        raw.extend_from_slice(&line1);
+
+        let record0 = crate::audit_record::parse_line(&line0[..line0.len() - 1]).unwrap();
+        let record1 = crate::audit_record::parse_line(&line1[..line1.len() - 1]).unwrap();
+        let lines = vec![crate::audit_chain::LineOutcome::Parsed(record0), crate::audit_chain::LineOutcome::Parsed(record1)];
+
+        let scan = crate::audit_chain::scan_chain(&lines);
+        assert!(scan.stop_reason.is_none(), "a chain built entirely from the two new variants must verify cleanly, got {:?}", scan.stop_reason);
+        assert_eq!(scan.verified_records.len(), 2);
+        assert_eq!(scan.verified_records[1].record_hash, hash1);
+
+        let decoded0 = crate::audit_record::parse_event(&scan.verified_records[0].content_bytes).unwrap();
+        let decoded1 = crate::audit_record::parse_event(&scan.verified_records[1].content_bytes).unwrap();
+        assert_eq!(decoded0.kind, AuditEventKind::ApprovalAttempted { attempt_id: attempt_id.clone(), proposal_id });
+        assert_eq!(decoded1.kind, AuditEventKind::CommitOutcome { attempt_id, outcome: CommitOutcomeKind::Committed });
     }
 
     // --- construction / sink behavior ---
