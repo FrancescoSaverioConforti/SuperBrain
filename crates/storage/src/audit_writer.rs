@@ -33,19 +33,39 @@
 //! itself never truncates, repairs, or deletes anything.
 //!
 //! **Single-writer locking (user requirement 4):** an OS-level exclusive,
-//! non-blocking advisory lock (`LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK
-//! | LOCKFILE_FAIL_IMMEDIATELY` on Windows) on a sibling
-//! `.audit/writer.lock` file, held for the `AuditWriterHandle`'s entire
-//! lifetime. Verified by direct reproduction on this project's real
-//! Windows host: a second handle to the same file cannot acquire the
-//! lock while a first handle holds it, and the lock becomes available
-//! again the instant the first handle is dropped for ANY reason
-//! (including an unhandled process crash, which releases all of a
-//! process's open handles without requiring any cleanup code to run).
-//! This same lock now covers BOTH the log append and the head-reference
-//! update (M5 Task 3): both happen inside one [`AuditWriterHandle::append`]
-//! call, under the one already-held lock — no second, independently
-//! acquirable lock exists for the reference.
+//! non-blocking advisory lock on a sibling `.audit/writer.lock` file,
+//! held for the `AuditWriterHandle`'s entire lifetime — `std::fs::File::
+//! try_lock()` (stabilized stdlib API: `LockFileEx` with
+//! `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` under the hood on
+//! Windows, `flock(2)`/`fcntl` under the hood on Unix), the SAME
+//! cross-platform primitive `vault_security::deletion_log::DeletionLog::
+//! acquire_existing_write_lock` already uses for its own, structurally
+//! identical single-writer problem — reused as a design pattern (not
+//! shared code, since that type's own retry/timeout semantics differ;
+//! this module's own lock is non-blocking/fail-immediately, never a
+//! bounded wait). M5 Task 8A correctness fix: this module originally
+//! called the raw `windows::Win32::Storage::FileSystem::LockFileEx` FFI
+//! directly, unconditionally, with no `#[cfg(windows)]` gate anywhere in
+//! the module or on its `mod audit_writer;` declaration in `lib.rs` —
+//! `storage` (and therefore every crate depending on it) could not
+//! compile at all on a non-Windows target. Switching to the stdlib's own
+//! cross-platform `try_lock()` removes the defect at its root: this
+//! module now compiles and provides the IDENTICAL real, functional
+//! locking guarantee on both platforms, not a stub — no `#[cfg]`
+//! gating is needed anywhere in this file. Verified by direct
+//! reproduction on this project's real Windows host (this task's own
+//! acceptance tests, inherited unmodified from M5 Task 2/3): a second
+//! handle to the same file cannot acquire the lock while a first handle
+//! holds it, and the lock becomes available again the instant the first
+//! handle is dropped for ANY reason (including an unhandled process
+//! crash, which releases all of a process's open handles without
+//! requiring any cleanup code to run) — `std::fs::File`'s own lock
+//! release-on-drop semantics are identical to `LockFileEx`'s on Windows,
+//! and the equivalent on Unix. This same lock now covers BOTH the log
+//! append and the head-reference update (M5 Task 3): both happen inside
+//! one [`AuditWriterHandle::append`] call, under the one already-held
+//! lock — no second, independently acquirable lock exists for the
+//! reference.
 //!
 //! **Head reference (M5 Task 3):** reuses `vault_security::{
 //! DpapiTrustedReferenceStore, TrustedReferenceStore, GenerationRef}`
@@ -81,13 +101,6 @@
 //! `deletion_log.rs` already accepts this exact limitation for.
 
 use std::io::Write;
-use std::os::windows::io::AsRawHandle;
-
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{
-    LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-};
-use windows::Win32::System::IO::OVERLAPPED;
 
 use vault_security::{DpapiTrustedReferenceStore, GenerationRef, TrustedReferenceStore};
 
@@ -403,21 +416,17 @@ impl Vault {
             .open(&lock_path)
             .map_err(StorageError::Io)?;
 
-        let raw_handle = HANDLE(lock_file.as_raw_handle());
-        let mut overlapped = OVERLAPPED::default();
-        let result = unsafe {
-            LockFileEx(
-                raw_handle,
-                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                None,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        };
-        match result {
+        // `std::fs::File::try_lock()`: the stdlib's own cross-platform
+        // exclusive, non-blocking advisory lock (see this module's own
+        // top-level doc comment for why this replaced a direct, Windows-
+        // only `LockFileEx` FFI call). `WouldBlock` is the ordinary,
+        // expected "another writer already holds it" outcome; any other
+        // error is a genuine I/O failure, surfaced the same way this
+        // module's other `std::fs` calls already are.
+        match lock_file.try_lock() {
             Ok(()) => Ok(lock_file),
-            Err(_) => Err(AuditWriterOpenError::AlreadyLocked),
+            Err(std::fs::TryLockError::WouldBlock) => Err(AuditWriterOpenError::AlreadyLocked),
+            Err(std::fs::TryLockError::Error(err)) => Err(AuditWriterOpenError::Storage(StorageError::Io(err))),
         }
     }
 
@@ -872,11 +881,19 @@ mod tests {
     // --- 11: reopen after a successful append ---
     // (covered by `reopening_after_a_clean_close_succeeds_and_preserves_prior_content` above)
 
-    // --- 12: attempted symlink/reparse-point/hard-link redirection on
-    //     Windows -- reuses handle_safety's own already-verified
-    //     rejection logic; this test proves it applies through the NEW
-    //     AppendOrCreate open mode specifically, not just the
-    //     pre-existing CreateOrOpenForWrite mode.
+    // --- 12: attempted symlink/reparse-point/hard-link redirection --
+    //     reuses handle_safety's own already-verified rejection logic;
+    //     this test proves it applies through the NEW AppendOrCreate open
+    //     mode specifically, not just the pre-existing
+    //     CreateOrOpenForWrite mode. M5 Task 8A: the symlink-creation call
+    //     itself is the only genuinely platform-specific line here (same
+    //     `#[cfg(windows)]`/`#[cfg(unix)]` split `handle_safety.rs`'s own
+    //     `rejects_a_symlinked_parent_directory_even_after_a_trusted_
+    //     snapshot` test already uses) -- the test BODY (the actual
+    //     rejection assertion) is identical on both platforms, so gating
+    //     the whole function (rather than just the symlink call) would
+    //     have silently dropped this coverage on Unix instead of actually
+    //     proving the same property there.
 
     #[test]
     fn a_symlink_planted_at_the_audit_log_path_is_rejected_not_followed() {
@@ -887,10 +904,15 @@ mod tests {
         let outside_file = outside.join("victim.log");
         std::fs::write(&outside_file, b"attacker content").unwrap();
 
-        match std::os::windows::fs::symlink_file(&outside_file, audit_dir.join(AUDIT_LOG_FILE)) {
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&outside_file, audit_dir.join(AUDIT_LOG_FILE));
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside_file, audit_dir.join(AUDIT_LOG_FILE));
+
+        match link_result {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("skipping: could not create a real symlink on this host (needs admin/dev-mode): {e}");
+                eprintln!("skipping: could not create a real symlink on this host (needs admin/dev-mode on Windows): {e}");
                 return;
             }
         }
