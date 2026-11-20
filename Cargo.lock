@@ -1178,6 +1178,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "windows",
 ]
 
 [[package]]

@@ -25,5 +25,17 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 thiserror = "1"
 
+[target.'cfg(windows)'.dependencies]
+# M6.4-S1: read-only Windows ACL inspection for trusted-location
+# executable/script identity verification (identity.rs's own
+# windows_acl module). Same windows crate version storage already
+# depends on; these two features add GetNamedSecurityInfoW/GetAce/
+# IsValidAcl/IsValidSecurityDescriptor/EqualSid (Win32_Security,
+# Win32_Security_Authorization) and OpenProcessToken/GetTokenInformation
+# (Win32_System_Threading, for retrieving the current process's own
+# user SID to build the allowlist) -- read-only inspection only, never
+# SECURITY_DESCRIPTOR/DACL construction.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }

@@ -96,6 +96,34 @@ pub struct ServerConfig {
     /// happens to be invoked from -- an operator-reviewable config must
     /// not have that ambiguity).
     pub working_dir: PathBuf,
+    /// M6.4-S1: the highest ancestor directory of the resolved `command`
+    /// the OPERATOR explicitly vouches for -- required, no default, no
+    /// inference. Kept SEPARATE from `script_trust_boundary` below
+    /// because the interpreter/native binary and the script file
+    /// typically live in two entirely unrelated directory trees (e.g.
+    /// the interpreter under its own install directory, the script
+    /// under the operator's own `working_dir`) -- a single shared
+    /// boundary would either have to be their nearest common ancestor
+    /// (often far too shallow to be meaningful, e.g. a drive root) or
+    /// would be wrong for one of the two paths. On Windows,
+    /// `windows_acl::verify_trusted_location` verifies write-into-
+    /// directory rights (Check A) only up to and including this
+    /// directory, and delete/rename/replace/re-ACL rights (Check B)
+    /// from the target all the way to the filesystem root regardless of
+    /// this value (Check B has no safe stopping point short of the root
+    /// -- see that module's own doc comment). The operator's own
+    /// declaration of this value is NEVER, by itself, treated as proof
+    /// of anything: it only tells the checker where Check A may stop;
+    /// the actual safety claim comes entirely from the real ACL
+    /// inspection both checks perform.
+    pub command_trust_boundary: PathBuf,
+    /// The same boundary concept as `command_trust_boundary`, but for
+    /// the resolved `script` path specifically -- required whenever
+    /// `script` is present (enforced in `validate`, not via `serde`
+    /// default, since a `script`-less config has no script path for
+    /// this to apply to).
+    #[serde(default)]
+    pub script_trust_boundary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -282,6 +310,9 @@ impl TrustedConfig {
                     self.server.command
                 )));
             }
+            if self.server.script_trust_boundary.is_none() {
+                return Err(ConfigError::Validation("server.script_trust_boundary is required whenever server.script is present".to_string()));
+            }
             for arg in &self.server.args {
                 if DYNAMIC_CODE_LOADING_FLAGS.iter().any(|flag| arg == flag) {
                     return Err(ConfigError::Validation(format!(
@@ -293,9 +324,9 @@ impl TrustedConfig {
             if script_sha256.len() != 64 || !script_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(ConfigError::Validation(format!("server.script_sha256 must be exactly 64 lowercase hex characters, got {script_sha256:?}")));
             }
-        } else if self.server.script.is_some() || self.server.script_sha256.is_some() {
+        } else if self.server.script.is_some() || self.server.script_sha256.is_some() || self.server.script_trust_boundary.is_some() {
             return Err(ConfigError::Validation(format!(
-                "server.command {:?} does not resolve to an allowlisted interpreter, but server.script/server.script_sha256 is present -- these fields are only meaningful for an interpreter+script invocation; omit them for a bare native binary",
+                "server.command {:?} does not resolve to an allowlisted interpreter, but server.script/server.script_sha256/server.script_trust_boundary is present -- these fields are only meaningful for an interpreter+script invocation; omit them for a bare native binary",
                 self.server.command
             )));
         }
@@ -360,6 +391,7 @@ name = "test-server"
 command = "/bin/does-not-matter-for-parse-test"
 command_sha256 = "{}"
 working_dir = "."
+command_trust_boundary = "."
 {extra_server_fields}
 
 {trusted_tools}
@@ -444,6 +476,7 @@ name = "test-server"
 command = "/bin/does-not-matter-for-parse-test"
 command_sha256 = "{}"
 working_dir = "."
+command_trust_boundary = "."
 
 [approval_policy]
 kind = "deny"
@@ -514,6 +547,8 @@ script = "server.py"
 script_sha256 = "{}"
 args = ["-m", "some_module"]
 working_dir = '{}'
+command_trust_boundary = '{}'
+script_trust_boundary = '{}'
 
 [[trusted_tools]]
 tool_name = "t"
@@ -527,6 +562,8 @@ kind = "deny"
 "#,
             "a".repeat(64),
             "b".repeat(64),
+            tmp.display(),
+            tmp.display(),
             tmp.display(),
             "c".repeat(64)
         );

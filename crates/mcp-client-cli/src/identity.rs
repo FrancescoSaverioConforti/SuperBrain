@@ -4,24 +4,51 @@
 //! real schema-binding mechanism, narrowly scoped: one exact hash, one
 //! exact match, no versioning or migration).
 //!
-//! **TOCTOU disclosure (stated here, once, as the authoritative text;
-//! quoted verbatim by `main.rs`'s own startup banner)**: the resolved
-//! executable/script files are hashed via `storage::read_trusted_file`
-//! -- the same symlink/reparse-point/hard-link/containment-verified
-//! primitive the trusted config and the audit log both use, closing the
-//! "open vs. separately stat" half of the race for the content-hash
-//! read itself. What remains open: the gap between this verification
-//! and the later, independent path resolution
-//! `tokio::process::Command::spawn()` performs on its own at actual
-//! spawn time. `tokio::process::Command`'s public API takes a path/
-//! command string, not a pre-opened file descriptor, so this binary
-//! cannot spawn directly from the already-verified handle -- full
-//! elimination of this window is not possible without a lower-level
-//! spawn primitive this binary does not have access to. This gap is
-//! real, narrow (an attacker needs write access to the exact resolved
-//! path at the exact right moment), and is disclosed rather than
-//! claimed closed.
-pub const TOCTOU_DISCLOSURE: &str = "Executable/script content verified by hash at config-validation time via a symlink-safe, link-count-verified handle. A narrow window remains between that verification and process spawn, during which tokio::process::Command's own independent path resolution could observe a different file if an attacker with write access to this exact path acts in that window. Full elimination of this window would require spawning directly from the already-verified file descriptor, which tokio::process::Command's public API does not support.";
+//! **M6.4-S1 correction (supersedes the original M6.4 TOCTOU framing
+//! below)**: hashing alone, followed by ordinary path-based spawning, is
+//! NOT race-free, and M6.4's original disclosure understated the
+//! window's real size (empirically measured at tens of milliseconds to
+//! seconds, growing with audit-log size, not "narrow/millisecond-scale"
+//! as first written). M6.4-S1 adds `windows_acl::verify_trusted_location`
+//! (Windows only) as the real mitigation: a read-only, conservative
+//! existence-scan of the resolved `command`/`script` path's own DACL and
+//! every ancestor directory's DACL up to the drive root, rejecting if
+//! any ALLOW-granting ACE (of an explicitly recognized type; any
+//! unrecognized ACE type, NULL DACL, or malformed security descriptor
+//! fails closed) grants a write/delete/re-ACL-shaped right to any
+//! trustee outside a fixed allowlist (the current process's own user
+//! SID, SYSTEM, Administrators). See `windows_acl`'s own module doc
+//! comment for the full, corrected design -- including why this is
+//! deliberately NOT a general Windows effective-access simulator (that
+//! would require either live logon tokens per principal or a from-
+//! scratch reimplementation of ACE-ordering/deny-precedence/group-
+//! membership semantics, exactly the class of mistake that risks FALSE
+//! ACCEPTANCE, not merely false rejection).
+//!
+//! **What this DOES establish**: if no allow-grant to a non-allowlisted
+//! trustee exists anywhere in the resolved DACL chain, no OTHER Windows
+//! principal holds the OS-level permission needed to modify the path --
+//! this is an access-control elimination claim for principals outside
+//! the allowlist, not a probabilistic "we re-checked right before
+//! spawn" narrowing, and not a claim of mathematically race-free
+//! execution in general.
+//!
+//! **What this does NOT establish (stated plainly, per M6.4-S1's own
+//! review)**: ZERO protection against a compromised process running
+//! under the SAME user account as this CLI -- that process already
+//! holds every permission the allowlist grants to "the current user" and
+//! can simply write the file directly. No SID-based ACL check can
+//! distinguish legitimate operator tooling from malware running as that
+//! same operator. Also: content-hash verification covers exactly the
+//! named `command`/`script` files, never anything dynamically loaded by
+//! the executed code (DLLs, Python's own standard library, any
+//! `import`ed third-party package) -- an operator whose script imports
+//! third-party packages extends their own trust boundary to that
+//! package's install location, which this binary never inspects.
+//! Windows-only: this mechanism adds no new Unix-specific hardening: on
+//! Unix, `storage::handle_safety`'s existing symlink/hard-link checks
+//! remain the sole protection, unchanged by M6.4-S1.
+pub const TOCTOU_DISCLOSURE: &str = "Executable/script content verified by hash, then (on Windows) the resolved path and every ancestor directory's own DACL are scanned for any write/delete/re-ACL grant to a principal outside a fixed allowlist (current user, SYSTEM, Administrators); an unrecognized ACE type, NULL DACL, or malformed security descriptor is rejected rather than interpreted. This establishes that no OTHER Windows principal holds the permission needed to replace this path -- it is NOT a claim of race-free execution in general, and it provides ZERO protection against a compromised process running under the SAME user account, which already holds every permission this check allows. On non-Windows platforms this ACL check does not run; only the existing symlink/hard-link verification applies.";
 
 pub const NO_SANDBOX_DISCLOSURE: &str = "This binary provides supervised, operator-reviewed authorization only. It does not sandbox the external process. A tool classified network_required: false or constrained to a filesystem_scope can still technically access anything the OS-level process itself is permitted to access; this binary trusts the external server's own good-faith compliance with what it was invoked to do, backed only by the operator's own prior review -- never by OS-enforced containment.";
 

@@ -42,13 +42,43 @@ fn sha256_hex_of_schema(schema: &serde_json::Value) -> String {
 
 fn unique_test_dir(label: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    // Rooted under the current user's own profile directory, NOT system
+    // %TEMP% -- M6.4-S1's own review found this development host's
+    // %TEMP% carries a real, non-inherit-only write-into grant for a
+    // separate principal (CodexSandboxUsers), which would make
+    // windows_acl::verify_trusted_location's own Check A correctly
+    // reject any `script_trust_boundary` rooted there. On Windows, this
+    // directory's own ACL is additionally reset via `icacls` to remove
+    // inherited ACEs and grant only the current user/SYSTEM/
+    // Administrators, mirroring windows_acl.rs's own
+    // `make_clean_test_dir` test helper exactly -- these acceptance
+    // tests exercise the REAL ACL check, so their own fixtures must be
+    // genuinely clean, not merely assumed to be.
+    #[cfg(windows)]
+    let base = std::env::var_os("USERPROFILE").map(PathBuf::from).expect("USERPROFILE must be set on any Windows test host");
+    #[cfg(not(windows))]
+    let base = std::env::temp_dir();
+    let dir = base.join(format!(
         "mcp-client-cli-acceptance-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    {
+        let current_user = std::env::var("USERNAME").unwrap_or_default();
+        let _ = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{current_user}:(OI)(CI)F"))
+            .arg("/grant:r")
+            .arg("SYSTEM:(OI)(CI)F")
+            .arg("/grant:r")
+            .arg("Administrators:(OI)(CI)F")
+            .status();
+    }
     dir
 }
 
@@ -137,14 +167,24 @@ impl TestFixture {
         let python_path = self.python_resolved_path();
         let command_sha256 = sha256_hex_of_file(&python_path);
         let script_sha256 = sha256_hex_of_file(&self.server_script_path);
+        // command_trust_boundary: the Python interpreter's own install
+        // directory (its own parent) -- a real, pre-existing, operator-
+        // maintained location, never created by these tests. script_
+        // trust_boundary: this test's own freshly created working_dir,
+        // which make_clean_test_dir-equivalent setup (unique_test_dir)
+        // already creates under this process's own temp root with no
+        // broad grants of its own.
+        let command_trust_boundary = python_path.parent().unwrap().to_path_buf();
         let toml_text = format!(
             r#"
 [server]
 name = "mock-server"
 command = '{}'
 command_sha256 = "{command_sha256}"
+command_trust_boundary = '{}'
 script = "mock_server.py"
 script_sha256 = "{script_sha256}"
+script_trust_boundary = '{}'
 args = []
 working_dir = '{}'
 
@@ -154,6 +194,8 @@ working_dir = '{}'
 {approval_policy_toml}
 "#,
             python_path.display(),
+            command_trust_boundary.display(),
+            self.working_dir.display(),
             self.working_dir.display(),
         );
         std::fs::copy(&self.server_script_path, self.working_dir.join("mock_server.py")).unwrap();
@@ -179,6 +221,21 @@ working_dir = '{}'
     fn read_raw_audit_log(&self) -> Vec<u8> {
         let vault = storage::Vault::open_with_default_indexer(self.audit_vault_root.clone(), &self.audit_journal_path).unwrap();
         vault.read_audit_log_for_recovery_scan().unwrap()
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        // These fixtures are now rooted under %USERPROFILE% on Windows
+        // (unique_test_dir's own M6.4-S1 correction), not ambient
+        // system Temp -- clean them up explicitly so repeated local/CI
+        // runs don't accumulate visible debris in the user's own
+        // profile directory.
+        for dir in [&self._server_dir, &self.working_dir, &self._config_dir, &self.audit_vault_root] {
+            #[cfg(windows)]
+            let _ = std::process::Command::new("icacls").arg(dir).arg("/reset").arg("/t").status();
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 

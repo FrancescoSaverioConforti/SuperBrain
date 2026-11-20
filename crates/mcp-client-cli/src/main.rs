@@ -30,6 +30,8 @@
 mod adapter;
 mod config;
 mod identity;
+#[cfg(windows)]
+mod windows_acl;
 
 use adapter::StorageAuditWriterAdapter;
 use config::TrustedConfig;
@@ -133,6 +135,11 @@ fn main() {
         eprintln!("error: server.command identity verification failed: {e}");
         std::process::exit(1);
     }
+    #[cfg(windows)]
+    if let Err(e) = windows_acl::verify_trusted_location(&resolved_command, &config.server.command_trust_boundary) {
+        eprintln!("error: server.command is not in a trusted location: {e}");
+        std::process::exit(1);
+    }
 
     let resolved_script_path = if let Some(script) = &config.server.script {
         let script_path = config.server.working_dir.join(script);
@@ -140,6 +147,14 @@ fn main() {
         if let Err(e) = identity::verify_file_content_hash(&script_path, script_sha256, "<server-script>") {
             eprintln!("error: server.script identity verification failed: {e}");
             std::process::exit(1);
+        }
+        #[cfg(windows)]
+        {
+            let script_trust_boundary = config.server.script_trust_boundary.as_ref().expect("config::validate already requires script_trust_boundary whenever script is present");
+            if let Err(e) = windows_acl::verify_trusted_location(&script_path, script_trust_boundary) {
+                eprintln!("error: server.script is not in a trusted location: {e}");
+                std::process::exit(1);
+            }
         }
         Some(script_path)
     } else {
