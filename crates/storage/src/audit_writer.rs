@@ -401,20 +401,44 @@ impl Vault {
         }
     }
 
+    /// M5-S1 security hardening: opens `writer.lock` through the SAME
+    /// handle-verification primitive (`handle_safety::open_verified`)
+    /// already used two lines below for `audit.log` — this function
+    /// used to re-derive a raw path string (`audit_dir.join(
+    /// WRITER_LOCK_FILE)`) and open it via plain `std::fs::OpenOptions`,
+    /// with no symlink/reparse-point/hard-link rejection at all: a
+    /// classic TOCTOU gap, since `open_audit_writer`'s own prior
+    /// `handle_safety::open_verified_dir(&audit_dir)` call only verifies
+    /// the PARENT directory's identity at that one instant — it is a
+    /// point-in-time check, not an fd anchor subsequent relative opens
+    /// go through (confirmed: `VerifiedDirHandle`'s own doc comment
+    /// states "never read directly... holding it for its lifetime is a
+    /// RAII anchor, not dead weight," i.e. its value is never reused to
+    /// derive a safer relative open) — so a `writer.lock`-shaped
+    /// symlink/junction/hard-link planted between that check and this
+    /// function's own (formerly unverified) open was never caught. This
+    /// did not enable arbitrary-content writes (the lock file's own
+    /// bytes are never meaningfully written or read), but it DID allow
+    /// an attacker with write access to `.audit/` to redirect the
+    /// exclusive-lock anchor itself — undermining the single-writer
+    /// guarantee (a legitimate writer locks the wrong file, so two
+    /// legitimate writers could each believe they hold exclusive
+    /// ownership) or denying the audit service outright (pointing the
+    /// symlink at a path the attacker keeps perpetually locked, or that
+    /// cannot be opened at all). `OpenMode::CreateOrOpenForWrite`'s own
+    /// existing semantics (`write(true).create(true)`, no `truncate`)
+    /// already match this call's own prior "never discard pre-existing
+    /// content" requirement exactly — no new `OpenMode` variant needed.
     fn acquire_writer_lock(
         audit_dir: &std::path::Path,
     ) -> Result<std::fs::File, AuditWriterOpenError> {
-        let lock_path = audit_dir.join(WRITER_LOCK_FILE);
-        // `.truncate(false)`: this file's only purpose is as an OS-level
-        // lock anchor (its own bytes are never read) -- explicit about
-        // never discarding any pre-existing content, rather than relying
-        // on `write(true).create(true)`'s own ambiguous-looking default.
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(StorageError::Io)?;
+        let handle = handle_safety::open_verified(
+            audit_dir,
+            std::path::Path::new(WRITER_LOCK_FILE),
+            OpenMode::CreateOrOpenForWrite,
+            "<audit-writer-lock>",
+        )?;
+        let lock_file = handle.file;
 
         // `std::fs::File::try_lock()`: the stdlib's own cross-platform
         // exclusive, non-blocking advisory lock (see this module's own
@@ -941,6 +965,97 @@ mod tests {
             result.is_err(),
             "a hard-linked audit log path (link count != 1) must be rejected, got {result:?}"
         );
+    }
+
+    // --- M5-S1: the exact same symlink/hard-link rejection, now proven
+    //     for `writer.lock` specifically -- acquire_writer_lock used to
+    //     open this path via plain `std::fs::OpenOptions`, with no
+    //     containment check at all, a TOCTOU gap distinct from (and
+    //     previously unprotected by) `audit.log`'s own already-verified
+    //     open two lines below it in `open_audit_writer`.
+
+    #[test]
+    fn a_symlink_planted_at_the_writer_lock_path_is_rejected_not_followed() {
+        let vault = open_test_vault("lock-symlink-redirect");
+        let audit_dir = vault.root().join(".audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let outside = unique_test_dir("lock-symlink-redirect-target");
+        let outside_file = outside.join("victim.lock");
+        std::fs::write(&outside_file, b"attacker content").unwrap();
+
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&outside_file, audit_dir.join(WRITER_LOCK_FILE));
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside_file, audit_dir.join(WRITER_LOCK_FILE));
+
+        match link_result {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping: could not create a real symlink on this host (needs admin/dev-mode on Windows): {e}");
+                return;
+            }
+        }
+
+        let result = vault.open_audit_writer(None);
+        assert!(result.is_err(), "a symlink planted at the writer-lock path must be rejected, never followed, got {result:?}");
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap(),
+            b"attacker content",
+            "the symlink target outside the vault must remain completely untouched"
+        );
+    }
+
+    #[test]
+    fn a_hard_link_at_the_writer_lock_path_is_rejected() {
+        let vault = open_test_vault("lock-hardlink-redirect");
+        let audit_dir = vault.root().join(".audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let outside = unique_test_dir("lock-hardlink-redirect-target");
+        let outside_file = outside.join("victim.lock");
+        std::fs::write(&outside_file, b"attacker content").unwrap();
+        std::fs::hard_link(&outside_file, audit_dir.join(WRITER_LOCK_FILE)).unwrap();
+
+        let result = vault.open_audit_writer(None);
+        assert!(
+            result.is_err(),
+            "a hard-linked writer-lock path (link count != 1) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_writer_lock_path_is_rejected_as_io_error_not_followed() {
+        // Mirrors `open_verified`'s own documented behavior: a directory
+        // sitting where a file is expected is data corruption, not an
+        // aliasing attack, and must surface as StorageError::Io (wrapped
+        // here in AuditWriterOpenError::Storage), never silently opened
+        // as if it were the lock file.
+        let vault = open_test_vault("lock-directory-substitution");
+        let audit_dir = vault.root().join(".audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::create_dir_all(audit_dir.join(WRITER_LOCK_FILE)).unwrap();
+
+        let result = vault.open_audit_writer(None);
+        assert!(result.is_err(), "a directory substituted at the writer-lock path must never be silently treated as the lock file, got {result:?}");
+    }
+
+    #[test]
+    fn two_legitimate_writers_never_both_believe_they_hold_the_lock_even_with_a_pre_existing_lock_file(
+    ) {
+        // Regression guard for the exact exploitability concern M5-S1
+        // investigated: with the fix in place, a SECOND vault handle
+        // against the same root must still be correctly excluded while
+        // the first holds the (now handle-verified) lock -- proving the
+        // fix didn't accidentally change the real single-writer
+        // guarantee while closing the containment gap.
+        let vault = open_test_vault("lock-dual-writer-guard");
+        let first = vault.open_audit_writer(None).unwrap();
+        let second = vault.open_audit_writer(None);
+        assert!(
+            matches!(second, Err(AuditWriterOpenError::AlreadyLocked)),
+            "a second handle must still be excluded while the first holds the writer lock, got {second:?}"
+        );
+        drop(first);
+        assert!(vault.open_audit_writer(None).is_ok(), "a fresh acquire must still succeed once the first handle is dropped");
     }
 
     // --- 13: no regression of Task 1's pure verification tests is
