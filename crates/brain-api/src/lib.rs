@@ -35,9 +35,9 @@ mod proposal;
 mod proposal_store;
 mod read;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
-pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, NullAuditSink};
+pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, CommitFailureCategory, CommitOutcomeKind, NullAuditSink};
 pub use audit_record::{parse_event, parse_line, serialize_record, AuditRecordParseError, AUDIT_RECORD_FORMAT_VERSION};
-pub use cli::{run_cli, run_cli_with_audit};
+pub use cli::{run_cli, run_cli_durable, run_cli_with_audit, DurableApprovalHooks, DurableCliOutcome};
 
 /// M5 Task 4's narrow facade onto `audit_chain`'s otherwise-private pure
 /// primitives — re-exported individually, not `pub use audit_chain::*`,

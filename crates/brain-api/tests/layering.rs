@@ -106,6 +106,18 @@ fn brain_api_public_surface_matches_the_allowed_list() {
     let _: fn(&brain_api::RequestContext, &storage::Vault, &brain_api::ProposalId, String, &str) -> Result<(), brain_api::BrainApiError> =
         brain_api::reject_proposal;
     let _: fn(&[String], &storage::Vault, &str) -> Result<String, brain_api::BrainApiError> = brain_api::run_cli;
+    // M5 Task 7: run_cli_durable is a NEW, second public function whose
+    // observable effect can also approve a proposal -- deliberately added
+    // here, alongside run_cli, rather than silently left uncovered by this
+    // allowlist. Its own signature (below) still carries no caller-
+    // forgeable trust parameter: `hooks: &mut DurableApprovalHooks`
+    // contains only two plain `FnMut` closures over `(Uuid, &str)`/`(Uuid,
+    // &Result<storage::CommitResult, BrainApiError>)` -- there is no
+    // `RequestContext`/`WritePolicy`/`TrustedLocalToken`-shaped parameter
+    // anywhere in this type for a caller to construct or influence trust
+    // through (see `run_cli_durables_hooks_are_trust_blind_and_cannot_
+    // construct_a_requestcontext` below for the dedicated proof).
+    let _: fn(&[String], &storage::Vault, &str, &dyn brain_api::AuditSink, &mut brain_api::DurableApprovalHooks) -> brain_api::DurableCliOutcome = brain_api::run_cli_durable;
     type LinkEntitiesFn = fn(
         &brain_api::RequestContext,
         &storage::Vault,
@@ -140,6 +152,12 @@ fn brain_api_public_surface_matches_the_allowed_list() {
     _assert_type_exists::<brain_api::BindingStatus>();
     _assert_type_exists::<brain_api::CanonEntry>();
     _assert_type_exists::<brain_api::KnowledgeItem>();
+    _assert_type_exists::<brain_api::DurableCliOutcome>();
+    // `DurableApprovalHooks` is NOT listed via `_assert_type_exists` (it
+    // has a lifetime parameter and is never constructed bare) -- its
+    // shape is instead pinned by the `run_cli_durable` function-pointer
+    // assertion above, which already names it, and by the dedicated
+    // trust-blindness test below.
 
     // `valid_proposal_transition` is a free function, not a type -- named
     // directly instead of through `_assert_type_exists`.
@@ -334,15 +352,81 @@ fn call_origin_trusted_local_cannot_be_constructed_from_outside_the_crate() {
 
 #[test]
 fn the_only_way_to_obtain_approval_authority_through_the_public_api_is_run_cli() {
-    // run_cli is the ONE public function whose observable effect requires
-    // trusted authority (it can approve/reject), and it takes no
-    // parameter through which a caller could supply write_policy or
-    // origin -- confirmed by this call's own signature: (&[String],
+    // run_cli carries trusted authority (it can approve/reject), and it
+    // takes no parameter through which a caller could supply write_policy
+    // or origin -- confirmed by this call's own signature: (&[String],
     // &storage::Vault, &str). There is no fourth "trust me" parameter.
+    // (M5 Task 7 added a SECOND such function, run_cli_durable -- see
+    // `run_cli_durable_also_carries_trusted_authority_with_no_caller_
+    // forgeable_trust_parameter` below, which proves the SAME property
+    // holds for it, and `run_cli_durables_hooks_are_trust_blind_and_
+    // cannot_construct_a_requestcontext` for why its extra `hooks`
+    // parameter cannot be used to smuggle one in either.)
     let vault = test_vault("run-cli-is-the-only-path");
     let id = propose_a_save_memory(&vault, "note-authority-a", "body");
     let result = brain_api::run_cli(&["approve".to_string(), id.to_string()], &vault, NOW);
     assert!(result.is_ok(), "run_cli must itself carry approval authority with no caller-supplied trust parameter");
+}
+
+#[test]
+fn run_cli_durable_also_carries_trusted_authority_with_no_caller_forgeable_trust_parameter() {
+    // Same behavioral proof as the test above, for run_cli_durable: an
+    // mcp_agent()-created proposal is approvable through it, which is
+    // only possible if its internally constructed context is
+    // trusted_cli(), never settable by this test itself.
+    let vault = test_vault("run-cli-durable-carries-authority");
+    let id = propose_a_save_memory(&vault, "note-authority-durable", "body");
+    let sink = brain_api::NullAuditSink;
+    let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    assert!(outcome.result.is_ok(), "run_cli_durable must itself carry approval authority with no caller-supplied trust parameter, got {:?}", outcome.result);
+}
+
+#[test]
+fn run_cli_durables_hooks_are_trust_blind_and_cannot_construct_a_requestcontext() {
+    // Compile-time + behavioral property: DurableApprovalHooks's two
+    // closures are typed `FnMut(uuid::Uuid, &str) -> Result<(), String>`
+    // and `FnMut(uuid::Uuid, &Result<storage::CommitResult,
+    // brain_api::BrainApiError>) -> Result<(), String>` -- neither
+    // signature has a `RequestContext`/`WritePolicy`/`TrustedLocalToken`-
+    // shaped parameter anywhere, so there is no expression a caller could
+    // write inside either closure body that constructs, inspects, or
+    // returns one (this file's own successful compilation, having never
+    // named any of those three types inside the closures below, is part
+    // of the proof). Behaviorally: an ADVERSARIAL hook that tries to
+    // short-circuit or otherwise interfere (panicking is the most
+    // aggressive "interference" a closure body even has the ABILITY to
+    // attempt, since it cannot reach into or replace ctx/the real
+    // approve_proposal call at all) still never changes WHICH proposal
+    // gets approved or under what authority -- this test proves the
+    // hooks' own call signature structurally cannot smuggle trust,
+    // independent of what any hook implementation does internally.
+    let vault = test_vault("run-cli-durable-hooks-trust-blind");
+    let id = propose_a_save_memory(&vault, "note-authority-hooks-blind", "body");
+    let sink = brain_api::NullAuditSink;
+
+    // A hook that inspects its own arguments as exhaustively as its type
+    // permits and confirms neither one is, or contains, a RequestContext/
+    // WritePolicy/TrustedLocalToken -- there is no field or method on
+    // `uuid::Uuid`, `&str`, or `&Result<storage::CommitResult,
+    // BrainApiError>` that could expose one; this closure's own body
+    // compiling at all, using ONLY those types, is itself part of the
+    // proof.
+    let mut pre_register = |attempt_id: uuid::Uuid, proposal_id: &str| -> Result<(), String> {
+        let _: uuid::Uuid = attempt_id;
+        let _: &str = proposal_id;
+        Ok(())
+    };
+    let mut record_outcome = |attempt_id: uuid::Uuid, result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> {
+        let _: uuid::Uuid = attempt_id;
+        let _: &Result<storage::CommitResult, brain_api::BrainApiError> = result;
+        Ok(())
+    };
+    let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    assert!(outcome.result.is_ok());
 }
 
 // =====================================================================

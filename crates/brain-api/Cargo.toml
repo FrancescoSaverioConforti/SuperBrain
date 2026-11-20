@@ -43,3 +43,17 @@ serde_json = "1"
 
 [dev-dependencies]
 git2 = "0.21"
+# M5 Task 7: used ONLY by examples/approve_cli.rs (the real composition
+# root) to construct the dedicated audit writer worker and bridge its
+# async record_durable(...) calls to run_cli_durable's own synchronous,
+# trust-blind hooks -- never by this crate's own library code, which
+# stays exactly as Tokio-free as before this task (run_cli/
+# run_cli_with_audit/run_cli_durable are all still plain, synchronous
+# functions; DurableApprovalHooks's own closures are plain FnMut, no
+# Future/async anywhere in brain-api's own public API). A dev-dependency
+# (not [dependencies]), the same "an [[example]] target is built with
+# [dependencies] + [dev-dependencies] available" mechanism
+# `mcp-server/Cargo.toml`'s own identical M5 Task 6 comment already
+# documents for its own serve_stdio example.
+brain-api-audit-worker = { path = "../brain-api-audit-worker" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

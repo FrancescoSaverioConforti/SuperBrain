@@ -177,6 +177,7 @@ name = "brain-api"
 version = "0.1.0"
 dependencies = [
  "api",
+ "brain-api-audit-worker",
  "chrono",
  "codegraph-domain",
  "codegraph-index",
@@ -190,6 +191,7 @@ dependencies = [
  "sha2 0.10.9",
  "storage",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 
