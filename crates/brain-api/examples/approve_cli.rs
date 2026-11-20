@@ -23,8 +23,9 @@
 //! `run_cli_durable` — there is no fallback to a best-effort-only or
 //! `NullAuditSink`-equivalent path for `approve`/`reject` in this file.
 //!
-//! **Sync/async bridge**: `run_cli_durable`'s own `DurableApprovalHooks`
-//! are plain synchronous `FnMut` closures (`brain-api` has no `tokio`
+//! **Sync/async bridge**: `run_cli_durable`'s own `DurableApprovalHooks`/
+//! `DurableRejectionHooks` (M5 Task 8B's rejection-specific mirror) are
+//! plain synchronous `FnMut` closures (`brain-api` has no `tokio`
 //! dependency and never will). This binary runs the ENTIRE synchronous
 //! `run_cli_durable` call on `tokio::task::spawn_blocking` (the same
 //! proven-safe sync/async boundary `brain-api-audit-worker::worker.rs`
@@ -41,7 +42,7 @@
 //! closed) a hook returns `Err` immediately — never hangs, never
 //! silently treats "no reply" as "it happened".
 
-use brain_api::DurableApprovalHooks;
+use brain_api::{DurableApprovalHooks, DurableRejectionHooks};
 
 /// One request a blocking-side hook sends to the async bridge task —
 /// `event` is the already-built `AuditEvent` (ApprovalAttempted or
@@ -128,8 +129,12 @@ fn main() {
 
         let req_tx_for_pre_register = req_tx.clone();
         let req_tx_for_outcome = req_tx.clone();
+        let req_tx_for_rejection_pre_register = req_tx.clone();
+        let req_tx_for_rejection_outcome = req_tx.clone();
         let now_for_pre_register = now.clone();
         let now_for_outcome = now.clone();
+        let now_for_rejection_pre_register = now.clone();
+        let now_for_rejection_outcome = now.clone();
         let command_args_for_blocking = command_args.clone();
         let cli_outcome = tokio::task::spawn_blocking(move || {
             let mut pre_register = move |attempt_id: uuid::Uuid, proposal_id: &str| -> Result<(), String> {
@@ -149,9 +154,27 @@ fn main() {
                 );
                 send_and_await_durable_ack(&req_tx_for_outcome, event)
             };
+            let mut rejection_pre_register = move |attempt_id: uuid::Uuid, proposal_id: &str| -> Result<(), String> {
+                let event = brain_api::event(
+                    brain_api::AuditEventKind::RejectionAttempted { attempt_id: attempt_id.to_string(), proposal_id: proposal_id.to_string() },
+                    &now_for_rejection_pre_register,
+                    uuid::Uuid::new_v4(),
+                );
+                send_and_await_durable_ack(&req_tx_for_rejection_pre_register, event)
+            };
+            let mut rejection_record_outcome = move |attempt_id: uuid::Uuid, result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> {
+                let outcome = rejection_outcome_kind_from(result);
+                let event = brain_api::event(
+                    brain_api::AuditEventKind::RejectionOutcome { attempt_id: attempt_id.to_string(), outcome },
+                    &now_for_rejection_outcome,
+                    uuid::Uuid::new_v4(),
+                );
+                send_and_await_durable_ack(&req_tx_for_rejection_outcome, event)
+            };
             let sink = brain_api::NullAuditSink;
-            let mut hooks = DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
-            brain_api::run_cli_durable(&command_args_for_blocking, &vault, &now, &sink, &mut hooks)
+            let mut approval_hooks = DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+            let mut rejection_hooks = DurableRejectionHooks { pre_register: &mut rejection_pre_register, record_outcome: &mut rejection_record_outcome };
+            brain_api::run_cli_durable(&command_args_for_blocking, &vault, &now, &sink, &mut approval_hooks, &mut rejection_hooks)
         })
         .await
         .expect("the blocking CLI closure itself never panics");
@@ -212,5 +235,28 @@ fn commit_outcome_kind_from(result: &Result<storage::CommitResult, brain_api::Br
         // impossible-today variant, since BrainApiError's own variant
         // set could grow in a future, separately authorized task.
         Err(_) => CommitOutcomeKind::Failed { category: CommitFailureCategory::RuntimeUnavailable },
+    }
+}
+
+/// Maps a real `reject_proposal` result onto the closed, content-free
+/// `RejectionOutcomeKind` schema (M5 Task 8B) -- the rejection-specific
+/// mirror of `commit_outcome_kind_from` above. `PermissionDenied` has no
+/// arm here for the same reason it has none above: `run_cli_durable`'s
+/// own `record_outcome` hook is only ever called AFTER a pre-registered
+/// attempt reaches `reject_proposal` -- a denied attempt never gets this
+/// far (see `cli.rs`'s own `run_reject_core`).
+fn rejection_outcome_kind_from(result: &Result<(), brain_api::BrainApiError>) -> brain_api::RejectionOutcomeKind {
+    use brain_api::{BrainApiError, CommitFailureCategory, RejectionOutcomeKind};
+    match result {
+        Ok(()) => RejectionOutcomeKind::Rejected,
+        Err(BrainApiError::NotFound) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::NotFound },
+        Err(BrainApiError::InvalidInput(_)) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::InvalidInput },
+        Err(BrainApiError::Conflict) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+        Err(BrainApiError::RuntimeUnavailable) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::RuntimeUnavailable },
+        Err(BrainApiError::CorruptData) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::CorruptData },
+        // PermissionDenied/DenseUnavailable/ExternalToolUnavailable/
+        // Timeout/UnsupportedOperation: same reasoning as
+        // commit_outcome_kind_from's own identical catch-all above.
+        Err(_) => RejectionOutcomeKind::Failed { category: CommitFailureCategory::RuntimeUnavailable },
     }
 }

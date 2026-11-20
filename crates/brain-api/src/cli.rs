@@ -78,16 +78,65 @@ impl<'a> DurableApprovalHooks<'a> {
     }
 }
 
+/// Closure shape for [`DurableRejectionHooks::record_outcome`] — the
+/// rejection-specific mirror of [`RecordOutcomeFn`]: `reject_proposal`
+/// returns `Result<(), BrainApiError>`, never a `storage::CommitResult`
+/// (it never calls `propose_and_commit`), so this is a distinct type,
+/// not a reuse of `RecordOutcomeFn`.
+type RejectionRecordOutcomeFn<'a> = &'a mut dyn FnMut(uuid::Uuid, &Result<(), BrainApiError>) -> Result<(), String>;
+
+/// M5 Task 8B: opaque, trust-blind hooks for the durable audit path
+/// around one `reject` command — the rejection-specific mirror of
+/// [`DurableApprovalHooks`]. Same trust-blindness guarantee (both
+/// closures see only plain data, never `RequestContext`/`WritePolicy`/
+/// `TrustedLocalToken`), same fail-closed pre-registration contract,
+/// same "`record_outcome`'s own return value never changes the real
+/// result" contract — this is a SEPARATE type, not a generalization of
+/// `DurableApprovalHooks`, because rejection's own outcome type
+/// (`Result<(), BrainApiError>`) is structurally different from
+/// approval's (`Result<storage::CommitResult, BrainApiError>`), and
+/// keeping them distinct makes it a type error, not a runtime
+/// discipline, to ever pass an approval's hooks to the reject dispatch
+/// arm or vice versa.
+pub struct DurableRejectionHooks<'a> {
+    /// Called exactly once, BEFORE [`crate::reject_proposal`] is ever
+    /// invoked, with a fresh `attempt_id` and the target proposal's id
+    /// as a plain string. `Err` refuses to proceed: `reject_proposal` is
+    /// NEVER called in that case (fail-closed pre-registration) and
+    /// [`run_cli_durable`] returns [`BrainApiError::RuntimeUnavailable`]
+    /// carrying this message.
+    pub pre_register: &'a mut dyn FnMut(uuid::Uuid, &str) -> Result<(), String>,
+    /// Called exactly once, AFTER `reject_proposal` returns (whatever
+    /// the outcome), with the SAME `attempt_id` and the real,
+    /// already-decided `Result`. This call's own return value NEVER
+    /// changes what [`run_cli_durable`] reports as the command's real
+    /// result — surfaced separately via
+    /// [`DurableCliOutcome::audit_outcome_write`], never folded into or
+    /// overwriting the rejection's own truth.
+    pub record_outcome: RejectionRecordOutcomeFn<'a>,
+}
+
+impl<'a> DurableRejectionHooks<'a> {
+    /// The inert default `run_reject` (the existing, non-durable entry
+    /// point) uses internally — same "never changes existing observable
+    /// behavior" guarantee [`DurableApprovalHooks::noop`] already
+    /// documents for approval.
+    fn noop(pre_register: &'a mut dyn FnMut(uuid::Uuid, &str) -> Result<(), String>, record_outcome: RejectionRecordOutcomeFn<'a>) -> Self {
+        Self { pre_register, record_outcome }
+    }
+}
+
 /// [`run_cli_durable`]'s own result: the REAL command outcome (identical
 /// truth to what [`run_cli_with_audit`] would have returned for the same
-/// command and inputs) plus, separately, whether the durable
-/// `CommitOutcome` write itself succeeded. `audit_outcome_write` is
-/// `Ok(())` for every command that never reaches
-/// [`DurableApprovalHooks::record_outcome`] at all (`list`, `reject`, or
-/// an `approve` that never got past pre-registration) — it is
-/// specifically about "did persisting the outcome event itself succeed",
-/// never a proxy for whether the approval/commit itself succeeded, and
-/// never discarded silently when it fails.
+/// command and inputs) plus, separately, whether the durable outcome
+/// write (`CommitOutcome` for `approve`, `RejectionOutcome` for
+/// `reject`) itself succeeded. `audit_outcome_write` is `Ok(())` for
+/// every command that never reaches either hook set's own
+/// `record_outcome` at all (`list`, or an `approve`/`reject` that never
+/// got past pre-registration) — it is specifically about "did
+/// persisting the outcome event itself succeed", never a proxy for
+/// whether the approval/rejection itself succeeded, and never discarded
+/// silently when it fails.
 #[derive(Debug)]
 pub struct DurableCliOutcome {
     pub result: Result<String, BrainApiError>,
@@ -166,7 +215,10 @@ fn run_approve(ctx: &RequestContext, vault: &storage::Vault, id: &str, now: &str
 }
 
 fn run_reject(ctx: &RequestContext, vault: &storage::Vault, id: &str, reason: String, now: &str, sink: &dyn AuditSink) -> Result<String, BrainApiError> {
-    run_reject_core(ctx, vault, id, reason, now, sink)
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| Ok(());
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), BrainApiError>| Ok(());
+    let mut hooks = DurableRejectionHooks::noop(&mut noop_pre_register, &mut noop_record_outcome);
+    run_reject_core(ctx, vault, id, reason, now, sink, &mut hooks).0
 }
 
 /// The shared, trusted implementation behind BOTH `run_approve` (today's
@@ -206,40 +258,69 @@ fn run_approve_core(ctx: &RequestContext, vault: &storage::Vault, id: &str, now:
     (formatted, audit_outcome_write)
 }
 
-fn run_reject_core(ctx: &RequestContext, vault: &storage::Vault, id: &str, reason: String, now: &str, sink: &dyn AuditSink) -> Result<String, BrainApiError> {
-    let id = parse_id(id)?;
+/// The shared, trusted implementation behind BOTH `run_reject` (today's
+/// existing, non-durable path, called with an inert no-op
+/// [`DurableRejectionHooks`]) and [`run_cli_durable`]'s own `reject`
+/// dispatch arm (called with real, caller-supplied hooks) — the exact
+/// rejection-specific mirror of [`run_approve_core`]'s own role for
+/// approval. Generates a fresh `attempt_id` itself immediately before
+/// calling `hooks.pre_register`. If `pre_register` returns `Err`,
+/// `crate::reject_proposal` is NEVER called (fail-closed): this function
+/// returns `BrainApiError::RuntimeUnavailable` immediately, before any
+/// authorization/validation boundary inside `reject_proposal` itself is
+/// ever reached — the proposal's status is left completely untouched in
+/// that case.
+fn run_reject_core(ctx: &RequestContext, vault: &storage::Vault, id: &str, reason: String, now: &str, sink: &dyn AuditSink, hooks: &mut DurableRejectionHooks) -> (Result<String, BrainApiError>, Result<(), String>) {
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(err) => return (Err(err), Ok(())),
+    };
+    let attempt_id = uuid::Uuid::new_v4();
+    if let Err(reason) = (hooks.pre_register)(attempt_id, &id.to_string()) {
+        return (Err(BrainApiError::RuntimeUnavailable), Err(reason));
+    }
     let result = crate::reject_proposal(ctx, vault, &id, reason, now);
+    let audit_outcome_write = (hooks.record_outcome)(attempt_id, &result);
     record_permission_decision(sink, "RejectProposal", allowed_from_result(&result), Some("permission denied"), now, ctx.correlation_id);
-    result?;
-    Ok(format!("rejected {id}"))
+    let formatted = result.map(|()| format!("rejected {id}"));
+    (formatted, audit_outcome_write)
 }
 
-/// Runs one CLI command with the durable audit path (M5 Task 7): the same
-/// trusted dispatch as [`run_cli_with_audit`] (`list`/`approve`/`reject`),
-/// but `approve` pre-registers an `ApprovalAttempted`-shaped event through
-/// `hooks.pre_register` BEFORE calling [`crate::approve_proposal`] (fail-
-/// closed: a failed pre-registration means `approve_proposal` is never
-/// called at all) and records the real outcome through
-/// `hooks.record_outcome` afterward. `reject` NEVER touches either hook —
-/// structurally impossible for a rejection to produce a `CommitOutcome`-
-/// shaped call, since `run_reject_core` takes no `DurableApprovalHooks`
-/// parameter at all. `list` is unchanged.
+/// Runs one CLI command with the durable audit path (M5 Task 7/8B): the
+/// same trusted dispatch as [`run_cli_with_audit`] (`list`/`approve`/
+/// `reject`), but `approve` pre-registers an `ApprovalAttempted`-shaped
+/// event through `approval_hooks.pre_register` BEFORE calling
+/// [`crate::approve_proposal`] (fail-closed: a failed pre-registration
+/// means `approve_proposal` is never called at all) and records the real
+/// outcome through `approval_hooks.record_outcome` afterward, as a
+/// `CommitOutcome`. `reject` is the exact symmetric case: it
+/// pre-registers a `RejectionAttempted`-shaped event through
+/// `rejection_hooks.pre_register` BEFORE calling
+/// [`crate::reject_proposal`] (same fail-closed contract) and records
+/// the real outcome through `rejection_hooks.record_outcome` afterward,
+/// as a `RejectionOutcome`. Only ONE of the two hook sets is ever
+/// invoked per call (dispatch is mutually exclusive on `args`) — `reject`
+/// NEVER touches `approval_hooks`, and vice versa; structurally
+/// impossible for a rejection to produce a `CommitOutcome`-shaped call
+/// or for an approval to produce a `RejectionOutcome`-shaped one, since
+/// `run_approve_core`/`run_reject_core` each take only their own
+/// hooks type. `list` is unchanged.
 ///
 /// This function constructs the SAME internal trusted context
 /// ([`trusted_ctx`]) as `run_cli`/`run_cli_with_audit` — there is no
 /// parameter here, or anywhere in this crate's public API, through which
-/// a caller could supply or influence `write_policy`/`origin`; `hooks`
-/// itself sees only plain, already-public data (an attempt id, a
-/// proposal id string, and the real `Result` `approve_proposal` already
-/// produced), never `RequestContext`/`WritePolicy`/`TrustedLocalToken`
-/// (see `tests/layering.rs`'s own compile-time + behavioral proof of
-/// this specific property).
-pub fn run_cli_durable(args: &[String], vault: &storage::Vault, now: &str, sink: &dyn AuditSink, hooks: &mut DurableApprovalHooks) -> DurableCliOutcome {
+/// a caller could supply or influence `write_policy`/`origin`; both hook
+/// sets see only plain, already-public data (an attempt id, a proposal
+/// id string, and the real `Result` the corresponding capability
+/// function already produced), never `RequestContext`/`WritePolicy`/
+/// `TrustedLocalToken` (see `tests/layering.rs`'s own compile-time +
+/// behavioral proof of this specific property).
+pub fn run_cli_durable(args: &[String], vault: &storage::Vault, now: &str, sink: &dyn AuditSink, approval_hooks: &mut DurableApprovalHooks, rejection_hooks: &mut DurableRejectionHooks) -> DurableCliOutcome {
     let ctx = trusted_ctx();
     let (result, audit_outcome_write) = match args {
         [cmd] if cmd == "list" => (run_list(&ctx, vault, now), Ok(())),
-        [cmd, id] if cmd == "approve" => run_approve_core(&ctx, vault, id, now, sink, hooks),
-        [cmd, id, reason] if cmd == "reject" => (run_reject_core(&ctx, vault, id, reason.clone(), now, sink), Ok(())),
+        [cmd, id] if cmd == "approve" => run_approve_core(&ctx, vault, id, now, sink, approval_hooks),
+        [cmd, id, reason] if cmd == "reject" => run_reject_core(&ctx, vault, id, reason.clone(), now, sink, rejection_hooks),
         [] => (Err(BrainApiError::InvalidInput("no command given — expected one of: list, approve <id>, reject <id> <reason>".to_string())), Ok(())),
         [cmd, ..] => (Err(BrainApiError::InvalidInput(format!("unknown command '{cmd}' — expected one of: list, approve <id>, reject <id> <reason>"))), Ok(())),
     };

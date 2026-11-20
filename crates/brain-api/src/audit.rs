@@ -52,8 +52,9 @@ use serde::{Deserialize, Serialize};
 /// decode a verified record's own `content_bytes` back into a typed
 /// value for recovery/inspection. The B5.12 freeze is on the ORIGINAL 7
 /// variants' own names and field shapes (still exactly those 7,
-/// unchanged, still content-free); M5 Task 5 adds two further variants
-/// (`ApprovalAttempted`/`CommitOutcome`) additively, never touching the
+/// unchanged, still content-free); M5 Task 5 adds `ApprovalAttempted`/
+/// `CommitOutcome` and M5 Task 8B adds `RejectionAttempted`/
+/// `RejectionOutcome`, all four purely additive, never touching the
 /// frozen 7.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -62,9 +63,11 @@ pub struct AuditEvent {
     pub correlation_id: uuid::Uuid,
 }
 
-/// The frozen set of audit event categories (B5.12), plus M5 Task 5's two
-/// additive variants below — the original 7 keep their exact names and
-/// field shapes unchanged. No field anywhere carries note content, query
+/// The frozen set of audit event categories (B5.12), plus the four
+/// additive variants below (M5 Task 5's `ApprovalAttempted`/
+/// `CommitOutcome`, M5 Task 8B's `RejectionAttempted`/`RejectionOutcome`)
+/// — the original 7 keep their exact names and field shapes unchanged.
+/// No field anywhere carries note content, query
 /// text, tool arguments, or any other content-bearing payload; `reason`
 /// fields are a short category/explanation chosen by the emitting call
 /// site, never a verbatim echo of caller-supplied free text.
@@ -106,6 +109,30 @@ pub enum AuditEventKind {
     /// own call site may emit it, and only after an `ApprovalAttempted`
     /// for the same `attempt_id` already exists.
     CommitOutcome { attempt_id: String, outcome: CommitOutcomeKind },
+    /// M5 Task 8B: the rejection-specific mirror of `ApprovalAttempted`
+    /// — records that a rejection attempt was MADE on `proposal_id`,
+    /// with its own, independently-minted `attempt_id`. Never emitted by
+    /// `approve_proposal`'s own call site; `reject_proposal`'s own call
+    /// site is the only one that may produce this variant, exactly as
+    /// `ApprovalAttempted` is `approve_proposal`'s own exclusive
+    /// counterpart — the two are never interchangeable, even though
+    /// their field shapes happen to be identical, because mixing them up
+    /// would let a reader mistake a rejection for an approval attempt or
+    /// vice versa when reconstructing history from the log alone.
+    RejectionAttempted { attempt_id: String, proposal_id: String },
+    /// M5 Task 8B: the rejection-specific mirror of `CommitOutcome` —
+    /// the terminal outcome of exactly one `RejectionAttempted` (linked
+    /// by `attempt_id`). `approve_proposal` must NEVER emit this variant
+    /// (symmetric to `CommitOutcome`'s own exclusivity to approval) —
+    /// `reject_proposal` never produces a `storage::CommitResult` at
+    /// all (it never calls `propose_and_commit`), so this variant's own
+    /// `RejectionOutcomeKind` has no `Committed`/`GitPending`-shaped
+    /// success case to mirror, only a plain `Rejected` success and the
+    /// same closed `CommitFailureCategory` failure bucket
+    /// `CommitOutcome` already uses (rejection's own failure surface is
+    /// a strict subset of approval's — no new failure category is
+    /// needed).
+    RejectionOutcome { attempt_id: String, outcome: RejectionOutcomeKind },
 }
 
 /// The terminal classification of one approval attempt's commit —
@@ -148,6 +175,25 @@ pub enum CommitFailureCategory {
     Conflict,
     RuntimeUnavailable,
     CorruptData,
+}
+
+/// The terminal classification of one rejection attempt — the rejection-
+/// specific mirror of [`CommitOutcomeKind`]. Rejection never produces a
+/// `storage::CommitResult` (it never calls `propose_and_commit`), so
+/// there is no `Committed`/`GitPending`-shaped success to represent —
+/// only a plain, binary `Rejected` success, plus the same closed
+/// [`CommitFailureCategory`] bucket `CommitOutcomeKind::Failed` already
+/// uses (`reject_proposal`'s own `BrainApiError` surface is a strict
+/// subset of `approve_proposal`'s — no new category is needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionOutcomeKind {
+    /// The proposal's status transition to `Rejected` was durably
+    /// persisted (`reject_proposal` returned `Ok(())`).
+    Rejected,
+    /// The rejection attempt did not complete, categorized by which
+    /// kind of operational failure it was — never the raw error message.
+    Failed { category: CommitFailureCategory },
 }
 
 /// Emission destination for [`AuditEvent`]s. Mirrors `mcp_client::
@@ -258,6 +304,18 @@ mod tests {
             AuditEventKind::CommitOutcome {
                 attempt_id: "22222222-2222-2222-2222-222222222222".into(),
                 outcome: CommitOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+            },
+            AuditEventKind::RejectionAttempted {
+                attempt_id: "33333333-3333-3333-3333-333333333333".into(),
+                proposal_id: "11111111-1111-1111-1111-111111111111".into(),
+            },
+            AuditEventKind::RejectionOutcome {
+                attempt_id: "33333333-3333-3333-3333-333333333333".into(),
+                outcome: RejectionOutcomeKind::Rejected,
+            },
+            AuditEventKind::RejectionOutcome {
+                attempt_id: "33333333-3333-3333-3333-333333333333".into(),
+                outcome: RejectionOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
             },
         ]
     }
@@ -416,6 +474,80 @@ mod tests {
         let decoded1 = crate::audit_record::parse_event(&scan.verified_records[1].content_bytes).unwrap();
         assert_eq!(decoded0.kind, AuditEventKind::ApprovalAttempted { attempt_id: attempt_id.clone(), proposal_id });
         assert_eq!(decoded1.kind, AuditEventKind::CommitOutcome { attempt_id, outcome: CommitOutcomeKind::Committed });
+    }
+
+    // --- M5 Task 8B: RejectionAttempted / RejectionOutcome schema --
+    //     mirrors the three tests above exactly, for the rejection-
+    //     specific variants.
+
+    #[test]
+    fn rejection_attempted_and_rejection_outcome_are_correlated_by_attempt_id_not_proposal_id() {
+        let attempted_1 = AuditEventKind::RejectionAttempted { attempt_id: "attempt-1".into(), proposal_id: "p1".into() };
+        let attempted_2 = AuditEventKind::RejectionAttempted { attempt_id: "attempt-2".into(), proposal_id: "p1".into() };
+        assert_ne!(attempted_1, attempted_2, "two distinct attempts against the same proposal must not collapse into equal events");
+
+        let outcome_1 = AuditEventKind::RejectionOutcome { attempt_id: "attempt-1".into(), outcome: RejectionOutcomeKind::Rejected };
+        let outcome_2 = AuditEventKind::RejectionOutcome {
+            attempt_id: "attempt-2".into(),
+            outcome: RejectionOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
+        };
+        if let (AuditEventKind::RejectionAttempted { attempt_id: a1, .. }, AuditEventKind::RejectionOutcome { attempt_id: o1, .. }) = (&attempted_1, &outcome_1) {
+            assert_eq!(a1, o1);
+        } else {
+            panic!("pattern must match");
+        }
+        if let (AuditEventKind::RejectionAttempted { attempt_id: a2, .. }, AuditEventKind::RejectionOutcome { attempt_id: o2, .. }) = (&attempted_2, &outcome_2) {
+            assert_eq!(a2, o2);
+        } else {
+            panic!("pattern must match");
+        }
+    }
+
+    #[test]
+    fn rejection_outcome_never_carries_a_proposal_id_field_only_attempt_id() {
+        let json = serde_json::to_string(&AuditEventKind::RejectionOutcome { attempt_id: "a1".into(), outcome: RejectionOutcomeKind::Rejected }).unwrap();
+        assert!(!json.contains("proposal_id"), "RejectionOutcome's own serialized shape must never carry a proposal_id field, got {json}");
+    }
+
+    #[test]
+    fn no_rejection_outcome_variant_serializes_a_raw_error_message_string() {
+        let json = serde_json::to_string(&AuditEventKind::RejectionOutcome {
+            attempt_id: "a1".into(),
+            outcome: RejectionOutcomeKind::Failed { category: CommitFailureCategory::InvalidInput },
+        })
+        .unwrap();
+        assert!(json.len() < 150, "a categorized failure must stay short and bounded, got {json}");
+        assert!(json.contains("invalid_input"), "the closed category label must appear, got {json}");
+    }
+
+    #[test]
+    fn rejection_variants_are_compatible_with_the_pure_hash_chain_functions_and_recovery_scan() {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let proposal_id = uuid::Uuid::new_v4().to_string();
+        let correlation_id = uuid::Uuid::new_v4();
+
+        let e0 = event(AuditEventKind::RejectionAttempted { attempt_id: attempt_id.clone(), proposal_id: proposal_id.clone() }, "2026-11-19T00:00:00Z", correlation_id);
+        let (line0, hash0) = crate::audit_record::serialize_record(&e0, 0, crate::audit_chain::GENESIS_HASH);
+
+        let e1 = event(AuditEventKind::RejectionOutcome { attempt_id: attempt_id.clone(), outcome: RejectionOutcomeKind::Rejected }, "2026-11-19T00:00:01Z", correlation_id);
+        let (line1, hash1) = crate::audit_record::serialize_record(&e1, 1, &hash0);
+
+        let mut raw = line0.clone();
+        raw.extend_from_slice(&line1);
+
+        let record0 = crate::audit_record::parse_line(&line0[..line0.len() - 1]).unwrap();
+        let record1 = crate::audit_record::parse_line(&line1[..line1.len() - 1]).unwrap();
+        let lines = vec![crate::audit_chain::LineOutcome::Parsed(record0), crate::audit_chain::LineOutcome::Parsed(record1)];
+
+        let scan = crate::audit_chain::scan_chain(&lines);
+        assert!(scan.stop_reason.is_none(), "a chain built entirely from the two new rejection variants must verify cleanly, got {:?}", scan.stop_reason);
+        assert_eq!(scan.verified_records.len(), 2);
+        assert_eq!(scan.verified_records[1].record_hash, hash1);
+
+        let decoded0 = crate::audit_record::parse_event(&scan.verified_records[0].content_bytes).unwrap();
+        let decoded1 = crate::audit_record::parse_event(&scan.verified_records[1].content_bytes).unwrap();
+        assert_eq!(decoded0.kind, AuditEventKind::RejectionAttempted { attempt_id: attempt_id.clone(), proposal_id });
+        assert_eq!(decoded1.kind, AuditEventKind::RejectionOutcome { attempt_id, outcome: RejectionOutcomeKind::Rejected });
     }
 
     // --- construction / sink behavior ---

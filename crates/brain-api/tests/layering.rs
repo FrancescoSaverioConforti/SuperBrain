@@ -110,14 +110,17 @@ fn brain_api_public_surface_matches_the_allowed_list() {
     // observable effect can also approve a proposal -- deliberately added
     // here, alongside run_cli, rather than silently left uncovered by this
     // allowlist. Its own signature (below) still carries no caller-
-    // forgeable trust parameter: `hooks: &mut DurableApprovalHooks`
-    // contains only two plain `FnMut` closures over `(Uuid, &str)`/`(Uuid,
-    // &Result<storage::CommitResult, BrainApiError>)` -- there is no
-    // `RequestContext`/`WritePolicy`/`TrustedLocalToken`-shaped parameter
-    // anywhere in this type for a caller to construct or influence trust
-    // through (see `run_cli_durables_hooks_are_trust_blind_and_cannot_
+    // forgeable trust parameter: `approval_hooks: &mut DurableApprovalHooks`/
+    // `rejection_hooks: &mut DurableRejectionHooks` (M5 Task 8B's own
+    // rejection-specific mirror, added the same way) each contain only
+    // two plain `FnMut` closures over `(Uuid, &str)`/`(Uuid,
+    // &Result<storage::CommitResult, BrainApiError>)` or `(Uuid,
+    // &Result<(), BrainApiError>)` -- there is no `RequestContext`/
+    // `WritePolicy`/`TrustedLocalToken`-shaped parameter anywhere in
+    // either type for a caller to construct or influence trust through
+    // (see `run_cli_durables_hooks_are_trust_blind_and_cannot_
     // construct_a_requestcontext` below for the dedicated proof).
-    let _: fn(&[String], &storage::Vault, &str, &dyn brain_api::AuditSink, &mut brain_api::DurableApprovalHooks) -> brain_api::DurableCliOutcome = brain_api::run_cli_durable;
+    let _: fn(&[String], &storage::Vault, &str, &dyn brain_api::AuditSink, &mut brain_api::DurableApprovalHooks, &mut brain_api::DurableRejectionHooks) -> brain_api::DurableCliOutcome = brain_api::run_cli_durable;
     type LinkEntitiesFn = fn(
         &brain_api::RequestContext,
         &storage::Vault,
@@ -153,11 +156,14 @@ fn brain_api_public_surface_matches_the_allowed_list() {
     _assert_type_exists::<brain_api::CanonEntry>();
     _assert_type_exists::<brain_api::KnowledgeItem>();
     _assert_type_exists::<brain_api::DurableCliOutcome>();
-    // `DurableApprovalHooks` is NOT listed via `_assert_type_exists` (it
-    // has a lifetime parameter and is never constructed bare) -- its
-    // shape is instead pinned by the `run_cli_durable` function-pointer
-    // assertion above, which already names it, and by the dedicated
-    // trust-blindness test below.
+    _assert_type_exists::<brain_api::CommitOutcomeKind>();
+    _assert_type_exists::<brain_api::CommitFailureCategory>();
+    _assert_type_exists::<brain_api::RejectionOutcomeKind>();
+    // `DurableApprovalHooks`/`DurableRejectionHooks` are NOT listed via
+    // `_assert_type_exists` (both have a lifetime parameter and are
+    // never constructed bare) -- their shape is instead pinned by the
+    // `run_cli_durable` function-pointer assertion above, which already
+    // names both, and by the dedicated trust-blindness tests below.
 
     // `valid_proposal_transition` is a free function, not a type -- named
     // directly instead of through `_assert_type_exists`.
@@ -380,7 +386,10 @@ fn run_cli_durable_also_carries_trusted_authority_with_no_caller_forgeable_trust
     let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
     let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
     assert!(outcome.result.is_ok(), "run_cli_durable must itself carry approval authority with no caller-supplied trust parameter, got {:?}", outcome.result);
 }
 
@@ -425,7 +434,60 @@ fn run_cli_durables_hooks_are_trust_blind_and_cannot_construct_a_requestcontext(
         Ok(())
     };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+    assert!(outcome.result.is_ok());
+}
+
+#[test]
+fn run_cli_durable_also_carries_trusted_rejection_authority_with_no_caller_forgeable_trust_parameter() {
+    // Rejection-specific mirror of
+    // run_cli_durable_also_carries_trusted_authority_with_no_caller_
+    // forgeable_trust_parameter above.
+    let vault = test_vault("run-cli-durable-carries-rejection-authority");
+    let id = propose_a_save_memory(&vault, "note-authority-durable-reject", "body");
+    let sink = brain_api::NullAuditSink;
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut approval_hooks = brain_api::DurableApprovalHooks { pre_register: &mut noop_pre_register, record_outcome: &mut noop_record_outcome };
+    let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut approval_hooks, &mut rejection_hooks);
+    assert!(outcome.result.is_ok(), "run_cli_durable must itself carry rejection authority with no caller-supplied trust parameter, got {:?}", outcome.result);
+}
+
+#[test]
+fn run_cli_durables_rejection_hooks_are_trust_blind_and_cannot_construct_a_requestcontext() {
+    // Rejection-specific mirror of
+    // run_cli_durables_hooks_are_trust_blind_and_cannot_construct_a_
+    // requestcontext above: DurableRejectionHooks's two closures are
+    // typed `FnMut(uuid::Uuid, &str) -> Result<(), String>` and
+    // `FnMut(uuid::Uuid, &Result<(), brain_api::BrainApiError>) ->
+    // Result<(), String>` -- neither signature has a `RequestContext`/
+    // `WritePolicy`/`TrustedLocalToken`-shaped parameter anywhere.
+    let vault = test_vault("run-cli-durable-rejection-hooks-trust-blind");
+    let id = propose_a_save_memory(&vault, "note-authority-rejection-hooks-blind", "body");
+    let sink = brain_api::NullAuditSink;
+
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut approval_hooks = brain_api::DurableApprovalHooks { pre_register: &mut noop_pre_register, record_outcome: &mut noop_record_outcome };
+
+    let mut pre_register = |attempt_id: uuid::Uuid, proposal_id: &str| -> Result<(), String> {
+        let _: uuid::Uuid = attempt_id;
+        let _: &str = proposal_id;
+        Ok(())
+    };
+    let mut record_outcome = |attempt_id: uuid::Uuid, result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> {
+        let _: uuid::Uuid = attempt_id;
+        let _: &Result<(), brain_api::BrainApiError> = result;
+        Ok(())
+    };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut approval_hooks, &mut rejection_hooks);
     assert!(outcome.result.is_ok());
 }
 

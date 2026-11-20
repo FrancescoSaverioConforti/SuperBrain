@@ -324,8 +324,11 @@ fn run_cli_durable_pre_registers_before_approving_and_records_the_real_commit_ou
         Ok(())
     };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
 
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
 
     assert!(outcome.result.is_ok(), "the real approval must succeed, got {:?}", outcome.result);
     assert!(outcome.audit_outcome_write.is_ok());
@@ -362,10 +365,13 @@ fn run_cli_durable_generates_a_distinct_attempt_id_for_each_separate_approval_at
     };
     let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
 
-    let first = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let first = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
     assert!(first.result.is_ok());
-    let second = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let second = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
     assert!(matches!(second.result, Err(brain_api::BrainApiError::Conflict)), "got {:?}", second.result);
 
     let ids = seen_attempt_ids.into_inner().unwrap();
@@ -384,8 +390,11 @@ fn run_cli_durable_never_calls_approve_proposal_when_pre_registration_fails() {
         panic!("record_outcome must never be called when pre-registration itself failed");
     };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
 
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
 
     assert!(matches!(outcome.result, Err(brain_api::BrainApiError::RuntimeUnavailable)), "a failed pre-registration must refuse to approve, fail closed, got {:?}", outcome.result);
 
@@ -407,8 +416,11 @@ fn run_cli_durable_reports_a_successful_commit_truthfully_even_when_the_outcome_
         Err("audit worker queue full".to_string())
     };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
 
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks);
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
 
     assert!(outcome.result.is_ok(), "the real commit succeeded and must be reported as such regardless of the outcome-write's own failure, got {:?}", outcome.result);
     assert_eq!(outcome.audit_outcome_write, Err("audit worker queue full".to_string()), "the outcome-write failure must be separately, honestly surfaced, never silently discarded");
@@ -419,25 +431,194 @@ fn run_cli_durable_reports_a_successful_commit_truthfully_even_when_the_outcome_
 }
 
 #[test]
-fn run_cli_durable_never_emits_a_commit_outcome_hook_call_for_rejection() {
+fn run_cli_durable_never_touches_the_approval_hooks_for_a_rejection() {
     let vault = test_vault();
-    let id = propose_a_note(&vault, "note-durable-reject-no-outcome");
+    let id = propose_a_note(&vault, "note-durable-reject-no-approval-hooks");
     let sink = RecordingSink::default();
 
     let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> {
-        panic!("pre_register must never be called for reject -- rejection has no approval attempt to pre-register");
+        panic!("the APPROVAL pre_register must never be called for reject -- rejection has its own, separate DurableRejectionHooks");
     };
     let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> {
-        panic!("record_outcome must never be called for reject -- rejection is a pure status transition, never a CommitOutcome");
+        panic!("the APPROVAL record_outcome must never be called for reject -- rejection never produces a CommitOutcome");
     };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut reject_pre_register, record_outcome: &mut reject_record_outcome };
 
-    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "not needed".to_string()], &vault, NOW, &sink, &mut hooks);
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "not needed".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
 
     assert!(outcome.result.is_ok(), "got {:?}", outcome.result);
-    assert!(outcome.audit_outcome_write.is_ok(), "reject's own audit_outcome_write must stay Ok(()) -- there is nothing to write an outcome for");
+    assert!(outcome.audit_outcome_write.is_ok());
     let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
     assert!(listing.contains("Rejected"), "got: {listing:?}");
+}
+
+// =====================================================================
+// M5 Task 8B: run_cli_durable's own rejection path -- fail-closed
+// durable pre-registration and outcome recording for rejections, the
+// exact symmetric mirror of the approval tests above.
+// =====================================================================
+
+struct RecordedRejectionOutcome {
+    attempt_id: uuid::Uuid,
+    outcome: Result<(), brain_api::BrainApiError>,
+}
+
+type RecordOutcomeFn<'a> = &'a mut dyn FnMut(uuid::Uuid, &Result<storage::CommitResult, brain_api::BrainApiError>) -> Result<(), String>;
+
+fn noop_approval_hooks_for_reject_tests<'a>(
+    pre_register: &'a mut dyn FnMut(uuid::Uuid, &str) -> Result<(), String>,
+    record_outcome: RecordOutcomeFn<'a>,
+) -> brain_api::DurableApprovalHooks<'a> {
+    brain_api::DurableApprovalHooks { pre_register, record_outcome }
+}
+
+#[test]
+fn run_cli_durable_pre_registers_before_rejecting_and_records_the_real_rejection_outcome() {
+    let vault = test_vault();
+    let id = propose_a_note(&vault, "note-durable-reject-success");
+    let sink = RecordingSink::default();
+
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| Ok(());
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| Ok(());
+    let mut hooks = noop_approval_hooks_for_reject_tests(&mut noop_pre_register, &mut noop_record_outcome);
+
+    let pre_registrations = std::sync::Mutex::new(Vec::<RecordedPreRegistration>::new());
+    let mut pre_register = |attempt_id: uuid::Uuid, proposal_id: &str| -> Result<(), String> {
+        pre_registrations.lock().unwrap().push(RecordedPreRegistration { attempt_id, proposal_id: proposal_id.to_string() });
+        Ok(())
+    };
+    let outcomes = std::sync::Mutex::new(Vec::<RecordedRejectionOutcome>::new());
+    let mut record_outcome = |attempt_id: uuid::Uuid, result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> {
+        outcomes.lock().unwrap().push(RecordedRejectionOutcome { attempt_id, outcome: result.clone() });
+        Ok(())
+    };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no longer needed".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+
+    assert!(outcome.result.is_ok(), "the real rejection must succeed, got {:?}", outcome.result);
+    assert!(outcome.audit_outcome_write.is_ok());
+
+    let pre = pre_registrations.into_inner().unwrap();
+    assert_eq!(pre.len(), 1, "pre_register must be called exactly once for one reject attempt");
+    assert_eq!(pre[0].proposal_id, id.to_string());
+
+    let out = outcomes.into_inner().unwrap();
+    assert_eq!(out.len(), 1, "record_outcome must be called exactly once");
+    assert_eq!(out[0].attempt_id, pre[0].attempt_id, "the SAME attempt_id must correlate pre-registration with its outcome");
+    assert_eq!(out[0].outcome, Ok(()), "got {:?}", out[0].outcome);
+
+    let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
+    assert!(listing.contains("Rejected"), "got: {listing:?}");
+}
+
+#[test]
+fn run_cli_durable_generates_a_distinct_attempt_id_for_each_separate_rejection_attempt() {
+    // First reject succeeds; a second reject of the SAME (now-Rejected)
+    // proposal fails with Conflict -- but both must still get their own
+    // distinct, independently pre-registered attempt_id.
+    let vault = test_vault();
+    let id = propose_a_note(&vault, "note-durable-reject-distinct-attempts");
+    let sink = RecordingSink::default();
+
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| Ok(());
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| Ok(());
+    let mut hooks = noop_approval_hooks_for_reject_tests(&mut noop_pre_register, &mut noop_record_outcome);
+
+    let seen_attempt_ids = std::sync::Mutex::new(Vec::<uuid::Uuid>::new());
+    let mut pre_register = |attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> {
+        seen_attempt_ids.lock().unwrap().push(attempt_id);
+        Ok(())
+    };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+
+    let first = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+    assert!(first.result.is_ok(), "got {:?}", first.result);
+    let second = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no again".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+    assert!(matches!(second.result, Err(brain_api::BrainApiError::Conflict)), "got {:?}", second.result);
+
+    let ids = seen_attempt_ids.into_inner().unwrap();
+    assert_eq!(ids.len(), 2, "both attempts must each get their own pre-registration call");
+    assert_ne!(ids[0], ids[1], "distinct rejection attempts must never share an attempt_id");
+}
+
+#[test]
+fn run_cli_durable_never_calls_reject_proposal_when_pre_registration_fails() {
+    let vault = test_vault();
+    let id = propose_a_note(&vault, "note-durable-reject-pre-register-fails");
+    let sink = RecordingSink::default();
+
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| Ok(());
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| Ok(());
+    let mut hooks = noop_approval_hooks_for_reject_tests(&mut noop_pre_register, &mut noop_record_outcome);
+
+    let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Err("durable audit worker unavailable".to_string()) };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> {
+        panic!("record_outcome must never be called when pre-registration itself failed");
+    };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+
+    assert!(matches!(outcome.result, Err(brain_api::BrainApiError::RuntimeUnavailable)), "a failed pre-registration must refuse to reject, fail closed, got {:?}", outcome.result);
+
+    // The proposal itself must still be genuinely Pending -- reject_proposal
+    // was never reached, so no status transition happened.
+    let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
+    assert!(listing.contains("Pending"), "the proposal must remain Pending since reject_proposal was never called, got: {listing:?}");
+}
+
+#[test]
+fn run_cli_durable_reports_a_successful_rejection_truthfully_even_when_the_outcome_write_itself_fails() {
+    let vault = test_vault();
+    let id = propose_a_note(&vault, "note-durable-reject-outcome-write-fails");
+    let sink = RecordingSink::default();
+
+    let mut noop_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| Ok(());
+    let mut noop_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| Ok(());
+    let mut hooks = noop_approval_hooks_for_reject_tests(&mut noop_pre_register, &mut noop_record_outcome);
+
+    let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Err("audit worker queue full".to_string()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+
+    assert!(outcome.result.is_ok(), "the real rejection succeeded and must be reported as such regardless of the outcome-write's own failure, got {:?}", outcome.result);
+    assert_eq!(outcome.audit_outcome_write, Err("audit worker queue full".to_string()), "the outcome-write failure must be separately, honestly surfaced, never silently discarded");
+
+    let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
+    assert!(listing.contains("Rejected"), "got: {listing:?}");
+}
+
+#[test]
+fn run_cli_durable_never_emits_a_commit_outcome_for_rejection_only_rejection_outcome() {
+    // Structural end-to-end guard: a rejection's own durable path must
+    // never be mistaken for, or able to produce, an approval-shaped
+    // outcome -- proven here by giving the APPROVAL record_outcome hook
+    // a panic trap (same technique as run_cli_durable_never_touches_the_
+    // approval_hooks_for_a_rejection above) while the rejection succeeds
+    // through its own, separate hooks.
+    let vault = test_vault();
+    let id = propose_a_note(&vault, "note-durable-reject-never-commit-outcome");
+    let sink = RecordingSink::default();
+
+    let mut approval_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut approval_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> {
+        panic!("a CommitOutcome-shaped hook call must never happen for a rejection");
+    };
+    let mut hooks = noop_approval_hooks_for_reject_tests(&mut approval_pre_register, &mut approval_record_outcome);
+
+    let mut pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+
+    let outcome = brain_api::run_cli_durable(&["reject".to_string(), id.to_string(), "no".to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
+    assert!(outcome.result.is_ok(), "got {:?}", outcome.result);
 }
 
 #[test]
@@ -462,8 +643,11 @@ fn run_cli_durable_permission_denial_never_calls_pre_register_or_reaches_an_unau
     };
     let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
     let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+    let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+    let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+    let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
 
-    let outcome = brain_api::run_cli_durable(&["approve".to_string(), unknown], &vault, NOW, &sink, &mut hooks);
+    let outcome = brain_api::run_cli_durable(&["approve".to_string(), unknown], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks);
     assert!(matches!(outcome.result, Err(brain_api::BrainApiError::NotFound)), "got {:?}", outcome.result);
     // pre_register IS still called here (parse_id succeeded; the id is
     // well-formed, just unknown) -- NotFound happens inside

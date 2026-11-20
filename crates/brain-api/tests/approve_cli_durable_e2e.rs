@@ -347,10 +347,148 @@ fn rejecting_a_proposal_changes_its_status_and_produces_no_commit_outcome_event(
 
     let raw = read_full_log(&root, &journal);
     let scan = verified_chain(&raw);
-    let outcomes = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::CommitOutcome { .. }));
-    assert!(outcomes.is_empty(), "rejection must never produce a CommitOutcome event, got {outcomes:?}");
-    let attempts = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::ApprovalAttempted { .. }));
-    assert!(attempts.is_empty(), "rejection must never produce an ApprovalAttempted event either, got {attempts:?}");
+    assert!(scan.stop_reason.is_none(), "got {:?}", scan.stop_reason);
+    let commit_outcomes = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::CommitOutcome { .. }));
+    assert!(commit_outcomes.is_empty(), "rejection must never produce a CommitOutcome event, got {commit_outcomes:?}");
+    let approval_attempts = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::ApprovalAttempted { .. }));
+    assert!(approval_attempts.is_empty(), "rejection must never produce an ApprovalAttempted event either, got {approval_attempts:?}");
+
+    // M5 Task 8B: rejection now DOES produce its own, durable, correlated
+    // RejectionAttempted + RejectionOutcome pair -- the P1 gap this task
+    // closes. Asserted here (not just "no CommitOutcome") so this test
+    // would fail if the new durable rejection path silently regressed to
+    // best-effort-only or no-audit-at-all.
+    let rejection_attempts = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionAttempted { .. }));
+    let rejection_outcomes = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionOutcome { .. }));
+    assert_eq!(rejection_attempts.len(), 1, "exactly one RejectionAttempted must be persisted, got {rejection_attempts:?}");
+    assert_eq!(rejection_outcomes.len(), 1, "exactly one RejectionOutcome must be persisted, got {rejection_outcomes:?}");
+    let (attempt_id_a, proposal_id_a) = match &rejection_attempts[0].kind {
+        brain_api::AuditEventKind::RejectionAttempted { attempt_id, proposal_id } => (attempt_id.clone(), proposal_id.clone()),
+        _ => unreachable!(),
+    };
+    let (attempt_id_o, outcome_kind) = match &rejection_outcomes[0].kind {
+        brain_api::AuditEventKind::RejectionOutcome { attempt_id, outcome } => (attempt_id.clone(), *outcome),
+        _ => unreachable!(),
+    };
+    assert_eq!(proposal_id_a, id.to_string());
+    assert_eq!(attempt_id_a, attempt_id_o, "the SAME attempt_id must correlate the persisted rejection intent with its persisted outcome");
+    assert_eq!(outcome_kind, brain_api::RejectionOutcomeKind::Rejected, "got {outcome_kind:?}");
+}
+
+// --- M5 Task 8B: repeated rejection attempts have distinct identifiers ---
+
+#[test]
+fn repeated_rejection_attempts_against_one_proposal_each_get_a_distinct_persisted_attempt_id() {
+    let root = unique_test_dir("reject-distinct-attempt-ids");
+    let journal = root.join("journal.sqlite");
+    init_git_repo(&root);
+    let id = {
+        let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+        propose_a_note(&vault, "note-e2e-reject-distinct-attempts")
+    };
+
+    let first = run_approve_cli(&root, &journal, &["reject", &id.to_string(), "no"]);
+    assert!(first.status.success());
+    let second = run_approve_cli(&root, &journal, &["reject", &id.to_string(), "no again"]);
+    assert!(!second.status.success(), "the second rejection of an already-Rejected proposal must fail (Conflict), got {second:?}");
+
+    let raw = read_full_log(&root, &journal);
+    let scan = verified_chain(&raw);
+    assert!(scan.stop_reason.is_none(), "got {:?}", scan.stop_reason);
+    let attempts = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionAttempted { .. }));
+    assert_eq!(attempts.len(), 2, "both the successful and the conflicting attempt must each be durably pre-registered, got {attempts:?}");
+    let ids: Vec<String> = attempts
+        .iter()
+        .map(|e| match &e.kind {
+            brain_api::AuditEventKind::RejectionAttempted { attempt_id, .. } => attempt_id.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1], "distinct attempts must never share an attempt_id, got {ids:?}");
+}
+
+// --- M5 Task 8B: permission denial cannot produce an unauthorized
+//     rejection (structural: run_cli_durable always constructs the
+//     trusted context internally -- proven via an unknown id, the same
+//     pattern approving_an_unknown_proposal_id_never_commits_anything
+//     already uses for approval) ---
+
+#[test]
+fn rejecting_an_unknown_proposal_id_never_changes_any_status() {
+    let root = unique_test_dir("reject-unknown-id-never-commits");
+    let journal = root.join("journal.sqlite");
+    init_git_repo(&root);
+    let unknown = uuid::Uuid::new_v4().to_string();
+
+    let output = run_approve_cli(&root, &journal, &["reject", &unknown, "no"]);
+    assert!(!output.status.success(), "rejecting an unknown id must fail, got {output:?}");
+
+    let raw = read_full_log(&root, &journal);
+    let scan = verified_chain(&raw);
+    let outcomes = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionOutcome { .. }));
+    assert_eq!(outcomes.len(), 1, "a NotFound outcome must still be durably recorded as a categorized failure, got {outcomes:?}");
+    assert!(matches!(&outcomes[0].kind, brain_api::AuditEventKind::RejectionOutcome { outcome: brain_api::RejectionOutcomeKind::Failed { category: brain_api::CommitFailureCategory::NotFound }, .. }), "got {:?}", outcomes[0].kind);
+}
+
+// --- M5 Task 8B: failed preregistration prevents status modification ---
+
+#[test]
+fn a_second_process_holding_the_audit_writer_lock_prevents_rejection_from_ever_changing_status() {
+    let root = unique_test_dir("reject-failed-intent-prevents-status-change");
+    let journal = root.join("journal.sqlite");
+    init_git_repo(&root);
+    let id = {
+        let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+        propose_a_note(&vault, "note-e2e-reject-locked-out")
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let locking_worker = {
+        let vault_for_lock = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+        rt.block_on(async { brain_api_audit_worker::spawn_worker(vault_for_lock, brain_api_audit_worker::WorkerConfig::default()).unwrap() })
+    };
+
+    let output = run_approve_cli(&root, &journal, &["reject", &id.to_string(), "no"]);
+    assert!(!output.status.success(), "the real process must fail closed when the audit store is already locked, got {output:?}");
+    assert!(output.stdout.is_empty(), "no command output may be printed when the audit worker itself never started");
+
+    rt.block_on(async { locking_worker.shutdown().await.unwrap() });
+    drop(rt);
+
+    // The proposal must still be genuinely Pending: reject_proposal was
+    // never reached at all.
+    let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+    let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
+    assert!(listing.contains("Pending"), "got: {listing:?}");
+}
+
+// --- M5 Task 8B: failed outcome persistence does not falsify a
+//     completed rejection ---
+
+#[test]
+fn a_successful_rejection_is_reported_truthfully_on_stdout_regardless_of_the_outcome_write(
+) {
+    // Mirrors a_successful_commit_is_reported_truthfully_on_stdout_even_
+    // if_the_outcome_write_itself_warns_on_stderr's own precondition
+    // check for approval: pins that the real binary's exit code is 0 and
+    // stdout is the real result for an ordinary successful rejection --
+    // the honest-reporting CONTRACT itself (never folding an outcome-
+    // write failure into the real result) is already proven
+    // deterministically at the brain-api layer by
+    // run_cli_durable_reports_a_successful_rejection_truthfully_even_when_the_outcome_write_itself_fails
+    // in tests/cli_approval_e2e.rs.
+    let root = unique_test_dir("reject-stdout-truthful-on-success");
+    let journal = root.join("journal.sqlite");
+    init_git_repo(&root);
+    let id = {
+        let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+        propose_a_note(&vault, "note-e2e-reject-stdout-truthful")
+    };
+
+    let output = run_approve_cli(&root, &journal, &["reject", &id.to_string(), "no"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rejected"), "the real, successful rejection result must appear verbatim on stdout, got {stdout:?}");
 }
 
 // --- 10: restart and recovery preserve the verified hash chain ---
@@ -452,8 +590,11 @@ async fn concurrent_in_process_approval_attempts_against_the_same_proposal_commi
                 };
                 let mut record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<storage::CommitResult, brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
                 let mut hooks = brain_api::DurableApprovalHooks { pre_register: &mut pre_register, record_outcome: &mut record_outcome };
+                let mut noop_reject_pre_register = |_attempt_id: uuid::Uuid, _proposal_id: &str| -> Result<(), String> { Ok(()) };
+                let mut noop_reject_record_outcome = |_attempt_id: uuid::Uuid, _result: &Result<(), brain_api::BrainApiError>| -> Result<(), String> { Ok(()) };
+                let mut rejection_hooks = brain_api::DurableRejectionHooks { pre_register: &mut noop_reject_pre_register, record_outcome: &mut noop_reject_record_outcome };
                 let sink = brain_api::NullAuditSink;
-                brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks)
+                brain_api::run_cli_durable(&["approve".to_string(), id.to_string()], &vault, NOW, &sink, &mut hooks, &mut rejection_hooks)
             })
             .await
             .unwrap();
@@ -648,6 +789,75 @@ fn killing_the_cli_process_mid_flight_never_corrupts_the_log_and_every_unresolve
         assert!(
             outcomes.iter().any(|e| matches!(&e.kind, brain_api::AuditEventKind::CommitOutcome { outcome: brain_api::CommitOutcomeKind::Committed | brain_api::CommitOutcomeKind::GitPending, .. })),
             "the proposal store shows Approved but no successful CommitOutcome was ever durably persisted for it -- the log must never under-report a real commit, got outcomes={outcomes:?}, listing={listing:?}"
+        );
+    }
+}
+
+// --- M5 Task 8B: the exact rejection mirror of the crash test above --
+//     crash between rejection-intent and outcome persistence leaves an
+//     explicitly unresolved attempt, never a fabricated success.
+
+#[test]
+fn killing_the_cli_process_mid_flight_during_rejection_never_corrupts_the_log_and_every_unresolved_attempt_is_honestly_representable() {
+    let root = unique_test_dir("crash-mid-flight-reject-honest");
+    let journal = root.join("journal.sqlite");
+    init_git_repo(&root);
+    let id = {
+        let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+        propose_a_note(&vault, "note-e2e-crash-mid-flight-reject")
+    };
+
+    let mut child = Command::new(approve_cli_binary_path())
+        .arg(&root)
+        .arg(&journal)
+        .args(["reject", &id.to_string(), "no"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("approve_cli must spawn as a real child process");
+
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let raw = read_full_log(&root, &journal);
+    let scan = verified_chain(&raw);
+    assert!(scan.stop_reason.is_none() || matches!(scan.stop_reason, Some(brain_api::ScanStopReason::PartialTrailingRecord)), "a kill must never leave anything OTHER than a clean chain or, at worst, a partial trailing record at the physical tail -- never corruption in the middle, got {:?}", scan.stop_reason);
+
+    let sequences: Vec<u64> = scan.verified_records.iter().map(|r| r.sequence).collect();
+    let mut deduped = sequences.clone();
+    deduped.dedup();
+    assert_eq!(sequences, deduped, "no duplicate sequence numbers, got {sequences:?}");
+
+    let attempts = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionAttempted { proposal_id, .. } if proposal_id == &id.to_string()));
+    let outcomes = events_of_kind(&scan, |k| matches!(k, brain_api::AuditEventKind::RejectionOutcome { .. }));
+    assert!(attempts.len() <= 1, "at most one RejectionAttempted for this one proposal, got {attempts:?}");
+    assert!(outcomes.len() <= 1, "at most one RejectionOutcome from this one invocation, got {outcomes:?}");
+    if !outcomes.is_empty() {
+        assert!(!attempts.is_empty(), "a RejectionOutcome must never appear without its own prior RejectionAttempted having been persisted first -- an outcome can never be fabricated without a real pre-registered attempt, got attempts={attempts:?} outcomes={outcomes:?}");
+        let attempt_id_a = match &attempts[0].kind {
+            brain_api::AuditEventKind::RejectionAttempted { attempt_id, .. } => attempt_id.clone(),
+            _ => unreachable!(),
+        };
+        let attempt_id_o = match &outcomes[0].kind {
+            brain_api::AuditEventKind::RejectionOutcome { attempt_id, .. } => attempt_id.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(attempt_id_a, attempt_id_o, "a present RejectionOutcome must correlate with the present RejectionAttempted via the SAME attempt_id");
+    }
+
+    // The proposal's own real, independently-read status must never
+    // claim Rejected unless a real Rejected RejectionOutcome exists for
+    // it -- the log is never a weaker source of truth than the proposal
+    // store.
+    let vault = storage::Vault::open_with_default_indexer(root.clone(), &journal).unwrap();
+    let listing = brain_api::run_cli(&["list".to_string()], &vault, NOW).unwrap();
+    if listing.contains(&format!("{id} [Rejected")) {
+        assert!(
+            outcomes.iter().any(|e| matches!(&e.kind, brain_api::AuditEventKind::RejectionOutcome { outcome: brain_api::RejectionOutcomeKind::Rejected, .. })),
+            "the proposal store shows Rejected but no successful RejectionOutcome was ever durably persisted for it -- the log must never under-report a real rejection, got outcomes={outcomes:?}, listing={listing:?}"
         );
     }
 }
