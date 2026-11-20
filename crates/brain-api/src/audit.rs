@@ -453,25 +453,25 @@ mod tests {
         let correlation_id = uuid::Uuid::new_v4();
 
         let e0 = event(AuditEventKind::ApprovalAttempted { attempt_id: attempt_id.clone(), proposal_id: proposal_id.clone() }, "2026-11-19T00:00:00Z", correlation_id);
-        let (line0, hash0) = crate::audit_record::serialize_record(&e0, 0, crate::audit_chain::GENESIS_HASH);
+        let (line0, hash0) = audit_chain_core::serialize_record(&e0, 0, audit_chain_core::GENESIS_HASH);
 
         let e1 = event(AuditEventKind::CommitOutcome { attempt_id: attempt_id.clone(), outcome: CommitOutcomeKind::Committed }, "2026-11-19T00:00:01Z", correlation_id);
-        let (line1, hash1) = crate::audit_record::serialize_record(&e1, 1, &hash0);
+        let (line1, hash1) = audit_chain_core::serialize_record(&e1, 1, &hash0);
 
         let mut raw = line0.clone();
         raw.extend_from_slice(&line1);
 
-        let record0 = crate::audit_record::parse_line(&line0[..line0.len() - 1]).unwrap();
-        let record1 = crate::audit_record::parse_line(&line1[..line1.len() - 1]).unwrap();
-        let lines = vec![crate::audit_chain::LineOutcome::Parsed(record0), crate::audit_chain::LineOutcome::Parsed(record1)];
+        let record0 = audit_chain_core::parse_line(&line0[..line0.len() - 1]).unwrap();
+        let record1 = audit_chain_core::parse_line(&line1[..line1.len() - 1]).unwrap();
+        let lines = vec![audit_chain_core::LineOutcome::Parsed(record0), audit_chain_core::LineOutcome::Parsed(record1)];
 
-        let scan = crate::audit_chain::scan_chain(&lines);
+        let scan = audit_chain_core::scan_chain(&lines);
         assert!(scan.stop_reason.is_none(), "a chain built entirely from the two new variants must verify cleanly, got {:?}", scan.stop_reason);
         assert_eq!(scan.verified_records.len(), 2);
         assert_eq!(scan.verified_records[1].record_hash, hash1);
 
-        let decoded0 = crate::audit_record::parse_event(&scan.verified_records[0].content_bytes).unwrap();
-        let decoded1 = crate::audit_record::parse_event(&scan.verified_records[1].content_bytes).unwrap();
+        let decoded0: AuditEvent = audit_chain_core::parse_event(&scan.verified_records[0].content_bytes).unwrap();
+        let decoded1: AuditEvent = audit_chain_core::parse_event(&scan.verified_records[1].content_bytes).unwrap();
         assert_eq!(decoded0.kind, AuditEventKind::ApprovalAttempted { attempt_id: attempt_id.clone(), proposal_id });
         assert_eq!(decoded1.kind, AuditEventKind::CommitOutcome { attempt_id, outcome: CommitOutcomeKind::Committed });
     }
@@ -527,25 +527,25 @@ mod tests {
         let correlation_id = uuid::Uuid::new_v4();
 
         let e0 = event(AuditEventKind::RejectionAttempted { attempt_id: attempt_id.clone(), proposal_id: proposal_id.clone() }, "2026-11-19T00:00:00Z", correlation_id);
-        let (line0, hash0) = crate::audit_record::serialize_record(&e0, 0, crate::audit_chain::GENESIS_HASH);
+        let (line0, hash0) = audit_chain_core::serialize_record(&e0, 0, audit_chain_core::GENESIS_HASH);
 
         let e1 = event(AuditEventKind::RejectionOutcome { attempt_id: attempt_id.clone(), outcome: RejectionOutcomeKind::Rejected }, "2026-11-19T00:00:01Z", correlation_id);
-        let (line1, hash1) = crate::audit_record::serialize_record(&e1, 1, &hash0);
+        let (line1, hash1) = audit_chain_core::serialize_record(&e1, 1, &hash0);
 
         let mut raw = line0.clone();
         raw.extend_from_slice(&line1);
 
-        let record0 = crate::audit_record::parse_line(&line0[..line0.len() - 1]).unwrap();
-        let record1 = crate::audit_record::parse_line(&line1[..line1.len() - 1]).unwrap();
-        let lines = vec![crate::audit_chain::LineOutcome::Parsed(record0), crate::audit_chain::LineOutcome::Parsed(record1)];
+        let record0 = audit_chain_core::parse_line(&line0[..line0.len() - 1]).unwrap();
+        let record1 = audit_chain_core::parse_line(&line1[..line1.len() - 1]).unwrap();
+        let lines = vec![audit_chain_core::LineOutcome::Parsed(record0), audit_chain_core::LineOutcome::Parsed(record1)];
 
-        let scan = crate::audit_chain::scan_chain(&lines);
+        let scan = audit_chain_core::scan_chain(&lines);
         assert!(scan.stop_reason.is_none(), "a chain built entirely from the two new rejection variants must verify cleanly, got {:?}", scan.stop_reason);
         assert_eq!(scan.verified_records.len(), 2);
         assert_eq!(scan.verified_records[1].record_hash, hash1);
 
-        let decoded0 = crate::audit_record::parse_event(&scan.verified_records[0].content_bytes).unwrap();
-        let decoded1 = crate::audit_record::parse_event(&scan.verified_records[1].content_bytes).unwrap();
+        let decoded0: AuditEvent = audit_chain_core::parse_event(&scan.verified_records[0].content_bytes).unwrap();
+        let decoded1: AuditEvent = audit_chain_core::parse_event(&scan.verified_records[1].content_bytes).unwrap();
         assert_eq!(decoded0.kind, AuditEventKind::RejectionAttempted { attempt_id: attempt_id.clone(), proposal_id });
         assert_eq!(decoded1.kind, AuditEventKind::RejectionOutcome { attempt_id, outcome: RejectionOutcomeKind::Rejected });
     }

@@ -110,6 +110,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audit-chain-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,6 +188,7 @@ name = "brain-api"
 version = "0.1.0"
 dependencies = [
  "api",
+ "audit-chain-core",
  "brain-api-audit-worker",
  "chrono",
  "codegraph-domain",
@@ -188,7 +200,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
  "storage",
  "thiserror 1.0.69",
  "tokio",

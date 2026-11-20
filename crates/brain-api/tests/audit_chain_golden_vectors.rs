@@ -27,7 +27,7 @@
 //! way around, and never regenerating an expected value from the
 //! implementation at assertion time.
 use brain_api::{
-    event, parse_event, parse_line, serialize_record, AuditEventKind, CommitFailureCategory,
+    event, parse_event, parse_line, serialize_record, AuditEvent, AuditEventKind, CommitFailureCategory,
     CommitOutcomeKind, RejectionOutcomeKind, GENESIS_HASH,
 };
 
@@ -290,7 +290,7 @@ fn golden_vector_parses_and_decodes_back_to_the_original_typed_event() {
     assert_eq!(record.sequence, 0);
     assert_eq!(record.prev_record_hash, GENESIS_HASH);
 
-    let decoded = parse_event(&record.content_bytes).unwrap();
+    let decoded: AuditEvent = parse_event(&record.content_bytes).unwrap();
     assert_eq!(
         decoded.kind,
         AuditEventKind::ApprovalAttempted { attempt_id: ATTEMPT_ID.into(), proposal_id: PROPOSAL_ID.into() }

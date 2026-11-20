@@ -170,7 +170,7 @@ fn a_real_tool_call_over_the_real_process_persists_a_verifiable_audit_event() {
     assert!(!scan.verified_records.is_empty());
 
     let has_tool_call = scan.verified_records.iter().any(|r| {
-        brain_api::parse_event(&r.content_bytes)
+        brain_api::parse_event::<brain_api::AuditEvent>(&r.content_bytes)
             .map(|e| matches!(e.kind, brain_api::AuditEventKind::ToolCall { ref tool, .. } if tool == "search"))
             .unwrap_or(false)
     });

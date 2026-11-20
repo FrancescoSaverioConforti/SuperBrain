@@ -25,20 +25,19 @@ domain = { path = "../domain" }
 index = { path = "../index" }
 codegraph-index = { path = "../codegraph-index" }
 codegraph-domain = { path = "../codegraph-domain" }
+# M6.2B: the pure hash-chain/record-envelope primitives that used to
+# live in this crate's own audit_chain.rs/audit_record.rs (B5 remediation
+# M5 Tasks 1/4), extracted so a future MCP Client audit payload can use
+# the same format without depending on brain-api. This crate's own
+# audit.rs re-exports a curated facade over this dependency; callers of
+# brain-api are unaffected (same public names/signatures, proven by
+# M6.2A's golden-vector suite run unchanged against the extracted code).
+audit-chain-core = { path = "../audit-chain-core" }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-# B5 remediation M5 Task 1: pure hash-chain functions for a future
-# durable audit log (crates/brain-api/src/audit_chain.rs). Same version
-# constraint as crates/vault-security's own existing sha2 dependency
-# (already resolves to 0.10.9 in this workspace's Cargo.lock) -- reused
-# for consistency, not a new version introduced.
-sha2 = "0.10"
-# B5 remediation M5 Task 4: promoted from [dev-dependencies] (same "1"
-# constraint, no version bump) -- crates/brain-api/src/audit_record.rs
-# needs it in production code now, not only in tests.
 serde_json = "1"
 
 [dev-dependencies]

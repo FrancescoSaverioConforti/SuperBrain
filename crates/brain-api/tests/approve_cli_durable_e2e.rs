@@ -111,7 +111,7 @@ fn verified_chain(raw: &[u8]) -> brain_api::ScanResult {
 fn events_of_kind(scan: &brain_api::ScanResult, mut pred: impl FnMut(&brain_api::AuditEventKind) -> bool) -> Vec<brain_api::AuditEvent> {
     scan.verified_records
         .iter()
-        .filter_map(|r| brain_api::parse_event(&r.content_bytes).ok())
+        .filter_map(|r| brain_api::parse_event::<brain_api::AuditEvent>(&r.content_bytes).ok())
         .filter(|e| pred(&e.kind))
         .collect()
 }

@@ -1,0 +1,17 @@
+[package]
+name = "audit-chain-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M6.2B: pure, domain-agnostic hash-chain and record-envelope primitives extracted from brain-api's audit_chain/audit_record modules -- no filesystem, storage, network or Tokio dependency, so a future MCP Client audit payload can depend on this crate directly without depending on brain-api, storage or mcp-server."
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4", "serde"] }
