@@ -1,0 +1,29 @@
+[package]
+name = "mcp-client-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M6.4: strictly supervised, one-shot MCP Client composition-root CLI. A separate, independent binary -- never an extension of brain-api/examples/approve_cli.rs. Owns operator-supplied trusted configuration, server registration/discovery, authorization, the durable audit worker, and exactly one explicitly requested invocation."
+
+[[bin]]
+name = "mcp-client-cli"
+path = "src/main.rs"
+
+[dependencies]
+mcp-client = { path = "../mcp-client" }
+mcp-client-audit-worker = { path = "../mcp-client-audit-worker" }
+storage = { path = "../storage" }
+audit-chain-core = { path = "../audit-chain-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+thiserror = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

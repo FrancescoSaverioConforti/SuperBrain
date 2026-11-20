@@ -101,6 +101,12 @@ mod note_id;
 mod propose;
 mod recovery;
 mod restore;
+/// M6.4: the minimal, pass-through seam exposing `handle_safety`'s
+/// existing verification to a caller outside this crate for a trusted
+/// local file (MCP Client composition-root configuration and executable
+/// identity checks) — see that module's own doc comment for why this is
+/// zero new logic, not a weakening of `handle_safety` itself.
+mod trusted_file;
 mod vault;
 
 // `atomic` is deliberately NOT re-exported: `atomic_write` is a raw,
@@ -113,6 +119,7 @@ pub use propose::{
     SENSITIVE_TOMBSTONE_BODY,
 };
 pub use restore::{restore_vault_from_backup, RestoreError};
+pub use trusted_file::read_trusted_file;
 pub use vault::{split_record, Indexer, SplitRecordError, StorageError, Vault, VaultRecord, Version};
 
 #[test]
