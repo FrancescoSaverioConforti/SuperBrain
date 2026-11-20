@@ -86,6 +86,20 @@ pub fn verify_file_content_hash(path: &Path, expected_hex: &str, label: &'static
     }
 }
 
+/// M6.5: the explicit scope statement for what a matching
+/// `input_schema_sha256` actually proves, quoted verbatim wherever this
+/// binary reports a schema-hash mismatch or success so the limitation is
+/// never left implicit. A match proves ONLY that the server's current
+/// `tools/list` reply for this tool declares the exact same interface
+/// shape (parameter names, types, structure) the operator reviewed and
+/// pinned -- it proves NOTHING about what the server's own `tools/call`
+/// implementation actually does at runtime when invoked. A malicious or
+/// compromised server could advertise a verbatim-matching schema while
+/// behaving arbitrarily differently inside its own `tools/call` handler;
+/// this check has no visibility into that at all. Schema-hash agreement
+/// is interface-shape verification, never behavioral-integrity proof.
+pub const SCHEMA_HASH_SCOPE_DISCLOSURE: &str = "input_schema_sha256 verification proves only that the server's currently-advertised tool interface shape matches what the operator reviewed and pinned. It proves nothing about the server's actual runtime behavior when the tool is invoked -- a server could advertise a verbatim-matching schema while behaving arbitrarily differently inside its own tools/call handler. Schema-hash agreement is interface-shape verification, never behavioral-integrity proof.";
+
 /// Canonicalizes a discovered tool's own `input_schema` the same
 /// deterministic way `serde_json::to_string` already does (key-sorted,
 /// since `serde_json::Map` is `BTreeMap`-backed with the `preserve_order`

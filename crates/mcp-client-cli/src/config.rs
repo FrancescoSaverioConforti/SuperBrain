@@ -134,11 +134,17 @@ pub struct TrustedTool {
     pub network_required: bool,
     #[serde(default)]
     pub filesystem_scope: Option<String>,
-    /// Pinned SHA-256 (lowercase hex) of the discovered tool's own
-    /// `input_schema`, canonicalized by `serde_json`'s own deterministic
-    /// (BTreeMap-backed, `preserve_order` not enabled anywhere in this
-    /// workspace) key-sorted serialization. A mismatch at runtime is a
-    /// hard deny -- see `main.rs`'s own `verify_schema_hash`.
+    /// Pinned SHA-256 (hex, case-insensitive) of the discovered tool's
+    /// own `input_schema`, canonicalized by `serde_json`'s own
+    /// deterministic (BTreeMap-backed, `preserve_order` not enabled
+    /// anywhere in this workspace) key-sorted serialization. A mismatch
+    /// at runtime is a hard deny, checked in `main.rs`'s own `execute`
+    /// function before authorization or `tools/call` are ever reached
+    /// (`identity::hash_discovered_schema`). M6.5: see
+    /// `identity::SCHEMA_HASH_SCOPE_DISCLOSURE` for the explicit,
+    /// load-bearing scope statement this field's own guarantee is
+    /// bounded by -- a match proves interface-shape agreement only,
+    /// never the server's actual runtime behavior.
     pub input_schema_sha256: String,
 }
 
@@ -264,12 +270,12 @@ impl TrustedConfig {
                 return Err(ConfigError::Validation(format!("trusted_tools contains a duplicate tool_name {:?} -- each tool_name must appear at most once, to avoid ambiguity about which entry's classification/sensitivity/hash applies", tool.tool_name)));
             }
             if tool.input_schema_sha256.len() != 64 || !tool.input_schema_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ConfigError::Validation(format!("trusted_tools entry {:?}: input_schema_sha256 must be exactly 64 lowercase hex characters, got {:?}", tool.tool_name, tool.input_schema_sha256)));
+                return Err(ConfigError::Validation(format!("trusted_tools entry {:?}: input_schema_sha256 must be exactly 64 hex characters (case-insensitive), got {:?}", tool.tool_name, tool.input_schema_sha256)));
             }
         }
 
         if self.server.command_sha256.len() != 64 || !self.server.command_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConfigError::Validation(format!("server.command_sha256 must be exactly 64 lowercase hex characters, got {:?}", self.server.command_sha256)));
+            return Err(ConfigError::Validation(format!("server.command_sha256 must be exactly 64 hex characters (case-insensitive), got {:?}", self.server.command_sha256)));
         }
 
         if !self.server.working_dir.is_dir() {
@@ -322,7 +328,7 @@ impl TrustedConfig {
             }
             let script_sha256 = self.server.script_sha256.as_deref().unwrap();
             if script_sha256.len() != 64 || !script_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ConfigError::Validation(format!("server.script_sha256 must be exactly 64 lowercase hex characters, got {script_sha256:?}")));
+                return Err(ConfigError::Validation(format!("server.script_sha256 must be exactly 64 hex characters (case-insensitive), got {script_sha256:?}")));
             }
         } else if self.server.script.is_some() || self.server.script_sha256.is_some() || self.server.script_trust_boundary.is_some() {
             return Err(ConfigError::Validation(format!(

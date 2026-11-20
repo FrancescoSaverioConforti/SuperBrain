@@ -108,6 +108,7 @@ fn main() {
 
     eprintln!("{}", identity::NO_SANDBOX_DISCLOSURE);
     eprintln!("{}", identity::TOCTOU_DISCLOSURE);
+    eprintln!("{}", identity::SCHEMA_HASH_SCOPE_DISCLOSURE);
 
     // --- Phase 3, step 1: load and validate trusted operator configuration ---
     let config = match TrustedConfig::load(&args.config_path) {

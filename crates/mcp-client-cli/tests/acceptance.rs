@@ -130,6 +130,83 @@ const READ_THING_SCHEMA: &str = r#"{"properties":{},"type":"object"}"#;
 const WRITE_THING_SCHEMA: &str = r#"{"properties":{"value":{"type":"string"}},"type":"object"}"#;
 const HANG_THING_SCHEMA: &str = r#"{"properties":{},"type":"object"}"#;
 
+/// M6.5 Test A: a mock server that advertises `read_thing` with a
+/// DIFFERENT, still-valid `inputSchema` than [`READ_THING_SCHEMA`] --
+/// the server genuinely answers `tools/list`/`tools/call` correctly by
+/// MCP protocol rules; only the schema's own content has drifted from
+/// what the operator originally pinned. Proves the schema-hash
+/// mismatch, not a malformed/missing schema.
+const MOCK_SERVER_SCRIPT_SCHEMA_DRIFT: &str = r#"
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+            {"name": "read_thing", "description": "reads a thing", "inputSchema": {"type": "object", "properties": {"extra_drifted_field": {"type": "string"}}}},
+        ]}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name")
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "content": [],
+            "structuredContent": {"echoed": params.get("arguments", {}), "tool": name},
+        }})
+    elif req.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "method not found"}})
+"#;
+
+/// M6.5 Test B: a mock server that completes the real MCP handshake
+/// (`initialize` succeeds normally) but returns a structurally invalid
+/// `tools/list` reply -- a result object missing the required `tools`
+/// field entirely, which `rmcp`'s own deserialization rejects as
+/// malformed, never reaching this crate's own `discover_tools` at all. A
+/// genuinely broken/misbehaving external server, not a simulated error.
+const MOCK_SERVER_SCRIPT_DISCOVERY_FAILS: &str = r#"
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        # Missing the required "tools" field entirely -- a real,
+        # structurally invalid reply, not a well-formed empty list.
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+    elif req.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "method not found"}})
+"#;
+
 struct TestFixture {
     _server_dir: PathBuf,
     server_script_path: PathBuf,
@@ -143,10 +220,19 @@ struct TestFixture {
 
 impl TestFixture {
     fn new(label: &str) -> Self {
+        Self::new_with_server_script(label, MOCK_SERVER_SCRIPT)
+    }
+
+    /// Same as [`TestFixture::new`], but with a caller-supplied mock
+    /// server script -- used by M6.5's own Test A (schema drift) and
+    /// Test B (discovery failure) to run the real binary against a
+    /// deliberately different, still-genuine external MCP server
+    /// implementation, never a simulated/mocked `mcp_client` call.
+    fn new_with_server_script(label: &str, server_script: &str) -> Self {
         let python = python_or_skip().expect("checked by caller via skip_if_no_python");
         let server_dir = unique_test_dir(&format!("{label}-server"));
         let server_script_path = server_dir.join("mock_server.py");
-        std::fs::write(&server_script_path, MOCK_SERVER_SCRIPT).unwrap();
+        std::fs::write(&server_script_path, server_script).unwrap();
 
         let working_dir = unique_test_dir(&format!("{label}-workdir"));
         let config_dir = unique_test_dir(&format!("{label}-config"));
@@ -505,4 +591,168 @@ fn the_real_vault_backed_writer_preserves_the_same_sequence_and_hash_chain_contr
     let first_record = audit_chain_core::parse_line(lines[0]).unwrap();
     assert_eq!(first_record.sequence, 0, "the first record the real writer ever appends must be sequence 0, exactly matching the in-memory worker tests' own assumption");
     assert_eq!(first_record.prev_record_hash, audit_chain_core::GENESIS_HASH, "the first record's prev_record_hash must be the real GENESIS_HASH constant");
+}
+
+// --- M6.5 Test A: schema mismatch denies the invocation, never dispatches tools/call ---
+
+#[test]
+fn a_tool_whose_live_schema_differs_from_the_pinned_hash_is_denied_before_tools_call() {
+    if skip_if_no_python() {
+        return;
+    }
+    // The config pins READ_THING_SCHEMA's own hash, but the server (via
+    // MOCK_SERVER_SCRIPT_SCHEMA_DRIFT) actually offers read_thing with a
+    // DIFFERENT, still well-formed inputSchema -- a genuine operator-
+    // reviewed pin against a server whose real schema has since
+    // drifted, not a malformed/missing schema.
+    let fx = TestFixture::new_with_server_script("schema-mismatch", MOCK_SERVER_SCRIPT_SCHEMA_DRIFT);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    assert_eq!(output.status.code(), Some(1), "a schema-hash mismatch must deny the invocation, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not match the pinned input_schema_sha256"), "stderr must name the specific schema-mismatch reason, got: {stderr}");
+    assert!(stderr.contains("denied, never invoked"), "stderr must state the tool was never invoked, got: {stderr}");
+
+    // stdout must be completely empty -- the real tools/call response
+    // (the mock server's own "echoed" structuredContent) must never
+    // appear, proving tools/call was never dispatched, not merely that
+    // its result was discarded.
+    assert!(output.stdout.is_empty(), "stdout must be empty: no tools/call response of any kind may ever reach the operator for a denied, unverified schema, got: {}", String::from_utf8_lossy(&output.stdout));
+
+    // The durable audit log must show DiscoveryOutcome (discovery
+    // evidence is retained, per the task's own requirement) but must
+    // NEVER show InvocationAttempted or InvocationOutcome for this
+    // tool -- the chain must also still verify cleanly end to end.
+    let raw = fx.read_raw_audit_log();
+    assert!(!raw.is_empty(), "discovery evidence must still be durably recorded even though the invocation itself was denied");
+    let lines: Vec<&[u8]> = raw[..raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let records: Vec<_> = lines.iter().map(|l| audit_chain_core::parse_line(l).unwrap()).collect();
+    let events: Vec<mcp_client_audit_worker::McpClientEvent> = records.iter().map(|r| audit_chain_core::parse_event(&r.content_bytes).unwrap()).collect();
+
+    assert!(
+        events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Discovered, .. })),
+        "a successful DiscoveryOutcome must still be durably retained as evidence, even though the subsequently-discovered tool's schema failed verification"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::InvocationAttempted { .. })),
+        "InvocationAttempted must NEVER be durably recorded for a tool whose schema failed verification -- the denial must happen strictly before any pre-registration, got events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::InvocationOutcome { .. })),
+        "InvocationOutcome must NEVER be durably recorded for a tool whose schema failed verification, got events: {events:?}"
+    );
+
+    let scan = audit_chain_core::scan_chain(&records.into_iter().map(audit_chain_core::LineOutcome::Parsed).collect::<Vec<_>>());
+    assert!(scan.stop_reason.is_none(), "the real persisted chain must still verify cleanly after a schema-mismatch denial, got {:?}", scan.stop_reason);
+}
+
+// --- M6.5 Test B: discovery failure fails closed, durably records DiscoveryOutcomeKind::Failed ---
+
+#[test]
+fn a_malformed_tools_list_reply_fails_closed_before_authorization_or_invocation() {
+    if skip_if_no_python() {
+        return;
+    }
+    let fx = TestFixture::new_with_server_script("discovery-fails", MOCK_SERVER_SCRIPT_DISCOVERY_FAILS);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    assert_eq!(output.status.code(), Some(1), "a malformed tools/list reply must fail closed, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to discover tools"), "stderr must name discovery as the failure point, got: {stderr}");
+    assert!(output.stdout.is_empty(), "stdout must be empty: no invocation of any kind can have occurred if discovery itself failed, got: {}", String::from_utf8_lossy(&output.stdout));
+
+    let raw = fx.read_raw_audit_log();
+    assert!(!raw.is_empty(), "DiscoveryOutcome::Failed must still be durably recorded even though discovery itself failed");
+    let lines: Vec<&[u8]> = raw[..raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let records: Vec<_> = lines.iter().map(|l| audit_chain_core::parse_line(l).unwrap()).collect();
+    let events: Vec<mcp_client_audit_worker::McpClientEvent> = records.iter().map(|r| audit_chain_core::parse_event(&r.content_bytes).unwrap()).collect();
+
+    assert!(
+        events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Failed, .. })),
+        "DiscoveryOutcomeKind::Failed must be durably recorded, got events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::AuthorizationDecision { .. })),
+        "authorization must never be reached if discovery itself failed, got events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::InvocationAttempted { .. } | mcp_client_audit_worker::McpClientEventKind::InvocationOutcome { .. })),
+        "no invocation of any kind may ever be recorded if discovery itself failed, got events: {events:?}"
+    );
+
+    // Verify the persisted audit chain after REOPENING the real Vault
+    // (a fresh storage::Vault::open_with_default_indexer call, the same
+    // real-recovery-scan path a future invocation of this binary would
+    // itself go through on startup) -- not merely reading the raw bytes
+    // once, proving the chain genuinely survives a real reopen.
+    let reopened_vault = storage::Vault::open_with_default_indexer(fx.audit_vault_root.clone(), &fx.audit_journal_path).unwrap();
+    let reopened_raw = reopened_vault.read_audit_log_for_recovery_scan().unwrap();
+    assert_eq!(reopened_raw, raw, "the raw audit log bytes must be identical after a real Vault reopen");
+    let reopened_lines: Vec<&[u8]> = reopened_raw[..reopened_raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let reopened_records: Vec<_> = reopened_lines.iter().map(|l| audit_chain_core::parse_line(l).unwrap()).collect();
+    let scan = audit_chain_core::scan_chain(&reopened_records.into_iter().map(audit_chain_core::LineOutcome::Parsed).collect::<Vec<_>>());
+    assert!(scan.stop_reason.is_none(), "the persisted chain must still verify cleanly after reopening the real Vault, got {:?}", scan.stop_reason);
+}
+
+// --- M6.5 Test C: ordering regression -- schema verification must precede authorization and invocation ---
+
+#[test]
+fn schema_verification_runs_before_authorization_and_before_any_tools_call_dispatch() {
+    if skip_if_no_python() {
+        return;
+    }
+    // Uses a policy that WOULD authorize read_thing (AllowReadOnly) --
+    // if schema verification ran AFTER authorization, or not at all,
+    // this test's own schema-drifted server would still be denied only
+    // by coincidence of the schema check existing somewhere, not
+    // provably BEFORE authorization. The decisive, observable proof is
+    // the ABSENCE of AuthorizationDecision in the durable log: if
+    // schema verification happens first and denies before authorize()
+    // is ever called, no AuthorizationDecision event can exist at all
+    // for this run -- a regression that moved the schema check to AFTER
+    // authorize() would instead produce a real AuthorizationDecision
+    // event (since AllowReadOnly would authorize a Read-classified
+    // tool), making this assertion the one that would catch it.
+    let fx = TestFixture::new_with_server_script("ordering-regression", MOCK_SERVER_SCRIPT_SCHEMA_DRIFT);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    assert_eq!(output.status.code(), Some(1));
+
+    let raw = fx.read_raw_audit_log();
+    let lines: Vec<&[u8]> = raw[..raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let events: Vec<mcp_client_audit_worker::McpClientEvent> = lines
+        .iter()
+        .map(|l| audit_chain_core::parse_line(l).unwrap())
+        .map(|r| audit_chain_core::parse_event::<mcp_client_audit_worker::McpClientEvent>(&r.content_bytes).unwrap())
+        .collect();
+
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::AuthorizationDecision { .. })),
+        "no AuthorizationDecision may ever be recorded when schema verification denies first -- its presence would prove schema verification happened AFTER (or not before) authorization, got events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::InvocationAttempted { .. })),
+        "no InvocationAttempted may ever be recorded when schema verification denies first, got events: {events:?}"
+    );
+}
+
+// --- M6.5 Phase 2 item 2: the explicit schema-hash scope disclosure is actually printed on every real run ---
+
+#[test]
+fn the_schema_hash_scope_disclosure_appears_in_real_cli_output_on_every_run() {
+    if skip_if_no_python() {
+        return;
+    }
+    let fx = TestFixture::new("schema-disclosure");
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Schema-hash agreement is interface-shape verification, never behavioral-integrity proof."),
+        "the real CLI's own stderr must contain the explicit M6.5 scope disclosure on every run, got: {stderr}"
+    );
 }
