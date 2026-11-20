@@ -1,0 +1,25 @@
+[package]
+name = "mcp-client-audit-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M6.3: independent audit event model and durable, cancellation-safe writer task for MCP Client activity. Depends on mcp-client and audit-chain-core only -- never brain-api, storage or mcp-server (see tests/dependency_boundary.rs)."
+
+[dependencies]
+mcp-client = { path = "../mcp-client" }
+audit-chain-core = { path = "../audit-chain-core" }
+# Runtime-agnostic feature set only, same choice and same reasoning as
+# brain-api-audit-worker's own Cargo.toml: this crate never creates its
+# own Tokio runtime and never requires one per request -- spawn_worker
+# just does tokio::spawn onto whatever runtime its composition-root
+# caller already has running.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }

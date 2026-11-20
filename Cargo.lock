@@ -1150,6 +1150,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-client-audit-worker"
+version = "0.1.0"
+dependencies = [
+ "audit-chain-core",
+ "mcp-client",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mcp-server"
 version = "0.1.0"
 dependencies = [
