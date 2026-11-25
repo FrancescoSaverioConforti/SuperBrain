@@ -52,6 +52,8 @@ mod error;
 mod invoke;
 mod permission;
 mod registration;
+#[cfg(windows)]
+mod windows_job;
 
 pub use discovery::{DiscoveredTool, ToolCache, discover_tools};
 pub use error::McpClientError;

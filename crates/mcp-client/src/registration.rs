@@ -126,6 +126,15 @@ pub struct McpConnection {
     // below) -- a type with a `Drop` impl cannot otherwise be partially
     // moved out of by value.
     service: Option<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+    // M6.6 (Windows only): the spawned external server's process is
+    // job-contained (`windows_job::ContainedChild`) rather than a plain
+    // `tokio::process::Child` -- see `connect_now`'s own doc comment
+    // for why. Unix keeps the prior `tokio::process::Child`-based
+    // spawn (Job Objects are a Windows-only mechanism; M6.6 added no
+    // equivalent containment for other platforms, by explicit scope).
+    #[cfg(windows)]
+    child: crate::windows_job::ContainedChild,
+    #[cfg(not(windows))]
     child: tokio::process::Child,
 }
 
@@ -159,7 +168,15 @@ impl Drop for McpConnection {
     /// detached task for the actual async wait rather than blocking drop
     /// itself.
     fn drop(&mut self) {
+        // `tokio::process::Child::start_kill` (Unix) returns
+        // `io::Result<()>`; `windows_job::ContainedChild::start_kill`
+        // (Windows) returns `()` directly -- both discarded here, the
+        // same "best-effort, Drop cannot propagate an error" intent on
+        // either platform.
+        #[cfg(not(windows))]
         let _ = self.child.start_kill();
+        #[cfg(windows)]
+        self.child.start_kill();
     }
 }
 
@@ -277,6 +294,12 @@ const CHILD_PROCESS_ENV_ALLOWLIST: &[&str] = &["PATH", "SystemRoot", "TEMP", "TM
 /// string), nothing else. This never reads, logs, or prints any
 /// variable's VALUE outside of passing it directly to the child process
 /// argument list `std::process::Command` itself manages.
+///
+/// Unix-only (M6.6): the Windows `connect_now` below uses
+/// `windows_job::spawn_contained`/`child_environment_pairs` instead,
+/// which needs the same allowlisted values collected as owned pairs
+/// rather than applied to a `tokio::process::Command` builder.
+#[cfg(not(windows))]
 fn isolate_child_environment(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
     for name in CHILD_PROCESS_ENV_ALLOWLIST {
@@ -286,6 +309,52 @@ fn isolate_child_environment(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// M6.6 (Windows only): the env allowlist as owned `(name, value)` pairs,
+/// the shape `windows_job::spawn_contained` takes — same values
+/// [`isolate_child_environment`] passes to `tokio::process::Command` on
+/// every other platform, just collected instead of applied to a
+/// `Command` builder (which `connect_now`'s Windows path does not use).
+#[cfg(windows)]
+fn child_environment_pairs() -> Vec<(String, String)> {
+    CHILD_PROCESS_ENV_ALLOWLIST.iter().filter_map(|name| std::env::var_os(name).map(|value| (name.to_string(), value.to_string_lossy().into_owned()))).collect()
+}
+
+#[cfg(windows)]
+async fn connect_now(registration: &McpServerRegistration) -> Result<McpConnection, McpClientError> {
+    let TransportConfig::ChildProcess { command, args } = &registration.transport;
+
+    // M6.6: creation-time Job Object containment replaces
+    // `tokio::process::Command::spawn()` on Windows -- see
+    // `windows_job`'s own module doc comment for why the ordinary
+    // spawn-then-assign pattern (and the `CREATE_SUSPENDED` alternative)
+    // were both rejected in favor of `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
+    // `cwd` is passed explicitly as this process's own current directory
+    // to match `tokio::process::Command`'s default (it inherits the
+    // parent's cwd when none is set via `.current_dir()`, which this
+    // crate's prior Windows behavior never called).
+    let cwd = std::env::current_dir().map_err(|e| McpClientError::ConnectionFailed(e.to_string()))?;
+    let env = child_environment_pairs();
+    let (mut child, stdio) = crate::windows_job::spawn_contained(std::path::Path::new(command), args, &cwd, &env).map_err(|e| McpClientError::ConnectionFailed(e.to_string()))?;
+    let (stdin, stdout) = stdio.into_async_io();
+
+    let transport = AsyncRwTransport::new_client(stdout, stdin).with_max_line_length(MCP_MAX_RESPONSE_LINE_BYTES);
+
+    let service = match ().serve(transport).await {
+        Ok(service) => service,
+        Err(err) => {
+            // The handshake never completed -- this connection attempt
+            // is abandoned, so the spawned child (and, per M6.6, its
+            // whole contained process tree) must not be left running.
+            child.start_kill();
+            return Err(McpClientError::ConnectionFailed(err.to_string()));
+        }
+    };
+    // The handshake succeeded. `McpConnection` must keep `child` alive
+    // for the connection's whole lifetime and kill it on close/drop.
+    Ok(McpConnection { service: Some(service), child })
+}
+
+#[cfg(not(windows))]
 async fn connect_now(registration: &McpServerRegistration) -> Result<McpConnection, McpClientError> {
     let TransportConfig::ChildProcess { command, args } = &registration.transport;
 
