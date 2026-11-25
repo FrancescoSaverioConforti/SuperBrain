@@ -1,14 +1,19 @@
 # M6 — Supervised MCP Client CLI: Closure
 
 **Branch:** `main` (all M6 work committed directly, no feature branch).
-**HEAD at closure:** `10c3757`. **Date:** 2026-11-25.
+**HEAD at closure:** `7930f11`. **Date:** 2026-11-25.
 **Milestones covered:** M6.4 (composition root + durable audit),
 M6.4-S1 (executable identity / Windows ACL), M6.5 (schema-hash
 verification), M6.6 (Windows creation-time Job Object containment),
 M6.7 (adversarial security audit), M6.8 (this closure).
 
-**Status: CONDITIONAL PASS.** See [§10](#10-closure-decision) for the
-exact condition and why PASS without qualification is not justified.
+**Status: PASS.** The CONDITIONAL PASS this document originally
+recorded (at commit `0970a7a`) is resolved: the one outstanding
+condition — `windows_job.rs`'s own test-suite flakiness under default
+`cargo test` parallelism — has been root-caused and fixed, not merely
+mitigated. See [§6a](#6a-resolved-finding-windows_jobrs-test-suite-concurrency-flake)
+for the finding and fix, and [§10](#10-closure-decision) for the
+updated verdict.
 
 ---
 
@@ -382,7 +387,92 @@ defend against at all).
 | The Windows-specific `CreateProcessW` command-line quoting and environment-block encoding (`quote_arg`/`build_command_line`/`build_environment_block`) are this crate's own hand-rolled reimplementations of MSVCRT/Win32 conventions, not `std::process::Command`'s own battle-tested native argv/env handling. | **Accepted limitation** (with evidence, not blind trust) | Necessary because `CreateProcessW` is called directly (bypassing `tokio::process::Command`, which has no way to pass `STARTUPINFOEXW`). Mitigated, not eliminated: adversarially tested against a real spawned child's own `sys.argv` for 13 shapes (spaces, embedded quotes, trailing backslashes, empty args, Unicode, newlines, option-injection-shaped strings) — all round-trip correctly. Remains security-sensitive custom code that any future change to this module must re-verify against the same real-process round-trip, not just unit-test the encoding function in isolation. |
 | `build_environment_block` has no embedded-NUL guard on key/value content — would corrupt the block's own structure (fracture one entry into two, shifting every subsequent variable) if ever fed such a value. | **Unsupported threat model for this function's own current real caller** (would be a real gap for any FUTURE caller with less-trusted input) | Not reachable today: the only real caller (`registration.rs`'s `child_environment_pairs`) sources every value exclusively from `std::env::var_os` against the fixed allowlist in §3, and a real OS environment variable cannot itself contain an embedded NUL. Confirmed structurally corrupting, not guarded, by a dedicated M6.7 unit test — documented rather than defensively patched, per this milestone's own instruction to fix only demonstrated-reachable issues. |
 | No CPU/memory/handle-count resource limits are configured on the Job Object beyond `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (no `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, `ActiveProcessLimit`, CPU rate limit, etc.). | **Deferred future hardening** | M6.6's own milestone text named `KILL_ON_JOB_CLOSE`/tree containment specifically; no other resource limit was named as in-scope, and none was added speculatively. A genuinely malicious or runaway external server can still consume unbounded CPU/memory for as long as it runs (it will still be reliably terminated on connection close/teardown). |
-| `windows_job.rs`'s own test suite is intermittently flaky under `cargo test`'s default (high/unbounded) parallelism on this development host (~25-35% of runs failing with `ERROR_INVALID_HANDLE` on real-process tests). | **Deferred future hardening, test infrastructure only — confirmed NOT a production risk** | Investigated directly (live documentation research + systematic `--test-threads` bisection): 100% reliable serialized or at `--test-threads=4` (16/16 clean runs); only high/default concurrency reproduces it. A `SPAWN_SERIALIZATION_LOCK` was added (closes one real, documented Windows handle-table race class per Raymond Chen's own guidance) but is confirmed NOT sufficient alone to eliminate the flake — the remaining cause is most consistent with a host-level resource/rate limit under very high concurrent real process creation. **Does not affect production**: the real binary calls `connect()`/`spawn_contained` exactly once per process run, from one thread, never concurrently with itself — the flake requires a concurrency shape production code never produces. This is the basis for M6.8's CONDITIONAL PASS condition; see [§10](#10-closure-decision). |
+
+(`windows_job.rs`'s test-suite concurrency flake, previously listed
+here as a deferred-hardening residual risk, is now a **resolved**
+finding — see [§6a](#6a-resolved-finding-windows_jobrs-test-suite-concurrency-flake)
+immediately below, not this table.)
+
+---
+
+## 6a. Resolved finding: `windows_job.rs` test-suite concurrency flake
+
+This finding was open at the previous version of this document (which
+recorded a CONDITIONAL PASS over it) and is now closed.
+
+**Original symptom:** `windows_job.rs`'s own test suite was
+intermittently flaky under `cargo test`'s default (unbounded)
+parallelism on this 20-logical-CPU host — ~25-35% of runs failed with
+`ERROR_INVALID_HANDLE` on one or more real-process-spawning tests,
+sometimes cascading to several tests in the same run once one failed.
+
+**Investigation path (summarized; the full trail is in the two
+relevant commits' own messages):**
+1. Bisected across `--test-threads` values: 0/18 failures at
+   `--test-threads≤12`, rising to 1/6 at 16 and 2/6 at 20 — a gradual,
+   probability-increasing pattern (not a sharp cutoff), consistent
+   with a genuine race rather than a hard resource ceiling.
+2. Added `SPAWN_SERIALIZATION_LOCK`, reasoning from a real, Microsoft-
+   documented Windows handle-table-mutation race class (`CreatePipe`
+   creates both pipe ends inheritable, then a later call narrows one
+   back — a brief window Raymond Chen's own canonical guidance
+   describes). Measured directly: still ~5/15 runs failing with the
+   lock in place — a real mitigation for a real but different race,
+   contributing nothing measurable to THIS flake.
+3. Replaced plain `eprintln!`-based diagnostics (which interleave
+   mid-line under real concurrent process output and produced one
+   misleading combined-looking line earlier in the investigation)
+   with a mutex-protected, thread-and-sequence-tagged log that prints
+   each failing Win32 call's own exact handle values atomically.
+4. The clean log made the root cause unambiguous: two concurrently-
+   running, otherwise-unrelated tests' diagnostic output showed the
+   IDENTICAL raw handle value — one attributed to a job handle, the
+   other to a stdin pipe handle, from two different threads' own
+   calls.
+
+**Root cause:** the test helper
+`OwnedJobHandle::already_closed_for_test` created a real job object
+via `CreateJobObjectW` and immediately closed it, returning the
+now-dangling handle VALUE to simulate "an invalid job handle" for one
+specific adversarial test
+(`job_setup_failure_in_the_real_spawn_path_prevents_the_untrusted_command_from_ever_running`).
+Under heavy concurrent handle churn, a DIFFERENT thread's own
+legitimate `CreatePipe`/`CreateJobObjectW` call reliably reused that
+exact just-freed handle value for its own, completely unrelated real
+object before the first test's own `spawn_contained_into` call ran.
+This is real, documented Windows handle-value-reuse behavior
+colliding with a test fixture that manufactured a dangling value on
+purpose — **not** a bug in `spawn_contained`'s own single-call
+correctness, **not** a kernel-level race in `CreateProcessW`/
+`PROC_THREAD_ATTRIBUTE_JOB_LIST` itself, and **not** antivirus/EDR
+interference (both explicitly considered and measured against before
+this root cause was isolated).
+
+**Fix:** `already_closed_for_test` now returns
+`OwnedJobHandle::placeholder()` — a `NULL` handle, a value the OS
+handle allocator never assigns to a real object — instead of a real
+create-then-close round trip. No handle value is ever freed back into
+contention. `SPAWN_SERIALIZATION_LOCK` was removed after confirming
+(20 consecutive clean runs with it present, 20 more consecutive clean
+runs with it absent) that it contributed nothing measurable once the
+real bug was fixed — kept, it would have been unexplained,
+unjustified serialization of code that must behave identically under
+concurrent and sequential callers.
+
+**Scope of the fix:** confined entirely to one test helper's own
+handle lifetime inside `crates/mcp-client/src/windows_job.rs`. No
+production Job Object mechanism, `CreateProcessW` call shape,
+`PROC_THREAD_ATTRIBUTE_JOB_LIST` usage, authorization/schema/audit
+semantics, M6.4/M6.5 behavior, or public API changed — confirmed by
+`git diff --stat`, one file touched.
+
+**Verification:** 25 consecutive runs of `cargo test -p mcp-client
+--lib windows_job::` with NO `--test-threads` override (this host's
+own default, unbounded parallelism) — 0 failures. Full workspace test
+suite (`cargo test --workspace`, default parallelism) run 4 times
+consecutively — 0 failures each time. Zero clippy warnings on
+`mcp-client`. No test ignored, no retry logic used to mask a failure,
+no arbitrary sleep used as stabilization.
 
 ---
 
@@ -426,11 +516,12 @@ without being re-executed now.
 | `mcp-client-cli` `tests/acceptance.rs` | 18 | 18 passed |
 | **Total** | **213** | **213 passed, 0 failed, 0 ignored** |
 
-Run command for the reliable result above:
+Run command for the result above, with NO `--test-threads` override
+(this host's own default, unbounded parallelism):
 `cargo test -p mcp-client -p mcp-client-cli -p mcp-client-audit-worker
--p audit-chain-core -- --test-threads=4` (see §6/§9 for why
-`--test-threads=4` is specified rather than the bare default for this
-specific run).
+-p audit-chain-core`. The `windows_job.rs` concurrency flake that
+previously required a bounded `--test-threads` value for a reliable
+result is resolved (§6a) — this run uses the plain default.
 
 Each guarantee in §7 is backed by at least one specific test named in
 its own Evidence column, all included in the 213 above.
@@ -442,32 +533,35 @@ its own Evidence column, all included in the 213 above.
 - **Full workspace build:** `cargo build --workspace` — clean, no
   errors, re-run at M6.8 closure time.
 - **Full workspace tests:** `cargo test --workspace` (default
-  parallelism) — all suites outside `mcp-client`'s own `windows_job`
-  module passed cleanly; one pre-existing, unrelated `#[ignore]`d test
-  found (`crates/api/examples/b3_metric_runner.rs`, reads a real
-  held-out eval dataset, explicitly self-documented, outside M6's own
-  scope entirely) — not a hidden M6 skip. `windows_job`'s own tests
-  are the one suite with a documented, bounded-concurrency requirement
-  (§6); re-run at `--test-threads=4` per-crate for the reliable count
-  in §8.
+  parallelism, no `--test-threads` override anywhere) — run 4 times
+  consecutively during this closure update, 0 failures each time. One
+  pre-existing, unrelated `#[ignore]`d test found
+  (`crates/api/examples/b3_metric_runner.rs`, reads a real held-out
+  eval dataset, explicitly self-documented, outside M6's own scope
+  entirely) — not a hidden M6 skip. `windows_job`'s own former
+  concurrency flake (§6a) is resolved; its own suite was additionally
+  run 25 consecutive times in isolation at default parallelism with 0
+  failures, for the count in §8.
 - **Clippy on touched crates:** `cargo clippy -p mcp-client -p
   mcp-client-cli -p mcp-client-audit-worker -p audit-chain-core
   --all-targets -- -D warnings` — zero warnings.
 - **Working tree:** clean immediately before this document's own
-  commit (`git status --short` empty after the M6.8 flakiness
-  fix/documentation commit `10c3757`).
+  update commit.
 - **No unexpected files modified:** confirmed by `git diff --stat`
-  scoped per milestone commit — M6.6 touched only `mcp-client/{Cargo.
-  toml, src/lib.rs, src/registration.rs, src/windows_job.rs}`; M6.7
-  touched only `mcp-client/{Cargo.toml, src/windows_job.rs, tests/
-  adversarial.rs}` and `mcp-client-cli/tests/acceptance.rs`; M6.8
-  (code) touched only `mcp-client/src/windows_job.rs`. `registration.
-  rs`'s non-Windows branch, `mcp-client-cli/src/*`, `mcp-server`,
-  `storage`, `brain-api`, and `audit-chain-core` were never modified
-  by M6.6/M6.7/M6.8.
+  scoped per commit — M6.6 touched only `mcp-client/{Cargo.toml,
+  src/lib.rs, src/registration.rs, src/windows_job.rs}`; M6.7 touched
+  only `mcp-client/{Cargo.toml, src/windows_job.rs, tests/
+  adversarial.rs}` and `mcp-client-cli/tests/acceptance.rs`; M6.8's
+  two code commits (`10c3757`, `7930f11`) touched only
+  `mcp-client/src/windows_job.rs`. `registration.rs`'s non-Windows
+  branch, `mcp-client-cli/src/*`, `mcp-server`, `storage`,
+  `brain-api`, and `audit-chain-core` were never modified by
+  M6.6/M6.7/M6.8.
 - **Commit ancestry M6.4 → M6.8**, confirmed present on `main` in
   order via `git log --oneline`:
   ```
+  7930f11 fix(mcp-client): M6.8 follow-up - real root cause of windows_job test flakiness found and fixed
+  0970a7a docs: M6.8 - M6 closure documentation (trust model, containment mechanism, guarantees matrix, CONDITIONAL PASS)
   10c3757 test(mcp-client): M6.8 - diagnose and document windows_job test-suite concurrency flake
   f3e2ee8 security(mcp-client): M6.7 - adversarial audit of M6.6 Job Object containment, 3 real findings fixed
   debfa65 feat(mcp-client): M6.6 - Windows creation-time Job Object containment for spawned MCP servers
@@ -475,7 +569,7 @@ its own Evidence column, all included in the 213 above.
   9b12551 fix(mcp-client-cli): M6.4-S1 - executable identity TOCTOU security review and Windows ACL-based trusted-location mitigation
   a1ab624 feat(mcp-client-cli): M6.4 - supervised MCP Client composition root & real durable audit integration
   ```
-  (M6.8's own closure-document commit, created immediately after this
+  (This document's own update commit, created immediately after this
   file, is the next commit in this ancestry.)
 - **No security-critical test is `ignored`/conditionally skipped
   without documentation:** confirmed directly — the one workspace
@@ -501,44 +595,32 @@ its own Evidence column, all included in the 213 above.
 
 ## 10. Closure decision
 
-### CONDITIONAL PASS
+### PASS
 
-M6 is functionally complete: all stated acceptance criteria for
-M6.4-M6.7 are met, all three M6.7 findings are fixed and covered by
-regression tests, the trust model and every frozen invariant are
-documented and re-verified intact, and 213 real tests pass with zero
-clippy warnings across every M6-related crate.
+M6 is complete: all stated acceptance criteria for M6.4-M6.7 are met,
+all three M6.7 findings are fixed and covered by regression tests,
+the trust model and every frozen invariant are documented and
+re-verified intact, and 213 real tests pass with zero clippy warnings
+across every M6-related crate — **at this host's own default,
+unbounded test parallelism, with no `--test-threads` override
+anywhere**, confirmed by 25 consecutive clean runs of `windows_job.rs`
+in isolation and 4 consecutive clean full-workspace runs.
 
-**The one condition before unconditional closure:** `windows_job.rs`'s
-own test suite must be run with bounded concurrency
-(`--test-threads=4` or lower) to get a reliable PASS signal on this
-specific module — the bare default `cargo test` invocation is
-intermittently flaky (~25-35% failure rate) on this host due to a
-real but not-fully-root-caused high-concurrency interaction (§6),
-confirmed NOT to reflect a production correctness bug (the real
-binary never calls `spawn_contained` concurrently with itself) but
-real enough that an uninvestigated default-parallelism CI run could
-report a false failure, or — if this document's own finding is not
-propagated — a future session could see a transient red run and
-either falsely distrust correct code or, worse, "fix" something that
-isn't actually broken.
-
-This is not used as an excuse to call the milestone done without
-addressing it: the finding is disclosed in full (§6, §9), a real
-mitigation was applied and measured (`SPAWN_SERIALIZATION_LOCK`,
-confirmed to close one real documented race but not the whole
-flake), and the exact reliable run command is documented in the
-module's own source comment and in this closure document. PASS
-without this caveat would understate a real, demonstrated test
-behavior; FAIL would overstate it, since no production guarantee in
-§7 is actually weakened by it.
+The condition recorded in the previous version of this document (a
+bounded-concurrency requirement for `windows_job.rs`'s own test
+suite) is resolved, not waived: the actual root cause was found (a
+test helper manufacturing a dangling handle value that collided with
+real concurrent handle allocation — §6a) and fixed at the source, not
+worked around with a weaker acceptance bar, a retry, or a sleep.
 
 **No Critical/High finding requiring a redesign of M6.4-M6.6's
 architecture emerged during M6.7 or M6.8.** The one Critical finding
 (M6.7, §5.1) was a real use-after-free, but its fix was fully local to
 `windows_job.rs` and required no change to the creation-time
 Job-Object-assignment mechanism itself, the trust model, the
-invocation ordering, or any frozen M6.4/M6.5 invariant.
+invocation ordering, or any frozen M6.4/M6.5 invariant. The §6a
+concurrency finding was a test-infrastructure bug, confined to one
+test helper, with zero production-code or public-API change.
 
 ---
 
@@ -547,8 +629,8 @@ invocation ordering, or any frozen M6.4/M6.5 invariant.
 No push, tag, merge, or branch change was performed as part of this
 closure, per instruction. If the operator wants a durable marker for
 this closure point, a lightweight tag at the current `main` HEAD
-(`10c3757`) — e.g. `git tag m6-mcp-client-cli-conditional-pass
-10c3757` — would mirror this repository's own existing convention
+(`7930f11`) — e.g. `git tag m6-mcp-client-cli-pass 7930f11` — would
+mirror this repository's own existing convention
 (`b5-brain-api-mcp-complete` exists for B5's own closure). This is a
 proposal only; it has not been created, and `main` has not been
 pushed as part of this work.
