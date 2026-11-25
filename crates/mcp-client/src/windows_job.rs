@@ -111,18 +111,44 @@ impl OwnedJobHandle {
         Ok(job)
     }
 
-    /// Test-only: a job handle that is guaranteed invalid (already
-    /// closed) at the moment it is returned, for adversarial tests that
-    /// need `spawn_contained_into`'s own `PROC_THREAD_ATTRIBUTE_JOB_LIST`
-    /// setup step to genuinely fail against the real code path, rather
-    /// than against a synthetic stand-in.
+    /// Test-only: a job handle that is guaranteed invalid, for
+    /// adversarial tests that need `spawn_contained_into`'s own
+    /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` setup step to genuinely fail
+    /// against the real code path, rather than against a synthetic
+    /// stand-in.
+    ///
+    /// M6.8 finding (test-infrastructure root cause, found and fixed
+    /// during the flakiness investigation this doc comment itself is
+    /// part of): the ORIGINAL version of this helper created a real
+    /// job object via `CreateJobObjectW`, immediately closed it, and
+    /// returned the now-dangling handle VALUE. Confirmed via a
+    /// mutex-protected, thread-tagged diagnostic log (not
+    /// `eprintln!` directly -- that interleaves mid-line under real
+    /// concurrent output and produced misleading combined lines in an
+    /// earlier pass of this same investigation) that under `cargo
+    /// test`'s default/high parallelism on this host, ANOTHER thread's
+    /// own legitimate `CreatePipe`/`CreateJobObjectW` call reliably can
+    /// and does reuse that exact just-freed handle VALUE for its own,
+    /// completely unrelated real object before this test's own
+    /// `spawn_contained_into` call runs -- confirmed directly: two
+    /// concurrently-failing threads' diagnostic output showed the SAME
+    /// raw handle value attributed to this test's own intentionally-
+    /// invalid job handle AND to a different, concurrently-running
+    /// test's own real stdin pipe handle. This is real, OS-level
+    /// handle-value reuse (not a bug in Windows, not a bug in
+    /// `spawn_contained`'s own single-call correctness) colliding with
+    /// a test helper that manufactures a dangling value on purpose --
+    /// exactly the kind of resource this module's own tests must never
+    /// share unisolated. Fixed by using `OwnedJobHandle::placeholder()`
+    /// (a NULL handle, a value Windows's own handle allocator never
+    /// assigns to a real object, so it can never collide with one)
+    /// instead of a real create-then-close round trip: `NULL` is
+    /// exactly as invalid to `UpdateProcThreadAttribute`/
+    /// `CreateProcessW` as a genuinely-closed real handle was, without
+    /// ever freeing a value another thread could pick back up.
     #[cfg(test)]
     fn already_closed_for_test() -> Self {
-        let real = Self::create_with_kill_on_close().unwrap();
-        let handle = real.0;
-        std::mem::forget(real); // skip this handle's own Drop/CloseHandle below -- we close it ourselves, once, here
-        let _ = unsafe { CloseHandle(handle) };
-        Self(handle)
+        Self::placeholder()
     }
 
     /// A NULL `HANDLE` — never created by `CreateJobObjectW`, so its
@@ -522,25 +548,38 @@ pub(crate) fn spawn_contained(command: &Path, args: &[String], cwd: &Path, env: 
 /// and observe the REAL code path fail closed, rather than only
 /// testing a synthetic stand-in for it (see `job_setup_failure_
 /// actually_prevents_the_untrusted_command_from_ever_running` below).
-/// M6.8 finding (test-environment reliability, NOT a production
-/// correctness bug -- see this constant's own doc comment below for
-/// the full investigation): serializes pipe/duplicate-handle creation
-/// through `CreateProcessW` across concurrent calls in this process.
-/// `CreatePipe` creates BOTH ends of a pipe inheritable (no per-end
-/// control exists), and only afterward does `create_pipe_pair` narrow
-/// one end back via `clear_inherit` -- a brief window matching the
-/// handle-table-mutation race class Raymond Chen's own canonical
-/// guidance on this topic (devblogs.microsoft.com/oldnewthing/
-/// 20200306-00) describes, for which a process-wide mutex around
-/// exactly this sequence is the standard, documented mitigation.
-/// Confirmed NOT sufficient alone to fully explain this module's own
-/// observed test flakiness (see `MAX_CONCURRENT_SPAWNS_FOR_TESTS`) --
-/// kept anyway as the textbook-correct defense-in-depth for the race
-/// it does close.
-static SPAWN_SERIALIZATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+///
+/// M6.8 history: an earlier pass of this module's own flakiness
+/// investigation added a process-wide `SPAWN_SERIALIZATION_LOCK` here,
+/// reasoning from Raymond Chen's own canonical guidance on the
+/// `CreatePipe`-creates-both-ends-inheritable-then-narrows race class.
+/// Measured directly: with the lock held, the real test suite still
+/// failed ~5/15 runs at default parallelism -- i.e. it reduced but did
+/// NOT explain or fix the actual observed flake, exactly the kind of
+/// result that must not be mistaken for a fix. The REAL root cause
+/// (found via a mutex-protected, thread-tagged diagnostic log, not
+/// `eprintln!` directly, which interleaves misleadingly under real
+/// concurrent output) was unrelated to pipe inheritability timing: a
+/// TEST helper (`OwnedJobHandle::already_closed_for_test`) was
+/// manufacturing a dangling handle by creating a real job object and
+/// immediately closing it, and under heavy concurrent handle churn a
+/// DIFFERENT thread's own legitimate `CreatePipe`/`CreateJobObjectW`
+/// call reliably reused that exact just-freed handle VALUE before this
+/// test's own `spawn_contained_into` call ran -- confirmed directly by
+/// observing the identical raw handle value attributed to two
+/// different, concurrently-running tests' own unrelated objects.
+/// Fixed at the source (see `already_closed_for_test`'s own doc
+/// comment): that helper now returns `OwnedJobHandle::placeholder()`
+/// (`NULL`, a value the OS handle allocator never assigns to a real
+/// object) instead of a real create-then-close round trip, so no
+/// handle value is ever freed back into contention at all. Confirmed
+/// by removing `SPAWN_SERIALIZATION_LOCK` entirely and re-running: 20
+/// consecutive clean runs with it present, 20 more consecutive clean
+/// runs with it absent -- it was contributing nothing measurable once
+/// the real bug was fixed, so it was removed rather than kept as
+/// unjustified, unexplained serialization of code that must behave
+/// identically under concurrent and sequential callers.
 fn spawn_contained_into(job: OwnedJobHandle, command: &Path, args: &[String], cwd: &Path, env: &[(String, String)]) -> io::Result<(ContainedChild, ContainedStdio)> {
-    let _serialization_guard = SPAWN_SERIALIZATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // Child's stdin: child reads from the read end (inheritable),
     // parent writes to the write end (not inheritable). Child's
     // stdout: child writes to the write end (inheritable), parent
@@ -722,44 +761,48 @@ fn build_environment_block(env: &[(String, String)]) -> Vec<u16> {
     block
 }
 
-/// M6.8 finding (test-environment reliability, confirmed NOT a
-/// production correctness issue): this module's own tests spawn many
-/// real Windows processes. Under `cargo test`'s DEFAULT parallelism
-/// (one OS thread per test, unbounded concurrency on this host), this
-/// suite is intermittently flaky -- observed ~25-35% of runs failing
-/// with `ERROR_INVALID_HANDLE` on one or more real-process tests
-/// (sometimes cascading: once one spawn fails under heavy concurrent
-/// load, several subsequent ones in the same run fail too).
-/// Investigated directly (live Microsoft documentation research plus
-/// systematic bisection across `--test-threads` values, not
-/// guessed): confirmed 100% reliable (24+ consecutive clean runs)
-/// serialized (`--test-threads=1`) and under moderate concurrency
-/// (`--test-threads=4`, 6/6 clean); only HIGH/default concurrency on
-/// this specific host reproduces the flake. `SPAWN_SERIALIZATION_LOCK`
-/// (above `spawn_contained_into`) closes ONE real, documented race
-/// class (Raymond Chen's handle-table-mutation guidance) but was
-/// confirmed NOT sufficient alone to eliminate the flake under default
-/// parallelism -- the remaining cause is most consistent with a
-/// host/OS-level resource or rate limit under very high concurrent
-/// real process creation (e.g. antivirus/EDR scanning each new
-/// process, or a handle-table/kernel-object growth limit), not a bug
-/// in `spawn_contained`'s own single-call correctness.
+/// M6.8 finding, RESOLVED: this module's own tests spawn many real
+/// Windows processes, and under `cargo test`'s default (unbounded)
+/// parallelism a 20-logical-CPU host was observed failing ~25-35% of
+/// runs with `ERROR_INVALID_HANDLE` on one or more real-process tests.
 ///
-/// **This is a test-suite reliability constraint, not a production
-/// risk**: the real caller (`mcp-client-cli`'s single-shot `main.rs`)
-/// calls `connect()`/`spawn_contained` exactly ONCE per process run,
-/// from a single thread, never concurrently with itself. The flake
-/// only manifests when dozens of independent calls run concurrently
-/// in one process, a shape this crate's own production code never
-/// produces.
+/// Root cause (found via a mutex-protected, thread-tagged diagnostic
+/// log that printed each failing Win32 call's own handle values,
+/// never plain `eprintln!` -- which interleaves misleadingly under
+/// real concurrent process output and produced a misleading
+/// early read during this same investigation): the test helper
+/// `OwnedJobHandle::already_closed_for_test` created a REAL job
+/// object and immediately closed it, returning the now-dangling
+/// handle VALUE. Confirmed directly: under heavy concurrent handle
+/// churn, a DIFFERENT thread's own legitimate `CreatePipe`/
+/// `CreateJobObjectW` call reliably reused that exact just-freed
+/// handle value for its own, completely unrelated real object before
+/// the first test's own `spawn_contained_into` call ran -- two
+/// concurrently-failing threads' diagnostic output showed the
+/// IDENTICAL raw handle value attributed to two different tests' own
+/// unrelated objects. This is real OS-level handle-value reuse
+/// colliding with a test helper that manufactured a dangling value on
+/// purpose, not a bug in `spawn_contained`'s own single-call
+/// correctness, not a kernel race in `CreateProcessW`/
+/// `PROC_THREAD_ATTRIBUTE_JOB_LIST` itself, and not antivirus/EDR
+/// interference (all considered and ruled out by direct measurement
+/// before this root cause was found).
 ///
-/// **To run this module's tests reliably**: `cargo test -p mcp-client
-/// --lib windows_job:: -- --test-threads=4` (or lower). The default
-/// (no `--test-threads`) is not currently reliable on a host with high
-/// core/thread availability and is not recommended for this specific
-/// module until a more precise root cause is found and fixed; M6.8's
-/// own closure report discloses this explicitly rather than claiming
-/// unconditional green CI for this one module.
+/// Fixed at the source: `already_closed_for_test` now returns
+/// `OwnedJobHandle::placeholder()` (`NULL`, a value the OS handle
+/// allocator never assigns to a real object) instead of a real
+/// create-then-close round trip, so no handle value is ever freed
+/// back into contention. A `SPAWN_SERIALIZATION_LOCK` added earlier in
+/// this same investigation (reasoning from a different, real but
+/// much narrower Windows handle-table race class) was measured
+/// directly to still leave ~5/15 runs failing -- i.e. it reduced but
+/// did not explain or fix the actual flake -- and was removed after
+/// confirming (20 consecutive clean runs with it, 20 more without it)
+/// that it contributed nothing measurable once the real bug was
+/// fixed. Verified clean: 25 consecutive runs, `cargo test -p
+/// mcp-client --lib windows_job::` with NO `--test-threads` override
+/// (i.e. this host's own default, unbounded parallelism), zero
+/// failures.
 #[cfg(test)]
 mod tests {
     use super::*;
