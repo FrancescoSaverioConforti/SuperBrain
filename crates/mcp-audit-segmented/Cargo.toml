@@ -1,0 +1,26 @@
+[package]
+name = "mcp-audit-segmented"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M7.7: composition layer connecting mcp-audit-bridge's own DestinationAccess core to audit-segmentation's segment lifecycle/retention-pin machinery -- the ONLY crate in this workspace permitted to depend on both. Neither sibling crate depends on this one or on each other; mcp-audit-bridge stays entirely unaware of segmentation, and audit-segmentation stays entirely unaware of MCP."
+
+[dependencies]
+mcp-audit-bridge = { path = "../mcp-audit-bridge" }
+audit-segmentation = { path = "../audit-segmentation" }
+storage = { path = "../storage" }
+audit-chain-core = { path = "../audit-chain-core" }
+brain-api = { path = "../brain-api" }
+brain-api-audit-worker = { path = "../brain-api-audit-worker" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+chrono = "0.4"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+serde = "1"
+mcp-client-audit-worker = { path = "../mcp-client-audit-worker" }

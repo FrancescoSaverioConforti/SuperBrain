@@ -264,6 +264,7 @@ mod tests {
         manifest_path: std::path::PathBuf,
         legacy_locator: std::path::PathBuf,
         retention_ledger_locator: std::path::PathBuf,
+        pin_store_locator: std::path::PathBuf,
         segment_1_locator: std::path::PathBuf,
         segment_2_locator: std::path::PathBuf,
     }
@@ -274,12 +275,14 @@ mod tests {
             let manifest_path = dir.path().join("segment-manifest.json");
             let legacy_locator = dir.path().join("segment-0");
             let retention_ledger_locator = dir.path().join("retention-ledger");
+            let pin_store_locator = dir.path().join("pin-store");
             let segment_1_locator = dir.path().join("segment-1");
             let segment_2_locator = dir.path().join("segment-2");
             std::fs::create_dir_all(&legacy_locator).unwrap();
             std::fs::create_dir_all(&retention_ledger_locator).unwrap();
+            std::fs::create_dir_all(&pin_store_locator).unwrap();
             crate::adoption::adopt_existing_vault(&manifest_path, &legacy_locator, &retention_ledger_locator).unwrap();
-            Self { dir, manifest_path, legacy_locator, retention_ledger_locator, segment_1_locator, segment_2_locator }
+            Self { dir, manifest_path, legacy_locator, retention_ledger_locator, pin_store_locator, segment_1_locator, segment_2_locator }
         }
 
         fn append(&self, locator: &std::path::Path, kind: brain_api::AuditEventKind) {
@@ -334,7 +337,7 @@ mod tests {
         let h = Harness::new();
         h.rotate_twice().await;
 
-        let config = RetentionConfig { manifest_path: h.manifest_path.clone(), retention_ledger_journal_path: h.retention_ledger_locator.join("journal.sqlite"), active_segment_journal_path: h.segment_2_locator.join("journal.sqlite"), retirement_authorized_by: "policy:test".into() };
+        let config = RetentionConfig { manifest_path: h.manifest_path.clone(), retention_ledger_journal_path: h.retention_ledger_locator.join("journal.sqlite"), active_segment_journal_path: h.segment_2_locator.join("journal.sqlite"), retirement_authorized_by: "policy:test".into(), pin_store_locator: h.pin_store_locator.clone(), pin_store_journal_path: h.pin_store_locator.join("journal.sqlite") };
         retire_segment(&config, &SegmentId::from_index(1)).await.unwrap();
         assert!(!h.segment_1_locator.exists(), "segment 1's own payload must genuinely be gone for this test to prove anything");
 

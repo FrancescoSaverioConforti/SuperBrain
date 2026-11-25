@@ -14,7 +14,7 @@
 //! may do recon/review but the main session must run the final passes
 //! itself.
 
-use mcp_audit_bridge::{run_once, RunConfig, RunOutcome};
+use mcp_audit_bridge::{register_source, run_once, RunConfig, RunFailure, RunOutcome};
 
 // --- test harness: real vaults, real chains, no shortcuts ---
 
@@ -44,6 +44,13 @@ impl Harness {
 
     fn config(&self) -> RunConfig {
         RunConfig::new(self.source_vault_root.clone(), self.source_journal_path.clone(), self.destination_vault_root.clone(), self.destination_journal_path.clone(), self.registration_path.clone(), self.checkpoint_path.clone())
+    }
+
+    /// M7.7.2: the explicit, one-time registration step every test that
+    /// models a genuinely first-ever run must now call -- `run_once`
+    /// itself never mints a `SourceLogId` automatically anymore.
+    fn register(&self) {
+        register_source(&self.registration_path, &self.source_vault_root).unwrap();
     }
 
     /// Appends `events` to the REAL source vault's own `.audit/audit.log`,
@@ -153,11 +160,43 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+// --- M7.7.2: explicit registration policy ---
+
+#[tokio::test]
+async fn missing_registration_with_zero_destination_evidence_never_auto_registers() {
+    let h = Harness::new();
+    h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
+    assert!(!h.registration_path.exists(), "genuinely unregistered source, zero prior destination evidence");
+
+    let result = run_once(&h.config()).await;
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::RegistrationMissing, at_least_one_durable_append_occurred: false })), "got {result:?}");
+    assert!(!h.registration_path.exists(), "a RegistrationMissing outcome must never itself create a registration file");
+    assert!(h.read_destination_events().is_empty(), "nothing must be imported before an explicit registration exists");
+
+    // The explicit path succeeds, and only then does run_once proceed.
+    let registration = register_source(&h.registration_path, &h.source_vault_root).unwrap();
+    assert!(h.registration_path.exists());
+
+    let report = run_once(&h.config()).await.unwrap();
+    assert_eq!(report.imported.len(), 1);
+    let saved = mcp_audit_bridge::registration::load(&h.registration_path).unwrap().unwrap();
+    assert_eq!(saved.registration.source_log_id, registration.source_log_id, "run_once must use the identity register_source already created, never mint a second one");
+}
+
+#[tokio::test]
+async fn register_source_refuses_to_run_twice_on_the_same_path() {
+    let h = Harness::new();
+    register_source(&h.registration_path, &h.source_vault_root).unwrap();
+    let second = register_source(&h.registration_path, &h.source_vault_root);
+    assert!(matches!(second, Err(mcp_audit_bridge::RegisterSourceError::AlreadyRegistered)), "got {second:?}");
+}
+
 // --- 1. normal import ---
 
 #[tokio::test]
 async fn scenario_1_normal_import_translates_every_source_event_into_the_destination_chain() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[
         sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1"),
         sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { server: "s".into(), outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Discovered }, "c1"),
@@ -177,6 +216,7 @@ async fn scenario_1_normal_import_translates_every_source_event_into_the_destina
 #[tokio::test]
 async fn scenario_2_second_import_of_the_same_source_produces_zero_new_brain_facts() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     run_once(&h.config()).await.unwrap();
@@ -193,6 +233,7 @@ async fn scenario_2_second_import_of_the_same_source_produces_zero_new_brain_fac
 #[tokio::test]
 async fn scenario_3_crash_after_destination_append_before_checkpoint_save_does_not_duplicate_on_restart() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     // Real fault injection through the production code path: the
@@ -201,7 +242,7 @@ async fn scenario_3_crash_after_destination_append_before_checkpoint_save_does_n
     let mut crashing_config = h.config();
     crashing_config.crash_after_n_destination_appends = Some(1);
     let result = run_once(&crashing_config).await;
-    assert!(matches!(result, Err(RunOutcome::InjectedFault { appends_so_far: 1 })), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::InjectedFault { appends_so_far: 1 }, .. })), "got {result:?}");
 
     let after_crash = h.read_destination_events();
     assert_eq!(bridge_identity_count(&after_crash), 1, "the destination append itself must have genuinely completed before the simulated crash");
@@ -232,6 +273,7 @@ fn registration_last_known_tail_sequence(path: &std::path::Path) -> Option<u64> 
 #[tokio::test]
 async fn scenario_4_interleaved_unrelated_destination_events_do_not_cause_a_duplicate_on_rerun() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     run_once(&h.config()).await.unwrap();
@@ -259,7 +301,7 @@ async fn scenario_5_a_tampered_source_chain_fails_closed_and_imports_nothing() {
     h.corrupt_source_log_byte(5);
 
     let result = run_once(&h.config()).await;
-    assert!(matches!(result, Err(RunOutcome::SourceChainInvalid(_))), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::SourceChainInvalid(_), .. })), "got {result:?}");
     assert!(h.read_destination_events().is_empty(), "a fail-closed source scan must import nothing at all, not even a partial prefix");
 }
 
@@ -295,6 +337,7 @@ async fn scenario_6_two_copies_of_the_same_source_record_identity_in_the_destina
 #[tokio::test]
 async fn scenario_7_deleting_only_the_progress_checkpoint_recovers_under_the_same_identity_with_zero_duplicates() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     run_once(&h.config()).await.unwrap();
@@ -324,6 +367,7 @@ async fn scenario_7_deleting_only_the_progress_checkpoint_recovers_under_the_sam
 #[tokio::test]
 async fn scenario_8_a_corrupted_registration_file_fails_closed_rather_than_being_silently_ignored() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
     run_once(&h.config()).await.unwrap();
 
@@ -331,7 +375,7 @@ async fn scenario_8_a_corrupted_registration_file_fails_closed_rather_than_being
 
     let before = h.read_destination_events();
     let result = run_once(&h.config()).await;
-    assert!(matches!(result, Err(RunOutcome::RegistrationLoadFailed(_))), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::RegistrationLoadFailed(_), .. })), "got {result:?}");
     assert_eq!(h.read_destination_events().len(), before.len(), "a fail-closed registration load must import nothing further");
 }
 
@@ -340,6 +384,7 @@ async fn scenario_8_a_corrupted_registration_file_fails_closed_rather_than_being
 #[tokio::test]
 async fn scenario_9a_losing_the_registration_file_entirely_recovers_the_same_identity_from_unique_destination_evidence() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     run_once(&h.config()).await.unwrap();
@@ -391,7 +436,7 @@ async fn scenario_9b_losing_the_registration_with_ambiguous_destination_evidence
     // fail closed rather than pick either candidate.
     assert!(!h.registration_path.exists());
     let result = run_once(&h.config()).await;
-    assert!(matches!(result, Err(RunOutcome::RegistrationRecoveryFailed(mcp_audit_bridge::RegistrationRecoveryError::AmbiguousCandidates(_)))), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::RegistrationRecoveryFailed(mcp_audit_bridge::RegistrationRecoveryError::AmbiguousCandidates(_)), .. })), "got {result:?}");
 }
 
 // --- 10. same path, incompatible replaced chain -> fail closed ---
@@ -399,6 +444,7 @@ async fn scenario_9b_losing_the_registration_with_ambiguous_destination_evidence
 #[tokio::test]
 async fn scenario_10_the_same_path_with_an_incompatible_replaced_chain_fails_closed() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[
         sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1"),
         sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { server: "s".into(), outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Discovered }, "c1"),
@@ -421,7 +467,7 @@ async fn scenario_10_the_same_path_with_an_incompatible_replaced_chain_fails_clo
 
     let before = h.read_destination_events();
     let result = run_once(&h.config()).await;
-    assert!(matches!(result, Err(RunOutcome::SourceRelocationRefused(_))), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::SourceRelocationRefused(_), .. })), "got {result:?}");
     assert_eq!(h.read_destination_events().len(), before.len(), "a fail-closed relocation refusal must import nothing");
 }
 
@@ -430,6 +476,7 @@ async fn scenario_10_the_same_path_with_an_incompatible_replaced_chain_fails_clo
 #[tokio::test]
 async fn scenario_11_relocating_to_a_new_path_with_a_compatible_chain_is_accepted_and_continues_importing() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
     run_once(&h.config()).await.unwrap();
     let registration_before = mcp_audit_bridge::registration::load(&h.registration_path).unwrap().unwrap();
@@ -472,7 +519,7 @@ async fn concurrency_1_and_2_a_second_run_once_against_the_same_state_fails_with
     assert!(!h.checkpoint_path.exists());
 
     let result = run_once(&h.config()).await;
-    assert!(matches!(result, Err(RunOutcome::AlreadyRunning(_))), "got {result:?}");
+    assert!(matches!(result, Err(RunFailure { outcome: RunOutcome::AlreadyRunning(_), .. })), "got {result:?}");
 
     // Neither state file was created, and the destination is untouched.
     assert!(!h.registration_path.exists(), "a refused run must never create a registration file");
@@ -486,11 +533,12 @@ async fn concurrency_1_and_2_a_second_run_once_against_the_same_state_fails_with
 #[tokio::test]
 async fn concurrency_3_after_lock_release_a_new_run_once_proceeds() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
 
     let held_lock = mcp_audit_bridge::bridge_lock::acquire(&h.checkpoint_path).unwrap();
     let blocked = run_once(&h.config()).await;
-    assert!(matches!(blocked, Err(RunOutcome::AlreadyRunning(_))));
+    assert!(matches!(blocked, Err(RunFailure { outcome: RunOutcome::AlreadyRunning(_), .. })));
     drop(held_lock);
 
     let report = run_once(&h.config()).await.unwrap();
@@ -514,8 +562,10 @@ async fn concurrency_3_after_lock_release_a_new_run_once_proceeds() {
 #[tokio::test]
 async fn concurrency_5_a_bridge_with_a_different_state_directory_runs_in_parallel() {
     let h1 = Harness::new();
+    h1.register();
     h1.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s1".into() }, "c1")]);
     let h2 = Harness::new();
+    h2.register();
     h2.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s2".into() }, "c2")]);
 
     let held_lock_1 = mcp_audit_bridge::bridge_lock::acquire(&h1.checkpoint_path).unwrap();
@@ -528,11 +578,19 @@ async fn concurrency_5_a_bridge_with_a_different_state_directory_runs_in_paralle
     drop(held_lock_1);
 }
 
-// 6: no duplicate SourceLogId is minted when two run_once calls race on
-// a genuine first-ever run (no registration yet) for the SAME state --
-// the lock makes this deterministic: the second call is always refused
-// outright, never allowed to observe "no registration" concurrently with
-// the first and mint its own competing identity.
+// 6: no duplicate Brain fact is produced when two run_once calls race
+// on the SAME already-registered source -- the bridge_lock makes this
+// deterministic: the second call is always refused outright, never
+// allowed to race the first through the dedup/append sequence.
+//
+// M7.7.2 note: this scenario used to be framed as "no duplicate
+// SourceLogId is minted under first-run concurrency," testing the
+// pre-M7.7 automatic-mint behavior. Under the new explicit-registration
+// policy, run_once never mints a SourceLogId at all (see
+// `register_source`), so that specific race no longer exists --
+// REPLACED here with the still-real, still-load-bearing concurrent-
+// IMPORT race: two run_once calls against the same, already-registered
+// state, racing on the destination append/dedup sequence itself.
 //
 // Multi-threaded runtime + `tokio::spawn`, deliberately: the default
 // current-thread `#[tokio::test]` runs cooperatively on one OS thread,
@@ -546,10 +604,11 @@ async fn concurrency_5_a_bridge_with_a_different_state_directory_runs_in_paralle
 // exclusivity has its own dedicated, more thorough reproduction in
 // `crate::bridge_lock`'s own test module).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrency_6_no_duplicate_source_log_id_is_minted_under_first_run_concurrency() {
+async fn concurrency_6_no_duplicate_brain_fact_under_concurrent_import_of_an_already_registered_source() {
     let h = Harness::new();
+    h.register();
     h.append_source_events(&[sample_event(mcp_client_audit_worker::McpClientEventKind::DiscoveryAttempted { server: "s".into() }, "c1")]);
-    assert!(!h.registration_path.exists(), "genuinely first-ever run: no registration exists yet");
+    assert!(h.registration_path.exists(), "this scenario starts from an already-registered source");
 
     let config_a = h.config();
     let config_b = h.config();
@@ -560,7 +619,7 @@ async fn concurrency_6_no_duplicate_source_log_id_is_minted_under_first_run_conc
 
     let outcomes = [result_a, result_b];
     let successes: Vec<_> = outcomes.iter().filter(|r| r.is_ok()).collect();
-    let refusals: Vec<_> = outcomes.iter().filter(|r| matches!(r, Err(RunOutcome::AlreadyRunning(_)))).collect();
+    let refusals: Vec<_> = outcomes.iter().filter(|r| matches!(r, Err(RunFailure { outcome: RunOutcome::AlreadyRunning(_), .. }))).collect();
     assert_eq!(successes.len(), 1, "exactly one of the two concurrent first-run calls must succeed, got {outcomes:?}");
     assert_eq!(refusals.len(), 1, "the other must be refused as AlreadyRunning, got {outcomes:?}");
 

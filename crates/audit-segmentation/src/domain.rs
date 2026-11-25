@@ -257,6 +257,74 @@ pub struct RetentionReceipt {
     pub retired_at: String,
 }
 
+/// M7.7.3: a bounded, generic identifier for a pin's OWNER — enforced
+/// by this constructor, never a raw `String` a caller could populate
+/// with anything. Deliberately generic: `audit-segmentation` never
+/// learns semantically what "mcp-audit-bridge" means, only that it is
+/// a short, ASCII-lowercase/digit/dash identifier — the same
+/// discipline every other content-free type in this workspace already
+/// follows, applied here to an identifier rather than free text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OwnerClass(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnerClassError {
+    #[error("owner class {0:?} must be 1-64 ASCII lowercase letters, digits, or '-'")]
+    InvalidShape(String),
+}
+
+impl OwnerClass {
+    pub fn new(raw: &str) -> Result<Self, OwnerClassError> {
+        let valid = !raw.is_empty() && raw.len() <= 64 && raw.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if valid {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(OwnerClassError::InvalidShape(raw.to_string()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// M7.7.3: a CLOSED enum (per the frozen correction's own preference,
+/// since this domain is already small and known) for why a pin exists
+/// — never a raw `String` reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinReason {
+    PendingCheckpointWrite,
+    PendingRegistrationWrite,
+    ManualOperatorHold,
+}
+
+/// M7.7.3: durable record that a pin was acquired on `segment_id` —
+/// never an `AuditEventKind`, never written into any audit segment;
+/// this is the pin-store's own, separate payload type, appended
+/// through the exact same `audit_chain_core::serialize_record`/
+/// `storage::Vault::open_audit_writer` machinery an audit segment or
+/// the retention ledger uses, but as its own independent chain (see
+/// `crate::pin_store`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinAcquired {
+    pub pin_id: uuid::Uuid,
+    pub segment_id: SegmentId,
+    pub owner_class: OwnerClass,
+    pub reason: PinReason,
+    pub acquired_at: String,
+}
+
+/// M7.7.3: durable record that a previously-acquired pin was released
+/// — correlates to exactly ONE `PinAcquired` by `pin_id`, never by
+/// `segment_id` alone (multiple pins, from different owners/windows,
+/// can exist for the same segment over time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinReleased {
+    pub pin_id: uuid::Uuid,
+    pub released_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +550,48 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let decoded: SegmentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, manifest);
+    }
+
+    // --- OwnerClass / PinReason / PinAcquired / PinReleased ---
+
+    #[test]
+    fn owner_class_accepts_a_well_formed_identifier() {
+        assert!(OwnerClass::new("mcp-audit-bridge").is_ok());
+        assert!(OwnerClass::new("a").is_ok());
+        assert!(OwnerClass::new(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn owner_class_rejects_empty_too_long_or_out_of_shape_strings() {
+        assert!(matches!(OwnerClass::new(""), Err(OwnerClassError::InvalidShape(_))));
+        assert!(matches!(OwnerClass::new(&"a".repeat(65)), Err(OwnerClassError::InvalidShape(_))));
+        assert!(matches!(OwnerClass::new("Mcp-Audit-Bridge"), Err(OwnerClassError::InvalidShape(_))), "uppercase must be rejected");
+        assert!(matches!(OwnerClass::new("mcp_audit_bridge"), Err(OwnerClassError::InvalidShape(_))), "underscore must be rejected");
+        assert!(matches!(OwnerClass::new("mcp audit bridge"), Err(OwnerClassError::InvalidShape(_))), "spaces must be rejected");
+    }
+
+    #[test]
+    fn pin_acquired_round_trips_through_serde_json_exactly() {
+        let pin = PinAcquired { pin_id: uuid::Uuid::new_v4(), segment_id: SegmentId::test_nth(1), owner_class: OwnerClass::new("mcp-audit-bridge").unwrap(), reason: PinReason::PendingCheckpointWrite, acquired_at: "2026-01-01T00:00:00Z".into() };
+        let json = serde_json::to_string(&pin).unwrap();
+        let decoded: PinAcquired = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, pin);
+    }
+
+    #[test]
+    fn pin_released_round_trips_through_serde_json_exactly() {
+        let released = PinReleased { pin_id: uuid::Uuid::new_v4(), released_at: "2026-01-01T00:00:00Z".into() };
+        let json = serde_json::to_string(&released).unwrap();
+        let decoded: PinReleased = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, released);
+    }
+
+    #[test]
+    fn every_pin_reason_round_trips_through_serde_json_exactly() {
+        for reason in [PinReason::PendingCheckpointWrite, PinReason::PendingRegistrationWrite, PinReason::ManualOperatorHold] {
+            let json = serde_json::to_string(&reason).unwrap();
+            let decoded: PinReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, reason);
+        }
     }
 }

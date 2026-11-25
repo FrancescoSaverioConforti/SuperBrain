@@ -56,6 +56,14 @@ pub enum RetentionError {
     LedgerAppendFailed(#[from] crate::ledger::LedgerError),
     #[error("failed to delete the target segment's retirable payload: {0}")]
     PayloadDeleteFailed(std::io::Error),
+    /// M7.7.3: at least one `RetentionPin` is still Active on the
+    /// target segment — denied BEFORE phase 1 (no `RetentionIntentAttempted`
+    /// is ever appended), a structural property of this function, never
+    /// a composition-root convention.
+    #[error("segment {0} has at least one Active RetentionPin -- denied before any audit mutation: {1:?}")]
+    SegmentHasActivePins(SegmentId, Vec<uuid::Uuid>),
+    #[error("failed to check for Active pins: {0}")]
+    PinStoreCheckFailed(#[from] crate::pin_store::PinStoreError),
 }
 
 pub struct RetentionConfig {
@@ -63,6 +71,14 @@ pub struct RetentionConfig {
     pub retention_ledger_journal_path: std::path::PathBuf,
     pub active_segment_journal_path: std::path::PathBuf,
     pub retirement_authorized_by: String,
+    /// M7.7.3: the pin store's own locator/journal path — ALWAYS
+    /// supplied explicitly by the caller (e.g. derived from a trusted
+    /// segmentation root), NEVER read from `manifest.retention_ledger_locator`
+    /// or any other manifest field. See `crate::pin_store`'s own doc
+    /// comment for why this crate never lets the manifest determine
+    /// the pin store's own authority.
+    pub pin_store_locator: std::path::PathBuf,
+    pub pin_store_journal_path: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -92,6 +108,17 @@ pub async fn retire_segment(config: &RetentionConfig, target_segment_id: &Segmen
     if target.status != crate::domain::SegmentStatus::Closed {
         return Err(RetentionError::TargetSegmentNotClosed(target_segment_id.clone()));
     }
+
+    // M7.7.3 frozen requirement: zero Active pins, checked BEFORE
+    // phase 1 -- a structural gate, never a composition-root
+    // convention. No audit mutation (not even RetentionIntentAttempted)
+    // has happened yet at this point.
+    let (_pin_store_vault, pin_store_state) = crate::pin_store::verify_and_scan(&config.pin_store_locator, &config.pin_store_journal_path)?;
+    let active_pins = pin_store_state.active_pins_for(target_segment_id)?;
+    if !active_pins.is_empty() {
+        return Err(RetentionError::SegmentHasActivePins(target_segment_id.clone(), active_pins.iter().map(|p| p.pin_id).collect()));
+    }
+
     let target_final_sequence = target.final_sequence.expect("SegmentManifest::validate guarantees a Closed segment always carries final_sequence");
     let target_final_record_hash = target.final_record_hash.clone().expect("SegmentManifest::validate guarantees a Closed segment always carries final_record_hash");
 
@@ -231,6 +258,7 @@ mod tests {
         manifest_path: std::path::PathBuf,
         legacy_locator: std::path::PathBuf,
         retention_ledger_locator: std::path::PathBuf,
+        pin_store_locator: std::path::PathBuf,
         segment_1_locator: std::path::PathBuf,
     }
 
@@ -240,11 +268,13 @@ mod tests {
             let manifest_path = dir.path().join("segment-manifest.json");
             let legacy_locator = dir.path().join("segment-0");
             let retention_ledger_locator = dir.path().join("retention-ledger");
+            let pin_store_locator = dir.path().join("pin-store");
             let segment_1_locator = dir.path().join("segment-1");
             std::fs::create_dir_all(&legacy_locator).unwrap();
             std::fs::create_dir_all(&retention_ledger_locator).unwrap();
+            std::fs::create_dir_all(&pin_store_locator).unwrap();
             crate::adoption::adopt_existing_vault(&manifest_path, &legacy_locator, &retention_ledger_locator).unwrap();
-            Self { dir, manifest_path, legacy_locator, retention_ledger_locator, segment_1_locator }
+            Self { dir, manifest_path, legacy_locator, retention_ledger_locator, pin_store_locator, segment_1_locator }
         }
 
         fn append(&self, locator: &std::path::Path, kind: brain_api::AuditEventKind) {
@@ -265,7 +295,7 @@ mod tests {
         }
 
         fn retention_config(&self) -> RetentionConfig {
-            RetentionConfig { manifest_path: self.manifest_path.clone(), retention_ledger_journal_path: self.retention_ledger_locator.join("journal.sqlite"), active_segment_journal_path: self.segment_1_locator.join("journal.sqlite"), retirement_authorized_by: "policy:test".into() }
+            RetentionConfig { manifest_path: self.manifest_path.clone(), retention_ledger_journal_path: self.retention_ledger_locator.join("journal.sqlite"), active_segment_journal_path: self.segment_1_locator.join("journal.sqlite"), retirement_authorized_by: "policy:test".into(), pin_store_locator: self.pin_store_locator.clone(), pin_store_journal_path: self.pin_store_locator.join("journal.sqlite") }
         }
 
         /// Rotates once (closing segment 0, opening segment 1 Active),
@@ -394,5 +424,119 @@ mod tests {
         let authorized_count = scan.verified_records.iter().filter(|r| matches!(audit_chain_core::parse_event::<brain_api::AuditEvent>(&r.content_bytes).map(|e| e.kind), Ok(brain_api::AuditEventKind::RetentionAuthorized { .. }))).count();
         assert_eq!(intent_count, 1, "resuming must never duplicate RetentionIntentAttempted");
         assert_eq!(authorized_count, 1, "resuming must never duplicate RetentionAuthorized");
+    }
+
+    // --- M7.7.3: retention denied by an Active pin, before any audit mutation ---
+
+    #[tokio::test]
+    async fn retention_is_denied_before_any_audit_mutation_when_the_target_segment_has_an_active_pin() {
+        let h = Harness::new();
+        h.rotate_twice().await;
+        let active_journal = active_segment_journal_after_second_rotation(&h);
+        let mut config = h.retention_config();
+        config.active_segment_journal_path = active_journal.clone();
+
+        let pin_id = crate::pin_store::acquire(&h.pin_store_locator, &config.pin_store_journal_path, &SegmentId::from_index(1), crate::domain::OwnerClass::new("mcp-audit-bridge").unwrap(), crate::domain::PinReason::PendingCheckpointWrite, "2026-01-01T00:00:00Z").unwrap();
+
+        let active_locator = h.dir.path().join("segment-2");
+        let before_count = {
+            let vault = storage::Vault::open_with_default_indexer(active_locator.clone(), &active_journal).unwrap();
+            scan_chain_bytes(&vault.read_audit_log_for_recovery_scan().unwrap()).verified_records.len()
+        };
+
+        let result = retire_segment(&config, &SegmentId::from_index(1)).await;
+        assert!(matches!(result, Err(RetentionError::SegmentHasActivePins(ref id, ref pins)) if id == &SegmentId::from_index(1) && pins.contains(&pin_id)), "got {result:?}");
+
+        // No audit mutation at all -- not even RetentionIntentAttempted.
+        let after_count = {
+            let vault = storage::Vault::open_with_default_indexer(active_locator, &active_journal).unwrap();
+            scan_chain_bytes(&vault.read_audit_log_for_recovery_scan().unwrap()).verified_records.len()
+        };
+        assert_eq!(before_count, after_count, "a pin-denied retention must append zero records to the Active segment");
+        assert!(h.segment_1_locator.exists(), "the target segment's payload must remain untouched");
+    }
+
+    #[tokio::test]
+    async fn retention_succeeds_once_the_active_pin_is_released() {
+        let h = Harness::new();
+        h.rotate_twice().await;
+        let mut config = h.retention_config();
+        config.active_segment_journal_path = active_segment_journal_after_second_rotation(&h);
+
+        let pin_id = crate::pin_store::acquire(&h.pin_store_locator, &config.pin_store_journal_path, &SegmentId::from_index(1), crate::domain::OwnerClass::new("mcp-audit-bridge").unwrap(), crate::domain::PinReason::PendingCheckpointWrite, "2026-01-01T00:00:00Z").unwrap();
+
+        let denied = retire_segment(&config, &SegmentId::from_index(1)).await;
+        assert!(matches!(denied, Err(RetentionError::SegmentHasActivePins(_, _))));
+
+        crate::pin_store::release(&h.pin_store_locator, &config.pin_store_journal_path, pin_id, "2026-01-01T00:05:00Z").unwrap();
+
+        let report = retire_segment(&config, &SegmentId::from_index(1)).await.unwrap();
+        assert_eq!(report.retired_segment_id, SegmentId::from_index(1));
+        assert!(!h.segment_1_locator.exists());
+    }
+
+    #[tokio::test]
+    async fn the_full_load_bearing_crash_scenario_pin_append_crash_rotation_retention_denied_then_recovery() {
+        // The scenario from the M7.7 design memo, step by step:
+        // 1. "bridge" acquires a durable pin on segment N (here: segment 1, the Active segment at the time);
+        // 2. an event is appended to N (modeling the bridge's own append);
+        // 3. (crash before checkpoint -- modeled by simply not releasing the pin yet);
+        // 4. N is rotated and becomes Closed;
+        // 5. retention on N is attempted;
+        // 6. retention is denied because the pin is still Active;
+        // 7. "bridge restart": the pin is still there, the append is still there;
+        // 8. a verified scan confirms the appended fact is still present;
+        // 9/10. the pin is released (simulating successful recovery+checkpoint);
+        // 11. retention can now proceed.
+        let h = Harness::new();
+        h.append(&h.legacy_locator, brain_api::AuditEventKind::McpConnection { server: "s0".into() });
+        rotate(&h.rotation_config()).await.unwrap();
+
+        let pin_store_journal = h.pin_store_locator.join("journal.sqlite");
+        let segment_1_journal = h.segment_1_locator.join("journal.sqlite");
+
+        // 1. Pin acquired on segment 1 (the current Active segment).
+        let pin_id = crate::pin_store::acquire(&h.pin_store_locator, &pin_store_journal, &SegmentId::from_index(1), crate::domain::OwnerClass::new("mcp-audit-bridge").unwrap(), crate::domain::PinReason::PendingCheckpointWrite, "2026-01-01T00:00:00Z").unwrap();
+
+        // 2. Append X into segment 1 (modeling the bridge's own durable append).
+        h.append(&h.segment_1_locator, brain_api::AuditEventKind::McpConnection { server: "X".into() });
+
+        // 3. Crash before checkpoint -- nothing to do, the pin is already durable and X is already durable.
+
+        // 4. Rotate segment 1 to Closed, segment 2 becomes Active.
+        let segment_2_locator = h.dir.path().join("segment-2");
+        let rotate_config = RotationConfig { manifest_path: h.manifest_path.clone(), retention_ledger_journal_path: h.retention_ledger_locator.join("journal.sqlite"), next_segment_locator: segment_2_locator.clone(), next_segment_journal_path: segment_2_locator.join("journal.sqlite") };
+        rotate(&rotate_config).await.unwrap();
+
+        // 5/6. Retention on segment 1 is attempted and denied.
+        let mut config = h.retention_config();
+        config.active_segment_journal_path = segment_2_locator.join("journal.sqlite");
+        let denied = retire_segment(&config, &SegmentId::from_index(1)).await;
+        assert!(matches!(denied, Err(RetentionError::SegmentHasActivePins(ref id, ref pins)) if id == &SegmentId::from_index(1) && pins.contains(&pin_id)), "got {denied:?}");
+        assert!(h.segment_1_locator.exists(), "segment 1's payload, containing X, must still exist");
+
+        // 7/8. "Restart": scan segment 1 and confirm X is still there.
+        // The vault handle is dropped immediately after reading (never
+        // held across the later retire_segment call below), since
+        // retire_segment's own Phase 4 deletes this exact directory --
+        // an open handle on Windows would otherwise block that delete,
+        // which would itself be a real bug in a real composition root
+        // too (never read a segment's vault and hold it open across a
+        // retention attempt on that same segment).
+        let found_x = {
+            let vault = storage::Vault::open_with_default_indexer(h.segment_1_locator.clone(), &segment_1_journal).unwrap();
+            let raw = vault.read_audit_log_for_recovery_scan().unwrap();
+            let scan = scan_chain_bytes(&raw);
+            scan.verified_records.iter().any(|r| matches!(audit_chain_core::parse_event::<brain_api::AuditEvent>(&r.content_bytes), Ok(e) if matches!(e.kind, brain_api::AuditEventKind::McpConnection { ref server } if server == "X")))
+        };
+        assert!(found_x, "X must still be recoverable from segment 1 after the simulated crash and failed retention attempt");
+
+        // 9/10. Release the pin (simulating successful recovery + checkpoint save).
+        crate::pin_store::release(&h.pin_store_locator, &pin_store_journal, pin_id, "2026-01-01T00:10:00Z").unwrap();
+
+        // 11. Retention can now proceed.
+        let report = retire_segment(&config, &SegmentId::from_index(1)).await.unwrap();
+        assert_eq!(report.retired_segment_id, SegmentId::from_index(1));
+        assert!(!h.segment_1_locator.exists(), "segment 1's payload may now be deleted");
     }
 }

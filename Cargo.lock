@@ -1177,6 +1177,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-audit-segmented"
+version = "0.1.0"
+dependencies = [
+ "audit-chain-core",
+ "audit-segmentation",
+ "brain-api",
+ "brain-api-audit-worker",
+ "chrono",
+ "mcp-audit-bridge",
+ "mcp-client-audit-worker",
+ "serde",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mcp-client"
 version = "0.1.0"
 dependencies = [

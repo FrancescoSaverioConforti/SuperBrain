@@ -22,18 +22,22 @@
 //! per source record," achieved by verifying, before every append,
 //! whether that exact source record has already been durably
 //! materialized in the destination chain.
+pub mod anti_bypass;
 pub mod bridge_lock;
 pub mod checkpoint;
 pub mod dedup;
+pub mod destination;
 pub mod identity;
 pub mod mapping;
 pub mod registration;
 pub mod run;
 
+pub use anti_bypass::{guard_against_segmented_destination, SegmentedDestinationGuardError};
 pub use bridge_lock::{BridgeLock, BridgeLockError};
 pub use checkpoint::{BridgeCheckpoint, CheckpointError};
 pub use dedup::{scan_destination_for_imported_identities, DestinationAnomaly};
+pub use destination::{DestinationAccess, DestinationAccessError, DestinationHistory, HistoryCompleteness, SingleVaultDestination};
 pub use identity::{RelocationError, SourceLogId, SourceLogRegistration, SourceRecordIdentity};
 pub use mapping::translate;
 pub use registration::{RegistrationError, RegistrationFile, RegistrationRecoveryError};
-pub use run::{run_once, RunConfig, RunOutcome, RunReport};
+pub use run::{register_source, run_once, run_with_destination, RegisterSourceError, RunConfig, RunFailure, RunOutcome, RunReport, SourceConfig};
