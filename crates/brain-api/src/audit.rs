@@ -133,6 +133,72 @@ pub enum AuditEventKind {
     /// a strict subset of approval's — no new failure category is
     /// needed).
     RejectionOutcome { attempt_id: String, outcome: RejectionOutcomeKind },
+    /// M7: one `mcp_client_audit_worker::McpClientEventKind` record,
+    /// translated by the `mcp-audit-bridge` crate from a verified MCP
+    /// client audit chain into this schema — additive, never a
+    /// reinterpretation of [`AuditEventKind::ExternalExecution`], which
+    /// keeps its own original meaning unchanged. `source_phase`
+    /// preserves which semantic phase (registration/discovery/tool
+    /// classification/authorization/invocation) produced the source
+    /// event, without losing it by collapsing into a single generic
+    /// shape; `source_kind` is the exact source variant name (a plain
+    /// string, not a shared enum — `brain-api` must not depend on
+    /// `mcp-client-audit-worker`, so the bridge is solely responsible for
+    /// this translation and must match exhaustively on the real source
+    /// enum at its own call site, never falling back to a catch-all that
+    /// could hide a future unmapped variant). `server`/`tool_name`/
+    /// `invocation_id`/`outcome` are `None` whenever the specific source
+    /// variant never carried that field — never fabricated, never
+    /// reconstructed from another event. `source_log_id`/
+    /// `source_sequence`/`source_record_hash` are pure provenance (never
+    /// a security claim on their own): together they identify the exact
+    /// source chain record this event was translated from, letting a
+    /// recovery scan of this destination chain determine whether a given
+    /// source record was already imported, without depending on
+    /// `invocation_id` (absent for many source variants) or on any
+    /// other derived identity.
+    McpBridgeEvent {
+        source_phase: McpBridgePhase,
+        source_kind: String,
+        server: Option<String>,
+        tool_name: Option<String>,
+        invocation_id: Option<String>,
+        outcome: Option<String>,
+        source_log_id: String,
+        source_sequence: u64,
+        source_record_hash: String,
+    },
+    /// M7: the dedicated mirror of `mcp_client_audit_worker::
+    /// McpClientEventKind::ExternalSideEffectUnknown` — kept as its own
+    /// variant, never folded into [`AuditEventKind::McpBridgeEvent`]'s
+    /// generic `outcome` field, so this explicit "the external side
+    /// effect's outcome could not be confirmed" security signal stays
+    /// visible to a reader without inspecting a shared field among many
+    /// other, less sensitive, outcomes.
+    McpBridgeExternalSideEffectUnknown {
+        invocation_id: String,
+        server: String,
+        tool_name: String,
+        reason: String,
+        source_log_id: String,
+        source_sequence: u64,
+        source_record_hash: String,
+    },
+}
+
+/// The semantic phase a translated [`AuditEventKind::McpBridgeEvent`]
+/// came from — preserves the M6 source event's own category even though
+/// `source_kind` alone (a plain string) would already name it; this
+/// typed field lets a reader filter by phase without string-matching
+/// `source_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpBridgePhase {
+    Registration,
+    Discovery,
+    ToolClassification,
+    Authorization,
+    Invocation,
 }
 
 /// The terminal classification of one approval attempt's commit —
@@ -317,6 +383,26 @@ mod tests {
                 attempt_id: "33333333-3333-3333-3333-333333333333".into(),
                 outcome: RejectionOutcomeKind::Failed { category: CommitFailureCategory::Conflict },
             },
+            AuditEventKind::McpBridgeEvent {
+                source_phase: McpBridgePhase::Invocation,
+                source_kind: "invocation_attempted".into(),
+                server: Some("srv".into()),
+                tool_name: Some("tool".into()),
+                invocation_id: Some("inv-1".into()),
+                outcome: None,
+                source_log_id: "44444444-4444-4444-4444-444444444444".into(),
+                source_sequence: 0,
+                source_record_hash: "a".repeat(64),
+            },
+            AuditEventKind::McpBridgeExternalSideEffectUnknown {
+                invocation_id: "inv-1".into(),
+                server: "srv".into(),
+                tool_name: "tool".into(),
+                reason: "connection_lost_mid_call".into(),
+                source_log_id: "44444444-4444-4444-4444-444444444444".into(),
+                source_sequence: 1,
+                source_record_hash: "b".repeat(64),
+            },
         ]
     }
 
@@ -334,7 +420,15 @@ mod tests {
         // JSON shape, not an open-ended content field.
         for kind in all_variants() {
             let json = serde_json::to_string(&kind).unwrap();
-            assert!(json.len() < 300, "variant serialized unexpectedly large, suggesting a content-bearing field crept in: {json}");
+            // M7: bound raised from 300 to 400 — McpBridgeEvent/
+            // McpBridgeExternalSideEffectUnknown each carry a UUID
+            // (source_log_id) plus a 64-hex-char SHA-256
+            // (source_record_hash), both identifier/hash-shaped
+            // provenance fields (the same shape `record_hash` already
+            // has elsewhere in this codebase's audit chain), never free
+            // text — this raises the bound to fit those two fixed-width
+            // fields, not to permit open-ended content.
+            assert!(json.len() < 400, "variant serialized unexpectedly large, suggesting a content-bearing field crept in: {json}");
             assert!(!json.contains('\n'), "a multi-line value suggests prose/content leaked into an audit event: {json}");
         }
     }
@@ -607,5 +701,96 @@ mod tests {
         assert!(allowed_from_result::<()>(&Err(crate::BrainApiError::NotFound)));
         assert!(allowed_from_result::<()>(&Err(crate::BrainApiError::Conflict)));
         assert!(allowed_from_result::<()>(&Err(crate::BrainApiError::CorruptData)));
+    }
+
+    // --- M7: McpBridgeEvent / McpBridgeExternalSideEffectUnknown schema ---
+
+    #[test]
+    fn every_m7_bridge_variant_round_trips_through_serde_json_exactly() {
+        for kind in [
+            AuditEventKind::McpBridgeEvent {
+                source_phase: McpBridgePhase::Registration,
+                source_kind: "registration_attempted".into(),
+                server: Some("s".into()),
+                tool_name: None,
+                invocation_id: None,
+                outcome: None,
+                source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+                source_sequence: 0,
+                source_record_hash: "a".repeat(64),
+            },
+            AuditEventKind::McpBridgeEvent {
+                source_phase: McpBridgePhase::Invocation,
+                source_kind: "invocation_outcome".into(),
+                server: None,
+                tool_name: None,
+                invocation_id: Some("inv-1".into()),
+                outcome: Some("success".into()),
+                source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+                source_sequence: 5,
+                source_record_hash: "b".repeat(64),
+            },
+            AuditEventKind::McpBridgeExternalSideEffectUnknown {
+                invocation_id: "inv-1".into(),
+                server: "s".into(),
+                tool_name: "t".into(),
+                reason: "timeout_mid_call".into(),
+                source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+                source_sequence: 6,
+                source_record_hash: "c".repeat(64),
+            },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: AuditEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind, "round trip through JSON must reproduce the exact original variant, got {json}");
+        }
+    }
+
+    #[test]
+    fn mcp_bridge_event_is_never_equal_to_external_execution_for_the_same_server_and_tool() {
+        // Decision 1's own invariant: ExternalExecution keeps its original
+        // meaning unchanged and is never reinterpreted as, or confused
+        // with, a bridge-translated event, even when both happen to name
+        // the same server/tool.
+        let bridge = AuditEventKind::McpBridgeEvent {
+            source_phase: McpBridgePhase::Invocation,
+            source_kind: "invocation_attempted".into(),
+            server: Some("srv".into()),
+            tool_name: Some("tool".into()),
+            invocation_id: Some("inv-1".into()),
+            outcome: None,
+            source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+            source_sequence: 0,
+            source_record_hash: "a".repeat(64),
+        };
+        let external = AuditEventKind::ExternalExecution { server: "srv".into(), tool: "tool".into() };
+        assert_ne!(bridge, external);
+    }
+
+    #[test]
+    fn mcp_bridge_external_side_effect_unknown_is_a_distinct_variant_never_collapsed_into_mcp_bridge_event() {
+        let unknown = AuditEventKind::McpBridgeExternalSideEffectUnknown {
+            invocation_id: "inv-1".into(),
+            server: "s".into(),
+            tool_name: "t".into(),
+            reason: "connection_lost_mid_call".into(),
+            source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+            source_sequence: 0,
+            source_record_hash: "a".repeat(64),
+        };
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert!(json.contains("mcp_bridge_external_side_effect_unknown"));
+        let as_generic_event = AuditEventKind::McpBridgeEvent {
+            source_phase: McpBridgePhase::Invocation,
+            source_kind: "external_side_effect_unknown".into(),
+            server: Some("s".into()),
+            tool_name: Some("t".into()),
+            invocation_id: Some("inv-1".into()),
+            outcome: Some("connection_lost_mid_call".into()),
+            source_log_id: "11111111-1111-1111-1111-111111111111".into(),
+            source_sequence: 0,
+            source_record_hash: "a".repeat(64),
+        };
+        assert_ne!(unknown, as_generic_event, "ExternalSideEffectUnknown must never equal its own generic-shaped equivalent");
     }
 }

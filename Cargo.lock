@@ -1141,6 +1141,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-audit-bridge"
+version = "0.1.0"
+dependencies = [
+ "audit-chain-core",
+ "brain-api",
+ "brain-api-audit-worker",
+ "mcp-client-audit-worker",
+ "serde",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mcp-client"
 version = "0.1.0"
 dependencies = [

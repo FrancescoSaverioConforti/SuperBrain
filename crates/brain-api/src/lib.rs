@@ -24,7 +24,7 @@ mod proposal;
 mod proposal_store;
 mod read;
 pub use approval::{approve_proposal, list_proposals, reject_proposal};
-pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, CommitFailureCategory, CommitOutcomeKind, NullAuditSink, RejectionOutcomeKind};
+pub use audit::{allowed_from_result, event, record_permission_decision, record_tool_call, record_write_memory, AuditEvent, AuditEventKind, AuditSink, CommitFailureCategory, CommitOutcomeKind, McpBridgePhase, NullAuditSink, RejectionOutcomeKind};
 pub use cli::{run_cli, run_cli_durable, run_cli_with_audit, DurableApprovalHooks, DurableCliOutcome, DurableRejectionHooks};
 
 /// M6.2B: `audit_chain`/`audit_record` (B5 remediation M5 Tasks 1 and 4)
