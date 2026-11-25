@@ -34,4 +34,8 @@ serde_json = "1"
 # `tokio::process::Command`'s own stdio piping (bypassed here because it
 # offers no way to call CreateProcessW directly with an attribute list).
 # Win32_Security: SECURITY_ATTRIBUTES (pipe inheritance control).
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+# Win32_System_Console: GetStdHandle(STD_ERROR_HANDLE) (M6.7 fix: real
+# stderr inheritance, matching Stdio::inherit()'s own semantics,
+# replacing an earlier throwaway-pipe bug found by M6.7's adversarial
+# review).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }

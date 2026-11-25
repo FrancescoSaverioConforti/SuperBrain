@@ -446,6 +446,62 @@ async fn an_allowlisted_bootstrap_variable_remains_visible_to_the_spawned_extern
     conn.close().await.unwrap();
 }
 
+/// M6.7 adversarial case: a secret-shaped env var set under a
+/// DIFFERENTLY-CASED name than any allowlist entry (e.g. `path` /
+/// `systemroot`, lowercase, vs. the allowlist's own `PATH`/`SystemRoot`)
+/// must not leak into the spawned external server, even though Windows
+/// itself treats environment variable NAMES case-insensitively at the
+/// OS/CRT level (e.g. `set PATH=x` and `set path=y` are typically the
+/// SAME variable from a real `cmd.exe`'s perspective) -- a mismatch
+/// between this crate's own allowlist matching (`std::env::var_os`,
+/// which is itself case-insensitive to the env block on Windows, same
+/// as the OS) and some DIFFERENT, hypothetically case-SENSITIVE
+/// mechanism elsewhere could in principle cause a differently-cased
+/// secret to either leak through unexpectedly or collide with and
+/// mask a real allowlisted value. Uses a clearly-fake sentinel value,
+/// under a name chosen to never collide with a real allowlisted
+/// variable's own canonical casing.
+#[tokio::test]
+async fn a_differently_cased_secret_env_var_does_not_leak_through_case_insensitive_matching() {
+    if skip_if_no_python() {
+        return;
+    }
+    unsafe {
+        std::env::set_var(
+            "superbrain_m67_casing_sentinel",
+            "fake-non-secret-casing-value-67890",
+        );
+    }
+
+    let conn = spawn_env_report_server().await;
+    let allow = ApprovalPolicy::AllowReadOnly;
+    // Probe with several differently-cased spellings of the same
+    // sentinel name -- if the spawned child's OWN environment (as
+    // opposed to merely this test process's) ends up with the
+    // variable visible under ANY casing, that's the leak this test
+    // exists to catch.
+    for probe_name in ["superbrain_m67_casing_sentinel", "SUPERBRAIN_M67_CASING_SENTINEL", "Superbrain_M67_Casing_Sentinel"] {
+        let result = invoke_external_tool_with_timeout(
+            &conn,
+            &env_report_metadata(),
+            &allow,
+            serde_json::json!({"sentinel_name": probe_name}),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("env_report call must succeed");
+        assert!(
+            result["structuredContent"]["sentinel_value"].is_null(),
+            "a differently-cased secret env var leaked into the spawned external server's own environment (probed as {probe_name:?}): {result:?}"
+        );
+    }
+
+    unsafe {
+        std::env::remove_var("superbrain_m67_casing_sentinel");
+    }
+    conn.close().await.unwrap();
+}
+
 /// The legitimate test server used throughout this whole file (not just
 /// the dedicated env-report fixture) must still start correctly under
 /// the new environment isolation -- a real, end-to-end smoke test that

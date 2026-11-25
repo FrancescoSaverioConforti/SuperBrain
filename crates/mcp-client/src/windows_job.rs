@@ -31,12 +31,15 @@
 //! separate "assign" step for this module's caller to race against.
 //! This requires bypassing `tokio::process::Command`/`std::process::
 //! Command` entirely for this one spawn (neither exposes `STARTUPINFOEXW`
-//! or an attribute list), so this module also creates the three stdio
-//! pipes itself (`CreatePipe`) and restricts which handles the child
-//! inherits via the complementary `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
-//! attribute — the child inherits exactly its own stdin/stdout/stderr
-//! pipe ends, never any other handle open in this process, regardless
-//! of how many other inheritable handles this process may hold.
+//! or an attribute list), so this module also creates the stdin/stdout
+//! pipes itself (`CreatePipe`; stderr is an inherited duplicate of this
+//! process's own real stderr handle instead of a pipe — see
+//! `inheritable_stderr_duplicate`'s own doc comment, an M6.7 fix) and
+//! restricts which handles the child inherits via the complementary
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute — the child inherits
+//! exactly its own stdin/stdout/stderr handles, never any other handle
+//! open in this process, regardless of how many other inheritable
+//! handles this process may hold.
 //!
 //! **Fail-closed by construction**: every setup step (job creation,
 //! limit configuration, attribute list construction, pipe creation)
@@ -59,15 +62,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
+use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 use windows::Win32::System::JobObjects::{CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject};
 #[cfg(test)]
 use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
 };
 
 /// An owned Windows Job Object handle. `KILL_ON_JOB_CLOSE` is set at
@@ -119,6 +123,19 @@ impl OwnedJobHandle {
         std::mem::forget(real); // skip this handle's own Drop/CloseHandle below -- we close it ourselves, once, here
         let _ = unsafe { CloseHandle(handle) };
         Self(handle)
+    }
+
+    /// A NULL `HANDLE` — never created by `CreateJobObjectW`, so its
+    /// own `Drop`'s `CloseHandle` call on it is a documented, safe
+    /// no-op (`CloseHandle(NULL)` fails closed with `ERROR_INVALID_
+    /// HANDLE`, never affecting any real object), unlike closing a
+    /// handle VALUE that used to be real and may since have been
+    /// reused. Exists only so `start_kill` has a value to leave in
+    /// place of a real job handle it has already closed itself,
+    /// without ever constructing a second `OwnedJobHandle` that owns
+    /// (and would re-close) that same real handle.
+    fn placeholder() -> Self {
+        Self(HANDLE::default())
     }
 
     pub(crate) fn raw(&self) -> HANDLE {
@@ -277,6 +294,41 @@ fn clear_inherit(handle: HANDLE) -> io::Result<()> {
     unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAGS(0)) }.map_err(io::Error::from)
 }
 
+/// M6.7 fix: returns an inheritable DUPLICATE of this process's own
+/// real stderr handle (`GetStdHandle(STD_ERROR_HANDLE)`), matching
+/// `std::process::Stdio::inherit()`'s actual semantic -- the child
+/// writes directly to wherever THIS process's own stderr goes
+/// (terminal, redirected file, etc.), never to a throwaway pipe with
+/// no reader (the M6.7 finding this replaces: closing a pipe's parent-
+/// side read end is NOT equivalent to inherit() and causes the
+/// child's own stderr writes to fail/crash once its pipe buffer
+/// fills). A duplicate, not the original, is marked inheritable and
+/// handed to the child: `GetStdHandle`'s returned handle is NOT
+/// guaranteed inheritable by itself, and mutating this process's own
+/// real stderr handle's inheritability in place (rather than
+/// duplicating) would be a wider, unwanted side effect reaching past
+/// this one child's own setup.
+fn inheritable_stderr_duplicate() -> io::Result<OwnedHandle> {
+    // SAFETY: `GetStdHandle` returns a handle this process does not
+    // own in the usual sense (closing it would be a process-wide
+    // mistake) -- never passed to `OwnedHandle`/`CloseHandle` directly
+    // here; only used as `DuplicateHandle`'s source.
+    let real_stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.map_err(io::Error::from)?;
+    let mut duplicate = HANDLE::default();
+    // SAFETY: duplicates `real_stderr` within the current process
+    // (`GetCurrentProcess()` for both source and target process
+    // handles is the documented pattern for an intra-process
+    // duplicate); `DUPLICATE_SAME_ACCESS` preserves the original's
+    // access rights; `bInheritHandle: true` is the one property this
+    // duplicate needs that the original is not guaranteed to have.
+    // The resulting `duplicate` is a freshly owned handle this
+    // function hands to its caller via `OwnedHandle`.
+    unsafe { DuplicateHandle(GetCurrentProcess(), real_stderr, GetCurrentProcess(), &mut duplicate, 0, true, DUPLICATE_SAME_ACCESS) }.map_err(io::Error::from)?;
+    // SAFETY: `duplicate` was just created above and is not yet owned
+    // by anything else.
+    unsafe { Ok(OwnedHandle::from_raw_handle(duplicate.0 as _)) }
+}
+
 /// The parent-side pipe ends `spawn_contained`'s caller reads/writes
 /// through, once the child process has been created. The child-side
 /// ends (handed to the child via `STARTUPINFOEXW` during
@@ -337,18 +389,36 @@ impl ContainedChild {
     /// start_kill`'s own shape (used from `Drop::drop`, where no
     /// `.await` is available).
     pub(crate) fn start_kill(&mut self) {
-        // SAFETY: `self.job.raw()` is a valid job handle owned by this
-        // struct for at least the duration of this call.
-        let _ = unsafe { CloseHandle(self.job.raw()) };
-        // The job handle is now closed (and KILL_ON_JOB_CLOSE has
-        // fired); replace `self.job` with a fresh, empty job object so
-        // `OwnedJobHandle`'s own `Drop` (which still runs later) closes
-        // a handle it actually owns, never the one already closed
-        // above. A fresh job with no process ever assigned is a no-op
-        // to close.
+        // M6.7 finding (fixed here): a plain `self.job = replacement`
+        // assignment would DROP the old `self.job` value first (Rust's
+        // own assignment semantics), running `OwnedJobHandle::drop` --
+        // which calls `CloseHandle` AGAIN on the handle this function
+        // already closed two lines below, a genuine double-close.
+        // `CloseHandle` on an already-closed handle value is usually
+        // harmless on Windows, but not always: if the handle VALUE has
+        // already been reused by an unrelated `Create*`-style call in
+        // the meantime (handle-value reuse is real and documented
+        // Windows behavior), the second `CloseHandle` would close that
+        // UNRELATED object instead -- a narrow but genuine
+        // use-after-close / wrong-object-closed bug. `std::mem::
+        // replace` swaps the fields without ever constructing then
+        // dropping an intermediate "old self.job" value in the normal
+        // way; `old_job` is explicitly forgotten below instead of
+        // dropped, since its handle was already closed by this
+        // function itself, deliberately, one line above.
+        let old_job = std::mem::replace(&mut self.job, OwnedJobHandle::placeholder());
+        // SAFETY: `old_job.raw()` is the valid job handle this
+        // `ContainedChild` owned until the line above; closed here,
+        // exactly once, as the actual kill action.
+        let _ = unsafe { CloseHandle(old_job.raw()) };
+        std::mem::forget(old_job); // already closed above; must not be closed again by its own Drop
         if let Ok(replacement) = OwnedJobHandle::create_with_kill_on_close() {
             self.job = replacement;
         }
+        // If `replacement` creation failed, `self.job` is left as the
+        // placeholder (an invalid handle, never created, so closing it
+        // on eventual Drop is a safe no-op) rather than retrying
+        // `CloseHandle` on the already-closed real handle again.
     }
 
     /// Async kill-and-wait, matching `tokio::process::Child::kill`'s
@@ -455,19 +525,39 @@ pub(crate) fn spawn_contained(command: &Path, args: &[String], cwd: &Path, env: 
 fn spawn_contained_into(job: OwnedJobHandle, command: &Path, args: &[String], cwd: &Path, env: &[(String, String)]) -> io::Result<(ContainedChild, ContainedStdio)> {
     // Child's stdin: child reads from the read end (inheritable),
     // parent writes to the write end (not inheritable). Child's
-    // stdout/stderr: child writes to the write end (inheritable),
-    // parent reads from the read end (not inheritable). This matches
+    // stdout: child writes to the write end (inheritable), parent
+    // reads from the read end (not inheritable). This matches
     // `tokio::process::Command`'s own piped-stdio inheritance shape.
+    //
+    // Child's stderr: NOT a pipe at all -- an inheritable duplicate of
+    // THIS process's own real stderr handle (M6.7 fix; see
+    // `inheritable_stderr_duplicate`'s own doc comment for the bug
+    // this replaces), matching `Stdio::inherit()`'s actual semantic.
     let (stdin_read, stdin_write) = create_pipe_pair(true, false)?;
     let (stdout_read, stdout_write) = create_pipe_pair(false, true)?;
-    let (stderr_read, stderr_write) = create_pipe_pair(false, true)?;
+    let stderr_inherited = inheritable_stderr_duplicate()?;
 
     let child_stdin = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&stdin_read) as _);
     let child_stdout = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&stdout_write) as _);
-    let child_stderr = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&stderr_write) as _);
+    let child_stderr = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&stderr_inherited) as _);
     let inherit_list = [child_stdin, child_stdout, child_stderr];
 
-    let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job.raw(), &inherit_list)?;
+    // M6.7 finding (Critical, fixed here): `UpdateProcThreadAttribute`'s
+    // own documentation (confirmed directly against Microsoft Learn)
+    // states `lpValue` "must persist until the attribute list is
+    // destroyed using DeleteProcThreadAttributeList" -- i.e. the
+    // attribute list stores the POINTER itself, not a copy of the
+    // value, and the OS reads through it again at `CreateProcessW`
+    // time (and potentially until `DeleteProcThreadAttributeList`).
+    // Passing `&job.raw()` directly (as this line previously did) took
+    // the address of a TEMPORARY `HANDLE` that is already gone by the
+    // time `CreateProcessW` runs -- a genuine use-after-free, not
+    // merely defensive-style over-caution. `job_handle_value` is a
+    // named local that lives for the rest of this function's scope,
+    // past `CreateProcessW` and past `attrs`'s own `Drop`
+    // (`DeleteProcThreadAttributeList`), closing that window.
+    let job_handle_value = job.raw();
+    let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job_handle_value, &inherit_list)?;
 
     let mut startup_info = STARTUPINFOEXW::default();
     startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -532,23 +622,18 @@ fn spawn_contained_into(job: OwnedJobHandle, command: &Path, args: &[String], cw
 
     let child = ContainedChild { process, process_id: process_info.dwProcessId, job };
     let stdio = ContainedStdio { parent_stdin_write: stdin_write, parent_stdout_read: stdout_read };
-    // `stderr_read` (the parent-side read end) is intentionally dropped
-    // here uninherited by the child and unused by the parent -- stderr
-    // is inherited (`std::process::Stdio::inherit()`'s own semantic,
-    // matched here) by closing the parent's read end immediately so
-    // the child's stderr writes do not block on an unread pipe; this
-    // crate's existing behavior (`registration.rs`'s prior
-    // `cmd.stderr(Stdio::inherit())`) never captured stderr either.
-    drop(stderr_read);
-    // The child-side handles (`stdin_read`, `stdout_write`,
-    // `stderr_write`) are duplicated into the child's own handle table
-    // by `CreateProcessW` itself; this process's own copies are closed
-    // here so the parent does not keep the child's pipe ends open
-    // (which would prevent e.g. EOF from ever being observed on the
-    // child's exit).
+    // The child-side handles (`stdin_read`, `stdout_write`, and the
+    // stderr duplicate) are themselves duplicated again into the
+    // child's own handle table by `CreateProcessW` (standard Windows
+    // handle-inheritance semantics: the child gets its own copy, not
+    // this process's copy); this process's own copies are closed here
+    // so the parent does not keep the child's pipe ends open (which
+    // would prevent e.g. EOF from ever being observed on the child's
+    // stdin/stdout exit), and so the stderr duplicate this function
+    // created does not leak.
     drop(stdin_read);
     drop(stdout_write);
-    drop(stderr_write);
+    drop(stderr_inherited);
 
     Ok((child, stdio))
 }
@@ -644,7 +729,8 @@ mod tests {
         // the real non-empty shape it actually uses.
         let (read_end, _write_end) = create_pipe_pair(true, false).unwrap();
         let handles = [HANDLE(read_end.as_raw_handle() as _)];
-        let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job.raw(), &handles);
+        let job_handle_value = job.raw();
+        let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job_handle_value, &handles);
         assert!(attrs.is_ok(), "expected attribute list construction to succeed: {:?}", attrs.err());
     }
 
@@ -657,7 +743,8 @@ mod tests {
         // that would let CreateProcessW fall back to unrestricted
         // handle inheritance.
         let job = OwnedJobHandle::create_with_kill_on_close().unwrap();
-        let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job.raw(), &[]);
+        let job_handle_value = job.raw();
+        let attrs = ProcThreadAttributeList::with_job_and_handle_list(&job_handle_value, &[]);
         assert!(attrs.is_err(), "an empty handle list must be rejected, never silently accepted");
     }
 
@@ -694,6 +781,62 @@ mod tests {
         assert_eq!(quote_arg(""), "\"\"");
     }
 
+    // --- M6.7: real argv round-trip through a real spawned child ---
+    // (quote_arg's own unit tests above check the ESCAPING algorithm in
+    // isolation; these additionally confirm the escaped command line
+    // ACTUALLY decodes back to the original argv inside a real Python
+    // child process's own sys.argv -- M6.7's explicit requirement, since
+    // a unit test of the encoder alone cannot catch a mismatch between
+    // this module's own encoding convention and Python's/MSVCRT's real
+    // decoding rules.)
+
+    #[tokio::test]
+    async fn real_argv_round_trip_through_a_spawned_child_for_adversarial_argument_shapes() {
+        let Some(python) = ["python", "python3"].into_iter().find(|candidate| std::process::Command::new(candidate).arg("--version").output().is_ok_and(|o| o.status.success())) else {
+            eprintln!("skipping real_argv_round_trip_through_a_spawned_child_for_adversarial_argument_shapes: no python on PATH");
+            return;
+        };
+        const PRINT_ARGV_AS_JSON: &str = "import sys, json\nsys.stdout.write(json.dumps(sys.argv[1:]))\nsys.stdout.flush()\n";
+
+        let cases: Vec<Vec<String>> = vec![
+            vec!["simple".to_string()],
+            vec!["has space".to_string()],
+            vec!["trailing\\".to_string()],
+            vec!["trailing\\\\".to_string()],
+            vec!["a\"b".to_string()],
+            vec!["\\\"escaped-quote-after-backslash".to_string()],
+            vec!["".to_string()],
+            vec!["unicode-héllo-日本語-🎉".to_string()],
+            vec!["multiple".to_string(), "separate".to_string(), "args".to_string()],
+            vec!["-x".to_string(), "--flag=value".to_string(), "/looks/like/an/option".to_string()],
+            vec!["new\nline".to_string()],
+            vec!["tab\ttab".to_string()],
+            vec!["a b\\c\"d\\\\e".to_string()], // combined: space, backslash, quote, trailing-before-quote backslashes
+        ];
+
+        for case in cases {
+            let cwd = std::env::current_dir().unwrap();
+            let mut args = vec!["-c".to_string(), PRINT_ARGV_AS_JSON.to_string()];
+            args.extend(case.iter().cloned());
+            let (_child, stdio) = spawn_contained(Path::new(python), &args, &cwd, &system_root_env()).unwrap();
+            let (_write, mut read) = stdio.into_async_io();
+
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = read.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let output = String::from_utf8_lossy(&buf);
+            let decoded: Vec<String> = serde_json::from_str(&output).unwrap_or_else(|e| panic!("child's argv output was not valid JSON for case {case:?}: {e}, raw output: {output:?}"));
+            assert_eq!(decoded, case, "argv did not round-trip correctly for case {case:?} -- got {decoded:?}");
+        }
+    }
+
     // --- build_environment_block ---
 
     #[test]
@@ -707,6 +850,110 @@ mod tests {
         let block = build_environment_block(&[("PATH".to_string(), "C:\\Windows".to_string())]);
         let as_string = String::from_utf16(&block).unwrap();
         assert!(as_string.contains("PATH=C:\\Windows\u{0}"));
+    }
+
+    // --- M6.7: environment isolation adversarial tests ---
+    // (`build_environment_block`'s only real caller today,
+    // `registration.rs`'s `child_environment_pairs`, reads values only
+    // from this process's own trusted environment via a fixed
+    // allowlist -- these cases are not reachable from an untrusted MCP
+    // server today. Tested anyway per M6.7's explicit instruction, and
+    // because a future caller could pass less-trusted values without
+    // this function's own contract changing to say so.)
+
+    #[test]
+    fn build_environment_block_preserves_an_empty_value() {
+        let block = build_environment_block(&[("EMPTY_VAR".to_string(), String::new())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        assert!(as_string.contains("EMPTY_VAR=\u{0}"), "an empty value must still produce a KEY= entry, not be silently dropped: {as_string:?}");
+    }
+
+    #[test]
+    fn build_environment_block_preserves_non_ascii_unicode_values() {
+        let block = build_environment_block(&[("UNICODE_VAR".to_string(), "héllo wörld 日本語 🎉".to_string())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        assert!(as_string.contains("UNICODE_VAR=héllo wörld 日本語 🎉\u{0}"), "non-ASCII values must survive the UTF-16 conversion unchanged: {as_string:?}");
+    }
+
+    #[test]
+    fn build_environment_block_is_case_preserving_for_windows_style_variable_names() {
+        // Windows env var names are conventionally case-insensitive
+        // (e.g. `Path` vs `PATH` vs `path` are often treated as the
+        // same variable by the OS/CRT), but this function itself must
+        // not silently normalize case -- that decision belongs to its
+        // caller (the allowlist), not to the block-building step.
+        let block = build_environment_block(&[("Path".to_string(), "C:\\A".to_string()), ("PATH".to_string(), "C:\\B".to_string())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        assert!(as_string.contains("Path=C:\\A\u{0}"), "mixed-case key must be preserved verbatim: {as_string:?}");
+        assert!(as_string.contains("PATH=C:\\B\u{0}"), "both differently-cased entries must both be present (deduplication, if any, is the caller's job): {as_string:?}");
+    }
+
+    #[test]
+    fn build_environment_block_handles_duplicate_keys_by_including_both_entries_verbatim() {
+        // This function performs no deduplication itself -- if a
+        // caller passes the same key twice, both entries land in the
+        // block as-is (CreateProcessW's own documented behavior for a
+        // malformed/duplicated environment block is implementation-
+        // defined; this function's contract is "verbatim pass-through
+        // of what the caller gives it," so this test pins THAT
+        // contract rather than guessing at CreateProcessW's own
+        // resolution order).
+        let block = build_environment_block(&[("DUP".to_string(), "first".to_string()), ("DUP".to_string(), "second".to_string())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        assert!(as_string.contains("DUP=first\u{0}"));
+        assert!(as_string.contains("DUP=second\u{0}"));
+    }
+
+    #[test]
+    fn build_environment_block_does_not_let_an_embedded_null_in_a_value_corrupt_the_block_structure() {
+        // M6.7 adversarial case: a Rust `String` CAN contain an
+        // embedded NUL byte (`\0` is valid UTF-8) even though this
+        // function's only current real caller never produces one (its
+        // values come from `std::env::var_os` on a fixed allowlist of
+        // real OS environment variables, which cannot themselves
+        // contain embedded NULs) -- tested anyway since this function
+        // has no type-level guard against it. An embedded NUL in the
+        // VALUE would prematurely terminate that one block entry one
+        // NUL early, causing CreateProcessW's own environment-block
+        // parser to interpret the remaining bytes of this entry as the
+        // START of the NEXT entry -- shifting every subsequent
+        // variable's effective name/value and potentially fabricating
+        // an extra, attacker-shaped environment variable the caller
+        // never intended to pass. Documents the CURRENT (unguarded)
+        // behavior precisely so a future change either fixes this
+        // deliberately or this test fails loudly rather than silently
+        // drifting.
+        let block = build_environment_block(&[("A".to_string(), "before\0after".to_string()), ("B".to_string(), "second".to_string())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        // Split on NUL exactly as CreateProcessW's own parser would:
+        // each NUL-separated piece is one "entry" (the final empty
+        // piece is the double-NUL terminator).
+        let entries: Vec<&str> = as_string.split('\u{0}').collect();
+        // Current (unguarded) behavior produces FOUR pieces --
+        // "A=before", "after", "B=second", "" -- not the clean
+        // THREE-piece ("A=before\0after", "B=second", "") shape a
+        // caller who wrote this value almost certainly intended. The
+        // "after" fragment becomes its own malformed entry (no `=`,
+        // so CreateProcessW's handling of it is implementation-
+        // defined) instead of remaining part of A's value, and B's
+        // real entry is pushed one position later than a correct
+        // encoder would place it. This pins that the corruption is
+        // real and structural, not merely "the raw bytes contain a
+        // NUL somewhere."
+        assert_eq!(entries, vec!["A=before", "after", "B=second", "", ""], "an embedded NUL in a value must not fracture the block into an extra malformed entry like this; got: {entries:?}");
+    }
+
+    #[test]
+    fn build_environment_block_treats_an_embedded_equals_sign_in_a_value_as_part_of_the_value_not_a_second_key() {
+        // A value containing `=` is syntactically fine for
+        // CreateProcessW's own `KEY=VALUE` format (only the FIRST `=`
+        // in an entry is the delimiter; Windows itself has env vars
+        // like `=C:` carrying extra `=` characters) -- confirms this
+        // function does not mis-split on an embedded `=` within the
+        // value half.
+        let block = build_environment_block(&[("CONNSTR".to_string(), "server=localhost;port=5432".to_string())]);
+        let as_string = String::from_utf16(&block).unwrap();
+        assert!(as_string.contains("CONNSTR=server=localhost;port=5432\u{0}"), "a value containing '=' must be preserved verbatim, not mis-split: {as_string:?}");
     }
 
     // --- spawn_contained: end-to-end, real process ---
@@ -761,6 +1008,81 @@ mod tests {
         assert!(output.contains("got:hello"), "expected the child's echoed response, got: {output:?}");
     }
 
+    // --- M6.7: handle inheritance adversarial test ---
+
+    #[tokio::test]
+    async fn an_artificially_inheritable_handle_open_in_the_parent_is_not_accessible_from_the_child() {
+        // The actual PROC_THREAD_ATTRIBUTE_HANDLE_LIST claim this
+        // module makes: the child inherits EXACTLY its own 3 stdio
+        // handles, never any other inheritable handle this process
+        // happens to hold open. Proves it adversarially: creates a
+        // SEPARATE pipe pair with BOTH ends marked inheritable
+        // (`create_pipe_pair(true, true)`-equivalent, simulating some
+        // other inheritable handle this process has open for an
+        // unrelated reason -- e.g. a leaked or forgotten inheritable
+        // handle elsewhere in a real process), writes a secret into
+        // it, then spawns a child via the REAL spawn_contained whose
+        // script tries to read that exact handle VALUE (passed via an
+        // allowlisted env var) using raw Win32 ReadFile through
+        // ctypes. If the handle leaked through, the child reads the
+        // secret; if PROC_THREAD_ATTRIBUTE_HANDLE_LIST is doing its
+        // job, the child's own handle table has no entry at that
+        // value and ReadFile fails.
+        let Some(python) = ["python", "python3"].into_iter().find(|candidate| std::process::Command::new(candidate).arg("--version").output().is_ok_and(|o| o.status.success())) else {
+            eprintln!("skipping an_artificially_inheritable_handle_open_in_the_parent_is_not_accessible_from_the_child: no python on PATH");
+            return;
+        };
+
+        const SECRET: &str = "m67-handle-leak-check-secret";
+        let (leak_read, leak_write) = create_pipe_pair(true, true).unwrap(); // BOTH ends inheritable -- the adversarial condition
+        {
+            use std::io::Write;
+            let mut std_write = std::fs::File::from(leak_write);
+            std_write.write_all(SECRET.as_bytes()).unwrap();
+            std_write.flush().unwrap();
+            // Keep std_write (and therefore the underlying handle)
+            // open for the duration of spawn_contained below by NOT
+            // dropping it here -- forget it deliberately so the
+            // handle stays live exactly as a real "other inheritable
+            // handle the process holds open" would, without this
+            // test's own cleanup closing it before the child even
+            // starts.
+            std::mem::forget(std_write);
+        }
+        use std::os::windows::io::AsRawHandle;
+        let leak_handle_value = leak_read.as_raw_handle() as isize;
+
+        const PROBE_SCRIPT: &str = r#"
+import ctypes, os, sys
+handle = int(os.environ['M67_PROBE_HANDLE'])
+buf = ctypes.create_string_buffer(256)
+read = ctypes.c_ulong(0)
+ok = ctypes.windll.kernel32.ReadFile(handle, buf, 256, ctypes.byref(read), None)
+if ok:
+    sys.stdout.write('LEAKED:' + buf.raw[:read.value].decode(errors='replace'))
+else:
+    sys.stdout.write('NOT_ACCESSIBLE:' + str(ctypes.windll.kernel32.GetLastError()))
+sys.stdout.flush()
+"#;
+        let cwd = std::env::current_dir().unwrap();
+        let mut env = system_root_env();
+        env.push(("M67_PROBE_HANDLE".to_string(), leak_handle_value.to_string()));
+        let (_child, stdio) = spawn_contained(Path::new(python), &["-c".to_string(), PROBE_SCRIPT.to_string()], &cwd, &env).unwrap();
+        let (_write, mut read) = stdio.into_async_io();
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 512];
+        let n = read.read(&mut buf).await.unwrap();
+        let output = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+        // Clean up the leaked-on-purpose read end now that the probe
+        // has run.
+        let _ = unsafe { CloseHandle(HANDLE(leak_handle_value as _)) };
+
+        assert!(!output.contains(SECRET), "the child was able to read the parent's artificially-inheritable handle -- PROC_THREAD_ATTRIBUTE_HANDLE_LIST is not restricting inheritance as claimed: {output:?}");
+        assert!(output.starts_with("NOT_ACCESSIBLE:"), "expected the probe to report the handle as not accessible, got: {output:?}");
+    }
+
     // --- real job containment semantics (the actual M6.6 security claim) ---
 
     fn system_root_env() -> Vec<(String, String)> {
@@ -776,25 +1098,67 @@ mod tests {
         child.kill().await.unwrap();
     }
 
+    /// M6.7 finding: the earlier version of these two tree-containment
+    /// tests used a `cmd /c start /b cmd /c (more & echo done > "...")`
+    /// script. Directly confirmed (via a throwaway diagnostic test,
+    /// using `tasklist` and checking the marker, both removed once the
+    /// finding was established) that this exact script never actually
+    /// launches `more.com` at all -- `cmd.exe`'s parser rejects the
+    /// parenthesized-group-with-embedded-quotes shape ("La sintassi del
+    /// nome del file... non è corretta" / invalid filename/path syntax,
+    /// now visible on stderr only because M6.7 also fixed stderr
+    /// inheritance -- it was previously silently swallowed by the
+    /// now-removed throwaway-pipe bug, which is how this went
+    /// undetected since M6.6). That means both tests were passing
+    /// VACUOUSLY: "the grandchild's marker never appears" was trivially
+    /// true because there never was a live grandchild to kill, not
+    /// because kill actually reached one. Replaced with a Python-based
+    /// script (`GRANDCHILD_SCRIPT`) that deterministically spawns a
+    /// real grandchild and writes a START marker immediately so these
+    /// tests can first assert the grandchild genuinely started before
+    /// testing that killing the job terminates it.
+    fn grandchild_script(start_marker: &std::path::Path, done_marker: &std::path::Path) -> String {
+        format!(
+            "import subprocess, sys, time\np = subprocess.Popen([sys.executable, '-c', 'import time; open(r{start:?}, \"w\").close(); time.sleep(30); open(r{done:?}, \"w\").close()'])\nprint(p.pid)\nsys.stdout.flush()\ntime.sleep(30)\n",
+            start = start_marker.display().to_string(),
+            done = done_marker.display().to_string(),
+        )
+    }
+
     #[tokio::test]
     async fn kill_terminates_a_descendant_the_direct_child_already_exited_from() {
         // Exercises `ContainedChild::kill` itself (not just dropping),
-        // against the same "direct child already exited, grandchild
-        // still running" shape as the drop test below -- proving
-        // `kill()`'s own tree-wide reach, not merely `Drop`'s.
+        // against a real grandchild process (see `grandchild_script`'s
+        // own doc comment for the vacuous-test finding this replaces).
+        let Some(python) = ["python", "python3"].into_iter().find(|candidate| std::process::Command::new(candidate).arg("--version").output().is_ok_and(|o| o.status.success())) else {
+            eprintln!("skipping kill_terminates_a_descendant_the_direct_child_already_exited_from: no python on PATH");
+            return;
+        };
         let cwd = std::env::current_dir().unwrap();
-        let marker = std::env::temp_dir().join(format!("m66-kill-tree-{}.marker", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        let script = format!("start /b cmd /c (more & echo done > \"{}\")", marker.display());
-        let (mut child, stdio) = spawn_contained(Path::new("cmd.exe"), &["/c".to_string(), script], &cwd, &system_root_env()).unwrap();
+        let pid = std::process::id();
+        let start_marker = std::env::temp_dir().join(format!("m66-kill-tree-start-{pid}.marker"));
+        let done_marker = std::env::temp_dir().join(format!("m66-kill-tree-done-{pid}.marker"));
+        let _ = std::fs::remove_file(&start_marker);
+        let _ = std::fs::remove_file(&done_marker);
+        let script = grandchild_script(&start_marker, &done_marker);
+        let (mut child, stdio) = spawn_contained(Path::new(python), &["-c".to_string(), script], &cwd, &system_root_env()).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Confirm the grandchild genuinely started before testing
+        // anything about killing it -- the exact gap the vacuous
+        // version of this test had.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !start_marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(start_marker.exists(), "the grandchild process never started -- this test cannot prove anything about killing it");
+
         drop(stdio);
         child.kill().await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!marker.exists(), "kill() must terminate the grandchild too, before it can complete and write its marker file");
-        let _ = std::fs::remove_file(&marker);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!done_marker.exists(), "kill() must terminate the grandchild before its own 30s sleep completes and it writes the done marker");
+        let _ = std::fs::remove_file(&start_marker);
+        let _ = std::fs::remove_file(&done_marker);
     }
 
     #[tokio::test]
@@ -813,30 +1177,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_the_contained_child_terminates_the_whole_process_tree_not_just_the_direct_child() {
-        // `cmd /c start /b cmd /c more` makes `more` (the grandchild)
-        // long-running while the direct child (the first `cmd.exe`)
-        // exits quickly on its own -- this specifically tests that
-        // KILL_ON_JOB_CLOSE reaches a DESCENDANT the direct child
-        // itself already exited from, not merely the one process this
-        // module's own handle refers to.
+    async fn start_kill_called_twice_does_not_double_close_or_panic_m67_finding() {
+        // M6.7 finding (fixed): the original `start_kill` did
+        // `self.job = replacement` directly, which drops the OLD
+        // `self.job` first (running its own `CloseHandle` again on a
+        // handle this function had already closed one line above) --
+        // a genuine double-close, narrowly exploitable as a
+        // wrong-object-closed bug if the handle VALUE had been reused
+        // by an unrelated Create*-style call in the meantime. Calling
+        // start_kill() twice in a row exercises exactly this path a
+        // second time; if the fix (std::mem::replace + explicit
+        // mem::forget of the already-closed old job) were reverted,
+        // this would be the double-close-on-an-arbitrary-handle-value
+        // shape, not a hang or panic a test could otherwise catch --
+        // so this test's main value is running real code through the
+        // exact call sequence under a tool like a debug CRT handle
+        // checker / Application Verifier, and documenting the
+        // invariant for anyone reading or modifying this code later.
         let cwd = std::env::current_dir().unwrap();
-        let marker = std::env::temp_dir().join(format!("m66-tree-{}.marker", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        let script = format!("start /b cmd /c (more & echo done > \"{}\")", marker.display());
-        let (child, stdio) = spawn_contained(Path::new("cmd.exe"), &["/c".to_string(), script], &cwd, &system_root_env()).unwrap();
+        let (mut child, _stdio) = spawn_contained(Path::new("cmd.exe"), &["/c".to_string(), "more".to_string()], &cwd, &system_root_env()).unwrap();
+        child.start_kill();
+        child.start_kill(); // must not panic, double-close, or affect any unrelated handle
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        use std::os::windows::io::AsRawHandle;
+        let mut exit_code = 0u32;
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(HANDLE(child.process.as_raw_handle() as _), &mut exit_code) }.unwrap();
+        const STILL_ACTIVE: u32 = 259;
+        assert_ne!(exit_code, STILL_ACTIVE, "the process must still be terminated after two start_kill() calls");
+    }
 
-        // Give the grandchild time to actually start before killing the
-        // job -- this test's own claim is about live descendants, not
-        // about a race against process creation.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    #[tokio::test]
+    async fn dropping_the_contained_child_terminates_the_whole_process_tree_not_just_the_direct_child() {
+        // See `grandchild_script`'s own doc comment for the vacuous-
+        // test finding this replaces (the direct child here is the
+        // Python interpreter itself, which stays alive for its own
+        // 30s sleep -- this test's own claim is specifically about a
+        // GRANDCHILD it spawned, reached only through job containment,
+        // not through this module's own direct-child handle).
+        let Some(python) = ["python", "python3"].into_iter().find(|candidate| std::process::Command::new(candidate).arg("--version").output().is_ok_and(|o| o.status.success())) else {
+            eprintln!("skipping dropping_the_contained_child_terminates_the_whole_process_tree_not_just_the_direct_child: no python on PATH");
+            return;
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let pid = std::process::id();
+        let start_marker = std::env::temp_dir().join(format!("m66-drop-tree-start-{pid}.marker"));
+        let done_marker = std::env::temp_dir().join(format!("m66-drop-tree-done-{pid}.marker"));
+        let _ = std::fs::remove_file(&start_marker);
+        let _ = std::fs::remove_file(&done_marker);
+        let script = grandchild_script(&start_marker, &done_marker);
+        let (child, stdio) = spawn_contained(Path::new(python), &["-c".to_string(), script], &cwd, &system_root_env()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !start_marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(start_marker.exists(), "the grandchild process never started -- this test cannot prove anything about dropping it");
 
         drop(stdio); // close our pipe ends first, matching normal connection teardown
         drop(child); // drops `job` -> CloseHandle -> KILL_ON_JOB_CLOSE terminates the whole tree
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!marker.exists(), "the grandchild (`more`, left running under the job) must have been terminated by dropping ContainedChild, before it could ever complete and write its marker file");
-        let _ = std::fs::remove_file(&marker);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!done_marker.exists(), "the grandchild (left running under the job) must have been terminated by dropping ContainedChild, before its own 30s sleep could complete and write the done marker");
+        let _ = std::fs::remove_file(&start_marker);
+        let _ = std::fs::remove_file(&done_marker);
+    }
+
+    #[tokio::test]
+    async fn stderr_writes_do_not_silently_fail_or_hang_the_child_m67_finding() {
+        // M6.7 finding: spawn_contained_into closes the parent-side read
+        // end of the stderr pipe immediately (treating it as "like
+        // Stdio::inherit()"), but that is NOT what Stdio::inherit()
+        // does -- inherit() passes the PARENT's own real stderr handle
+        // through, never a fresh pipe with no reader. Writing to a pipe
+        // whose only reader has closed is a broken-pipe condition on
+        // Windows. This test writes a large-ish amount to stderr (more
+        // than one pipe buffer's worth, to force the OS to actually
+        // notice there is no reader rather than buffering it away) and
+        // asserts the child still exits cleanly with its intended exit
+        // code -- if stderr writes block or fail the process, this
+        // fails (reproducing the finding) until fixed.
+        let cwd = std::env::current_dir().unwrap();
+        let Some(python) = ["python", "python3"].into_iter().find(|candidate| std::process::Command::new(candidate).arg("--version").output().is_ok_and(|o| o.status.success())) else {
+            eprintln!("skipping stderr_writes_do_not_silently_fail_or_hang_the_child_m67_finding: no python on PATH");
+            return;
+        };
+        // Write ~128KB to stderr -- comfortably larger than the default
+        // anonymous pipe buffer (commonly 4-64KB), so a blocked/broken
+        // write would actually manifest rather than being masked by
+        // buffering.
+        const SCRIPT: &str = "import sys\nsys.stderr.write('e' * 131072)\nsys.stderr.flush()\nsys.exit(42)\n";
+        let (child, _stdio) = spawn_contained(Path::new(python), &["-c".to_string(), SCRIPT.to_string()], &cwd, &system_root_env()).unwrap();
+
+        use std::os::windows::io::AsRawHandle;
+        let raw = child.process.as_raw_handle() as isize;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let handle = HANDLE(raw as _);
+            let wait = unsafe { windows::Win32::System::Threading::WaitForSingleObject(handle, 5000) };
+            let mut code = 0u32;
+            if wait != windows::Win32::Foundation::WAIT_TIMEOUT {
+                let _ = unsafe { windows::Win32::System::Threading::GetExitCodeProcess(handle, &mut code) };
+            }
+            let _ = tx.send((wait, code));
+        });
+        let (wait_result, exit_code) = rx.await.unwrap();
+        assert_ne!(wait_result, windows::Win32::Foundation::WAIT_TIMEOUT, "child hung writing >1 pipe buffer of stderr with no reader -- confirms the broken-pipe/blocking finding");
+        assert_eq!(exit_code, 42, "child did not reach its intended exit(42); a stderr write error likely crashed it first, got exit code {exit_code}");
     }
 
     #[test]

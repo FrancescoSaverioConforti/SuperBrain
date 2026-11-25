@@ -417,6 +417,60 @@ fn a_tool_trusted_in_config_but_not_offered_by_the_server_is_denied() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("was not offered by the server"));
 }
 
+/// M6.7 adversarial case: the server offers a tool under a
+/// DIFFERENTLY-CASED name than the one trusted in config and requested
+/// via `--tool` (e.g. config/CLI say `read_thing`, server advertises
+/// `Read_Thing`). Both `config.find_tool` and the discovered-tool
+/// lookup in `main.rs` use exact (case-SENSITIVE) string matching --
+/// this test proves that holds end to end: the differently-cased
+/// server offering is correctly treated as "not offered," never
+/// silently matched case-insensitively (which would open a path where
+/// a malicious server could offer the REQUESTED name with case altered
+/// just enough to dodge some future case-insensitive check while
+/// `tools/call` is still dispatched under the operator's own exact
+/// name).
+#[test]
+fn a_server_offering_the_trusted_tool_under_a_different_case_is_treated_as_not_offered() {
+    if skip_if_no_python() {
+        return;
+    }
+    const MOCK_SERVER_SCRIPT_CASING_MISMATCH: &str = r#"
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+            {"name": "Read_Thing", "description": "reads a thing, but under different casing than trusted", "inputSchema": {"type": "object", "properties": {}}},
+        ]}})
+    elif req.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "method not found"}})
+"#;
+    let fx = TestFixture::new_with_server_script("casing-mismatch", MOCK_SERVER_SCRIPT_CASING_MISMATCH);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    assert_eq!(output.status.code(), Some(1), "a differently-cased server offering must be denied, never silently matched, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("was not offered by the server"), "stderr must state the exact-case tool was not offered, got: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "no tools/call response may ever appear when the requested exact-case tool was never offered, got: {}", String::from_utf8_lossy(&output.stdout));
+}
+
 // --- 5: invalid configuration denied ---
 
 #[test]
@@ -755,4 +809,136 @@ fn the_schema_hash_scope_disclosure_appears_in_real_cli_output_on_every_run() {
         stderr.contains("Schema-hash agreement is interface-shape verification, never behavioral-integrity proof."),
         "the real CLI's own stderr must contain the explicit M6.5 scope disclosure on every run, got: {stderr}"
     );
+}
+
+// --- M6.7: server crash/exit during each phase, fail-closed, no audit evidence beyond the reached phase ---
+
+/// Crashes (hard `os._exit`, no clean shutdown) immediately after
+/// answering `initialize` but before ever answering `tools/list` --
+/// discovery itself must fail, never silently treated as "zero tools."
+const MOCK_SERVER_CRASH_DURING_DISCOVERY: &str = r#"
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        os._exit(1)  # hard crash, no tools/list reply ever sent
+"#;
+
+#[test]
+fn a_server_that_crashes_during_discovery_fails_closed_and_records_no_tool_classification_or_authorization() {
+    if skip_if_no_python() {
+        return;
+    }
+    let fx = TestFixture::new_with_server_script("crash-discovery", MOCK_SERVER_CRASH_DURING_DISCOVERY);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    assert_eq!(output.status.code(), Some(1), "a server crash during discovery must deny the invocation, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "no tools/call response of any kind may ever appear when discovery itself never completed, got: {}", String::from_utf8_lossy(&output.stdout));
+
+    let raw = fx.read_raw_audit_log();
+    let lines: Vec<&[u8]> = raw[..raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let records: Vec<_> = lines.iter().map(|l| audit_chain_core::parse_line(l).unwrap()).collect();
+    let events: Vec<mcp_client_audit_worker::McpClientEvent> = records.iter().map(|r| audit_chain_core::parse_event(&r.content_bytes).unwrap()).collect();
+
+    assert!(
+        events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Failed, .. })),
+        "a DiscoveryOutcome::Failed must be durably recorded when the server crashes mid-discovery, got events: {events:?}"
+    );
+    for forbidden in ["ToolClassified", "AuthorizationDecision", "AuthorizationDenied", "InvocationAttempted", "InvocationOutcome"] {
+        assert!(
+            !events.iter().any(|e| format!("{:?}", e.kind).starts_with(forbidden)),
+            "{forbidden} must never appear when the server crashed before discovery ever completed -- no later phase may leave audit evidence as if it had been reached, got events: {events:?}"
+        );
+    }
+
+    let scan = audit_chain_core::scan_chain(&records.into_iter().map(audit_chain_core::LineOutcome::Parsed).collect::<Vec<_>>());
+    assert!(scan.stop_reason.is_none(), "the persisted chain must still verify cleanly after a mid-discovery crash, got {:?}", scan.stop_reason);
+}
+
+/// Answers `initialize` and `tools/list` correctly (so discovery and
+/// schema verification both succeed normally against a genuinely
+/// matching schema), then hard-crashes the instant `tools/call` is
+/// received -- never sending any reply at all. This is DIFFERENT from
+/// `hang_thing` (which never answers but stays alive): here the whole
+/// process is gone, so the client observes a closed pipe/EOF rather
+/// than a timeout.
+const MOCK_SERVER_CRASH_DURING_INVOCATION: &str = r#"
+import sys, json, os
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock-test-server", "version": "0.0.1"},
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+            {"name": "read_thing", "description": "reads a thing", "inputSchema": {"type": "object", "properties": {}}},
+        ]}})
+    elif method == "tools/call":
+        os._exit(1)  # hard crash, no reply, no clean pipe close
+"#;
+
+#[test]
+fn a_server_that_crashes_during_invocation_records_invocation_attempted_but_never_a_fabricated_success_outcome() {
+    if skip_if_no_python() {
+        return;
+    }
+    let fx = TestFixture::new_with_server_script("crash-invocation", MOCK_SERVER_CRASH_DURING_INVOCATION);
+    fx.write_config(&trusted_tool_toml("read_thing", "read", "internal", READ_THING_SCHEMA), "kind = \"allow_read_only\"");
+
+    let output = fx.run_cli("read_thing", "{}");
+    // Exit code 1 (real failure) is the only acceptable outcome here --
+    // never 0 (which would mean a fabricated success was reported).
+    assert_eq!(output.status.code(), Some(1), "a server crash during tools/call must never be reported as success, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty(), "no fabricated tools/call result may ever reach stdout when the server crashed before answering, got: {}", String::from_utf8_lossy(&output.stdout));
+
+    let raw = fx.read_raw_audit_log();
+    let lines: Vec<&[u8]> = raw[..raw.len().saturating_sub(1)].split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let records: Vec<_> = lines.iter().map(|l| audit_chain_core::parse_line(l).unwrap()).collect();
+    let events: Vec<mcp_client_audit_worker::McpClientEvent> = records.iter().map(|r| audit_chain_core::parse_event(&r.content_bytes).unwrap()).collect();
+
+    // Discovery and authorization genuinely completed before the crash
+    // -- their evidence must be present (this is NOT the
+    // crash-during-discovery case).
+    assert!(events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::DiscoveryOutcome { outcome: mcp_client_audit_worker::DiscoveryOutcomeKind::Discovered, .. })), "discovery genuinely succeeded before the crash and must be recorded as such, got events: {events:?}");
+    assert!(events.iter().any(|e| matches!(e.kind, mcp_client_audit_worker::McpClientEventKind::AuthorizationDecision { allowed: true, .. })), "authorization genuinely succeeded before the crash and must be recorded as such, got events: {events:?}");
+
+    // The crash happened AFTER tools/call was dispatched -- invocation
+    // was genuinely attempted, so InvocationAttempted recording that is
+    // correct, not a violation of "no evidence beyond the reached
+    // phase." What must NEVER happen is a fabricated SUCCESS outcome.
+    let has_success_outcome = events.iter().any(|e| matches!(&e.kind, mcp_client_audit_worker::McpClientEventKind::InvocationOutcome { outcome, .. } if format!("{outcome:?}").to_lowercase().contains("success")));
+    assert!(!has_success_outcome, "a crashed, unanswered tools/call must never be durably recorded as a success outcome, got events: {events:?}");
+
+    let scan = audit_chain_core::scan_chain(&records.into_iter().map(audit_chain_core::LineOutcome::Parsed).collect::<Vec<_>>());
+    assert!(scan.stop_reason.is_none(), "the persisted chain must still verify cleanly after a mid-invocation crash, got {:?}", scan.stop_reason);
 }
