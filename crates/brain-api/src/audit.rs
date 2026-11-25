@@ -184,6 +184,57 @@ pub enum AuditEventKind {
         source_sequence: u64,
         source_record_hash: String,
     },
+    /// M7.5: the FIRST record of every rotated-into audit segment except
+    /// the legacy one (additive — `audit-segmentation`'s own concern;
+    /// `brain-api` itself has no concept of "segment," only this
+    /// schema). Commits this new segment to its predecessor's own
+    /// already-verified final chain state (`prev_segment_id`/
+    /// `prev_final_sequence`/`prev_final_record_hash`/
+    /// `prev_segment_record_count`) AND to the retention ledger's own
+    /// tail at the moment of this rotation
+    /// (`retention_ledger_sequence`/`retention_ledger_record_hash`) —
+    /// never fabricated: both commitments are copied from an
+    /// independently verified `scan_chain` result at the moment of
+    /// rotation, never guessed or derived from the manifest alone (the
+    /// manifest is an accelerator, never this record's own source of
+    /// truth).
+    SegmentLinkage {
+        prev_segment_id: String,
+        prev_final_sequence: u64,
+        prev_final_record_hash: String,
+        prev_segment_record_count: u64,
+        retention_ledger_sequence: u64,
+        retention_ledger_record_hash: String,
+    },
+    /// M7.6: phase 1 of the 5-phase retention protocol — records that a
+    /// retention INTENT was made on `target_segment_id`, durably, in the
+    /// currently Active segment (never in the segment being targeted for
+    /// retirement, which may already be Closed) — BEFORE any
+    /// `RetentionReceipt` is written to the ledger and before any
+    /// payload is touched. Distinct from `RetentionAuthorized` (phase 3)
+    /// the same way `ApprovalAttempted` is distinct from `CommitOutcome`
+    /// elsewhere in this schema: recording that an attempt was MADE is
+    /// not evidence that it completed.
+    RetentionIntentAttempted {
+        target_segment_id: String,
+        target_segment_final_sequence: u64,
+        target_segment_final_record_hash: String,
+    },
+    /// M7.6: phase 3 — the durable commitment that phases 1 and 2 both
+    /// completed: a `RetentionReceipt` for `target_segment_id` now
+    /// durably exists in the retention ledger at
+    /// `retention_ledger_sequence`/`retention_ledger_record_hash`. From
+    /// the moment this record is durably appended, deleting
+    /// `target_segment_id`'s own payload (phase 4) is authorized — this
+    /// record's own presence (verified against the ledger, never
+    /// assumed) is the one and only proof that distinguishes an
+    /// authorized retirement from tampering/cancellation, per
+    /// `audit-segmentation`'s own retention protocol.
+    RetentionAuthorized {
+        target_segment_id: String,
+        retention_ledger_sequence: u64,
+        retention_ledger_record_hash: String,
+    },
 }
 
 /// The semantic phase a translated [`AuditEventKind::McpBridgeEvent`]
@@ -402,6 +453,24 @@ mod tests {
                 source_log_id: "44444444-4444-4444-4444-444444444444".into(),
                 source_sequence: 1,
                 source_record_hash: "b".repeat(64),
+            },
+            AuditEventKind::SegmentLinkage {
+                prev_segment_id: "00000000000000000000".into(),
+                prev_final_sequence: 999,
+                prev_final_record_hash: "c".repeat(64),
+                prev_segment_record_count: 1000,
+                retention_ledger_sequence: 3,
+                retention_ledger_record_hash: "d".repeat(64),
+            },
+            AuditEventKind::RetentionIntentAttempted {
+                target_segment_id: "00000000000000000000".into(),
+                target_segment_final_sequence: 999,
+                target_segment_final_record_hash: "c".repeat(64),
+            },
+            AuditEventKind::RetentionAuthorized {
+                target_segment_id: "00000000000000000000".into(),
+                retention_ledger_sequence: 4,
+                retention_ledger_record_hash: "e".repeat(64),
             },
         ]
     }
@@ -792,5 +861,74 @@ mod tests {
             source_record_hash: "a".repeat(64),
         };
         assert_ne!(unknown, as_generic_event, "ExternalSideEffectUnknown must never equal its own generic-shaped equivalent");
+    }
+
+    // --- M7.5/M7.6: SegmentLinkage / RetentionIntentAttempted / RetentionAuthorized schema ---
+
+    #[test]
+    fn every_m7_5_and_m7_6_variant_round_trips_through_serde_json_exactly() {
+        for kind in [
+            AuditEventKind::SegmentLinkage {
+                prev_segment_id: "00000000000000000000".into(),
+                prev_final_sequence: 999,
+                prev_final_record_hash: "c".repeat(64),
+                prev_segment_record_count: 1000,
+                retention_ledger_sequence: 3,
+                retention_ledger_record_hash: "d".repeat(64),
+            },
+            AuditEventKind::RetentionIntentAttempted {
+                target_segment_id: "00000000000000000000".into(),
+                target_segment_final_sequence: 999,
+                target_segment_final_record_hash: "c".repeat(64),
+            },
+            AuditEventKind::RetentionAuthorized {
+                target_segment_id: "00000000000000000000".into(),
+                retention_ledger_sequence: 4,
+                retention_ledger_record_hash: "e".repeat(64),
+            },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: AuditEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind, "round trip through JSON must reproduce the exact original variant, got {json}");
+        }
+    }
+
+    #[test]
+    fn segment_linkage_is_never_equal_to_mcp_bridge_event_even_with_overlapping_field_shapes() {
+        // Decision 1's own invariant, extended: a new additive variant
+        // must never be confused with an unrelated existing one, even
+        // when both happen to carry similarly-shaped hash/sequence
+        // fields.
+        let linkage = AuditEventKind::SegmentLinkage { prev_segment_id: "s".into(), prev_final_sequence: 0, prev_final_record_hash: "a".repeat(64), prev_segment_record_count: 0, retention_ledger_sequence: 0, retention_ledger_record_hash: "b".repeat(64) };
+        let bridge = AuditEventKind::McpBridgeEvent { source_phase: McpBridgePhase::Invocation, source_kind: "invocation_attempted".into(), server: None, tool_name: None, invocation_id: None, outcome: None, source_log_id: "s".into(), source_sequence: 0, source_record_hash: "a".repeat(64) };
+        assert_ne!(linkage, bridge);
+    }
+
+    #[test]
+    fn retention_intent_attempted_and_retention_authorized_are_correlated_by_target_segment_id_and_remain_distinct_variants() {
+        let intent = AuditEventKind::RetentionIntentAttempted { target_segment_id: "seg-1".into(), target_segment_final_sequence: 5, target_segment_final_record_hash: "a".repeat(64) };
+        let authorized = AuditEventKind::RetentionAuthorized { target_segment_id: "seg-1".into(), retention_ledger_sequence: 1, retention_ledger_record_hash: "b".repeat(64) };
+        assert_ne!(intent, authorized, "intent and authorized must stay two distinct records -- recording an attempt is never evidence it completed");
+        if let (AuditEventKind::RetentionIntentAttempted { target_segment_id: t1, .. }, AuditEventKind::RetentionAuthorized { target_segment_id: t2, .. }) = (&intent, &authorized) {
+            assert_eq!(t1, t2, "both records correlate on target_segment_id");
+        } else {
+            panic!("pattern must match");
+        }
+    }
+
+    #[test]
+    fn no_m7_5_or_m7_6_variant_serializes_a_free_text_shaped_field() {
+        // Same content-free regression discipline as every other
+        // variant in this schema -- these three carry only ids,
+        // sequences, and fixed-width hashes, never prose.
+        for kind in [
+            AuditEventKind::SegmentLinkage { prev_segment_id: "s".into(), prev_final_sequence: 0, prev_final_record_hash: "a".repeat(64), prev_segment_record_count: 0, retention_ledger_sequence: 0, retention_ledger_record_hash: "b".repeat(64) },
+            AuditEventKind::RetentionIntentAttempted { target_segment_id: "s".into(), target_segment_final_sequence: 0, target_segment_final_record_hash: "a".repeat(64) },
+            AuditEventKind::RetentionAuthorized { target_segment_id: "s".into(), retention_ledger_sequence: 0, retention_ledger_record_hash: "a".repeat(64) },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert!(json.len() < 400, "variant serialized unexpectedly large, suggesting a content-bearing field crept in: {json}");
+            assert!(!json.contains('\n'), "a multi-line value suggests prose/content leaked into an audit event: {json}");
+        }
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "audit-segmentation"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# Private project, not intended for crates.io.
+publish = false
+description = "SuperBrain M7.5/M7.6: audit log segment lifecycle (rotation), a dedicated-Vault retention ledger, and the 5-phase retention protocol, built entirely on top of the existing, unmodified storage::audit_writer -- no change to AUDIT_RECORD_FORMAT_VERSION, ChainRecord, or the .audit/audit.log+head.ref contract. Sole responsibility: segment lifecycle, rotation, retention ledger, retention/recovery, and end-to-end segment verification -- never MCP import/translation (that is mcp-audit-bridge's own, separate responsibility; this crate has no dependency on mcp-client, mcp-client-audit-worker, mcp-audit-bridge or mcp-server)."
+
+[dependencies]
+brain-api = { path = "../brain-api" }
+brain-api-audit-worker = { path = "../brain-api-audit-worker" }
+storage = { path = "../storage" }
+audit-chain-core = { path = "../audit-chain-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"

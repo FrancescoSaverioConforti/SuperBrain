@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/api", "crates/audit-chain-core", "crates/brain-api", "crates/brain-api-audit-worker", "crates/codegraph-domain", "crates/codegraph-index", "crates/domain", "crates/index", "crates/mcp-audit-bridge", "crates/mcp-client", "crates/mcp-client-audit-worker", "crates/mcp-client-cli", "crates/mcp-server", "crates/policy", "crates/storage", "crates/vault-security"]
+members = ["crates/api", "crates/audit-chain-core", "crates/audit-segmentation", "crates/brain-api", "crates/brain-api-audit-worker", "crates/codegraph-domain", "crates/codegraph-index", "crates/domain", "crates/index", "crates/mcp-audit-bridge", "crates/mcp-client", "crates/mcp-client-audit-worker", "crates/mcp-client-cli", "crates/mcp-server", "crates/policy", "crates/storage", "crates/vault-security"]
